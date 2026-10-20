@@ -46,7 +46,7 @@ What those commands do:
 - `pico pin .` writes the exact orchestrator commit to `.pi/orchestrator.lock`; later `pico run .` honors that reviewed commit. `pico update .` explicitly advances an existing lock to the resolved update revision.
 
 To report a PICO bug while working in any repository, write a short report and
-preview the issue before sending it to `dhuzard/pi-coding-orchestrator`:
+preview the issue before sending it to `dhuzard/pico-orchestrator`:
 
 ```sh
 pico report --title "PICO bug: short summary" --body-file report.md

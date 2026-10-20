@@ -11,7 +11,7 @@ from pathlib import Path
 import github_sync
 
 
-PICO_REPOSITORY = "dhuzard/pi-coding-orchestrator"
+PICO_REPOSITORY = "dhuzard/pico-orchestrator"
 
 
 def report(*, title: str, body_file: Path, apply: bool = False,

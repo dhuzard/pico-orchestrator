@@ -10,7 +10,7 @@ import report_pico_issue
 
 
 class FakeGithub:
-    def __init__(self, resolved="dhuzard/pi-coding-orchestrator"):
+    def __init__(self, resolved="dhuzard/pico-orchestrator"):
         self.resolved = resolved
         self.calls = []
 
@@ -20,7 +20,7 @@ class FakeGithub:
 
     def create_issue(self, title, body, *, repo):
         self.calls.append(("create_issue", repo, title, body))
-        return {"number": 75, "url": "https://github.com/dhuzard/pi-coding-orchestrator/issues/75"}
+        return {"number": 123, "url": "https://github.com/dhuzard/pico-orchestrator/issues/123"}
 
 
 class ReportPicoIssueTests(unittest.TestCase):
@@ -32,7 +32,7 @@ class ReportPicoIssueTests(unittest.TestCase):
             result = subprocess.run([sys.executable, str(script), "--title", "Bug", "--body-file", str(body_file)],
                                     cwd=directory, capture_output=True, text=True, check=True)
             preview = json.loads(result.stdout)
-            self.assertEqual(preview["plan"]["repository"], "dhuzard/pi-coding-orchestrator")
+            self.assertEqual(preview["plan"]["repository"], "dhuzard/pico-orchestrator")
             self.assertEqual(preview["status"], "DRY_RUN")
 
     def test_preview_and_apply_use_only_the_canonical_repository(self):
@@ -47,8 +47,8 @@ class ReportPicoIssueTests(unittest.TestCase):
                                               apply=True, plan_hash=preview["plan_hash"], adapter=adapter)
             self.assertEqual(result["status"], "COMPLETED")
             self.assertEqual(adapter.calls, [
-                ("repo_view", "dhuzard/pi-coding-orchestrator"),
-                ("create_issue", "dhuzard/pi-coding-orchestrator", "Watch bug",
+                ("repo_view", "dhuzard/pico-orchestrator"),
+                ("create_issue", "dhuzard/pico-orchestrator", "Watch bug",
                  "The watch command lost --workspace.\n"),
             ])
 
@@ -68,7 +68,7 @@ class ReportPicoIssueTests(unittest.TestCase):
                 report_pico_issue.report(title="Bug", body_file=body_file, apply=True,
                                          plan_hash=report_pico_issue.report(title="Bug", body_file=body_file)["plan_hash"],
                                          adapter=adapter)
-            self.assertEqual(adapter.calls, [("repo_view", "dhuzard/pi-coding-orchestrator")])
+            self.assertEqual(adapter.calls, [("repo_view", "dhuzard/pico-orchestrator")])
 
 
 if __name__ == "__main__":
