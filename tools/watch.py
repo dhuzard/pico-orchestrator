@@ -1,0 +1,598 @@
+#!/usr/bin/env python3
+"""Read-only, loopback-only viewer for parent orchestration records."""
+from __future__ import annotations
+
+import argparse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import json
+import os
+from pathlib import Path
+import re
+import sys
+from urllib.parse import urlsplit
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "tools"))
+import github_integration
+import workspace_plan
+import workspace_run
+import garden_controls  # noqa: E402
+from usage import TOKEN_FIELDS, run_tokens, sum_tokens  # noqa: E402,F401
+import workspace_scheduler
+
+RUN_ID = re.compile(r"^run-[A-Za-z0-9-]+$")
+REPOSITORY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$")
+SLUG = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+SHA = re.compile(r"^[0-9a-f]{40}$")
+CODE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,79}$")
+STAMP = re.compile(r"^[0-9T:.Z+-]{1,40}$")
+SESSION_ID = re.compile(r"^[0-9TZ:-]{1,40}-[0-9]{1,10}$")
+ASSETS = {"/": ("index.html", "text/html; charset=utf-8"),
+          "/app.js": ("app.js", "text/javascript; charset=utf-8"),
+          "/style.css": ("style.css", "text/css; charset=utf-8")}
+
+
+def publication_links(record: dict, directory: Path) -> list[dict]:
+    """Resolve linked publication child records into verified GitHub PR URLs."""
+    parent = record.get("parent_orchestration") or {}
+    repository = parent.get("target_repository")
+    if not isinstance(repository, str) or not REPOSITORY.fullmatch(repository):
+        return []
+    links: dict[int, dict] = {}
+    for phase in parent.get("phases") or []:
+        if not isinstance(phase, dict):
+            continue
+        for child_id in phase.get("child_run_ids") or []:
+            if not isinstance(child_id, str) or not RUN_ID.fullmatch(child_id):
+                continue
+            try:
+                child = json.loads((directory / f"{child_id}.json").read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            integration = child.get("github_integration") if isinstance(child, dict) else None
+            if not isinstance(integration, dict) or not isinstance(integration.get("target_repository"), str):
+                continue
+            if integration["target_repository"].casefold() != repository.casefold():
+                continue
+            for item in integration.get("audit") or []:
+                if not isinstance(item, dict):
+                    continue
+                number = item.get("pr")
+                if (item.get("operation") in {"create_draft_pr", "create_pr"}
+                        and item.get("status") == "applied" and type(number) is int and number > 0):
+                    links[number] = {"kind": "pr", "number": number,
+                                     "url": f"https://github.com/{repository}/pull/{number}"}
+    return list(links.values())
+
+
+def _merge_links(*groups: list[dict]) -> list[dict]:
+    merged: dict[str, dict] = {}
+    for group in groups:
+        for link in group:
+            merged.setdefault(link["url"], link)
+    return list(merged.values())
+
+
+def workspace_pr_links(entry: dict, directory: Path) -> list[dict]:
+    """The draft PR recorded by `pico workspace publish`, verified against its publication run."""
+    pr = ((entry.get("observed") or {}).get("pr")) if isinstance(entry.get("observed"), dict) else None
+    if not isinstance(pr, dict):
+        return []
+    number, repository, run_id = pr.get("number"), pr.get("repository"), pr.get("publication_run_id")
+    if (type(number) is not int or number < 1 or not isinstance(repository, str) or not REPOSITORY.fullmatch(repository)
+            or not isinstance(run_id, str) or not RUN_ID.fullmatch(run_id)):
+        return []
+    try:
+        record = json.loads((directory / f"{run_id}.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    integration = record.get("github_integration") if isinstance(record, dict) else None
+    if not isinstance(integration, dict) or str(integration.get("target_repository", "")).casefold() != repository.casefold():
+        return []
+    applied = any(isinstance(item, dict) and item.get("operation") in {"create_draft_pr", "create_pr"}
+                  and item.get("status") == "applied" and item.get("pr") == number
+                  for item in integration.get("audit") or [])
+    return [{"kind": "pr", "number": number, "url": f"https://github.com/{repository}/pull/{number}"}] if applied else []
+
+
+def public_run(record: dict, directory: Path | None = None) -> dict:
+    """Expose only display metadata, never full trace contents or prompts."""
+    parent = record.get("parent_orchestration") or {}
+    context = parent.get("context") or {}
+    metrics = record.get("orchestration_metrics") or {}
+    interactions = []
+    for item in parent.get("interactions") or []:
+        if not isinstance(item, dict) or item.get("type") not in {"directive", "feedback", "decision"}:
+            continue
+        interactions.append({key: item.get(key) for key in (
+            "sequence", "at", "type", "summary", "task_id", "step_id", "subagent_id", "reply_to")})
+    return {
+        "id": record.get("run_id"), "repository": parent.get("target_repository"),
+        "started_at": record.get("started_at"), "ended_at": record.get("ended_at"),
+        "status": parent.get("final_status") or record.get("outcome"),
+        "blocker_code": parent.get("blocker_code"),
+        "phases": parent.get("phases") or [], "waves": parent.get("waves") or [],
+        "activity": parent.get("activity") or [],
+        "interactions": interactions,
+        "links": publication_links(record, directory) if directory else [],
+        "context": {key: context.get(key) for key in (
+            "spawned_agents", "peak_concurrent_workers", "worker_active_ms",
+            "peak_context_tokens", "compactions", "lead_usage", "worker_usage")},
+        "metrics": {key: metrics.get(key) for key in (
+            "wall_clock_ms", "total_tokens", "lead_input_tokens", "lead_output_tokens",
+            "worker_input_tokens", "worker_output_tokens", "parallel_speedup",
+            "estimated_cost_usd", "lead_model")},
+    }
+
+
+def load_runs(directory: Path, repository: str | None) -> list[dict]:
+    records = []
+    if not directory.is_dir():
+        return records
+    for path in directory.glob("run-*.json"):
+        if not RUN_ID.fullmatch(path.stem):
+            continue
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+            parent = record.get("parent_orchestration")
+            if not isinstance(parent, dict):
+                continue
+            if repository and (parent.get("target_repository") or "").casefold() != repository.casefold():
+                continue
+            records.append(public_run(record, directory))
+        except (OSError, ValueError, TypeError, AttributeError):
+            continue  # A damaged older record must not take down the live viewer.
+    records.sort(key=lambda run: run.get("started_at") or "", reverse=True)
+    return records[:40]
+
+
+def load_runs_by_id(directory: Path, run_ids: list[str]) -> list[dict]:
+    """The run view of a workspace: exactly its linked child runs."""
+    records = []
+    for run_id in dict.fromkeys(run_ids):
+        if not isinstance(run_id, str) or not RUN_ID.fullmatch(run_id):
+            continue
+        try:
+            record = json.loads((directory / f"{run_id}.json").read_text(encoding="utf-8"))
+            if isinstance(record.get("parent_orchestration"), dict):
+                records.append(public_run(record, directory))
+        except (OSError, ValueError, TypeError, AttributeError):
+            continue
+    records.sort(key=lambda run: run.get("started_at") or "", reverse=True)
+    return records
+
+
+# --- Workspace mode ---------------------------------------------------------
+# The workspace view reads only the workspace record
+# (<state>/workspaces/<id>.json), the optional manifest plan and the child run
+# records. Execution records (<state>/executions/) carry the child objective
+# and are never opened here. Every served value is whitelisted and
+# shape-checked: ids, codes, states, timestamps and counters, never task
+# titles, goals, objectives, prompts, error details, local paths or logs.
+
+class WorkspaceViewError(Exception):
+    def __init__(self, code: str, detail: str, http_status: int):
+        self.code, self.detail, self.http_status = code, detail, http_status
+        super().__init__(f"{code}: {detail}")
+
+
+def _match(value, pattern: re.Pattern):
+    return value if isinstance(value, str) and pattern.fullmatch(value) else None
+
+
+def _count(value):
+    return value if type(value) is int and value >= 0 else None
+
+
+def _ids(values) -> list[str]:
+    return [v for v in values if _match(v, SLUG)] if isinstance(values, list) else []
+
+
+def _child_run(directory: Path, run_id, identity) -> tuple[dict | None, dict | None]:
+    """Display summary and full record of one child run, or (None, None) when it cannot be attributed."""
+    if not _match(run_id, RUN_ID):
+        return None, None
+    try:
+        record = json.loads((directory / f"{run_id}.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None, None
+    parent = record.get("parent_orchestration") if isinstance(record, dict) else None
+    if not isinstance(parent, dict):
+        return None, None
+    target = parent.get("target_repository")
+    if isinstance(identity, str) and (not isinstance(target, str) or target.casefold() != identity.casefold()):
+        return None, None  # A run bound to another repository is never attributed to this task.
+    phases = [phase for phase in parent.get("phases") or [] if isinstance(phase, dict)]
+    summary = {"id": run_id, "status": _match(parent.get("final_status") or record.get("outcome"), CODE),
+               "blocker_code": _match(parent.get("blocker_code"), CODE),
+               "started_at": _match(record.get("started_at"), STAMP), "ended_at": _match(record.get("ended_at"), STAMP),
+               "phases_total": len(phases),
+               "phases_completed": sum(1 for phase in phases if phase.get("status") == "completed")}
+    return summary, record
+
+
+def _record_plan(record: dict) -> dict:
+    """A plan-shaped view of the workspace record alone: recorded tasks, no waves or declared readiness."""
+    entries = record.get("tasks") if isinstance(record.get("tasks"), dict) else {}
+    tasks = []
+    for task_id in sorted(t for t in entries if _match(t, SLUG)):
+        entry = entries[task_id] if isinstance(entries[task_id], dict) else {}
+        inputs = entry.get("inputs") if isinstance(entry.get("inputs"), dict) else {}
+        upstream = [item.get("task") for item in inputs.get("upstream") or [] if isinstance(item, dict)]
+        tasks.append({"id": task_id, "repository": _match(entry.get("repository"), SLUG) or "unknown",
+                      "depends_on": sorted(t for t in _ids(upstream) if t in entries), "blocks": [],
+                      "wave": None, "readiness": "planned", "blocked_by": []})
+    by_id = {task["id"]: task for task in tasks}
+    for task in tasks:
+        for dep in task["depends_on"]:
+            by_id[dep]["blocks"].append(task["id"])
+    return {"workspace_id": record.get("workspace_id"), "status": None, "max_parallel": None, "waves": [],
+            "repositories": [{"id": repo_id} for repo_id in sorted({t["repository"] for t in tasks})],
+            "tasks": tasks, "blockers": []}
+
+
+def _sessions(record: dict) -> list[dict]:
+    sessions = []
+    for session in record.get("scheduler_sessions") or []:
+        if not isinstance(session, dict):
+            continue
+        refused = session.get("refused") if isinstance(session.get("refused"), dict) else {}
+        sessions.append({"id": _match(session.get("id"), SESSION_ID),
+                         "started_at": _match(session.get("started_at"), STAMP),
+                         "finished_at": _match(session.get("finished_at"), STAMP),
+                         "cap": _count(session.get("cap")),
+                         "dispatched": _ids(session.get("dispatched")), "resumed": _ids(session.get("resumed")),
+                         "qualified": _ids(session.get("qualified")),
+                         "held_by_budget": _ids(session.get("held_by_budget")),
+                         "observed_running": _ids(session.get("observed_running")),
+                         "refused": {t: c for t, c in refused.items() if _match(t, SLUG) and _match(c, CODE)},
+                         "status": session.get("status") if session.get("status") in {"OK", "ATTENTION"} else None})
+    sessions.sort(key=lambda s: s["started_at"] or "", reverse=True)
+    return sessions
+
+
+def _manifest_plan(manifest: Path, state: Path | None = None) -> dict:
+    """The manifest's plan with the workspace record's observed state overlaid, as the scheduler sees it."""
+    observed = None
+    try:
+        raw = workspace_plan.load_manifest(manifest)
+        workspace_id = raw.get("id") if isinstance(raw, dict) else None
+        if state is not None and _match(workspace_id, SLUG):
+            record = workspace_run.load_workspace(state / "workspaces" / f"{workspace_id}.json")
+            observed = workspace_run.observed_from_record(record or {})
+    except (workspace_plan.WorkspaceError, workspace_run.WorkspaceRunError):
+        observed = None  # the plan call below reports an unreadable manifest
+    try:
+        return workspace_plan.plan(manifest, access_check=None, observed=observed)
+    except workspace_plan.WorkspaceError as exc:
+        # The planner's message can quote manifest content; only the code is served.
+        raise WorkspaceViewError("WORKSPACE_MANIFEST_INVALID",
+                                 "the workspace manifest cannot be read or violates its schema", 422) from exc
+
+
+def workspace_view(state: Path, *, workspace_id: str | None = None, manifest: Path | None = None,
+                   plan: dict | None = None) -> dict:
+    """Display metadata of one workspace: tasks grouped by repository, scheduler states, child runs, tokens.
+
+    With a manifest the task graph (waves, depends_on, declared readiness,
+    blocked_by) comes from workspace_plan.plan(access_check=None); with an id
+    alone it comes from the workspace record. States are computed by
+    workspace_scheduler.report, so they are the scheduler's own states.
+    """
+    if plan is None and manifest is not None:
+        plan = _manifest_plan(manifest, state)
+    if plan is not None:
+        workspace_id = plan["workspace_id"]
+    if not _match(workspace_id, SLUG):
+        raise WorkspaceViewError("WORKSPACE_ID_INVALID", "a workspace id is 1-64 letters, digits, - or _", 400)
+    try:
+        record = workspace_run.load_workspace(state / "workspaces" / f"{workspace_id}.json")
+    except workspace_run.WorkspaceRunError as exc:
+        raise WorkspaceViewError(exc.code, "the workspace record cannot be read", 422) from exc
+    if record is None and plan is None:
+        raise WorkspaceViewError("WORKSPACE_UNKNOWN", f"no workspace record for {workspace_id} in this state directory", 404)
+    record = record or {}
+    source = "manifest" if plan is not None else "record"
+    plan = plan or _record_plan(record)
+    raw_entries = record.get("tasks") if isinstance(record.get("tasks"), dict) else {}
+    entries = {task_id: entry for task_id, entry in raw_entries.items() if isinstance(entry, dict)}
+    sessions = _sessions(record)
+    # A refusal is not persisted as a launch; the latest session's refusals
+    # still describe the tasks that have not been launched since.
+    latest = sessions[0]["refused"] if sessions else {}
+    refused = {task_id: {"code": code} for task_id, code in latest.items()
+               if workspace_scheduler.classify(entries.get(task_id)) == "not_launched"}
+    report = workspace_scheduler.report(plan, entries, refused)
+    rows = {row["id"]: row for row in report["tasks"]}
+    # A scheduler still running records its dispatches before the children return.
+    open_session = next((x for x in sessions if x["finished_at"] is None), None)
+    if open_session is not None:
+        in_flight = set(open_session["dispatched"]) | set(open_session["resumed"]) | set(open_session["qualified"])
+        settled = {"completed", "partial", "failed", "cancelled", "refused", "needs_reconciliation",
+                   "validated", "ready_for_downstream", "merged"}
+        for task_id in in_flight & set(rows):
+            if rows[task_id]["state"] not in settled:
+                rows[task_id] = {**rows[task_id], "state": "running"}
+        if in_flight & set(rows):
+            report["counts"] = {}
+            for row in rows.values():
+                report["counts"][row["state"]] = report["counts"].get(row["state"], 0) + 1
+    runs_dir = state / "runs"
+    tasks_by_repo: dict[str, list[dict]] = {}
+    tokens_by_repo: dict[str, list[dict]] = {}
+    for task in sorted(plan["tasks"], key=lambda t: (t["wave"] if t["wave"] is not None else 1 << 30, t["id"])):
+        row, entry = rows[task["id"]], entries.get(task["id"]) or {}
+        run, run_record = _child_run(runs_dir, row["run_id"], entry.get("target_repository"))
+        tokens = run_tokens(run_record["parent_orchestration"]) if run_record else None
+        if tokens is not None:
+            tokens_by_repo.setdefault(task["repository"], []).append(tokens)
+        tasks_by_repo.setdefault(task["repository"], []).append({
+            "id": task["id"], "repository": task["repository"], "wave": task["wave"],
+            "kind": task.get("kind") if task.get("kind") in {"implementation", "qualification"} else None,
+            "readiness": task["readiness"] if source == "manifest" else None,
+            "state": row["state"], "depends_on": _ids(task["depends_on"]), "blocks": _ids(task["blocks"]),
+            "blocked_by": _ids(row["blocked_by"]),
+            "execution_status": _match(entry.get("execution_status"), SLUG), "launches": _count(row["launches"]),
+            "run_id": _match(row["run_id"], RUN_ID), "run_status": _match(row["run_status"], CODE),
+            "run_blocker_code": _match(row["run_blocker_code"], CODE),
+            "refusal_code": _match((row["refusal"] or {}).get("code"), CODE),
+            "run": run, "links": _merge_links(publication_links(run_record, runs_dir) if run_record else [],
+                                              workspace_pr_links(entry, runs_dir)), "tokens": tokens})
+    repositories = []
+    declared_ids = [repo["id"] for repo in plan["repositories"]]
+    for repo_id in declared_ids + sorted(set(tasks_by_repo) - set(declared_ids)):
+        declared = next((repo for repo in plan["repositories"] if repo["id"] == repo_id), {})
+        tasks = tasks_by_repo.get(repo_id, [])
+        recorded = [entries[t["id"]] for t in tasks if t["id"] in entries]
+        identity = next((e.get("target_repository") for e in recorded if e.get("target_repository")), None)
+        pinned = declared.get("pinned_commit") or next((e.get("pinned_commit") for e in recorded), None)
+        repositories.append({"id": repo_id, "repository": _match(identity or declared.get("repository"), REPOSITORY),
+                             "pinned_commit": _match(pinned, SHA), "blocker_code": _match(declared.get("blocker_code"), CODE),
+                             "tasks": tasks, "tokens": sum_tokens(tokens_by_repo.get(repo_id, []))})
+    return {"workspace_id": workspace_id, "source": source, "record_found": bool(record),
+            "updated_at": _match(record.get("updated_at"), STAMP),
+            "plan_status": plan.get("status") if plan.get("status") in {"PLANNED", "BLOCKED"} else None,
+            "max_parallel": _count(plan.get("max_parallel")),
+            "waves": [_ids(wave) for wave in plan.get("waves") or []],
+            "status": report["status"], "counts": report["counts"], "repositories": repositories,
+            "tokens": sum_tokens([part for parts in tokens_by_repo.values() for part in parts]),
+            "budget": workspace_scheduler.budget_state(plan, record, runs_dir) if source == "manifest" else None,
+            "sessions": sessions}
+
+
+class WorkspaceSource:
+    """The watched workspace, resolved per request; a manifest's plan is cached until the file changes."""
+
+    def __init__(self, state: Path, target: str | Path):
+        self.state = state
+        path = Path(target).expanduser()
+        self.manifest = path.resolve() if path.is_file() else None
+        self._id = None if self.manifest else str(target)
+        self._key = None
+        self._plan = None
+
+    def plan(self) -> dict | None:
+        if self.manifest is None:
+            return None
+        try:
+            stat = self.manifest.stat()
+            key = (stat.st_mtime_ns, stat.st_size)
+        except OSError:
+            key = None
+        record = self.state / "workspaces"
+        try:
+            # Observed state changes with the record, so it is part of the cache key.
+            raw = workspace_plan.load_manifest(self.manifest)
+            record_stat = (record / f"{raw.get('id')}.json").stat() if isinstance(raw, dict) else None
+            key = (key, record_stat.st_mtime_ns if record_stat else None)
+        except (OSError, workspace_plan.WorkspaceError):
+            key = (key, None)
+        if key[0] is None or key != self._key:
+            self._key, self._plan = None, None
+            self._plan = _manifest_plan(self.manifest, self.state)
+            self._key = key
+        return self._plan
+
+    @property
+    def workspace_id(self) -> str | None:
+        if self._id is not None:
+            return self._id
+        try:
+            return self.plan()["workspace_id"]
+        except WorkspaceViewError:
+            return None
+
+    def view(self) -> dict:
+        return workspace_view(self.state, workspace_id=self._id, plan=self.plan())
+
+    def run_ids(self) -> list[str]:
+        try:
+            view = self.view()
+        except WorkspaceViewError:
+            return []
+        return [task["run_id"] for repo in view["repositories"] for task in repo["tasks"] if task["run_id"]]
+
+
+def make_handler(directory: Path, repository: str | None, workspace: WorkspaceSource | None = None,
+                 controls=None, port: int | None = None):
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, format, *args):
+            if not self.path.startswith("/api/"):
+                super().log_message(format, *args)
+
+        def _json(self, status: int, body: dict) -> bytes:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            return json.dumps(body).encode()
+
+        def _host_ok(self) -> bool:
+            # DNS-rebinding guard: only this server's own loopback names are served.
+            bound = port if port is not None else self.server.server_address[1]
+            if garden_controls.host_allowed(self.headers.get("Host"), bound):
+                return True
+            payload = self._json(421, {"ok": False, "error_code": "HOST_REJECTED", "error": "unexpected Host header"})
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return False
+
+        def _send(self, payload: bytes) -> None:
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def do_POST(self):
+            if not self._host_ok():
+                return
+            path = urlsplit(self.path).path
+            if path != "/api/action" or controls is None:
+                self._send(self._json(404, {"ok": False, "error_code": "CONTROLS_OFF",
+                                            "error": "start pico watch with --workspace <manifest> --controls"}))
+                return
+            length = int(self.headers.get("Content-Length") or 0)
+            body = self.rfile.read(min(length, garden_controls.MAX_BODY + 1)) if length > 0 else b""
+            try:
+                data = controls.authorize(self.headers, body)
+                result = controls.act(data)
+                payload = self._json(200, result)
+            except garden_controls.ControlError as exc:
+                payload = self._json(exc.status, {"ok": False, "error_code": exc.code, "error": exc.detail})
+            except workspace_run.WorkspaceRunError as exc:
+                payload = self._json(422, {"ok": False, "error_code": exc.code, "error": "the action was refused"})
+            self._send(payload)
+
+        def do_GET(self):
+            if not self._host_ok():
+                return
+            parts = urlsplit(self.path)
+            path = parts.path
+            if path == "/api/controls":
+                if workspace is None or workspace.manifest is None:
+                    payload = self._json(404, {"ok": False, "error_code": "WORKSPACE_MANIFEST_REQUIRED",
+                                               "error": "panels need pico watch --workspace <manifest>"})
+                else:
+                    try:
+                        panel_source = controls or garden_controls.Controls(workspace.manifest, 0, token="unused")
+                        payload = self._json(200, {"ok": True, "enabled": controls is not None,
+                                                   "actions": list(garden_controls.ACTIONS) if controls else [],
+                                                   **panel_source.panels()})
+                    except workspace_run.WorkspaceRunError as exc:
+                        payload = self._json(422, {"ok": False, "error_code": exc.code, "error": "panels unavailable"})
+                self._send(payload)
+                return
+            if path == "/api/branches":
+                task = (dict(item.split("=", 1) for item in parts.query.split("&") if "=" in item)).get("task")
+                if controls is None:
+                    payload = self._json(404, {"ok": False, "error_code": "CONTROLS_OFF", "error": "controls are off"})
+                else:
+                    try:
+                        payload = self._json(200, {"ok": True, "task": task, "branches": controls.branches(task)})
+                    except garden_controls.ControlError as exc:
+                        payload = self._json(exc.status, {"ok": False, "error_code": exc.code, "error": exc.detail})
+                    except workspace_run.WorkspaceRunError as exc:
+                        payload = self._json(422, {"ok": False, "error_code": exc.code, "error": "branches unavailable"})
+                self._send(payload)
+                return
+            if path == "/api/runs":
+                if workspace is None:
+                    body = {"repository": repository, "workspace_mode": False, "workspace": None,
+                            "runs": load_runs(directory, repository)}
+                else:
+                    body = {"repository": None, "workspace_mode": True, "workspace": workspace.workspace_id,
+                            "runs": load_runs_by_id(directory, workspace.run_ids())}
+                payload = self._json(200, body)
+            elif path == "/api/workspace":
+                if workspace is None:
+                    payload = self._json(404, {"ok": False, "error_code": "WORKSPACE_MODE_OFF",
+                                               "error": "start pico watch with --workspace to see a workspace"})
+                else:
+                    try:
+                        payload = self._json(200, {"ok": True, **workspace.view()})
+                    except WorkspaceViewError as exc:
+                        payload = self._json(exc.http_status, {"ok": False, "error_code": exc.code, "error": exc.detail})
+            elif path in ASSETS:
+                filename, content_type = ASSETS[path]
+                payload = (ROOT / "viewer" / filename).read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Cache-Control", "no-cache")
+            else:
+                self.send_error(404)
+                return
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Content-Security-Policy", "default-src 'self'; style-src 'self'; script-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    return Handler
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Watch pico runs in a local browser")
+    parser.add_argument("target", nargs="?", default=".", help="Target Git repository")
+    parser.add_argument("--repo", help="Select owner/repository when the target has multiple remotes")
+    parser.add_argument("--all", action="store_true", help="Show runs from every repository in this state directory")
+    parser.add_argument("--workspace", metavar="ID_OR_MANIFEST",
+                        help="Show one workspace across its repositories (workspace id or manifest path)")
+    parser.add_argument("--state-dir", type=Path, default=None)
+    parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--controls", action="store_true",
+                        help="with --workspace <manifest>: enable validate, request PR, CI and promote actions")
+    args = parser.parse_args()
+    if args.all and args.repo:
+        parser.error("--all and --repo cannot be combined")
+    if args.workspace and (args.all or args.repo):
+        parser.error("--workspace cannot be combined with --all or --repo")
+    if not 0 <= args.port <= 65535:
+        parser.error("--port must be between 0 and 65535")
+    default_state = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "pi-coding-orchestrator"
+    state = args.state_dir or Path(os.environ.get("PI_ORCHESTRATOR_STATE_DIR") or
+                                    os.environ.get("PI_CODING_ORCHESTRATOR_STATE_DIR") or default_state)
+    directory = state / "runs"
+    repository = None
+    workspace = None
+    if args.workspace:
+        workspace = WorkspaceSource(state, args.workspace)
+        if workspace.manifest is None and not SLUG.fullmatch(args.workspace):
+            parser.error(f"--workspace {args.workspace}: no such manifest file, and not a workspace id")
+        try:
+            workspace.view()
+        except WorkspaceViewError as exc:
+            if exc.code != "WORKSPACE_UNKNOWN":
+                parser.error(f"{exc.code}: {exc.detail}")
+            print(f"Note: {exc.detail}; the page will show it once the workspace is scheduled.", flush=True)
+    elif not args.all:
+        try:
+            repository = github_integration.resolve_target(Path(args.target).resolve(), args.repo)
+        except github_integration.IntegrationError as exc:
+            parser.error(f"{exc}; use --repo owner/repository or --all")
+    controls = None
+    if args.controls:
+        if workspace is None or workspace.manifest is None:
+            parser.error("--controls needs --workspace <manifest path>")
+        # The contract tools resolve state through the environment; align it with this viewer.
+        os.environ["PI_ORCHESTRATOR_STATE_DIR"] = str(state)
+    server = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(directory, repository, workspace))
+    if args.controls:
+        controls = garden_controls.Controls(workspace.manifest, server.server_port)
+        server.RequestHandlerClass = make_handler(directory, repository, workspace, controls, server.server_port)
+    label = f"workspace {workspace.workspace_id}" if workspace else repository or "all repositories"
+    if controls:
+        print(f"Pico watch: http://127.0.0.1:{server.server_port}/#token={controls.token}  ({label}, controls on)", flush=True)
+        print("Keep this URL private: it authorizes actions for this session only.", flush=True)
+    else:
+        print(f"Pico watch: http://127.0.0.1:{server.server_port}  ({label})", flush=True)
+    print(f"Reading: {state / 'workspaces' if workspace else directory}", flush=True)
+    try:
+        server.serve_forever(poll_interval=0.5)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+
+
+if __name__ == "__main__":
+    main()

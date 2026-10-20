@@ -1,0 +1,27 @@
+- backlog_items:
+  - ORCH-015
+  - ORCH-016
+  - ORCH-017
+  - ORCH-018
+  - ORCH-019
+  base_branch: null
+  base_sha: null
+  budgets:
+    max_agent_runs: 20
+    max_parallel_tasks: 3
+    max_repair_attempts_per_task: 2
+  created_at: '2026-09-25T08:35:55Z'
+  current:
+    blocked: []
+    running: []
+    waiting_ci: []
+  goal: "Concrete next PRs could be:\n\n - ORCH-015: Mission planner + backlog DAG\
+    \ creation\n - ORCH-016: Scheduler invoking /orchestrate\n - ORCH-017: Deterministic\
+    \ git branch/push controller\n - ORCH-018: PR/CI observer and repair loop\n -\
+    \ ORCH-019: Merge policy + guarded auto-merge"
+  id: MISSION-001
+  policy:
+    autonomy_profile: guarded
+  status: planned
+  success_criteria: []
+  updated_at: '2026-09-25T08:48:16Z'

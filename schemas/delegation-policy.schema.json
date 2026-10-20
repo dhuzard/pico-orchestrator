@@ -1,0 +1,446 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "LeadDelegationPolicy",
+  "description": "Machine-validatable policy governing nested delegation by Codex or Claude lead agents after deterministic top-level route selection.",
+  "type": "object",
+  "required": [
+    "version",
+    "objective",
+    "allowed_modes",
+    "utility",
+    "shared",
+    "families",
+    "metrics",
+    "learning"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "version": {
+      "const": 1
+    },
+    "objective": {
+      "const": "minimize_wall_clock_tokens_duplication_integration_risk_while_preserving_correctness"
+    },
+    "allowed_modes": {
+      "type": "array",
+      "minItems": 5,
+      "maxItems": 5,
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "DIRECT",
+          "DELEGATE",
+          "PARALLEL",
+          "BLOCKED",
+          "SEQUENTIAL"
+        ]
+      }
+    },
+    "utility": {
+      "type": "object",
+      "required": [
+        "positive",
+        "negative"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "positive": {
+          "type": "array",
+          "minItems": 3,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "parallelism",
+              "context_isolation",
+              "specialization"
+            ]
+          }
+        },
+        "negative": {
+          "type": "array",
+          "minItems": 3,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "coordination_cost",
+              "shared_state_risk",
+              "verification_cost"
+            ]
+          }
+        }
+      }
+    },
+    "shared": {
+      "type": "object",
+      "required": [
+        "max_parallel_workers",
+        "prefer_smallest_useful_fanout",
+        "manager_owns_final_response",
+        "large_team_requires_repository_wide_independence",
+        "deterministic_verification_first",
+        "parallel_mutation_requires_isolated_worktrees",
+        "overlapping_write_ownership",
+        "event_driven_coordination",
+        "poll_only_without_event_mechanism",
+        "continue_until_scoped_batch_complete",
+        "ambiguous_requirement_action",
+        "direct_conditions",
+        "delegation_conditions",
+        "independent_review_conditions",
+        "retry"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "max_parallel_workers": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4
+        },
+        "prefer_smallest_useful_fanout": {
+          "const": true
+        },
+        "manager_owns_final_response": {
+          "const": true
+        },
+        "large_team_requires_repository_wide_independence": {
+          "const": true
+        },
+        "deterministic_verification_first": {
+          "const": true
+        },
+        "parallel_mutation_requires_isolated_worktrees": {
+          "const": true
+        },
+        "overlapping_write_ownership": {
+          "const": "forbidden"
+        },
+        "event_driven_coordination": {
+          "const": true
+        },
+        "poll_only_without_event_mechanism": {
+          "const": true
+        },
+        "continue_until_scoped_batch_complete": {
+          "const": true
+        },
+        "ambiguous_requirement_action": {
+          "const": "lead_or_user"
+        },
+        "direct_conditions": {
+          "type": "array",
+          "minItems": 8,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "few_tool_calls",
+              "shared_file_writes",
+              "strongly_sequential",
+              "deterministic_tool_can_answer",
+              "delegation_overhead_exceeds_execution",
+              "duplicate_review",
+              "fixed_deterministic_graph",
+              "single_slow_external_operation"
+            ]
+          },
+          "maxItems": 8
+        },
+        "delegation_conditions": {
+          "type": "array",
+          "minItems": 7,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "independent_parallel_work",
+              "substantial_isolated_exploration",
+              "specialist_review_improves_correctness",
+              "independent_hypotheses",
+              "implementation_and_verification_parallelizable",
+              "context_isolation_prevents_overload",
+              "distinct_specialist_contract"
+            ]
+          },
+          "maxItems": 7
+        },
+        "independent_review_conditions": {
+          "type": "array",
+          "minItems": 7,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "security_sensitive",
+              "migration",
+              "scientific_or_statistical_logic",
+              "complex_concurrency",
+              "large_architectural_change",
+              "subtle_regression_risk",
+              "tests_may_share_implementation_assumption"
+            ]
+          },
+          "maxItems": 7
+        },
+        "retry": {
+          "type": "object",
+          "required": [
+            "local_failure",
+            "wrong_architecture",
+            "repeated_failure",
+            "ambiguous_requirement",
+            "deterministic_failure",
+            "blind_retry_loops"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "local_failure": {
+              "const": "focused_correction_same_worker"
+            },
+            "wrong_architecture": {
+              "const": "return_to_lead_and_replan"
+            },
+            "repeated_failure": {
+              "const": "escalate_capability_or_fresh_agent"
+            },
+            "ambiguous_requirement": {
+              "const": "lead_or_user"
+            },
+            "deterministic_failure": {
+              "const": "return_exact_error"
+            },
+            "blind_retry_loops": {
+              "const": false
+            }
+          }
+        }
+      }
+    },
+    "families": {
+      "type": "object",
+      "required": [
+        "codex",
+        "claude"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "codex": {
+          "type": "object",
+          "required": [
+            "bias",
+            "planning_assignment_min",
+            "planning_assignment_max",
+            "max_parallel_workers",
+            "architecture_owned_by_lead",
+            "continue_existing_for_contextual_followup",
+            "fresh_agent_for_independent_reasoning",
+            "nested_delegation"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "bias": {
+              "const": "slight_delegate_when_parallelism_or_context_isolation_exists"
+            },
+            "planning_assignment_min": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 5
+            },
+            "planning_assignment_max": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 5
+            },
+            "max_parallel_workers": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4
+            },
+            "architecture_owned_by_lead": {
+              "const": true
+            },
+            "continue_existing_for_contextual_followup": {
+              "const": true
+            },
+            "fresh_agent_for_independent_reasoning": {
+              "const": true
+            },
+            "nested_delegation": {
+              "enum": [
+                "allowed_with_clear_benefit",
+                "discouraged",
+                "forbidden"
+              ]
+            }
+          }
+        },
+        "claude": {
+          "type": "object",
+          "required": [
+            "bias",
+            "max_parallel_workers",
+            "architecture_owned_by_lead",
+            "nested_delegation",
+            "strongest_model_not_default",
+            "worker_architecture_redesign",
+            "model_tiers"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "bias": {
+              "const": "direct_unless_clear_parallelism_isolation_or_specialization_benefit"
+            },
+            "max_parallel_workers": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4
+            },
+            "architecture_owned_by_lead": {
+              "const": true
+            },
+            "nested_delegation": {
+              "const": "clear_benefit_required"
+            },
+            "strongest_model_not_default": {
+              "const": true
+            },
+            "worker_architecture_redesign": {
+              "const": "forbidden_unless_explicitly_assigned"
+            },
+            "model_tiers": {
+              "type": "object",
+              "required": [
+                "strong_lead",
+                "mid_worker",
+                "lightweight_worker",
+                "light_worker"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "strong_lead": {
+                  "enum": [
+                    "light",
+                    "economy",
+                    "standard",
+                    "high",
+                    "max"
+                  ]
+                },
+                "mid_worker": {
+                  "enum": [
+                    "light",
+                    "economy",
+                    "standard",
+                    "high",
+                    "max"
+                  ]
+                },
+                "lightweight_worker": {
+                  "enum": [
+                    "light",
+                    "economy",
+                    "standard",
+                    "high",
+                    "max"
+                  ]
+                },
+                "light_worker": {
+                  "enum": [
+                    "light",
+                    "economy",
+                    "standard",
+                    "high",
+                    "max"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "metrics": {
+      "type": "object",
+      "required": [
+        "record_where_possible",
+        "derived"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "record_where_possible": {
+          "type": "array",
+          "minItems": 20,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "lead_model",
+              "worker_models",
+              "spawned_agents",
+              "assigned_tasks",
+              "lead_tokens",
+              "worker_tokens",
+              "cached_tokens",
+              "total_tokens",
+              "wall_clock_duration",
+              "worker_execution_time",
+              "coordination_time",
+              "conflicting_edits",
+              "corrective_turns",
+              "failed_attempts",
+              "test_outcome",
+              "ci_outcome",
+              "reviewer_findings",
+              "human_corrections_required",
+              "final_task_success",
+              "estimated_cost"
+            ]
+          },
+          "maxItems": 20
+        },
+        "derived": {
+          "type": "array",
+          "minItems": 4,
+          "maxItems": 4,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "coordination_tax_tokens",
+              "coordination_tax_time",
+              "quality_gain",
+              "parallel_speedup"
+            ]
+          }
+        }
+      }
+    },
+    "learning": {
+      "type": "object",
+      "required": [
+        "online_adaptation",
+        "policy_update_mode",
+        "required_benchmark_topologies"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "online_adaptation": {
+          "const": false
+        },
+        "policy_update_mode": {
+          "const": "offline_reviewed_versioned_change"
+        },
+        "required_benchmark_topologies": {
+          "type": "array",
+          "minItems": 6,
+          "maxItems": 6,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "direct",
+              "one_worker",
+              "two_workers",
+              "three_to_four_workers",
+              "mixed_model_workers",
+              "same_model_workers"
+            ]
+          }
+        }
+      }
+    }
+  }
+}

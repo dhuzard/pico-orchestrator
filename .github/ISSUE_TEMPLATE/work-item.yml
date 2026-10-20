@@ -1,0 +1,45 @@
+name: Technical work item
+description: Track technical debt, hardening, maintenance, or a bounded engineering task.
+title: "[Work] "
+body:
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: Current state and why this work is needed now.
+    validations:
+      required: true
+  - type: textarea
+    id: debt
+    attributes:
+      label: Debt / risk
+      description: Correctness, maintainability, operability, security, reproducibility, or developer-experience impact.
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope
+      description: Files, components, contracts, or workflows expected to change.
+  - type: textarea
+    id: dependencies
+    attributes:
+      label: Dependencies / blockers
+      description: Prerequisite issues, PRs, external services, or version constraints.
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      placeholder: "- [ ] ..."
+    validations:
+      required: true
+  - type: textarea
+    id: verification
+    attributes:
+      label: Verification evidence
+      description: Tests, CI jobs, benchmarks, or runtime checks required before completion.
+  - type: textarea
+    id: nonscope
+    attributes:
+      label: Non-scope
+      description: Work deliberately excluded from this item.

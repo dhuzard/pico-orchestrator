@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AutonomyPolicy",
+  "description": "Execution authority policy for goal-level autonomous delivery. This is separate from routing policy, which only selects execution workflows.",
+  "type": "object",
+  "required": ["profile", "permissions", "limits"],
+  "additionalProperties": false,
+  "properties": {
+    "profile": { "type": "string", "enum": ["manual", "guarded"] },
+    "pr_granularity": {
+      "type": "string",
+      "enum": ["batch", "task"],
+      "default": "batch",
+      "description": "batch: tasks of a wave are validated in their own worktrees, integrated locally into one pico/batch-<n> branch, and published with one push and one PR referencing every included issue. task: one PR per task. Pushing and opening PRs still require permissions.push_branch and permissions.create_pr."
+    },
+    "permissions": {
+      "type": "object",
+      "required": [
+        "create_backlog_items",
+        "create_github_issues",
+        "create_worktrees",
+        "commit",
+        "push_branch",
+        "create_pr",
+        "comment_on_issue",
+        "comment_on_pr",
+        "mark_pr_ready",
+        "merge",
+        "deploy"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "create_backlog_items": { "type": "boolean" },
+        "create_github_issues": { "type": "boolean" },
+        "create_worktrees": { "type": "boolean" },
+        "commit": { "type": "boolean" },
+        "push_branch": { "type": "boolean" },
+        "create_pr": { "type": "boolean" },
+        "comment_on_issue": { "type": "boolean" },
+        "comment_on_pr": { "type": "boolean" },
+        "mark_pr_ready": { "type": "boolean" },
+        "deploy": { "type": "boolean" },
+        "merge": {
+          "type": "object",
+          "required": ["enabled", "max_failure_cost", "require_ci", "require_review_if_policy_demands"],
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "max_failure_cost": { "type": "string", "enum": ["low", "medium", "high"] },
+            "require_ci": { "type": "boolean" },
+            "require_review_if_policy_demands": { "type": "boolean" }
+          }
+        }
+      }
+    },
+    "limits": {
+      "type": "object",
+      "required": ["parallel_tasks", "nested_agents_per_task", "repair_attempts", "replans"],
+      "additionalProperties": false,
+      "properties": {
+        "parallel_tasks": { "type": "integer", "minimum": 1, "description": "Most routed tasks one wave may run concurrently (orchestration_record declare_wave enforces it)." },
+        "open_prs": { "type": "integer", "minimum": 1, "default": 2, "description": "Most open batch PRs; when reached, new batches stack on the newest batch branch instead of opening another PR." },
+        "nested_agents_per_task": { "type": "integer", "minimum": 0 },
+        "repair_attempts": { "type": "integer", "minimum": 0 },
+        "replans": { "type": "integer", "minimum": 0 }
+      }
+    }
+  }
+}

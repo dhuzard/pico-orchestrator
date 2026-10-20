@@ -1,0 +1,350 @@
+#!/usr/bin/env python3
+"""Garden controls over real HTTP: security gates, preview/confirm binding, and the
+validate -> request PR -> CI -> promote flow on two real repositories."""
+from __future__ import annotations
+
+import http.client
+import json
+import os
+import sys
+import threading
+import unittest
+from http.server import ThreadingHTTPServer
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT / "tools"))
+sys.path.insert(0, str(REPO_ROOT / "tests"))
+
+import garden_controls as gc  # noqa: E402
+import watch  # noqa: E402
+import workspace_run as wr  # noqa: E402
+from test_headless_run import git  # noqa: E402
+import test_workspace_contracts as twc  # noqa: E402
+
+COMMIT, GREEN, PENDING = twc.COMMIT, twc.GREEN, twc.PENDING
+
+
+class GardenControlsTest(unittest.TestCase):
+    # Borrow the two-repository fixture without rerunning the contract tests.
+    setUp_fixture = twc.ContractLifecycleTest.setUp
+    tearDown_fixture = twc.ContractLifecycleTest.tearDown
+    manifest = twc.ContractLifecycleTest.manifest
+    work = twc.ContractLifecycleTest.work
+    allow_publication = twc.ContractLifecycleTest.allow_publication
+    schedule = twc.ContractLifecycleTest.schedule
+
+    def setUp(self):
+        self.setUp_fixture()
+        self.path = self.manifest()
+        source = watch.WorkspaceSource(self.state, self.path)
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), watch.make_handler(self.state / "runs", None, source))
+        self.port = self.server.server_port
+        self.controls = gc.Controls(self.path, self.port, adapter=self.fake)
+        self.server.RequestHandlerClass = watch.make_handler(self.state / "runs", None, source, self.controls, self.port)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.tearDown_fixture()
+
+    def request(self, method, path, body=None, *, host=None, origin="default", token="default", ctype="application/json"):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=30)
+        headers = {"Host": host or f"127.0.0.1:{self.port}"}
+        if method == "POST":
+            if origin:
+                headers["Origin"] = f"http://127.0.0.1:{self.port}" if origin == "default" else origin
+            if token:
+                headers["X-Pico-Token"] = self.controls.token if token == "default" else token
+            if ctype:
+                headers["Content-Type"] = ctype
+        payload = json.dumps(body).encode() if body is not None else None
+        conn.request(method, path, body=payload, headers=headers)
+        response = conn.getresponse()
+        data = json.loads(response.read() or b"{}")
+        conn.close()
+        return response.status, data
+
+    def act(self, **body):
+        return self.request("POST", "/api/action", body)
+
+    def test_security_gates(self):
+        status, data = self.request("GET", "/api/workspace", host="evil.example:80")
+        self.assertEqual((status, data["error_code"]), (421, "HOST_REJECTED"))
+        status, _ = self.request("GET", "/api/workspace", host=f"localhost:{self.port}")
+        self.assertEqual(status, 200)
+        body = {"action": "ci", "task": "a1"}
+        for kwargs, expected in (({"token": None}, "CONTROL_TOKEN_INVALID"), ({"token": "x" * 43}, "CONTROL_TOKEN_INVALID"),
+                                 ({"origin": None}, "CONTROL_ORIGIN_REJECTED"),
+                                 ({"origin": "http://evil.example"}, "CONTROL_ORIGIN_REJECTED"),
+                                 ({"ctype": "text/plain"}, "CONTROL_BODY_INVALID")):
+            status, data = self.request("POST", "/api/action", body, **kwargs)
+            self.assertIn(status, {403, 415})
+            self.assertEqual(data["error_code"], expected)
+        status, data = self.request("POST", "/api/action", body, host="evil.example:80")
+        self.assertEqual(status, 421)
+        status, data = self.act(action="merge", task="a1")
+        self.assertEqual(data["error_code"], "CONTROL_ACTION_UNKNOWN")
+        status, data = self.act(action="ci", task="../a1")
+        self.assertEqual(data["error_code"], "CONTROL_TASK_INVALID")
+        record = wr.load_workspace(wr.workspace_record_path("ws")) or {}
+        self.assertEqual(record.get("garden_actions", []), [])
+
+    def test_actions_are_off_without_controls(self):
+        source = watch.WorkspaceSource(self.state, self.path)
+        server = ThreadingHTTPServer(("127.0.0.1", 0), watch.make_handler(self.state / "runs", None, source))
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=10)
+            conn.request("POST", "/api/action", body=b"{}", headers={"Content-Type": "application/json"})
+            response = conn.getresponse()
+            self.assertEqual((response.status, json.loads(response.read())["error_code"]), (404, "CONTROLS_OFF"))
+            conn.request("GET", "/api/controls")
+            panels = json.loads(conn.getresponse().read())
+            self.assertEqual((panels["ok"], panels["enabled"], panels["actions"]), (True, False, []))
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_panels_show_policy_and_models_read_only(self):
+        self.allow_publication("beta")
+        status, data = self.request("GET", "/api/controls")
+        self.assertEqual((status, data["enabled"]), (200, True))
+        repos = {r["id"]: r for r in data["repositories"]}
+        self.assertTrue(repos["alpha"]["source"].startswith("default"))
+        self.assertFalse(repos["alpha"]["permissions"]["create_pr"])
+        self.assertEqual(repos["beta"]["source"], ".pi/autonomy.yaml")
+        self.assertTrue(repos["beta"]["permissions"]["create_pr"] and repos["beta"]["permissions"]["push_branch"])
+        self.assertFalse(repos["beta"]["merge_enabled"])
+        self.assertIn("claude", data["models"]["models"])
+        self.assertNotIn("Interoperable claims", json.dumps(data))  # the workspace goal is never served
+
+    def test_validate_publish_ci_promote_flow(self):
+        self.schedule(self.path)
+        commit = self.work("alpha", "pico/a1", "claims.json")
+        status, data = self.request("GET", "/api/branches?task=a1")
+        self.assertEqual(data["branches"], [{"name": "pico/a1", "commit": commit, "descends_from_pin": True}])
+
+        _, preview = self.act(action="validate", task="a1", head="pico/a1")
+        self.assertEqual((preview["stage"], preview["preview"]["commit"]), ("preview", commit))
+        _, tampered = self.act(action="validate", task="a1", head="pico/a1", confirm="0" * 64)
+        self.assertEqual(tampered["error_code"], "CONTROL_PREVIEW_STALE")
+        _, done = self.act(action="validate", task="a1", head="pico/a1", confirm=preview["confirm"])
+        self.assertEqual((done["stage"], done["status"]), ("done", "VALIDATED"))
+
+        _, refused = self.act(action="publish", task="a1")
+        self.assertEqual((refused["stage"], refused["error_code"]), ("refused", "PUBLICATION_NOT_AUTHORIZED"))
+        self.allow_publication("alpha")
+        _, preview = self.act(action="publish", task="a1")
+        self.assertEqual(preview["stage"], "preview")
+        self.assertEqual((preview["preview"]["head"], preview["preview"]["draft"], preview["preview"]["mutations_planned"]),
+                         ("pico/a1", True, 2))
+        self.assertIn("Refs #7", preview["preview"]["body"])
+        self.assertEqual(git("--git-dir", str(self.bare["alpha"]), "for-each-ref"), "")
+        _, published = self.act(action="publish", task="a1", confirm=preview["confirm"])
+        self.assertEqual((published["status"], published["pr"], published["url"]),
+                         ("COMPLETED", 101, "https://github.com/acme/alpha/pull/101"))
+        self.assertTrue(self.fake.created[0]["draft"])
+
+        self.fake.checks[101] = ("OPEN", commit, PENDING)
+        _, ci = self.act(action="ci", task="a1")
+        self.assertEqual((ci["ok"], ci["ci"]["status"]), (False, "pending"))
+        _, preview = self.act(action="promote", task="a1")
+        self.assertEqual((preview["stage"], preview["ok"]), ("preview", False))
+        self.fake.checks[101] = ("OPEN", commit, GREEN)
+        _, stale = self.act(action="promote", task="a1", confirm=preview["confirm"])
+        self.assertEqual(stale["error_code"], "CONTROL_PREVIEW_STALE")  # CI changed since the preview
+        _, preview = self.act(action="promote", task="a1")
+        _, promoted = self.act(action="promote", task="a1", confirm=preview["confirm"])
+        self.assertEqual(promoted["readiness"], "ready_for_downstream")
+
+        log = wr.load_workspace(wr.workspace_record_path("ws"))["garden_actions"]
+        self.assertEqual([(e["action"], e["stage"], e["ok"]) for e in log],
+                         [("validate", "refused", False), ("validate", "done", True), ("publish", "refused", False),
+                          ("publish", "done", True), ("ci", "done", False), ("promote", "refused", False),
+                          ("promote", "done", True)])
+
+    def test_moved_head_after_preview_is_refused(self):
+        self.schedule(self.path)
+        self.work("alpha", "pico/a1", "claims.json")
+        _, preview = self.act(action="validate", task="a1", head="pico/a1")
+        path, _ = self.repos["alpha"]
+        git("-C", str(path), "checkout", "-q", "pico/a1")
+        (path / "late.txt").write_text("x\n")
+        git("-C", str(path), "add", "late.txt")
+        git("-C", str(path), *COMMIT, "moved after preview")
+        git("-C", str(path), "checkout", "-q", "main")
+        _, result = self.act(action="validate", task="a1", head="pico/a1", confirm=preview["confirm"])
+        self.assertEqual(result["error_code"], "CONTROL_PREVIEW_STALE")
+
+    def test_one_action_at_a_time(self):
+        self.controls._lock.acquire()
+        try:
+            status, data = self.act(action="ci", task="a1")
+        finally:
+            self.controls._lock.release()
+        self.assertEqual((status, data["error_code"]), (409, "CONTROL_BUSY"))
+
+    # -- slice 2 -------------------------------------------------------------
+    def validated_a1(self):
+        self.schedule(self.path)
+        commit = self.work("alpha", "pico/a1", "claims.json")
+        _, preview = self.act(action="validate", task="a1", head="pico/a1")
+        self.act(action="validate", task="a1", head="pico/a1", confirm=preview["confirm"])
+        return commit
+
+    def test_one_shot_grant_publishes_without_changing_the_policy(self):
+        commit = self.validated_a1()
+        _, refused = self.act(action="publish", task="a1")
+        self.assertEqual((refused["error_code"], refused["grantable"]), ("PUBLICATION_NOT_AUTHORIZED", True))
+        _, plain = self.act(action="publish", task="a1", grant_once=True)
+        self.assertEqual((plain["stage"], plain["preview"]["authorization"]), ("preview", "one_shot_grant"))
+        # A confirmation for the granted plan cannot be replayed without the grant, and vice versa.
+        _, mismatch = self.act(action="publish", task="a1", confirm=plain["confirm"])
+        self.assertEqual(mismatch["error_code"], "PUBLICATION_NOT_AUTHORIZED")
+        _, done = self.act(action="publish", task="a1", grant_once=True, confirm=plain["confirm"])
+        self.assertEqual((done["status"], done["pr"]), ("COMPLETED", 101))
+        self.assertEqual(git("--git-dir", str(self.bare["alpha"]), "rev-parse", "refs/heads/pico/a1"), commit)
+        self.assertFalse((self.repos["alpha"][0] / ".pi" / "autonomy.yaml").exists())
+        record = wr.load_workspace(wr.workspace_record_path("ws"))
+        run_id = record["tasks"]["a1"]["observed"]["pr"]["publication_run_id"]
+        publication = json.loads((self.state / "runs" / f"{run_id}.json").read_text())
+        self.assertEqual(publication["github_integration"]["authorization"],
+                         {"source": "one_shot_grant", "granted_by": "garden", "granted": ["push_branch", "create_pr"]})
+        self.assertEqual(record["garden_actions"][-1]["authorization"], "one_shot_grant")
+
+    def test_permission_toggle_writes_a_reviewed_policy_diff(self):
+        _, preview = self.act(action="set_permission", repository="alpha", permission="push_branch", value=True)
+        self.assertEqual((preview["stage"], preview["preview"]["creates_file"]), ("preview", True))
+        self.assertIn("+  push_branch: true", preview["preview"]["diff"])
+        _, done = self.act(action="set_permission", repository="alpha", permission="push_branch", value=True,
+                           confirm=preview["confirm"])
+        self.assertEqual(done["status"], "POLICY_UPDATED")
+        policy = (self.repos["alpha"][0] / ".pi" / "autonomy.yaml").read_text()
+        self.assertIn("  push_branch: true", policy)
+        self.assertIn("  create_pr: false", policy)
+        self.assertIn("# Project-local execution authority policy", policy)  # comments preserved
+        _, panels = self.request("GET", "/api/controls")
+        alpha = next(r for r in panels["repositories"] if r["id"] == "alpha")
+        self.assertTrue(alpha["permissions"]["push_branch"] and alpha["policy_uncommitted"])
+        for locked in ("merge", "deploy", "mark_pr_ready"):
+            _, data = self.act(action="set_permission", repository="alpha", permission=locked, value=True)
+            self.assertEqual(data["error_code"], "CONTROL_PERMISSION_LOCKED")
+        _, preview = self.act(action="set_permission", repository="alpha", permission="create_pr", value=True)
+        path = self.repos["alpha"][0] / ".pi" / "autonomy.yaml"
+        path.write_text(path.read_text().replace("commit: true", "commit: false"))
+        _, stale = self.act(action="set_permission", repository="alpha", permission="create_pr", value=True,
+                            confirm=preview["confirm"])
+        self.assertEqual(stale["error_code"], "CONTROL_PREVIEW_STALE")
+        _, unknown = self.act(action="set_permission", repository="gamma", permission="commit", value=True)
+        self.assertEqual(unknown["error_code"], "CONTROL_REPOSITORY_INVALID")
+
+    def test_schedule_runs_in_the_background_and_cancel_stops_a_child(self):
+        self.controls.pi_executable = str(self.pi)
+        _, preview = self.act(action="schedule", allow_mutation=False)
+        self.assertEqual((preview["preview"]["dispatch"], preview["preview"]["cap"]), (["a1"], 2))
+        _, started = self.act(action="schedule", allow_mutation=False, confirm=preview["confirm"])
+        self.assertEqual(started["status"], "SCHEDULER_STARTED")
+        _, busy = self.act(action="schedule", allow_mutation=False)
+        self.assertIn(busy.get("error_code"), {"CONTROL_BUSY", None})
+        self.controls._scheduler.join(timeout=60)
+        self.assertEqual(self.controls.last_schedule["status"], "finished")
+        record = wr.load_workspace(wr.workspace_record_path("ws"))
+        self.assertEqual(record["tasks"]["a1"]["run_status"], "PARTIAL")
+        started_entry = next(e for e in record["garden_actions"] if e["stage"] == "started")
+        self.assertEqual((started_entry["dispatch"], started_entry["allow_mutation"]), (["a1"], False))
+        _, nothing = self.act(action="cancel", task="a1")
+        self.assertEqual(nothing["error_code"], "CONTROL_NOTHING_TO_CANCEL")
+
+        os.environ["FAKE_PI_BEHAVIOR"] = "hang"
+        self.manifest(a1={"readiness": "ready_for_downstream"})
+        record = wr.load_workspace(wr.workspace_record_path("ws"))
+        record["tasks"]["a1"]["observed"] = {"readiness": "ready_for_downstream", "validated_contracts": {"claims": "1.0"}}
+        with wr.locked_workspace("ws"):
+            wr.save_workspace(wr.workspace_record_path("ws"), record)
+        wr.launch(manifest=self.path, task_id="b1", access_check=None, pi_executable=str(self.pi), wait=False)
+        import time
+        deadline = time.monotonic() + 10
+        while wr.status(manifest=self.path, task_id="b1", access_check=None)["tasks"]["b1"].get("run_id") is None \
+                and time.monotonic() < deadline:
+            time.sleep(0.05)
+        _, preview = self.act(action="cancel", task="b1")
+        self.assertEqual(preview["stage"], "preview")
+        _, cancelled = self.act(action="cancel", task="b1", confirm=preview["confirm"])
+        self.assertEqual((cancelled["status"], cancelled["error_code"]), ("cancelled", "EXECUTION_CANCELLED"))
+
+    def test_model_set_and_reset_through_the_user_config(self):
+        # A fresh user config directory: the default models.yaml does not exist until a model is set.
+        os.environ.pop("PI_ORCHESTRATOR_MODEL_CONFIG", None)
+        os.environ["XDG_CONFIG_HOME"] = str(self.base / "config")
+        config = self.base / "config" / "pi-coding-orchestrator" / "models.yaml"
+        _, panels = self.request("GET", "/api/controls")
+        models = panels["models"]
+        default = models["models"]["codex"]["light"]
+        other = next(c for c in models["choices"]["codex"] if c["model"] != default)
+        capacity = max(other["capacity"], models["floors"]["light"])
+        _, preview = self.act(action="set_model", family="codex", tier="light", model=other["model"], capacity=capacity)
+        self.assertEqual((preview["preview"]["current"]["model"], preview["preview"]["new"]["model"]), (default, other["model"]))
+        _, done = self.act(action="set_model", family="codex", tier="light", model=other["model"], capacity=capacity,
+                           confirm=preview["confirm"])
+        self.assertEqual(done["status"], "MODEL_UPDATED")
+        self.assertTrue(config.is_file())
+        _, panels = self.request("GET", "/api/controls")
+        self.assertEqual(panels["models"]["models"]["codex"]["light"], other["model"])
+        _, refused = self.act(action="set_model", family="codex", tier="light", model="vendor/unknown-model", capacity=5)
+        self.assertEqual(refused["error_code"], "MODEL_CHANGE_INVALID")
+        _, preview = self.act(action="reset_model", family="codex", tier="light")
+        _, reset = self.act(action="reset_model", family="codex", tier="light", confirm=preview["confirm"])
+        self.assertEqual(reset["status"], "MODEL_RESET")
+        _, panels = self.request("GET", "/api/controls")
+        self.assertEqual(panels["models"]["models"]["codex"]["light"], default)
+
+    # -- slice 3 -------------------------------------------------------------
+    def test_commit_policy_commits_only_the_policy_on_the_base_branch(self):
+        alpha = self.repos["alpha"][0]
+        _, data = self.act(action="commit_policy", repository="alpha")
+        self.assertEqual(data["error_code"], "POLICY_UNCHANGED")
+        _, preview = self.act(action="set_permission", repository="alpha", permission="push_branch", value=True)
+        self.act(action="set_permission", repository="alpha", permission="push_branch", value=True, confirm=preview["confirm"])
+        (alpha / "unrelated.txt").write_text("not part of the policy commit\n")
+        git("-C", str(alpha), "checkout", "-q", "-b", "pico/work")
+        _, wrong = self.act(action="commit_policy", repository="alpha")
+        self.assertEqual(wrong["error_code"], "POLICY_COMMIT_BRANCH")
+        git("-C", str(alpha), "checkout", "-q", "main")
+        _, preview = self.act(action="commit_policy", repository="alpha")
+        self.assertEqual((preview["stage"], preview["preview"]["branch"]), ("preview", "main"))
+        self.assertIn("push_branch: true", preview["preview"]["diff"])
+        git("-C", str(alpha), "config", "user.name", "t")
+        git("-C", str(alpha), "config", "user.email", "t@example.com")
+        _, done = self.act(action="commit_policy", repository="alpha", confirm=preview["confirm"])
+        self.assertEqual(done["status"], "POLICY_COMMITTED", done)
+        self.assertEqual(git("-C", str(alpha), "show", "--name-only", "--format=%s", "HEAD").splitlines(),
+                         ["Update PICO autonomy policy", "", ".pi/autonomy.yaml"])
+        self.assertEqual(git("-C", str(alpha), "status", "--porcelain"), "?? unrelated.txt")
+        self.assertEqual(git("-C", str(alpha), "for-each-ref", "refs/remotes"), "")  # nothing pushed
+        _, panels = self.request("GET", "/api/controls")
+        self.assertFalse(next(r for r in panels["repositories"] if r["id"] == "alpha")["policy_uncommitted"])
+
+    def test_budget_is_reported_and_blocks_schedule_preview(self):
+        import yaml
+        data = yaml.safe_load(self.path.read_text())
+        data["budget"] = {"max_tokens": 1000}
+        self.path.write_text(yaml.safe_dump(data))
+        os.environ["FAKE_PI_USAGE"] = "700,400"
+        self.schedule(self.path)
+        _, view = self.request("GET", "/api/workspace")
+        self.assertEqual((view["budget"]["spent_tokens"], view["budget"]["max_tokens"], view["budget"]["exhausted"]),
+                         (1100, 1000, True))
+        record = wr.load_workspace(wr.workspace_record_path("ws"))
+        record["tasks"]["a1"]["observed"] = {"readiness": "ready_for_downstream", "validated_contracts": {"claims": "1.0"}}
+        with wr.locked_workspace("ws"):
+            wr.save_workspace(wr.workspace_record_path("ws"), record)
+        _, preview = self.act(action="schedule", allow_mutation=False)
+        self.assertEqual(preview["preview"]["dispatch"], ["b1"])
+        self.assertTrue(preview["preview"]["budget"]["exhausted"])
+        self.assertFalse(preview["ok"])  # nothing may launch while the budget is exhausted
+
+
+if __name__ == "__main__":
+    unittest.main()

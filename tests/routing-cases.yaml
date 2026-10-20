@@ -1,0 +1,669 @@
+version: 1
+
+# Structured task fixtures consumed by tools/validate_routing.py.
+#
+# `cases` exercise routing/default-policy.yaml directly: each `task` must be
+# valid against schemas/task.schema.json. `expected_matches` lists every
+# route whose `match` expression evaluates true (order-independent);
+# `expected_route` is the route selected after applying `precedence` (or
+# `fallback_route` when `expected_matches` is empty).
+#
+# `override_cases` exercise the project-constraint selection algorithm
+# described in prompts/orchestrate.md: route the base task, apply
+# `project_routing.risk_overrides` as floors, route the constrained task,
+# union the matches, add the base task's own selected route (`base_route`,
+# which is `fallback_route` when nothing matched) as a selection candidate,
+# and select the earliest route under global precedence. `base_route` is
+# always included as a candidate so that an override which only newly
+# matches a lower-precedence route than the base's fallback cannot downgrade
+# routing below its unconstrained outcome.
+#
+# `invalid_project_routing_examples` are project-routing.yaml fragments that
+# MUST fail validation against schemas/project-routing.schema.json, proving
+# unknown/weakening keys fail closed rather than being silently accepted.
+
+cases:
+
+  - id: case-1-diagnosis-required
+    task:
+      id: case-1-diagnosis-required
+      goal: Fix a subtle race condition causing persisted metadata edits to disappear.
+      task_type: debugging
+      failure_cost: high
+      semantic_correctness: normal
+      ambiguity: 5
+      implementation_scope: small
+      implementation_required: true
+      cross_layer: false
+      behavior_preservation: required
+      diagnosis_required: true
+      assumptions_must_be_explicit: true
+      many_routine_decisions: false
+      production_feature: false
+      security_sensitive: false
+      destructive_operation: false
+      escalation_evidence:
+        failure_cost: Lost metadata edits silently destroy persisted user data.
+        behavior_preservation: Existing persisted behavior must remain unchanged except for the race.
+        assumptions_must_be_explicit: The race's trigger conditions are unverified and must be stated before fixing.
+      dependencies: []
+      acceptance_criteria:
+        - Race condition no longer causes lost metadata edits.
+        - Regression test reproduces and verifies the fix.
+      files_or_areas:
+        - src/metadata/persistence
+    expected_matches: [CODEX]
+    expected_route: CODEX
+
+  - id: case-2-behavior-preservation
+    task:
+      id: case-2-behavior-preservation
+      goal: Refactor the calculation engine while preserving numerical behavior exactly.
+      task_type: refactor
+      failure_cost: low
+      semantic_correctness: normal
+      ambiguity: 2
+      implementation_scope: small
+      implementation_required: true
+      cross_layer: false
+      behavior_preservation: required
+      diagnosis_required: false
+      assumptions_must_be_explicit: false
+      many_routine_decisions: false
+      production_feature: false
+      security_sensitive: false
+      destructive_operation: false
+      escalation_evidence:
+        behavior_preservation: Refactor must keep numerical output bit-identical to the existing corpus.
+      dependencies: []
+      acceptance_criteria:
+        - Refactored engine produces bit-identical numerical output for the existing test corpus.
+      files_or_areas:
+        - src/engine/calculation.py
+    expected_matches: [CODEX]
+    expected_route: CODEX
+
+  - id: case-3-cross-layer-feature
+    task:
+      id: case-3-cross-layer-feature
+      goal: Build a settings feature spanning UI, API and persistence from a clear specification.
+      task_type: broad_feature
+      failure_cost: medium
+      semantic_correctness: normal
+      ambiguity: 2
+      implementation_scope: broad
+      implementation_required: true
+      cross_layer: true
+      behavior_preservation: preferred
+      diagnosis_required: false
+      assumptions_must_be_explicit: false
+      many_routine_decisions: false
+      production_feature: true
+      security_sensitive: false
+      destructive_operation: false
+      dependencies: []
+      acceptance_criteria:
+        - Settings are readable and writable end to end through UI, API and persistence.
+      files_or_areas:
+        - src/settings
+    expected_matches: [CLAUDE, CLAUDE_CODEX]
+    expected_route: CLAUDE_CODEX
+
+  - id: case-4-ui-polish
+    task:
+      id: case-4-ui-polish
+      goal: Improve spacing, layout and usability across the administration UI.
+      task_type: ui_ux
+      failure_cost: low
+      semantic_correctness: normal
+      ambiguity: 2
+      implementation_scope: small
+      implementation_required: true
+      cross_layer: false
+      behavior_preservation: preferred
+      diagnosis_required: false
+      assumptions_must_be_explicit: false
+      many_routine_decisions: true
+      production_feature: false
+      security_sensitive: false
+      destructive_operation: false
+      dependencies: []
+      acceptance_criteria:
+        - Administration UI spacing and layout are visibly more consistent.
+      files_or_areas:
+        - src/admin/ui
+    expected_matches: [CLAUDE]
+    expected_route: CLAUDE
+
+  - id: case-5-broad-critical-semantics
+    task:
+      id: case-5-broad-critical-semantics
+      goal: Implement a broad feature that changes correctness-critical scientific data semantics.
+      task_type: scientific_semantics
+      failure_cost: high
+      semantic_correctness: critical
+      ambiguity: 5
+      implementation_scope: broad
+      implementation_required: true
+      cross_layer: true
+      behavior_preservation: required
+      diagnosis_required: false
+      assumptions_must_be_explicit: true
+      many_routine_decisions: false
+      production_feature: true
+      security_sensitive: false
+      destructive_operation: false
+      escalation_evidence:
+        failure_cost: Wrong scientific data semantics would invalidate downstream results.
+        semantic_correctness: A wrong change silently corrupts scientific data semantics.
+        behavior_preservation: Existing data semantics outside the change must stay exactly equivalent.
+        assumptions_must_be_explicit: The change must decide unverified domain/data-contract assumptions.
+      dependencies: []
+      acceptance_criteria:
+        - New scientific data semantics are implemented and independently verified.
+      files_or_areas:
+        - src/science
+    expected_matches: [CODEX, CODEX_CLAUDE_CODEX]
+    expected_route: CODEX_CLAUDE_CODEX
+
+  - id: case-6-routine-plumbing
+    task:
+      id: case-6-routine-plumbing
+      goal: Create routine adapters and plumbing from an explicit interface specification.
+      task_type: plumbing
+      failure_cost: low
+      semantic_correctness: normal
+      ambiguity: 2
+      implementation_scope: small
+      implementation_required: true
+      cross_layer: false
+      behavior_preservation: preferred
+      diagnosis_required: false
+      assumptions_must_be_explicit: false
+      many_routine_decisions: true
+      production_feature: false
+      security_sensitive: false
+      destructive_operation: false
+      dependencies: []
+      acceptance_criteria:
+        - Adapters conform exactly to the given interface specification.
+      files_or_areas:
+        - src/adapters
+    expected_matches: [CLAUDE]
+    expected_route: CLAUDE
+
+  - id: case-7-security-audit
+    task:
+      id: case-7-security-audit
+      goal: Audit authorization logic for privilege escalation vulnerabilities.
+      task_type: security_review
+      failure_cost: high
+      semantic_correctness: normal
+      ambiguity: 5
+      implementation_scope: small
+      implementation_required: false
+      cross_layer: false
+      behavior_preservation: preferred
+      diagnosis_required: true
+      assumptions_must_be_explicit: true
+      many_routine_decisions: false
+      production_feature: false
+      security_sensitive: true
+      destructive_operation: false
+      escalation_evidence:
+        failure_cost: A missed privilege escalation exposes protected resources.
+        assumptions_must_be_explicit: The intended authorization model must be stated, not assumed.
+        security_sensitive: Audits authorization logic for privilege escalation.
+      dependencies: []
+      acceptance_criteria:
+        - Privilege escalation paths in authorization logic are enumerated and reported.
+      files_or_areas:
+        - src/auth
+    expected_matches: [CODEX]
+    expected_route: CODEX
+
+  - id: case-8-architectural-ambiguity
+    task:
+      id: case-8-architectural-ambiguity
+      goal: Build a major multi-layer feature where requirements contain unresolved architectural ambiguity.
+      task_type: broad_feature
+      failure_cost: high
+      semantic_correctness: normal
+      ambiguity: 8
+      implementation_scope: broad
+      implementation_required: true
+      cross_layer: true
+      behavior_preservation: preferred
+      diagnosis_required: false
+      assumptions_must_be_explicit: false
+      many_routine_decisions: false
+      production_feature: true
+      security_sensitive: false
+      destructive_operation: false
+      escalation_evidence:
+        failure_cost: A wrong architecture choice in a major multi-layer feature is costly to reverse.
+        ambiguity: Requirements contain unresolved architectural ambiguity.
+      dependencies: []
+      acceptance_criteria:
+        - Architectural ambiguity is resolved into an explicit contract before implementation.
+      files_or_areas:
+        - src
+    expected_matches: [CODEX_CLAUDE_CODEX]
+    expected_route: CODEX_CLAUDE_CODEX
+
+  - id: case-9-fallback-no-match
+    task:
+      id: case-9-fallback-no-match
+      goal: Write a short internal note summarizing a completed exploration spike, no code changes.
+      task_type: testing
+      failure_cost: low
+      semantic_correctness: normal
+      ambiguity: 5
+      implementation_scope: small
+      implementation_required: false
+      cross_layer: false
+      behavior_preservation: not_required
+      diagnosis_required: false
+      assumptions_must_be_explicit: false
+      many_routine_decisions: false
+      production_feature: false
+      security_sensitive: false
+      destructive_operation: false
+      dependencies: []
+      acceptance_criteria:
+        - Note is written and accurately reflects the spike findings.
+      files_or_areas:
+        - docs/notes
+    expected_matches: []
+    expected_route: CODEX
+
+  - id: case-10-precedence-three-way
+    task:
+      id: case-10-precedence-three-way
+      goal: Review-driven implementation task designed to match CODEX and CLAUDE simultaneously.
+      task_type: review
+      failure_cost: medium
+      semantic_correctness: normal
+      ambiguity: 2
+      implementation_scope: small
+      implementation_required: true
+      cross_layer: false
+      behavior_preservation: preferred
+      diagnosis_required: true
+      assumptions_must_be_explicit: false
+      many_routine_decisions: true
+      production_feature: false
+      security_sensitive: false
+      destructive_operation: false
+      dependencies: []
+      acceptance_criteria:
+        - Consequential review and diagnosis signals keep the task Codex-led.
+      files_or_areas:
+        - src
+    expected_matches: [CODEX, CLAUDE]
+    expected_route: CODEX
+
+  - id: case-11-operator-in-task-type
+    task:
+      id: case-11-operator-in-task-type
+      goal: Migrate a legacy data store to the current schema version.
+      task_type: migration
+      failure_cost: low
+      semantic_correctness: normal
+      ambiguity: 2
+      implementation_scope: small
+      implementation_required: false
+      cross_layer: false
+      behavior_preservation: preferred
+      diagnosis_required: false
+      assumptions_must_be_explicit: false
+      many_routine_decisions: false
+      production_feature: false
+      security_sensitive: false
+      destructive_operation: false
+      dependencies: []
+      acceptance_criteria:
+        - Migration plan is produced and validated against the current schema.
+      files_or_areas:
+        - migrations
+    expected_matches: [CODEX]
+    expected_route: CODEX
+
+  - id: case-12-operator-not-equal-gating
+    task:
+      id: case-12-operator-not-equal-gating
+      goal: Implement a change that touches critical semantic correctness despite low failure cost.
+      task_type: implementation
+      failure_cost: low
+      semantic_correctness: critical
+      ambiguity: 2
+      implementation_scope: broad
+      implementation_required: true
+      cross_layer: false
+      behavior_preservation: required
+      diagnosis_required: false
+      assumptions_must_be_explicit: false
+      many_routine_decisions: false
+      production_feature: false
+      security_sensitive: false
+      destructive_operation: false
+      escalation_evidence:
+        semantic_correctness: The change touches contract semantics where a wrong result is silent.
+        behavior_preservation: Existing contract behavior must remain exactly equivalent.
+      dependencies: []
+      acceptance_criteria:
+        - Critical semantic correctness is preserved and independently verified.
+      files_or_areas:
+        - src/core
+    expected_matches: [CODEX, CODEX_CLAUDE_CODEX]
+    expected_route: CODEX_CLAUDE_CODEX
+
+  - id: case-13-high-failure-medium-implementation
+    task:
+      id: case-13-high-failure-medium-implementation
+      goal: Implement a high-consequence permissions change from a clear specification.
+      task_type: implementation
+      failure_cost: high
+      semantic_correctness: normal
+      ambiguity: 2
+      implementation_scope: medium
+      implementation_required: true
+      cross_layer: false
+      behavior_preservation: preferred
+      diagnosis_required: false
+      assumptions_must_be_explicit: false
+      many_routine_decisions: false
+      production_feature: true
+      security_sensitive: false
+      destructive_operation: false
+      escalation_evidence:
+        failure_cost: A wrong permissions change grants or denies access in production.
+      dependencies: []
+      acceptance_criteria:
+        - High-consequence behavior is specified before implementation and independently reviewed.
+      files_or_areas:
+        - src/permissions
+    expected_matches: [CODEX_CLAUDE_CODEX]
+    expected_route: CODEX_CLAUDE_CODEX
+
+  - id: case-14-migration-implementation
+    task:
+      id: case-14-migration-implementation
+      goal: Implement a data migration that rewrites persisted records to the current schema.
+      task_type: migration
+      failure_cost: medium
+      semantic_correctness: normal
+      ambiguity: 2
+      implementation_scope: medium
+      implementation_required: true
+      cross_layer: false
+      behavior_preservation: preferred
+      diagnosis_required: false
+      assumptions_must_be_explicit: false
+      many_routine_decisions: false
+      production_feature: true
+      security_sensitive: false
+      destructive_operation: false
+      dependencies: []
+      acceptance_criteria:
+        - Migration contract is explicit before implementation and the result is independently reviewed.
+      files_or_areas:
+        - migrations
+    expected_matches: [CODEX, CODEX_CLAUDE_CODEX]
+    expected_route: CODEX_CLAUDE_CODEX
+
+  - id: case-15-vcs-operation
+    task:
+      id: case-15-vcs-operation
+      goal: Commit the reviewed changes on a feature branch and open a pull request.
+      task_type: vcs_operation
+      failure_cost: low
+      semantic_correctness: normal
+      ambiguity: 2
+      implementation_scope: small
+      implementation_required: true
+      cross_layer: false
+      behavior_preservation: not_required
+      diagnosis_required: false
+      assumptions_must_be_explicit: false
+      many_routine_decisions: false
+      production_feature: false
+      security_sensitive: false
+      destructive_operation: false
+      dependencies: []
+      acceptance_criteria:
+        - A pull request exists for the feature branch with the reviewed commit.
+      files_or_areas:
+        - git
+    expected_matches: [CLAUDE]
+    expected_route: CLAUDE
+
+  - id: case-16-issue-management
+    task:
+      id: case-16-issue-management
+      goal: File a GitHub issue recording a follow-up backlog item.
+      task_type: issue_management
+      failure_cost: low
+      semantic_correctness: normal
+      ambiguity: 2
+      implementation_scope: small
+      implementation_required: true
+      cross_layer: false
+      behavior_preservation: not_required
+      diagnosis_required: false
+      assumptions_must_be_explicit: false
+      many_routine_decisions: false
+      production_feature: false
+      security_sensitive: false
+      destructive_operation: false
+      dependencies: []
+      acceptance_criteria:
+        - The follow-up issue exists with a clear title and description.
+      files_or_areas:
+        - github issues
+    expected_matches: [CLAUDE]
+    expected_route: CLAUDE
+
+  - id: case-17-config-edit
+    task:
+      id: case-17-config-edit
+      goal: Allow push in the project autonomy configuration.
+      task_type: config_edit
+      failure_cost: low
+      semantic_correctness: normal
+      ambiguity: 2
+      implementation_scope: small
+      implementation_required: true
+      cross_layer: false
+      behavior_preservation: not_required
+      diagnosis_required: false
+      assumptions_must_be_explicit: false
+      many_routine_decisions: false
+      production_feature: false
+      security_sensitive: false
+      destructive_operation: false
+      dependencies: []
+      acceptance_criteria:
+        - .pi/autonomy.yaml allows push and validates against its schema.
+      files_or_areas:
+        - .pi/autonomy.yaml
+    expected_matches: [CLAUDE]
+    expected_route: CLAUDE
+
+  - id: case-18-ci-fix-known-cause
+    task:
+      id: case-18-ci-fix-known-cause
+      goal: Fix the named ruff lint error that fails CI.
+      task_type: ci_fix
+      failure_cost: low
+      semantic_correctness: normal
+      ambiguity: 2
+      implementation_scope: small
+      implementation_required: true
+      cross_layer: false
+      behavior_preservation: not_required
+      diagnosis_required: false
+      assumptions_must_be_explicit: false
+      many_routine_decisions: false
+      production_feature: false
+      security_sensitive: false
+      destructive_operation: false
+      dependencies: []
+      acceptance_criteria:
+        - The CI lint job passes.
+      files_or_areas:
+        - tools
+    expected_matches: [CLAUDE]
+    expected_route: CLAUDE
+
+  - id: case-19-ci-fix-unknown-cause
+    task:
+      id: case-19-ci-fix-unknown-cause
+      goal: Find and fix why the CI test job fails intermittently.
+      task_type: ci_fix
+      failure_cost: low
+      semantic_correctness: normal
+      ambiguity: 2
+      implementation_scope: small
+      implementation_required: true
+      cross_layer: false
+      behavior_preservation: not_required
+      diagnosis_required: true
+      assumptions_must_be_explicit: false
+      many_routine_decisions: false
+      production_feature: false
+      security_sensitive: false
+      destructive_operation: false
+      dependencies: []
+      acceptance_criteria:
+        - The CI test job passes reliably.
+      files_or_areas:
+        - tests
+    expected_matches: [CLAUDE, CODEX]
+    expected_route: CODEX
+
+override_cases:
+
+  - id: override-a-security-sensitive-floor
+    task:
+      id: override-a-security-sensitive-floor
+      goal: Improve spacing, layout and usability across the administration UI.
+      task_type: ui_ux
+      failure_cost: low
+      semantic_correctness: normal
+      ambiguity: 2
+      implementation_scope: small
+      implementation_required: true
+      cross_layer: false
+      behavior_preservation: preferred
+      diagnosis_required: false
+      assumptions_must_be_explicit: false
+      many_routine_decisions: true
+      production_feature: false
+      security_sensitive: false
+      destructive_operation: false
+      dependencies: []
+      acceptance_criteria:
+        - Administration UI spacing and layout are visibly more consistent.
+      files_or_areas:
+        - src/admin/ui
+    project_routing:
+      risk_overrides:
+        security_sensitive: true
+    expected_matches: [CLAUDE]
+    expected_route: CLAUDE
+    expected_matches_with_overrides: [CLAUDE, CODEX_CLAUDE_CODEX]
+    expected_route_with_overrides: CODEX_CLAUDE_CODEX
+
+  - id: override-b-semantic-correctness-floor
+    task:
+      id: override-b-semantic-correctness-floor
+      goal: Create routine adapters and plumbing from an explicit interface specification.
+      task_type: plumbing
+      failure_cost: low
+      semantic_correctness: normal
+      ambiguity: 2
+      implementation_scope: small
+      implementation_required: true
+      cross_layer: false
+      behavior_preservation: preferred
+      diagnosis_required: false
+      assumptions_must_be_explicit: false
+      many_routine_decisions: true
+      production_feature: false
+      security_sensitive: false
+      destructive_operation: false
+      dependencies: []
+      acceptance_criteria:
+        - Adapters conform exactly to the given interface specification.
+      files_or_areas:
+        - src/adapters
+    project_routing:
+      risk_overrides:
+        semantic_correctness: critical
+    expected_matches: [CLAUDE]
+    expected_route: CLAUDE
+    expected_matches_with_overrides: [CLAUDE, CODEX, CODEX_CLAUDE_CODEX]
+    expected_route_with_overrides: CODEX_CLAUDE_CODEX
+
+  - id: override-c-fallback-not-downgraded
+    task:
+      id: override-c-fallback-not-downgraded
+      goal: Write a short internal note summarizing a completed exploration spike, no code changes.
+      task_type: testing
+      failure_cost: low
+      semantic_correctness: normal
+      ambiguity: 5
+      implementation_scope: small
+      implementation_required: false
+      cross_layer: false
+      behavior_preservation: not_required
+      diagnosis_required: false
+      assumptions_must_be_explicit: false
+      many_routine_decisions: false
+      production_feature: false
+      security_sensitive: false
+      destructive_operation: false
+      dependencies: []
+      acceptance_criteria:
+        - Note is written and accurately reflects the spike findings.
+      files_or_areas:
+        - docs/notes
+    project_routing:
+      risk_overrides:
+        implementation_scope: broad
+    expected_matches: []
+    expected_route: CODEX
+    expected_matches_with_overrides: [CLAUDE]
+    expected_route_with_overrides: CODEX
+
+invalid_project_routing_examples:
+
+  - id: invalid-unknown-top-level-key
+    reason: routes is not a permitted project-routing key
+    config:
+      routes:
+        CLAUDE: {}
+
+  - id: invalid-precedence-override
+    reason: precedence may not be overridden by a project
+    config:
+      precedence: [CLAUDE]
+
+  - id: invalid-safety-boolean-false
+    reason: safety booleans may only be forced to true, never weakened to false
+    config:
+      risk_overrides:
+        security_sensitive: false
+
+  - id: invalid-risk-override-unknown-field
+    reason: task_type is not an overridable risk field
+    config:
+      risk_overrides:
+        task_type: debugging
+
+  - id: invalid-risk-override-bad-enum
+    reason: extreme is not a valid failure_cost value
+    config:
+      risk_overrides:
+        failure_cost: extreme

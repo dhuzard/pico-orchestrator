@@ -1,0 +1,109 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ProjectRoutingOverrides",
+  "description": "Safe, constraints-only project-local overrides for .pi/routing.yaml. This schema deliberately excludes routes, models, capacity assignment, precedence, fallback, execution/worktree isolation, mutation policy, review categories, and completion requirements: those remain sole properties of routing/default-policy.yaml.",
+  "type": "object",
+  "properties": {
+    "project": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "domain": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "critical_invariants": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "architecture_constraints": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "terminology": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "validation": {
+      "type": "object",
+      "properties": {
+        "commands": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "risk_overrides": {
+      "type": "object",
+      "description": "Floors applied on top of a task's classification. Ordered fields raise the task's value to at least the given floor; safety booleans may only be set to true (OR-merged). Fields absent here can never weaken global routing.",
+      "properties": {
+        "failure_cost": {
+          "type": "string",
+          "enum": ["low", "medium", "high"]
+        },
+        "semantic_correctness": {
+          "type": "string",
+          "enum": ["low", "normal", "critical"]
+        },
+        "ambiguity": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 10
+        },
+        "implementation_scope": {
+          "type": "string",
+          "enum": ["small", "medium", "broad"]
+        },
+        "behavior_preservation": {
+          "type": "string",
+          "enum": ["not_required", "preferred", "required"]
+        },
+        "cross_layer": {
+          "enum": [true]
+        },
+        "diagnosis_required": {
+          "enum": [true]
+        },
+        "assumptions_must_be_explicit": {
+          "enum": [true]
+        },
+        "production_feature": {
+          "enum": [true]
+        },
+        "security_sensitive": {
+          "enum": [true]
+        },
+        "destructive_operation": {
+          "enum": [true]
+        }
+      },
+      "additionalProperties": false
+    },
+    "protected_areas": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "notes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,982 @@
+- acceptance_criteria:
+  - routing/default-policy.yaml defines all four routes with structured match predicates,
+    precedence and fallback_route
+  - schemas/task.schema.json and schemas/project-routing.schema.json exist and are
+    valid JSON Schemas
+  - tools/validate_routing.py exists and validates policy/prompt/template/fixture
+    consistency
+  created_at: '2026-09-14T10:22:09Z'
+  dependencies: []
+  description: 'Establishes the reusable routing policy contract: routing/default-policy.yaml
+    (route match predicates, precedence, fallback route, models, review_findings categories,
+    completion requirements), schemas/task.schema.json, schemas/project-routing.schema.json,
+    tools/validate_routing.py, prompts/orchestrate.md, templates/project-routing.yaml,
+    and tests/routing-cases.yaml. Evidence: commits 9b66042 (Initialize Claude Codex
+    orchestration policy), bf8adca (Fix orchestrate prompt argument forwarding), and
+    4e44eea (Establish deterministic Claude Codex routing contract).'
+  id: ORCH-001
+  labels:
+  - routing
+  - architecture
+  priority: high
+  status: completed
+  title: v0.1 deterministic Claude/Codex routing contract
+  updated_at: '2026-09-14T10:22:09Z'
+  version: v0.1
+- acceptance_criteria:
+  - tools/route_task.py accepts {classified_task} on stdin and returns a deterministic
+    ok:true/false JSON result
+  - tools/routing_engine.py is the single shared evaluator imported by both the static
+    validator and the runtime adapter
+  - extensions/model-router.ts registers a route_task Pi tool with no duplicated routing
+    logic
+  created_at: '2026-09-14T10:22:09Z'
+  dependencies:
+  - ORCH-001
+  description: 'Adds the runtime routing path: tools/routing_engine.py (shared deterministic
+    evaluator), tools/route_task.py (JSON-over-stdio adapter), extensions/model-router.ts
+    (Pi extension exposing the route_task tool), and tests/test_runtime_routing.py
+    / tests/model-router.test.ts. Evidence: commit 67a8503 (Add deterministic Pi runtime
+    router), which introduced tools/route_task.py, tools/routing_engine.py, extensions/model-router.ts,
+    tests/test_runtime_routing.py and updated tools/validate_routing.py to import
+    the shared engine.'
+  id: ORCH-002
+  labels:
+  - routing
+  - runtime
+  priority: high
+  status: completed
+  title: v0.2 runtime route_task tool
+  updated_at: '2026-09-14T10:22:09Z'
+  version: v0.2
+- acceptance_criteria:
+  - every route/primary-intent combination has a schema-valid execution plan in routing/default-policy.yaml
+  - route_task results include execution_plan and backend_bindings, never a hard-coded
+    tool/model name elsewhere
+  - tools/validate_route_result.py validates the runtime result envelope without reimplementing
+    plan semantics
+  created_at: '2026-09-14T10:22:09Z'
+  dependencies:
+  - ORCH-002
+  description: 'Adds schemas/execution-plan.schema.json and materializes a schema-valid,
+    backend-agnostic execution_plan (with backend_bindings) as part of every successful
+    route_task result; adds tools/validate_route_result.py for the TypeScript extension
+    boundary. Evidence: commit 74d5046 (Add deterministic execution plan architecture),
+    which introduced schemas/execution-plan.schema.json, tools/validate_route_result.py,
+    execution/execution_backends sections of routing/default-policy.yaml, and materialize_execution_plan/resolve_backend_bindings
+    in tools/routing_engine.py.'
+  id: ORCH-003
+  labels:
+  - routing
+  - execution-plans
+  priority: high
+  status: completed
+  title: v0.3 machine-validatable execution plan architecture
+  updated_at: '2026-09-14T10:22:09Z'
+  version: v0.3
+- acceptance_criteria:
+  - backlog/backlog.yaml validates against schemas/backlog-item.schema.json with unique
+    ids, valid transitions, and no circular dependencies
+  - provenance/runs/<run_id>.json validates against schemas/run-record.schema.json
+    and stores route_task results verbatim
+  - tools/github_sync.py invokes gh only via a fixed allowlist with shell=False, and
+    is fully mockable in tests
+  - an issue may only be closed once its backlog item is deterministically completed
+  created_at: '2026-09-14T10:22:22Z'
+  dependencies:
+  - ORCH-003
+  description: Adds a durable machine-readable backlog (backlog/backlog.yaml), append-oriented
+    run provenance (provenance/runs/<run_id>.json), an agent/subagent attribution
+    data model, deterministic backlog commands (tools/backlog.py), and a safe gh-CLI
+    GitHub synchronization boundary (tools/github_sync.py) with mocked tests. Does
+    not implement v0.4 capacity routing and does not modify routing/default-policy.yaml
+    semantics.
+  id: ORCH-004
+  labels:
+  - backlog
+  - provenance
+  - github
+  priority: high
+  status: completed
+  title: v0.3.5 durable backlog, run provenance, and GitHub sync
+  updated_at: '2026-09-14T10:43:05Z'
+  version: v0.3.5
+- acceptance_criteria:
+  - routing/default-policy.yaml has version 2 model profiles with validated family
+    capabilities and capacity_models mappings
+  - schemas/execution-plan.schema.json requires schema_version 2 and capacity_tier,
+    reasoning_effort, and context_strategy on every step
+  - Capacity, reasoning, context, and concrete model mapping are materialized only
+    after route selection without changing predicates, names, precedence, fallback,
+    task schema, primary-intent derivation, topology, or risk floors
+  - Backend bindings resolve through profile references and expose only families and
+    capacity tiers used by the materialized plan
+  - Policy bootstrap and route-result boundaries fail closed on invalid profile references,
+    family mismatches, unsupported reasoning/context values, cross-intent metadata
+    drift, or policy-version mismatch
+  - Run provenance supports nullable capacity_tier, context_strategy, context_window_tier,
+    and enumerated reasoning_setting without inferring historical values
+  - README and orchestration prompt document generic execution of v2 metadata and
+    centralized bindings
+  - Deterministic Python and TypeScript tests cover the v0.4 contract and preserve
+    existing routing fixture behavior
+  created_at: '2026-09-14T10:22:22Z'
+  dependencies:
+  - ORCH-004
+  description: Implements policy contract v2 and execution-plan schema v2 capacity
+    tiers, reasoning effort, context strategy, and centralized family/capacity model
+    and context-window mapping after deterministic route selection. Preserves v0.3
+    route predicates, names, precedence, fallback, task classification and primary-intent
+    derivation, topology, and project risk floors; extends runtime result validation,
+    provenance, prompts, documentation, and deterministic tests.
+  github_issue: 1
+  github_sync:
+    issue: 1
+    last_synced_at: '2026-09-14T11:57:03Z'
+    remote_labels:
+    - capacity
+    - routing
+    remote_state: closed
+    remote_title: v0.4 capacity tiers, reasoning effort, and context/model mapping
+    repo: dhuzard/pi-coding-orchestrator
+  id: ORCH-005
+  labels:
+  - routing
+  - capacity
+  priority: medium
+  status: completed
+  title: v0.4 capacity tiers, reasoning effort, and context/model mapping
+  updated_at: '2026-09-14T11:57:03Z'
+  version: v0.4
+- acceptance_criteria:
+  - Policy contract v3 and execution-plan schema v3 support economy, standard, and
+    high capacity while requiring standard/high profiles and initially mapping economy
+    only for Claude.
+  - The centralized low-risk-claude-worker rule assigns economy only after route resolution
+    from the effective classification and eligible authored standard Claude non-review
+    worker steps.
+  - Successful route_task results contain one validated capacity assignment per step,
+    and backend bindings contain only selected tiers; malformed rules, unsupported
+    profiles, forged assignments, and project capacity/model/worktree overrides fail
+    closed.
+  - Economy assignment does not alter route predicates or names, precedence, fallback,
+    task schema, risk floors, primary-intent derivation, plan topology, fresh context,
+    independent review, or mutation permissions.
+  - README and orchestration prompts define dedicated worktree/branch isolation from
+    a pinned commit, scoped and serialized integration, read-only review, worker/GitHub
+    prohibitions, and cautious cleanup.
+  - Deterministic Python and TypeScript tests cover economy selection, risk-floor
+    blocking, invariant preservation, prompt model indirection, provenance economy,
+    and forged-assignment rejection.
+  created_at: '2026-09-14T10:22:23Z'
+  dependencies:
+  - ORCH-005
+  description: Implements policy/execution-plan contract v3 with safe post-route economy
+    assignment for low-risk Claude workers, centralized model bindings, strict result
+    validation, and an operational worktree protocol for isolated delegated mutations
+    without weakening deterministic routing, review, or mutation-safety guarantees.
+  github_issue: 2
+  github_sync:
+    issue: 2
+    last_synced_at: '2026-09-14T12:42:32Z'
+    remote_labels:
+    - capacity
+    - worktrees
+    remote_state: closed
+    remote_title: v0.5 subagent strategy and git worktrees
+    repo: dhuzard/pi-coding-orchestrator
+  id: ORCH-006
+  labels:
+  - worktrees
+  - capacity
+  priority: medium
+  status: completed
+  title: v0.5 subagent strategy and git worktrees
+  updated_at: '2026-09-14T12:42:32Z'
+  version: v0.5
+- acceptance_criteria:
+  - schemas/run-record.schema.json supports top-level routing_telemetry and per-step
+    telemetry with explicit nulls for unobserved values.
+  - tools/provenance.py validates closed, non-secret telemetry structures and rejects
+    transcript/reasoning/secret-like telemetry keys.
+  - route_task results remain deterministic and telemetry-free; route-result validation
+    rejects forged telemetry fields inside ok:true route results.
+  - Runtime adapter tests verify routing telemetry stays outside details.result and
+    LLM-visible routing content.
+  - Historical provenance records are migrated with explicit null telemetry fields
+    and deterministic tests/docs cover the v0.6 contract.
+  created_at: '2026-09-14T10:22:23Z'
+  dependencies:
+  - ORCH-006
+  description: Implements v0.6 observational telemetry for routing adapter execution
+    and delegated steps. Telemetry is provenance-only metadata for timing, token,
+    byte, and cost observations; it is never used for routing, capacity, or model
+    selection and never stores prompts, completions, transcripts, hidden reasoning,
+    or secrets.
+  github_issue: 3
+  github_sync:
+    issue: 3
+    last_synced_at: '2026-09-15T07:12:34Z'
+    remote_labels:
+    - telemetry
+    remote_state: closed
+    remote_title: v0.6 telemetry
+    repo: dhuzard/pi-coding-orchestrator
+  id: ORCH-007
+  labels:
+  - telemetry
+  priority: low
+  status: completed
+  title: v0.6 telemetry
+  updated_at: '2026-09-15T07:12:34Z'
+  version: v0.6
+- acceptance_criteria:
+  - tools/github_sync.py supports only allowlisted gh pr view/create operations with
+    shell=False; gh api, pr merge, pr checkout, pr ready, and git push remain unsupported.
+  - schemas/backlog-item.schema.json and tools/backlog_store.py validate github_pr
+    and github_pr_sync snapshots, uniqueness, and issue/PR identity consistency.
+  - tools/backlog.py provides github-pr-sync, github-pr-create, and github-pr-link
+    composition commands; PR create/link require status review or completed and an
+    existing mapped GitHub issue.
+  - 'Generated PR bodies reference issues with ''Refs #N'' and do not use GitHub closing
+    keywords.'
+  - Mocked tests cover the PR gh boundary, schema/store behavior, lifecycle guards,
+    snapshot persistence, and conflict reporting without invoking real GitHub.
+  created_at: '2026-09-14T10:22:23Z'
+  dependencies:
+  - ORCH-004
+  - ORCH-007
+  description: Implements the v0.7 GitHub issue-to-PR lifecycle by extending the safe
+    gh CLI boundary to limited PR view/create operations, adding backlog github_pr/github_pr_sync
+    metadata, and composing guarded PR create/link/sync commands that require a mapped
+    issue and review or completed status without pushing, merging, checking out, marking
+    ready, or using gh api.
+  github_issue: 4
+  github_sync:
+    issue: 4
+    last_synced_at: '2026-09-15T07:12:37Z'
+    remote_labels:
+    - github
+    remote_state: closed
+    remote_title: v0.7 GitHub issue-to-PR lifecycle
+    repo: dhuzard/pi-coding-orchestrator
+  id: ORCH-008
+  labels:
+  - github
+  priority: low
+  status: completed
+  title: v0.7 GitHub issue-to-PR lifecycle
+  updated_at: '2026-09-15T07:12:37Z'
+  version: v0.7
+- acceptance_criteria:
+  - README contains a concise v1.0 readiness/reuse section explaining how another
+    project loads the extension/prompt, uses project-local constraints, and runs the
+    validation suite.
+  - A release checklist documents the full workflow from classified task to route_task
+    decision, agent execution, provenance trace, validation, branch/PR creation, and
+    GitHub issue closure.
+  - 'All validation commands pass from clean master: python3 tools/validate_routing.py,
+    python3 tools/backlog.py validate, python3 -m pytest, npm test, and npm run typecheck.'
+  - Backlog has no in_progress, review, or blocked items except ORCH-009 while the
+    release checklist is being executed.
+  - GitHub issue/PR sync state is checked for mapped backlog items, with no unresolved
+    conflicts before ORCH-009 is completed.
+  - A sample trace-backed orchestration run is referenced or summarized to demonstrate
+    the user-facing agent organization report.
+  - Known limitations and follow-up recommendations are explicit, including provider-dependent
+    worker token telemetry, no cost estimation without a reviewed pricing table, and
+    no autonomous merge/deploy behavior.
+  - ORCH-009 closes only after the release checklist is complete and the final GitHub
+    issue is synchronized.
+  created_at: '2026-09-14T10:22:23Z'
+  dependencies:
+  - ORCH-005
+  - ORCH-006
+  - ORCH-007
+  - ORCH-008
+  - ORCH-010
+  - ORCH-011
+  - ORCH-012
+  - ORCH-013
+  description: 'Release-hardening/meta issue for declaring the orchestrator stable
+    and reusable across projects. This is not a new feature bucket: it is a final
+    readiness pass that verifies the integrated routing, delegation, backlog, provenance/trace,
+    telemetry, GitHub issue/PR lifecycle, documentation, installation/reuse path,
+    validation suite, and known limitations are coherent, synchronized, and documented
+    from a clean master.'
+  github_issue: 5
+  github_sync:
+    issue: 5
+    last_synced_at: '2026-09-24T10:56:44Z'
+    remote_labels:
+    - future
+    - release
+    remote_state: open
+    remote_title: v1.0 release hardening and reusable orchestrator readiness
+    repo: dhuzard/pi-coding-orchestrator
+  id: ORCH-009
+  labels:
+  - release
+  - future
+  priority: high
+  status: review
+  title: v1.0 release hardening and reusable orchestrator readiness
+  updated_at: '2026-09-24T10:56:44Z'
+  version: v1.0
+- acceptance_criteria:
+  - A valid Codex economy model profile is added only with an explicit supported model
+    identifier, such as an approved mini-class Codex model, and no model identifier
+    is guessed.
+  - Economy activation is governed by centralized, deterministic, auditable predicates
+    that prove low risk before lowering capacity.
+  - Every economy assignment records why it was selected, which guard predicates passed,
+    which higher-risk predicates would have blocked it, and the selected model profile.
+  - Conservative fail-closed behavior prevents economy mode for ambiguity, diagnosis,
+    security, destructive operations, critical semantics, required behavior preservation,
+    independent review, specifier steps, or unresolved project risk floors unless
+    explicitly proven safe by policy.
+  - Tests cover positive and negative economy activation cases for Claude and Codex,
+    including boundary cases where one risk signal disables economy.
+  - The design supports future nuanced capacity tiers/model choices through centralized
+    profiles and policy validation without adding adaptive routing or prompt-level
+    model selection.
+  created_at: '2026-09-14T12:45:25Z'
+  dependencies:
+  - ORCH-006
+  description: 'Define and implement a more rigorous capacity-decision framework for
+    activating economy mode, including Codex economy support only after selecting
+    a valid smaller Codex model identifier. The work should make economy activation
+    auditable, deterministic, and conservative: lower-capacity models may be used
+    only when explicit safety predicates prove low risk, with clear explanations,
+    test coverage, and fail-closed behavior. It should also prepare for future nuanced
+    model choices across multiple model families without introducing adaptive routing,
+    telemetry-driven optimization, or prompt-level model selection.'
+  github_issue: 6
+  github_pr: 9
+  github_pr_sync:
+    base_ref: master
+    head_ref: feat/orch-010-capacity-proofing
+    is_draft: false
+    issue: 6
+    last_synced_at: '2026-09-23T08:33:00Z'
+    pr: 9
+    remote_body: 'Backlog id: ORCH-010
+
+      Version: v0.5.1
+
+      GitHub issue: Refs #6
+
+
+      This pull request is associated with the backlog item above.'
+    remote_state: open
+    remote_title: v0.5.1 Codex economy and capacity-decision proofing
+    repo: dhuzard/pi-coding-orchestrator
+  github_sync:
+    issue: 6
+    last_synced_at: '2026-09-23T09:20:07Z'
+    remote_labels:
+    - capacity
+    - future
+    - routing
+    remote_state: closed
+    remote_title: v0.5.1 Codex economy and capacity-decision proofing
+    repo: dhuzard/pi-coding-orchestrator
+  id: ORCH-010
+  labels:
+  - routing
+  - capacity
+  - future
+  priority: high
+  status: completed
+  title: v0.5.1 Codex economy and capacity-decision proofing
+  updated_at: '2026-09-23T09:20:07Z'
+  version: v0.5.1
+- acceptance_criteria:
+  - Each orchestration run can produce a concise human-readable summary with the provenance
+    run path, backlog/GitHub issue refs, route decisions, execution plan, agent/subagent
+    tree, step outcomes, returned artifact summaries, validation commands/results,
+    and final status.
+  - The underlying provenance schema or derived report represents parent/child relationships
+    between lead steps and nested subagents without storing private prompts, hidden
+    reasoning, full transcripts, secrets, or unavailable guessed metrics.
+  - Observable token/cost/timing fields are included only when exposed by the backend;
+    unavailable values remain explicit null/unknown.
+  - A deterministic CLI/report command can render the trace from provenance/runs/<run_id>.json
+    and can filter by backlog id or latest run.
+  - Docs and prompt instructions tell the orchestrator to finish runs by reporting
+    the trace path and summary to the user.
+  - Tests cover schema validation, trace rendering, missing telemetry behavior, no-secret/no-transcript
+    guards, and a multi-agent Codex-Claude-Codex run shape.
+  created_at: '2026-09-23T08:31:56Z'
+  dependencies:
+  - ORCH-010
+  description: 'Add a user-facing end-of-run trace/report that explains how the orchestrator
+    handled a request: task/issue mapping, route_task classifications and route decisions,
+    execution-plan steps, lead agents and subagents, spawned nested workers, returned
+    artifacts, review/repair interactions, validation outcomes, observable telemetry/token/cost
+    metrics when available, and provenance/run-file paths. This should make agentic
+    organization understandable and visualizable without storing prompts, hidden reasoning,
+    transcripts, secrets, or guessed costs.'
+  github_issue: 10
+  github_pr: 11
+  github_pr_sync:
+    base_ref: master
+    head_ref: feat/orch-011-run-trace
+    is_draft: false
+    issue: 10
+    last_synced_at: '2026-09-23T10:14:22Z'
+    pr: 11
+    remote_body: 'Backlog id: ORCH-011
+
+      Version: v0.8
+
+      GitHub issue: Refs #10
+
+
+      This pull request is associated with the backlog item above.'
+    remote_state: open
+    remote_title: End-of-run orchestration trace and user-facing summary
+    repo: dhuzard/pi-coding-orchestrator
+  github_sync:
+    issue: 10
+    last_synced_at: '2026-09-23T10:32:16Z'
+    remote_labels: []
+    remote_state: closed
+    remote_title: End-of-run orchestration trace and user-facing summary
+    repo: dhuzard/pi-coding-orchestrator
+  id: ORCH-011
+  labels: []
+  priority: high
+  status: completed
+  title: End-of-run orchestration trace and user-facing summary
+  updated_at: '2026-09-23T10:32:16Z'
+  version: v0.8
+- acceptance_criteria:
+  - Codex economy and standard capacity profiles resolve to openai-codex/gpt-6-luna.
+  - Codex high capacity profile resolves to openai-codex/gpt-6-sol.
+  - Claude profiles are not changed without verified cheaper equivalent capability;
+    economy remains the cheapest configured Claude tier.
+  - Runtime and adapter tests are updated to expect the new centralized profiles.
+  - Documentation reflects the Luna/Sol cost-prioritized mapping without hard-coding
+    model selection in prompts.
+  created_at: '2026-09-23T10:18:20Z'
+  dependencies:
+  - ORCH-010
+  description: Update centralized Codex capacity model profiles to prefer GPT-6 Luna
+    for economy/standard work and GPT-6 Sol for high-capacity work based on newly
+    available cost guidance, while preserving deterministic routing and conservative
+    Claude cost behavior.
+  github_issue: 12
+  github_pr: 13
+  github_pr_sync:
+    base_ref: master
+    head_ref: feat/cost-prioritize-gpt6
+    is_draft: false
+    issue: 12
+    last_synced_at: '2026-09-23T10:19:07Z'
+    pr: 13
+    remote_body: 'Backlog id: ORCH-012
+
+      Version: v0.8.1
+
+      GitHub issue: Refs #12
+
+
+      This pull request is associated with the backlog item above.'
+    remote_state: open
+    remote_title: Prioritize GPT-6 Luna/Sol cost-efficient Codex profiles
+    repo: dhuzard/pi-coding-orchestrator
+  github_sync:
+    issue: 12
+    last_synced_at: '2026-09-23T12:02:54Z'
+    remote_labels: []
+    remote_state: closed
+    remote_title: Prioritize GPT-6 Luna/Sol cost-efficient Codex profiles
+    repo: dhuzard/pi-coding-orchestrator
+  id: ORCH-012
+  priority: high
+  status: completed
+  title: Prioritize GPT-6 Luna/Sol cost-efficient Codex profiles
+  updated_at: '2026-09-23T12:02:54Z'
+  version: v0.8.1
+- acceptance_criteria:
+  - The orchestrator/provenance flow can record started_at, ended_at, and duration_ms
+    for route_task and every top-level/nested worker step without relying on provider
+    support.
+  - When a backend/tool result exposes token usage, input/output/cached/total token
+    counters are captured into the appropriate provenance telemetry fields; if not
+    exposed they remain explicit null.
+  - Trace output surfaces timing and token telemetry per route/step/run metrics when
+    observed and continues to show unknown/null when unavailable.
+  - No prompts, transcripts, hidden reasoning, secrets, or raw provider responses
+    are persisted while extracting usage metadata.
+  - Tests cover timing capture, token-metadata extraction from mocked tool results,
+    missing-usage behavior, and trace rendering of observed versus unknown metrics.
+  - Cost estimation remains out of scope unless backed by observed tokens and a reviewed
+    versioned pricing table.
+  created_at: '2026-09-23T11:12:13Z'
+  dependencies:
+  - ORCH-007
+  - ORCH-011
+  description: 'Add first-class observed usage capture for orchestration runs: wall-clock
+    timing around route_task/top-level worker/subagent calls immediately, and token
+    counters when exposed by Pi/provider tool results. Persist only observed usage
+    in provenance/trace summaries with explicit nulls for unavailable fields; do not
+    estimate cost until token counts and pricing policy are available.'
+  github_issue: 14
+  github_pr: 15
+  github_pr_sync:
+    base_ref: master
+    head_ref: feat/orch-013-telemetry-capture
+    is_draft: false
+    issue: 14
+    last_synced_at: '2026-09-23T11:37:32Z'
+    pr: 15
+    remote_body: 'Backlog id: ORCH-013
+
+      Version: v0.8.2
+
+      GitHub issue: Refs #14
+
+
+      This pull request is associated with the backlog item above.'
+    remote_state: open
+    remote_title: Observed timing and token telemetry capture
+    repo: dhuzard/pi-coding-orchestrator
+  github_sync:
+    issue: 14
+    last_synced_at: '2026-09-23T11:59:23Z'
+    remote_labels: []
+    remote_state: closed
+    remote_title: Observed timing and token telemetry capture
+    repo: dhuzard/pi-coding-orchestrator
+  id: ORCH-013
+  priority: critical
+  status: completed
+  title: Observed timing and token telemetry capture
+  updated_at: '2026-09-23T11:59:23Z'
+  version: v0.8.2
+- acceptance_criteria:
+  - mission state is stored separately from backlog and validates against a closed
+    JSON schema
+  - mission CLI can create/list/show/reconcile/pause/resume/cancel/link missions deterministically
+    without routing or GitHub side effects
+  - mission completion is guarded by referenced backlog items all being completed
+  - project autonomy policy template/schema exists and validates guarded permissions
+  - /deliver-related extension commands are registered as safe command stubs that
+    use the mission CLI and queue /orchestrate rather than embedding a giant prompt
+  - deterministic tests cover mission store, reconciliation, CLI behavior, and init
+    wiring
+  created_at: '2026-09-25T08:29:35Z'
+  dependencies: []
+  description: 'Add the first safe /deliver mission-controller foundation: durable
+    mission state separate from backlog, deterministic mission CLI/reconciliation,
+    autonomy policy schema/template, Pi /deliver commands, initialization wiring,
+    documentation, tests, and trace provenance. This deliberately avoids autonomous
+    GitHub push/merge/deploy behavior.'
+  github_issue: 16
+  github_pr: 17
+  github_pr_sync:
+    base_ref: master
+    head_ref: feat/orch-014-mission-controller
+    is_draft: false
+    issue: 16
+    last_synced_at: '2026-09-25T08:30:07Z'
+    pr: 17
+    remote_body: 'Backlog id: ORCH-014
+
+      Version: v0.9
+
+      GitHub issue: Refs #16
+
+
+      This pull request is associated with the backlog item above.'
+    remote_state: open
+    remote_title: Autonomous delivery mission controller foundation
+    repo: dhuzard/pi-coding-orchestrator
+  github_sync:
+    issue: 16
+    last_synced_at: '2026-09-25T08:57:37Z'
+    remote_labels: []
+    remote_state: closed
+    remote_title: Autonomous delivery mission controller foundation
+    repo: dhuzard/pi-coding-orchestrator
+  id: ORCH-014
+  labels: []
+  priority: high
+  status: completed
+  title: Autonomous delivery mission controller foundation
+  updated_at: '2026-09-25T08:57:37Z'
+  version: v0.9
+- acceptance_criteria:
+  - A mission-planning command or CLI path can derive and persist a bounded backlog
+    DAG for a mission using tools/backlog.py/mission.py storage boundaries rather
+    than hand-editing YAML.
+  - Generated backlog items include deterministic ids/titles/descriptions/dependencies/acceptance
+    criteria/statuses and validate against schemas/backlog-item.schema.json.
+  - Mission state can link planned backlog items without completing or mutating unrelated
+    backlog/GitHub/PR state.
+  - The design explicitly keeps /orchestrate as the one-task execution engine and
+    does not add scheduler, git push/branch controller, PR/CI repair loop, merge,
+    deploy, or auto-merge behavior.
+  - Tests cover mission planner success, dependency ordering, duplicate/idempotency
+    behavior, validation failures, and the no-broadening boundary.
+  created_at: '2026-09-25T08:37:41Z'
+  dependencies:
+  - ORCH-014
+  description: 'Add the next bounded /deliver capability: a deterministic mission
+    planner that turns a mission goal into a proposed backlog DAG with explicit dependencies,
+    acceptance criteria, and safe linkage to mission state. This item must preserve
+    /orchestrate as the bounded task executor; it must not introduce a persistent
+    /orchestrate controller, scheduler invocation, git branch/push automation, PR/CI
+    repair loops, or guarded auto-merge behavior, which remain separate future backlog
+    items.'
+  github_issue: 18
+  github_pr: 19
+  github_pr_sync:
+    base_ref: master
+    head_ref: feat/orch-015-mission-planner
+    is_draft: false
+    issue: 18
+    last_synced_at: '2026-09-25T08:58:14Z'
+    pr: 19
+    remote_body: 'Backlog id: ORCH-015
+
+      Version: v0.10
+
+      GitHub issue: Refs #18
+
+
+      This pull request is associated with the backlog item above.'
+    remote_state: open
+    remote_title: Mission planner and backlog DAG creation
+    repo: dhuzard/pi-coding-orchestrator
+  github_sync:
+    issue: 18
+    last_synced_at: '2026-09-25T08:58:06Z'
+    remote_labels: []
+    remote_state: closed
+    remote_title: Mission planner and backlog DAG creation
+    repo: dhuzard/pi-coding-orchestrator
+  id: ORCH-015
+  labels: []
+  priority: high
+  status: completed
+  title: Mission planner and backlog DAG creation
+  updated_at: '2026-09-25T08:58:14Z'
+  version: v0.10
+- acceptance_criteria:
+  - The bounded task 'Scheduler invoking /orchestrate' is implemented only within
+    its explicit scope.
+  - The change preserves /orchestrate as a bounded one-task execution engine and does
+    not introduce unrelated persistent-controller behavior.
+  - Backlog, mission state, GitHub/PR state, and run provenance boundaries remain
+    separate and deterministic.
+  - Relevant deterministic tests and validation commands cover the behavior introduced
+    by this item.
+  created_at: '2026-09-25T08:48:16Z'
+  dependencies:
+  - ORCH-015
+  description: 'Generated from MISSION-001 as part of its bounded delivery backlog
+    DAG: Scheduler invoking /orchestrate. This item is one bounded engineering task
+    and must preserve /orchestrate as the one-task execution engine; scheduler, git
+    push/branch, PR/CI, merge, deploy, and auto-merge behavior must remain within
+    their own explicitly-scoped backlog items.'
+  id: ORCH-016
+  labels:
+  - mission
+  - planned
+  priority: high
+  status: planned
+  title: Scheduler invoking /orchestrate
+  updated_at: '2026-09-25T08:48:16Z'
+  version: v0.10
+- acceptance_criteria:
+  - The bounded task 'Deterministic git branch/push controller' is implemented only
+    within its explicit scope.
+  - The change preserves /orchestrate as a bounded one-task execution engine and does
+    not introduce unrelated persistent-controller behavior.
+  - Backlog, mission state, GitHub/PR state, and run provenance boundaries remain
+    separate and deterministic.
+  - Relevant deterministic tests and validation commands cover the behavior introduced
+    by this item.
+  created_at: '2026-09-25T08:48:16Z'
+  dependencies:
+  - ORCH-016
+  description: 'Generated from MISSION-001 as part of its bounded delivery backlog
+    DAG: Deterministic git branch/push controller. This item is one bounded engineering
+    task and must preserve /orchestrate as the one-task execution engine; scheduler,
+    git push/branch, PR/CI, merge, deploy, and auto-merge behavior must remain within
+    their own explicitly-scoped backlog items.'
+  id: ORCH-017
+  labels:
+  - mission
+  - planned
+  priority: high
+  status: planned
+  title: Deterministic git branch/push controller
+  updated_at: '2026-09-25T08:48:16Z'
+  version: v0.10
+- acceptance_criteria:
+  - The bounded task 'PR/CI observer and repair loop' is implemented only within its
+    explicit scope.
+  - The change preserves /orchestrate as a bounded one-task execution engine and does
+    not introduce unrelated persistent-controller behavior.
+  - Backlog, mission state, GitHub/PR state, and run provenance boundaries remain
+    separate and deterministic.
+  - Relevant deterministic tests and validation commands cover the behavior introduced
+    by this item.
+  created_at: '2026-09-25T08:48:16Z'
+  dependencies:
+  - ORCH-017
+  description: 'Generated from MISSION-001 as part of its bounded delivery backlog
+    DAG: PR/CI observer and repair loop. This item is one bounded engineering task
+    and must preserve /orchestrate as the one-task execution engine; scheduler, git
+    push/branch, PR/CI, merge, deploy, and auto-merge behavior must remain within
+    their own explicitly-scoped backlog items.'
+  id: ORCH-018
+  labels:
+  - mission
+  - planned
+  priority: high
+  status: planned
+  title: PR/CI observer and repair loop
+  updated_at: '2026-09-25T08:48:16Z'
+  version: v0.10
+- acceptance_criteria:
+  - The bounded task 'Merge policy + guarded auto-merge' is implemented only within
+    its explicit scope.
+  - The change preserves /orchestrate as a bounded one-task execution engine and does
+    not introduce unrelated persistent-controller behavior.
+  - Backlog, mission state, GitHub/PR state, and run provenance boundaries remain
+    separate and deterministic.
+  - Relevant deterministic tests and validation commands cover the behavior introduced
+    by this item.
+  created_at: '2026-09-25T08:48:16Z'
+  dependencies:
+  - ORCH-018
+  description: 'Generated from MISSION-001 as part of its bounded delivery backlog
+    DAG: Merge policy + guarded auto-merge. This item is one bounded engineering task
+    and must preserve /orchestrate as the one-task execution engine; scheduler, git
+    push/branch, PR/CI, merge, deploy, and auto-merge behavior must remain within
+    their own explicitly-scoped backlog items.'
+  id: ORCH-019
+  labels:
+  - mission
+  - planned
+  priority: high
+  status: planned
+  title: Merge policy + guarded auto-merge
+  updated_at: '2026-09-25T08:48:16Z'
+  version: v0.10
+- acceptance_criteria:
+  - Missing launcher identity fails closed as BACKEND_IDENTITY_UNINITIALIZED while
+    actual executable drift remains MODEL_BACKEND_MISMATCH.
+  - Canonical launchers refresh/load all extensions and pin backend identity without
+    stale cache execution.
+  - Extension-load and workflow-command safe-default regressions are covered.
+  - External repository provenance ownership is explicit and covered.
+  - Deterministic launcher-to-route_task-to-backend-preflight tests cover READY and
+    blocker cases.
+  created_at: '2026-10-02T15:09:02Z'
+  dependencies: []
+  description: 'Complete secured router/backend-preflight recovery work: launcher-pinned
+    Claude identity, fail-closed route availability recovery, workflow command loading/defaults,
+    external provenance documentation, CI and deterministic regression coverage.'
+  github_issue: 23
+  github_pr: 24
+  github_pr_sync:
+    base_ref: main
+    head_ref: wip/router-preflight-recovery-20261002
+    is_draft: false
+    issue: 23
+    last_synced_at: '2026-10-04T13:05:22Z'
+    pr: 24
+    remote_body: 'Backlog id: ORCH-020
+
+      Version: v0.11
+
+      GitHub issue: Refs #23
+
+
+      This pull request is associated with the backlog item above.'
+    remote_state: merged
+    remote_title: Router backend preflight recovery
+    repo: dhuzard/pi-coding-orchestrator
+  github_sync:
+    issue: 23
+    last_synced_at: '2026-10-04T13:05:22Z'
+    remote_labels:
+    - routing
+    remote_state: closed
+    remote_title: Router backend preflight recovery
+    repo: dhuzard/pi-coding-orchestrator
+  id: ORCH-020
+  labels:
+  - routing
+  priority: high
+  status: completed
+  title: Router backend preflight recovery
+  updated_at: '2026-10-04T13:05:22Z'
+  version: v0.11
+- acceptance_criteria:
+  - AskClaude isolated:false is blocked (SESSION_ISOLATION_REQUIRED); omitted isolation
+    is forced on
+  - A Claude worker outside the target repository or its linked worktrees fails closed
+    (SESSION_REPOSITORY_MISMATCH)
+  - message_subagent for a subagent from another run or repository is blocked (SESSION_SCOPE_VIOLATION)
+  - Regression tests reproduce an A -> B -> A repository-switch sequence in TypeScript
+    and with real git repositories
+  created_at: '2026-10-05T10:48:00Z'
+  dependencies: []
+  description: Worker sessions are scoped repository -> parent run -> phase -> step.
+    During a parent run the lifecycle extension forces AskClaude isolated (no shared
+    bridge session or Pi history), verifies the Claude worker directory shares the
+    target's git common directory, and allows message_subagent only for subagents
+    spawned in the same run. State passes through explicit artifacts. Motivated by
+    a real cross-repository contamination between two projects.
+  id: ORCH-021
+  labels:
+  - orchestration
+  - isolation
+  priority: critical
+  status: review
+  title: Repository-scoped backend session isolation
+  updated_at: '2026-10-05T10:48:00Z'
+  version: v1.1
+- acceptance_criteria:
+  - Context policy is schema-validated with keep_recent < target < trigger < hard_limit
+  - Structured checkpoints are validated, secret-scanned, namespaced checkpoints/<owner>__<repo>/<run>/<seq>.json
+    and linked into parent provenance
+  - Unparseable model output falls back to Pi default compaction and is recorded as
+    unstructured
+  - Re-arm logic prevents back-to-back compactions; hard limit gates AskClaude/spawn_subagent/message_subagent
+  created_at: '2026-10-05T10:48:00Z'
+  dependencies:
+  - ORCH-021
+  description: routing/context-policy.yaml defines a working-token budget for the
+    parent session (target 20k, compact trigger 24k, hard limit 32k, keep-recent 6k)
+    counted above the run baseline. Crossing the trigger compacts the session into
+    a schema-validated checkpoint (objective, phase, facts, decisions, tests, questions,
+    blockers, next actions, artifacts, files touched, git and orchestration state)
+    persisted under the state directory per repository/run. Above the hard limit worker
+    launches are blocked until compaction lands.
+  id: ORCH-022
+  labels:
+  - orchestration
+  - context
+  priority: high
+  status: review
+  title: Bounded parent context with structured checkpoint compaction
+  updated_at: '2026-10-05T10:48:00Z'
+  version: v1.1
+- acceptance_criteria:
+  - assigned_reasoning_effort <= authored effort for every assignment; forged escalation
+    is rejected at the route boundary
+  - AskClaude thinking mismatching the routed assignment is blocked (REASONING_EFFORT_MISMATCH)
+  - Phase escalation_reason is limited to FAILED_ATTEMPTS, REVIEW_FINDINGS, AMBIGUITY,
+    ARCHITECTURE, SECURITY_SENSITIVE, SEMANTIC_RISK, CONTEXT_BUDGET
+  created_at: '2026-10-05T10:48:00Z'
+  dependencies: []
+  description: 'Policy v5: low-risk economy capacity downgrades also lower reasoning
+    effort (never raise it); capacity_assignments carry authored/assigned reasoning
+    effort, validated by exact recomputation. The lifecycle enforces the assigned
+    effort as AskClaude thinking. Escalation is a re-classification through route_task
+    with a closed escalation_reason recorded on the phase.'
+  id: ORCH-023
+  labels:
+  - routing
+  - effort
+  priority: high
+  status: review
+  title: Adaptive reasoning-effort routing with recorded escalation
+  updated_at: '2026-10-05T10:48:00Z'
+  version: v1.1
+- acceptance_criteria:
+  - Context and usage events are recorded by the extension only and validated by schemas/run-record.schema.json
+  - Telemetry write failures are diagnosed but never block the run
+  created_at: '2026-10-05T10:48:00Z'
+  dependencies:
+  - ORCH-022
+  description: Parent provenance records baseline/peak context and working tokens,
+    compactions (structured and unstructured), checkpoint references, per-worker reasoning
+    effort, phase escalation reasons, and accumulated per-backend worker usage (invocations,
+    duration, input/output/cached tokens) observed from tool results. Unobserved counters
+    stay null; the model cannot report this telemetry. AskClaude currently exposes
+    duration only; cost remains absent without a reviewed pricing table.
+  id: ORCH-024
+  labels:
+  - telemetry
+  - context
+  priority: medium
+  status: review
+  title: Token and context telemetry for parent runs
+  updated_at: '2026-10-05T10:48:00Z'
+  version: v1.1
+- acceptance_criteria:
+  - Budgets are validated policy, not prompt text
+  - Budget decisions use observed counters only and are recorded in provenance
+  created_at: '2026-10-05T10:48:00Z'
+  dependencies:
+  - ORCH-024
+  description: Add optional mission budgets (max_total_tokens, max_worker_tokens)
+    and phase budgets. Reaching a budget requires the parent to compact, finish the
+    phase, or record an explicit escalation reason; it never silently truncates work.
+    Deferred until backend token telemetry is complete enough (AskClaude reports no
+    token usage today) to make budgets enforceable rather than estimated.
+  id: ORCH-025
+  labels:
+  - telemetry
+  - budget
+  priority: medium
+  status: planned
+  title: Mission and phase token budgets
+  updated_at: '2026-10-05T10:48:00Z'
+  version: v1.1
+- acceptance_criteria:
+  - Worker packages are assembled from declared artifacts with size bounds
+  - Package contents are recorded by reference in provenance
+  created_at: '2026-10-05T10:48:01Z'
+  dependencies:
+  - ORCH-021
+  - ORCH-022
+  description: Build each worker's context package deterministically from explicit
+    artifacts (specification, checkpoint, diff, failing tests, review findings) scoped
+    to the run, instead of the parent forwarding ad hoc repository or history excerpts.
+    Measure the effect with ORCH-024 telemetry.
+  id: ORCH-026
+  labels:
+  - context
+  - orchestration
+  priority: medium
+  status: planned
+  title: Minimal repository-scoped worker context construction
+  updated_at: '2026-10-05T10:48:01Z'
+  version: v1.1
+- acceptance_criteria:
+  - Concurrent pinned and unpinned sessions execute from distinct immutable runtimes
+  - Mutating Claude steps require a bound linked worktree and parent-checkout writes
+    block further workers
+  - Follow-up turns keep AskClaude isolated and subagents repository-scoped
+  - Regression tests cover every audited issue
+  created_at: '2026-10-05T11:29:04Z'
+  dependencies:
+  - ORCH-021
+  description: 'Fixes from the pico/CLI audit: immutable per-commit runtimes so concurrent
+    sessions never share mutable code; worker workspace binding with Claude executed
+    in the bound worktree and parent-checkout change detection; always-on AskClaude
+    isolation and subagent scope between parent runs; offline pinned runs; launch
+    without Claude Code (reroutable unavailability); target missions stored in orchestrator
+    state; complete vendored bundle with its own launcher; doctor diagnoses invalid
+    pins, broken model config, and missing Pi packages; safe reset-cache and purge
+    guards; order-independent run options; stable Claude launcher path with collision-free
+    bridge config writes; executable launcher scripts.'
+  id: ORCH-027
+  labels:
+  - launcher
+  - isolation
+  priority: high
+  status: review
+  title: Pico launcher and worker-scope audit fixes
+  updated_at: '2026-10-05T11:29:04Z'
+  version: v1.1

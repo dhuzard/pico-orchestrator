@@ -1,0 +1,43 @@
+# Safe, constraints-only project-local routing overrides.
+#
+# Validated against schemas/project-routing.schema.json. This file may only
+# add constraints on top of routing/default-policy.yaml: it can never define
+# or replace routes, models, precedence, fallback, execution isolation,
+# review categories, or completion requirements. Unknown keys are rejected.
+
+project:
+  name: ""
+  domain: ""
+
+critical_invariants: []
+
+architecture_constraints: []
+
+terminology: {}
+
+validation:
+  commands: []
+
+# Floors, not replacements. Ordered fields raise the task's effective value
+# to at least the given floor (never lower it). Safety booleans may only be
+# set to `true` and are OR-merged with the task's own classification.
+#
+# Ordered fields (uncomment to set a floor):
+#   failure_cost: low | medium | high
+#   semantic_correctness: low | normal | critical
+#   ambiguity: 0..10 (numeric floor)
+#   implementation_scope: small | medium | broad
+#   behavior_preservation: not_required | preferred | required
+#
+# Safety booleans (uncomment to force true; false is not a valid value here):
+#   cross_layer: true
+#   diagnosis_required: true
+#   assumptions_must_be_explicit: true
+#   production_feature: true
+#   security_sensitive: true
+#   destructive_operation: true
+risk_overrides: {}
+
+protected_areas: []
+
+notes: []

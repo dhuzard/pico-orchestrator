@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "claude_code_minimum_versions": {
+    "anthropic/claude-opus-5-5": "2.1.280"
+  },
+  "claude_code_model_ids": {
+    "haiku": "haiku",
+    "sonnet": "sonnet",
+    "anthropic/claude-opus-5-5": "claude-opus-5-5"
+  }
+}

@@ -1,0 +1,36 @@
+# Project-local execution authority policy for mission-level delivery.
+# This is intentionally separate from .pi/routing.yaml:
+# - routing.yaml decides which execution workflow/model family handles a task.
+# - autonomy.yaml decides which repository/GitHub actions a mission controller may perform.
+profile: guarded
+
+# batch: the tasks of a wave are validated locally in their own worktrees,
+# merged into one local pico/batch-<n> branch, and published with one push and
+# one PR (when push_branch and create_pr allow it). task: one PR per task.
+pr_granularity: batch
+
+permissions:
+  create_backlog_items: true
+  create_github_issues: true
+  create_worktrees: true
+  commit: true
+  push_branch: false
+  create_pr: false
+  comment_on_issue: true
+  comment_on_pr: true
+  mark_pr_ready: false
+
+  merge:
+    enabled: false
+    max_failure_cost: medium
+    require_ci: true
+    require_review_if_policy_demands: true
+
+  deploy: false
+
+limits:
+  parallel_tasks: 3     # most routed tasks per wave (declare_wave enforces it)
+  open_prs: 2           # at the limit, new batches stack on the newest batch branch
+  nested_agents_per_task: 4
+  repair_attempts: 2
+  replans: 3

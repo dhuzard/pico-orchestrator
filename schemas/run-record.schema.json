@@ -1,0 +1,1944 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "RunRecord",
+  "description": "An append-oriented, machine-readable record of one orchestration run, stored as provenance/runs/<run_id>.json. Captures the route_task decision verbatim (never reinterpreted), the delegated steps actually executed, and their worker/model attribution and outcomes, where observable. Distinct from backlog items (durable task metadata in backlog/backlog.yaml) and GitHub Issues (human-facing collaboration surface). A field whose value the orchestrator cannot observe MUST be explicit null (or the literal string \"unknown\" for free-text fields where a string is required) -- never a guessed value.",
+  "type": "object",
+  "required": [
+    "run_id",
+    "backlog_id",
+    "github_issue",
+    "user_objective",
+    "started_at",
+    "ended_at",
+    "route_task_result",
+    "routing_telemetry",
+    "starting_commit",
+    "ending_commit",
+    "outcome",
+    "steps"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "parent_orchestration": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": false,
+      "required": [
+        "target_repository",
+        "policy_version",
+        "phases",
+        "mutations",
+        "final_status",
+        "blocker_code"
+      ],
+      "properties": {
+        "target_repository": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "policy_version": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1
+        },
+        "final_status": {
+          "type": "string",
+          "enum": [
+            "IN_PROGRESS",
+            "COMPLETED",
+            "BLOCKED",
+            "FAILED",
+            "PARTIAL"
+          ]
+        },
+        "blocker_code": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "mutations": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "github",
+            "code"
+          ],
+          "properties": {
+            "github": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "code": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
+        "phases": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "id",
+              "status",
+              "route",
+              "blocker_code",
+              "workers",
+              "child_run_ids"
+            ],
+            "properties": {
+              "id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$"
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "not_started",
+                  "in_progress",
+                  "completed",
+                  "blocked",
+                  "failed",
+                  "partial"
+                ]
+              },
+              "route": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "enum": [
+                  "CODEX",
+                  "CLAUDE",
+                  "CLAUDE_CODEX",
+                  "CODEX_CLAUDE_CODEX",
+                  null
+                ]
+              },
+              "routing": {
+                "type": "object",
+                "additionalProperties": false,
+                "description": "Compact policy decision metadata for the viewer. No task prose or repository evidence. Absent on historical runs.",
+                "required": [
+                  "task_type",
+                  "ambiguity",
+                  "failure_cost",
+                  "semantic_correctness",
+                  "diagnosis_required",
+                  "implementation_scope",
+                  "signals",
+                  "matches",
+                  "fallback_applied",
+                  "assignments"
+                ],
+                "properties": {
+                  "task_type": {
+                    "type": "string"
+                  },
+                  "ambiguity": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 10
+                  },
+                  "ambiguity_dimensions": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "outcome",
+                      "contract",
+                      "design",
+                      "evidence",
+                      "authority"
+                    ],
+                    "properties": {
+                      "outcome": {
+                        "$ref": "#/$defs/score_0_10"
+                      },
+                      "contract": {
+                        "$ref": "#/$defs/score_0_10"
+                      },
+                      "design": {
+                        "$ref": "#/$defs/score_0_10"
+                      },
+                      "evidence": {
+                        "$ref": "#/$defs/score_0_10"
+                      },
+                      "authority": {
+                        "$ref": "#/$defs/score_0_10"
+                      }
+                    }
+                  },
+                  "work_profile": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "search",
+                      "analysis",
+                      "writing",
+                      "implementation",
+                      "verification",
+                      "coordination"
+                    ],
+                    "properties": {
+                      "search": {
+                        "$ref": "#/$defs/score_0_10"
+                      },
+                      "analysis": {
+                        "$ref": "#/$defs/score_0_10"
+                      },
+                      "writing": {
+                        "$ref": "#/$defs/score_0_10"
+                      },
+                      "implementation": {
+                        "$ref": "#/$defs/score_0_10"
+                      },
+                      "verification": {
+                        "$ref": "#/$defs/score_0_10"
+                      },
+                      "coordination": {
+                        "$ref": "#/$defs/score_0_10"
+                      }
+                    }
+                  },
+                  "failure_cost": {
+                    "enum": [
+                      "low",
+                      "medium",
+                      "high"
+                    ]
+                  },
+                  "semantic_correctness": {
+                    "enum": [
+                      "low",
+                      "normal",
+                      "critical"
+                    ]
+                  },
+                  "diagnosis_required": {
+                    "type": "boolean"
+                  },
+                  "implementation_scope": {
+                    "enum": [
+                      "small",
+                      "medium",
+                      "broad"
+                    ]
+                  },
+                  "signals": {
+                    "type": "array",
+                    "uniqueItems": true,
+                    "items": {
+                      "enum": [
+                        "behavior_preservation_required",
+                        "assumptions_must_be_explicit",
+                        "security_sensitive",
+                        "destructive_operation",
+                        "cross_layer",
+                        "production_feature",
+                        "many_routine_decisions"
+                      ]
+                    }
+                  },
+                  "matches": {
+                    "type": "array",
+                    "uniqueItems": true,
+                    "items": {
+                      "enum": [
+                        "CODEX",
+                        "CLAUDE",
+                        "CLAUDE_CODEX",
+                        "CODEX_CLAUDE_CODEX"
+                      ]
+                    }
+                  },
+                  "fallback_applied": {
+                    "type": "boolean"
+                  },
+                  "assignments": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "step_id",
+                        "role",
+                        "family",
+                        "capacity_tier",
+                        "ambiguity_capacity",
+                        "rule"
+                      ],
+                      "properties": {
+                        "step_id": {
+                          "type": "string"
+                        },
+                        "role": {
+                          "enum": [
+                            "worker",
+                            "specifier",
+                            "reviewer"
+                          ]
+                        },
+                        "family": {
+                          "enum": [
+                            "codex",
+                            "claude"
+                          ]
+                        },
+                        "capacity_tier": {
+                          "enum": [
+                            "light",
+                            "economy",
+                            "standard",
+                            "high",
+                            "max"
+                          ]
+                        },
+                        "ambiguity_capacity": {
+                          "$ref": "#/$defs/score_0_10"
+                        },
+                        "rule": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        }
+                      }
+                    }
+                  }
+                }
+              },
+              "blocker_code": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "escalation_reason": {
+                "type": "string",
+                "enum": [
+                  "FAILED_ATTEMPTS",
+                  "REVIEW_FINDINGS",
+                  "AMBIGUITY",
+                  "ARCHITECTURE",
+                  "SECURITY_SENSITIVE",
+                  "SEMANTIC_RISK",
+                  "CONTEXT_BUDGET"
+                ]
+              },
+              "wave_id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$",
+                "description": "The wave this routed task (phase) last ran in. Absent for tasks never declared in a wave."
+              },
+              "workers": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "step_id",
+                    "model",
+                    "status",
+                    "blocker_code",
+                    "installed_backend_version",
+                    "required_backend_version"
+                  ],
+                  "properties": {
+                    "step_id": {
+                      "type": "string"
+                    },
+                    "model": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "backend_model": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "backend": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "reasoning_effort": {
+                      "type": [
+                        "string",
+                        "null"
+                      ],
+                      "enum": [
+                        "low",
+                        "medium",
+                        "high",
+                        null
+                      ]
+                    },
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "not_started",
+                        "in_progress",
+                        "completed",
+                        "blocked",
+                        "failed"
+                      ]
+                    },
+                    "blocker_code": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "installed_backend_version": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "required_backend_version": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  }
+                }
+              },
+              "child_run_ids": {
+                "type": "array",
+                "uniqueItems": true,
+                "items": {
+                  "type": "string",
+                  "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$"
+                }
+              }
+            }
+          }
+        },
+        "waves": {
+          "type": "array",
+          "description": "Waves of routed tasks with disjoint write scopes that ran concurrently, in declaration order, with their integration state. Absent on historical records.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "id",
+              "task_ids",
+              "status"
+            ],
+            "properties": {
+              "id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$"
+              },
+              "task_ids": {
+                "type": "array",
+                "minItems": 1,
+                "uniqueItems": true,
+                "items": {
+                  "type": "string",
+                  "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$"
+                }
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "declared",
+                  "integrating",
+                  "integrated"
+                ]
+              }
+            }
+          }
+        },
+        "activity": {
+          "type": "array",
+          "description": "Recent metadata-only worker interactions for live viewers. No prompts or outputs.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "at",
+              "status",
+              "tool",
+              "task_id",
+              "step_id",
+              "subagent_id"
+            ],
+            "properties": {
+              "at": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "started",
+                  "finished",
+                  "failed",
+                  "spawned"
+                ]
+              },
+              "tool": {
+                "type": "string",
+                "enum": [
+                  "spawn_subagent",
+                  "message_subagent",
+                  "ClaudeWorker",
+                  "AskClaude"
+                ]
+              },
+              "task_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "step_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "subagent_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            }
+          }
+        },
+        "interactions": {
+          "type": "array",
+          "description": "Numbered, concise parent-authored summaries of directives, worker feedback, and parent decisions. No prompts, transcripts, hidden reasoning, or raw outputs. Absent on older runs.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "sequence",
+              "at",
+              "type",
+              "summary",
+              "task_id",
+              "step_id",
+              "subagent_id",
+              "reply_to"
+            ],
+            "properties": {
+              "sequence": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "at": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "directive",
+                  "feedback",
+                  "decision"
+                ]
+              },
+              "summary": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 180
+              },
+              "task_id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$"
+              },
+              "step_id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$"
+              },
+              "subagent_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "reply_to": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "minimum": 1
+              }
+            }
+          }
+        },
+        "context": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Parent-session context telemetry: observed baseline/peak tokens, Pi compactions, explicit checkpoint references, and accumulated per-backend worker usage. Unobserved counters are null. Absent on historical records.",
+          "required": [
+            "starting_commit",
+            "baseline_tokens",
+            "peak_context_tokens",
+            "peak_working_tokens",
+            "compactions",
+            "structured_compactions",
+            "checkpoints",
+            "worker_usage"
+          ],
+          "properties": {
+            "starting_commit": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "pattern": "^[0-9a-f]{7,64}$"
+            },
+            "baseline_tokens": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "peak_context_tokens": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "peak_working_tokens": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "compactions": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "structured_compactions": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "peak_concurrent_workers": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0,
+              "description": "Most worker calls observed in flight at once by the lifecycle extension."
+            },
+            "worker_active_ms": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0,
+              "description": "Observed wall-clock time with at least one worker call in flight."
+            },
+            "spawned_agents": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "lead_usage": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "model": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "mixed_models": {
+                  "type": "boolean"
+                },
+                "total_tokens_complete": {
+                  "type": "boolean"
+                },
+                "input_tokens": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "output_tokens": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "cached_tokens": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "total_tokens": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              }
+            },
+            "lead_calls": {
+              "type": "array",
+              "description": "Observed assistant model calls, in order; task_type is null when attribution is ambiguous or routing has not completed.",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "sequence",
+                  "phase",
+                  "task_type",
+                  "model",
+                  "turn_index",
+                  "duration_ms",
+                  "input_tokens",
+                  "output_tokens",
+                  "cached_tokens",
+                  "total_tokens"
+                ],
+                "properties": {
+                  "sequence": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "phase": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$"
+                  },
+                  "task_type": {
+                    "enum": [
+                      null,
+                      "exploration",
+                      "architecture",
+                      "debugging",
+                      "root_cause",
+                      "invariant_definition",
+                      "scientific_semantics",
+                      "implementation",
+                      "broad_feature",
+                      "end_to_end_feature",
+                      "ui_ux",
+                      "scaffolding",
+                      "plumbing",
+                      "refactor",
+                      "review",
+                      "security_review",
+                      "migration",
+                      "documentation",
+                      "testing",
+                      "vcs_operation",
+                      "issue_management",
+                      "config_edit",
+                      "ci_fix"
+                    ]
+                  },
+                  "model": {
+                    "type": "string",
+                    "pattern": "^[A-Za-z0-9_.:/-]{1,128}$"
+                  },
+                  "turn_index": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ],
+                    "minimum": 0
+                  },
+                  "duration_ms": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ],
+                    "minimum": 0
+                  },
+                  "input_tokens": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ],
+                    "minimum": 0
+                  },
+                  "output_tokens": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ],
+                    "minimum": 0
+                  },
+                  "cached_tokens": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ],
+                    "minimum": 0
+                  },
+                  "total_tokens": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ],
+                    "minimum": 0
+                  }
+                }
+              }
+            },
+            "checkpoints": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "sequence",
+                  "reference",
+                  "reason",
+                  "tokens_before"
+                ],
+                "properties": {
+                  "sequence": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "reference": {
+                    "type": "string",
+                    "pattern": "^checkpoints/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/[0-9]{4}\\.json$"
+                  },
+                  "reason": {
+                    "type": "string",
+                    "enum": [
+                      "budget",
+                      "threshold",
+                      "overflow",
+                      "manual"
+                    ]
+                  },
+                  "tokens_before": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ],
+                    "minimum": 0
+                  }
+                }
+              }
+            },
+            "worker_usage": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "claude-code": {
+                  "$ref": "#/$defs/worker_usage_counters"
+                },
+                "pi-subagent": {
+                  "$ref": "#/$defs/worker_usage_counters"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "github_integration": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": false,
+      "required": [
+        "target_repository",
+        "target_worktree",
+        "phase",
+        "blocker_code",
+        "reason",
+        "mutations_planned",
+        "mutations_applied",
+        "qa_status",
+        "audit"
+      ],
+      "properties": {
+        "target_repository": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "discovered_repositories": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$"
+          }
+        },
+        "repository_selection": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "method",
+            "requested",
+            "resolved"
+          ],
+          "properties": {
+            "method": {
+              "type": "string",
+              "enum": [
+                "explicit",
+                "inferred"
+              ]
+            },
+            "requested": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "resolved": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        },
+        "target_worktree": {
+          "type": "string"
+        },
+        "phase": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "route": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "worker": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "policy_version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "blocker_code": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "mutations_planned": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "mutations_applied": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "qa_status": {
+          "type": "string",
+          "enum": [
+            "not_run",
+            "passed",
+            "failed"
+          ]
+        },
+        "audit": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "operation",
+              "issue",
+              "label",
+              "status"
+            ],
+            "properties": {
+              "operation": {
+                "type": "string"
+              },
+              "issue": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "pr": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "label": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "status": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "authorization": {
+          "description": "How publication was authorized: the target's autonomy policy, or a one-shot grant confirmed in the Garden for this single reviewed plan.",
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": false,
+          "required": [
+            "source"
+          ],
+          "properties": {
+            "source": {
+              "enum": [
+                "policy",
+                "one_shot_grant"
+              ]
+            },
+            "granted_by": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "maxLength": 64
+            },
+            "granted": {
+              "type": "array",
+              "items": {
+                "enum": [
+                  "push_branch",
+                  "create_pr"
+                ]
+              },
+              "uniqueItems": true
+            }
+          }
+        }
+      }
+    },
+    "run_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$"
+    },
+    "backlog_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^ORCH-[0-9]{3,}$"
+    },
+    "github_issue": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 1
+    },
+    "user_objective": {
+      "type": "string"
+    },
+    "started_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "ended_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "route_task_result": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "description": "The tools/route_task.py result object, stored verbatim (byte-for-byte equal to what route_task returned). This module never reinterprets or revalidates routing semantics -- schemas/execution-plan.schema.json and tools/routing_engine.py remain the sole authority for that."
+    },
+    "routing_telemetry": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/observational_telemetry"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Structured observational telemetry for the routing adapter call (timing, byte counts, token/cost counters if exposed). Never influences route_task output or routing policy decisions; null when unobserved."
+    },
+    "starting_commit": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "ending_commit": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "outcome": {
+      "type": "string",
+      "enum": [
+        "in_progress",
+        "completed",
+        "failed",
+        "partial",
+        "blocked",
+        "dry_run"
+      ]
+    },
+    "steps": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/step"
+      }
+    },
+    "orchestration_metrics": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/orchestration_metrics"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Observational run-level delegation metrics. Missing/unobservable values are explicit null. These metrics never change routing/delegation inside the active run; they support offline benchmark analysis and reviewed policy updates."
+    },
+    "trace_schema_version": {
+      "anyOf": [
+        {
+          "const": 1
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Version of the deterministic trace-rendering contract (tools/provenance.py build_trace_report/render_trace_text and tools/backlog.py trace). Intentionally NOT in `required`: records written before this field existed remain valid and are rendered tolerantly. New records written by this module always set it to 1."
+    }
+  },
+  "$defs": {
+    "score_0_10": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 10
+    },
+    "step": {
+      "type": "object",
+      "description": "One delegated execution-plan step actually performed during the run. Field names mirror schemas/execution-plan.schema.json where applicable (role/family/capacity/context/fresh-context/mutation), plus resolved context-window and attribution/outcome fields that execution plans intentionally do not carry.",
+      "required": [
+        "task_id",
+        "parent_task_id",
+        "execution_plan_step_id",
+        "role",
+        "family",
+        "backend",
+        "model",
+        "capacity_tier",
+        "reasoning_setting",
+        "context_strategy",
+        "context_window_tier",
+        "fresh_context",
+        "mutation_permission",
+        "worker_identifier",
+        "status",
+        "outcome",
+        "files_changed",
+        "validation_performed",
+        "review_findings",
+        "repair_of",
+        "telemetry"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "task_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "parent_task_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "execution_plan_step_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The matching step id from the run's route_task_result.execution_plan.steps, if this step corresponds to one."
+        },
+        "role": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "specifier",
+            "worker",
+            "reviewer",
+            null
+          ]
+        },
+        "family": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "codex",
+            "claude",
+            null
+          ]
+        },
+        "backend": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Concrete backend/tool actually invoked (e.g. 'spawn_subagent', 'AskClaude'), if observable."
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Concrete model identifier actually used, if observable. Never guessed -- null when not exposed by the backend."
+        },
+        "capacity_tier": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "light",
+            "economy",
+            "standard",
+            "high",
+            "max",
+            null
+          ],
+          "description": "Capacity tier actually requested for this step, if observable."
+        },
+        "context_strategy": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "focused",
+            "full",
+            null
+          ],
+          "description": "Context strategy actually requested for this step, if observable."
+        },
+        "context_window_tier": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "standard",
+            "extended",
+            null
+          ],
+          "description": "Resolved context-window tier actually used, if observable."
+        },
+        "fresh_context": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "mutation_permission": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "forbidden",
+            "allowed",
+            null
+          ]
+        },
+        "worker_identifier": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Worker/subagent/session identifier, if available from the backend."
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "pending",
+            "in_progress",
+            "completed",
+            "failed",
+            "skipped"
+          ]
+        },
+        "outcome": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Free-text summary of the step's outcome (e.g. 'accepted', 'repaired once', 'rejected'). Use 'unknown' rather than guessing when unobservable."
+        },
+        "files_changed": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "validation_performed": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 1024,
+                "description": "Legacy/simple form: a command string with no observed result. Rendered as result 'unknown'."
+              },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "command",
+                  "result",
+                  "exit_code",
+                  "summary"
+                ],
+                "properties": {
+                  "command": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 1024
+                  },
+                  "result": {
+                    "type": "string",
+                    "enum": [
+                      "pass",
+                      "fail",
+                      "partial",
+                      "not_run",
+                      "unknown"
+                    ]
+                  },
+                  "exit_code": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "summary": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "maxLength": 1000
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "returned_artifacts": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "description": "Compact summaries of artifacts a step actually returned (a spec, a diff summary, a review, a validation report). Never stores artifact bodies, diffs, stdout, transcripts, or prompt content -- `summary` is a short description and `reference` is a repository-relative path or stable external reference. Not in `required`: absent on historical records and simply rendered as '(none observed)'.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "kind",
+              "summary",
+              "reference"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "specification",
+                  "implementation",
+                  "review",
+                  "validation",
+                  "documentation",
+                  "other"
+                ]
+              },
+              "summary": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 2000
+              },
+              "reference": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "maxLength": 512
+              }
+            }
+          }
+        },
+        "review_findings": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "object",
+            "required": [
+              "category",
+              "description"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "category": {
+                "type": "string",
+                "description": "Mirrors routing/default-policy.yaml's review_findings categories (that file remains the sole source of truth for the category list).",
+                "enum": [
+                  "BLOCKER",
+                  "CORRECTNESS",
+                  "REGRESSION",
+                  "TEST_GAP",
+                  "ARCHITECTURAL_DEBT",
+                  "STYLE_ONLY"
+                ]
+              },
+              "description": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "repair_of": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "task_id of the step this step repairs, if this step is a repair."
+        },
+        "reasoning_setting": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "low",
+            "medium",
+            "high",
+            null
+          ],
+          "description": "Reasoning/thinking effort setting actually used, if observable. Not free-form hidden reasoning."
+        },
+        "telemetry": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/observational_telemetry"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Structured observational telemetry for this delegated step (timing, byte counts, token/cost counters if exposed). Never contains prompts, transcripts, hidden reasoning, or secrets; null when unobserved."
+        }
+      }
+    },
+    "worker_usage_counters": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "invocations",
+        "duration_ms",
+        "input_tokens",
+        "output_tokens",
+        "cached_tokens"
+      ],
+      "properties": {
+        "invocations": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "duration_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "input_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "output_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "cached_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "total_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "total_tokens_complete": {
+          "type": "boolean"
+        },
+        "estimated_cost_usd": {
+          "type": "number",
+          "minimum": 0
+        }
+      }
+    },
+    "observational_telemetry": {
+      "type": "object",
+      "description": "Closed, structured observational telemetry. All unobserved values are explicit null. This object is for counters/timing only and must not contain prompts, transcripts, hidden reasoning, credentials, or secret-like fields.",
+      "required": [
+        "schema_version",
+        "source",
+        "started_at",
+        "ended_at",
+        "duration_ms",
+        "queue_ms",
+        "input_tokens",
+        "output_tokens",
+        "total_tokens",
+        "estimated_cost_usd",
+        "input_bytes",
+        "output_bytes"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "source": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Telemetry source/backend name, if observable."
+        },
+        "started_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "ended_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "duration_ms": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "queue_ms": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "input_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "output_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "cached_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "Cached/read-from-cache token count if explicitly exposed by the backend; null when unavailable."
+        },
+        "total_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "estimated_cost_usd": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "input_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "output_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        }
+      }
+    },
+    "orchestration_metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Run-level metrics for evaluating whether delegation improved speed/cost/quality. Derived fields are computed only when their required explicit baselines are available.",
+      "required": [
+        "schema_version",
+        "lead_model",
+        "delegation_topology",
+        "worker_model_mix",
+        "spawned_agents",
+        "lead_input_tokens",
+        "lead_output_tokens",
+        "lead_cached_tokens",
+        "worker_input_tokens",
+        "worker_output_tokens",
+        "worker_cached_tokens",
+        "total_tokens",
+        "wall_clock_ms",
+        "worker_execution_ms",
+        "coordination_ms",
+        "conflicting_edits",
+        "corrective_turns",
+        "failed_attempts",
+        "test_outcome",
+        "ci_outcome",
+        "reviewer_findings",
+        "human_corrections_required",
+        "final_task_success",
+        "estimated_cost_usd",
+        "estimated_direct_tokens",
+        "estimated_serial_time_ms",
+        "direct_baseline_quality",
+        "delegated_quality",
+        "coordination_tax_tokens",
+        "coordination_tax_time_ms",
+        "quality_gain",
+        "parallel_speedup"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "lead_model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "delegation_topology": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "direct",
+            "one_worker",
+            "two_workers",
+            "three_to_four_workers",
+            "larger_team",
+            null
+          ]
+        },
+        "worker_model_mix": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "none",
+            "same_model",
+            "mixed_model",
+            null
+          ]
+        },
+        "spawned_agents": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "lead_input_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "lead_output_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "lead_cached_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "worker_input_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "worker_output_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "worker_cached_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "total_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "wall_clock_ms": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "worker_execution_ms": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "coordination_ms": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "conflicting_edits": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "corrective_turns": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "failed_attempts": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "test_outcome": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "pass",
+            "fail",
+            "partial",
+            "not_run",
+            null
+          ]
+        },
+        "ci_outcome": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "pass",
+            "fail",
+            "partial",
+            "not_run",
+            null
+          ]
+        },
+        "reviewer_findings": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "human_corrections_required": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "final_task_success": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "estimated_cost_usd": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "estimated_direct_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "estimated_serial_time_ms": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "direct_baseline_quality": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 1
+        },
+        "delegated_quality": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 1
+        },
+        "coordination_tax_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "coordination_tax_time_ms": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "quality_gain": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": -1,
+          "maximum": 1
+        },
+        "parallel_speedup": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        }
+      }
+    }
+  }
+}

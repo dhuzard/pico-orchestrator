@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Mission",
+  "description": "A durable goal-level mission that references backlog items. Mission state is distinct from backlog task state, run provenance, routing decisions, and GitHub issue/PR state.",
+  "type": "object",
+  "required": [
+    "id",
+    "goal",
+    "status",
+    "base_branch",
+    "base_sha",
+    "success_criteria",
+    "backlog_items",
+    "policy",
+    "budgets",
+    "current",
+    "created_at",
+    "updated_at"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "id": { "type": "string", "pattern": "^MISSION-[0-9]{3,}$" },
+    "goal": { "type": "string", "minLength": 1 },
+    "status": { "type": "string", "enum": ["planned", "running", "paused", "completed", "cancelled"] },
+    "base_branch": { "type": ["string", "null"] },
+    "base_sha": { "type": ["string", "null"] },
+    "success_criteria": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "backlog_items": {
+      "type": "array",
+      "items": { "type": "string", "pattern": "^ORCH-[0-9]{3,}$" },
+      "uniqueItems": true
+    },
+    "policy": {
+      "type": "object",
+      "required": ["autonomy_profile"],
+      "additionalProperties": false,
+      "properties": {
+        "autonomy_profile": { "type": "string", "enum": ["manual", "guarded"] }
+      }
+    },
+    "budgets": {
+      "type": "object",
+      "required": ["max_parallel_tasks", "max_agent_runs", "max_repair_attempts_per_task"],
+      "additionalProperties": false,
+      "properties": {
+        "max_parallel_tasks": { "type": "integer", "minimum": 1 },
+        "max_agent_runs": { "type": "integer", "minimum": 1 },
+        "max_repair_attempts_per_task": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "current": {
+      "type": "object",
+      "required": ["running", "waiting_ci", "blocked"],
+      "additionalProperties": false,
+      "properties": {
+        "running": { "type": "array", "items": { "type": "string", "pattern": "^ORCH-[0-9]{3,}$" }, "uniqueItems": true },
+        "waiting_ci": { "type": "array", "items": { "type": "string", "pattern": "^ORCH-[0-9]{3,}$" }, "uniqueItems": true },
+        "blocked": { "type": "array", "items": { "type": "string", "pattern": "^ORCH-[0-9]{3,}$" }, "uniqueItems": true }
+      }
+    },
+    "created_at": { "type": "string", "format": "date-time" },
+    "updated_at": { "type": "string", "format": "date-time" }
+  }
+}

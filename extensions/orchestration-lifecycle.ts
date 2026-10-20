@@ -1,0 +1,1169 @@
+/** Parent-run trace and backend readiness boundary for /orchestrate. */
+import { spawn } from "node:child_process";
+import { realpathSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
+import { classifyClaudeInvocationError, resolveClaudeBackendModel } from "./claude-backend-adapter.ts";
+import { inGitDirectory, runClaudeWorker } from "./claude-worker.ts";
+import type { ClaudeWorkerOutcome, ClaudeWorkerPlan } from "./claude-worker.ts";
+import { initialBudgetState, observeContext } from "./context-budget.ts";
+import type { BudgetState } from "./context-budget.ts";
+
+const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
+const PARENT = join(ROOT, "tools", "parent_orchestration.py");
+const PREFLIGHT = join(ROOT, "tools", "backend_preflight.py");
+const SESSION_SCOPE = join(ROOT, "tools", "session_scope.py");
+const CONTEXT = join(ROOT, "tools", "context_budget.py");
+const AUTONOMY = join(ROOT, "tools", "autonomy_policy.py");
+const WORKER_TOOLS = new Set(["AskClaude", "ClaudeWorker", "spawn_subagent", "message_subagent"]);
+const CLAUDE_TOOLS = new Set(["AskClaude", "ClaudeWorker"]);
+const MARKER = "PI_ORCHESTRATION_RUN_V1";
+const SESSION_ENTRY = "pi-orchestration-parent-v1";
+const MAX_OUTPUT = 256 * 1024;
+const COMMAND_TIMEOUT_MS = 30_000;
+const PHASE_STATUS = Type.Union([Type.Literal("not_started"), Type.Literal("in_progress"),
+  Type.Literal("completed"), Type.Literal("blocked"), Type.Literal("failed"), Type.Literal("partial")]);
+const WORKER_STATUS = Type.Union([Type.Literal("not_started"), Type.Literal("in_progress"),
+  Type.Literal("completed"), Type.Literal("blocked"), Type.Literal("failed")]);
+const ROUTE = Type.Union([Type.Literal("CODEX"), Type.Literal("CLAUDE"),
+  Type.Literal("CLAUDE_CODEX"), Type.Literal("CODEX_CLAUDE_CODEX")]);
+/**
+ * The closed set of reasoning efforts a route result may assign to a step. It
+ * is the only place the lifecycle names efforts: capacity tiers are never
+ * named here (models are resolved generically through the route's
+ * backend_bindings), so adding tiers or efforts only extends this constant.
+ */
+export const REASONING_EFFORTS: readonly string[] = ["low", "medium", "high"];
+const EFFORT = Type.Union(REASONING_EFFORTS.map((effort) => Type.Literal(effort)));
+/** Default `limits.parallel_tasks` when the target has no .pi/autonomy.yaml. */
+const DEFAULT_PARALLEL_TASKS = 3;
+const TAG_ID = "[A-Za-z0-9][A-Za-z0-9_.-]{0,127}";
+const LABEL_TAG = new RegExp(`^(${TAG_ID}):(${TAG_ID})$`);
+const PROMPT_TAG = new RegExp(`^\\s*\\[pico-task (${TAG_ID}):(${TAG_ID})\\]`);
+const ESCALATION = Type.Union(["FAILED_ATTEMPTS", "REVIEW_FINDINGS", "AMBIGUITY", "ARCHITECTURE",
+  "SECURITY_SENSITIVE", "SEMANTIC_RISK", "CONTEXT_BUDGET"].map((reason) => Type.Literal(reason)));
+const SCORE = Type.Integer({ minimum: 0, maximum: 10 });
+const ROUTING_SUMMARY = Type.Object({
+  task_type: Type.String(), ambiguity: SCORE,
+  ambiguity_dimensions: Type.Optional(Type.Record(Type.String(), SCORE)),
+  work_profile: Type.Optional(Type.Record(Type.String(), SCORE)),
+  failure_cost: Type.String(), semantic_correctness: Type.String(),
+  diagnosis_required: Type.Boolean(), implementation_scope: Type.String(),
+  signals: Type.Array(Type.String()), matches: Type.Array(ROUTE), fallback_applied: Type.Boolean(),
+  assignments: Type.Array(Type.Object({ step_id: Type.String(), role: Type.String(),
+    family: Type.String(), capacity_tier: Type.String(), ambiguity_capacity: SCORE,
+    rule: Type.Union([Type.String(), Type.Null()]) }, { additionalProperties: false })),
+}, { additionalProperties: false });
+const EVENT = Type.Union([
+  Type.Object({ kind: Type.Literal("phase"), phase: Type.String(), status: PHASE_STATUS,
+    route: Type.Optional(ROUTE), policy_version: Type.Optional(Type.Integer({ minimum: 1 })),
+    routing: Type.Optional(ROUTING_SUMMARY), blocker_code: Type.Optional(Type.String()),
+    escalation_reason: Type.Optional(ESCALATION) },
+    { additionalProperties: false }),
+  Type.Object({ kind: Type.Literal("worker"), phase: Type.String(), step_id: Type.String(),
+    status: WORKER_STATUS, model: Type.Optional(Type.String()), backend: Type.Optional(Type.String()),
+    backend_model: Type.Optional(Type.String()), reasoning_effort: Type.Optional(EFFORT),
+    blocker_code: Type.Optional(Type.String()),
+    installed_backend_version: Type.Optional(Type.String()),
+    required_backend_version: Type.Optional(Type.String()) }, { additionalProperties: false }),
+  Type.Object({ kind: Type.Literal("child"), phase: Type.String(), run_id: Type.String() },
+    { additionalProperties: false }),
+  Type.Object({ kind: Type.Literal("mutation"), github: Type.Optional(Type.Integer({ minimum: 0 })),
+    code: Type.Optional(Type.Integer({ minimum: 0 })) }, { additionalProperties: false }),
+  Type.Object({ kind: Type.Literal("interaction"), type: Type.Union([Type.Literal("directive"),
+    Type.Literal("feedback"), Type.Literal("decision")]), summary: Type.String({ minLength: 1, maxLength: 180 }),
+    task_id: Type.String({ pattern: `^${TAG_ID}$` }), step_id: Type.String({ pattern: `^${TAG_ID}$` }),
+    subagent_id: Type.Optional(Type.String({ pattern: `^${TAG_ID}$` })),
+    reply_to: Type.Optional(Type.Integer({ minimum: 1 })) }, { additionalProperties: false }),
+]);
+
+type Json = Record<string, unknown>;
+type Guard = { block: true; reason: string; terminate?: boolean } | undefined;
+function python(): string { return process.env.PI_ROUTER_PYTHON ?? "python3"; }
+function samePath(left: string, right: string): boolean {
+  try { return realpathSync(left) === realpathSync(right); } catch { return false; }
+}
+function isWorktreeAdd(call: { toolName: string; input: Record<string, unknown> }): boolean {
+  return (call.toolName === "bash" || call.toolName === "powershell") && typeof call.input.command === "string"
+    && /\bgit\s+(?:-\S+\s+)*worktree\s+add\b/.test(call.input.command);
+}
+function count(value: unknown): number | null {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : null;
+}
+
+function completionSummary(result: Json, runId: string): string {
+  const metrics = (result.orchestration_metrics ?? {}) as Json;
+  const parent = (result.parent_orchestration ?? {}) as Json;
+  const context = (parent.context ?? {}) as Json;
+  const usage = (context.worker_usage ?? {}) as Record<string, Json>;
+  const workers = Object.values(usage).reduce((sum, entry) => sum + (count(entry.invocations) ?? 0), 0);
+  const models = ((parent.phases ?? []) as Json[]).flatMap((phase) =>
+    ((phase.workers ?? []) as Json[]).map((worker) => worker.model).filter((model): model is string => typeof model === "string"));
+  const value = (item: unknown) => item === null || item === undefined ? "unknown" : String(item);
+  const tracePath = typeof result.trace_path === "string" ? result.trace_path : `provenance/runs/${runId}.json`;
+  return `Parent orchestration run ${runId} finalized.\n` +
+    `Run stats: ${value(metrics.wall_clock_ms)} ms wall time; ${value(metrics.spawned_agents)} subagents spawned; ` +
+    `${workers} worker calls; lead model ${value(metrics.lead_model)}; worker models ${models.length ? [...new Set(models)].join(", ") : "none observed"}; ` +
+    `lead tokens ${value(metrics.lead_input_tokens)}/${value(metrics.lead_output_tokens)} input/output; ` +
+    `worker tokens ${value(metrics.worker_input_tokens)}/${value(metrics.worker_output_tokens)} input/output; ` +
+    `total tokens ${value(metrics.total_tokens)}.\n` +
+    `Trace: ${tracePath}\n` +
+    `Render it with: python3 ${join(ROOT, "tools", "backlog.py")} trace ${runId}`;
+}
+
+function assignment(route: Json, stepId: unknown): Json | undefined {
+  const assignments = Array.isArray(route.capacity_assignments) ? route.capacity_assignments as Json[] : [];
+  return assignments.find((item) => item.step_id === stepId);
+}
+
+/** Keep only policy metadata needed to explain a routed worker in the viewer. */
+function routingSummary(route: Json): Json | null {
+  const effective = ((route.classification as Json)?.effective ?? {}) as Json;
+  const dimensionNames = ["outcome", "contract", "design", "evidence", "authority"];
+  const modeNames = ["search", "analysis", "writing", "implementation", "verification", "coordination"];
+  const scores = (value: unknown, names: string[]): Record<string, number> | undefined => {
+    if (!value || typeof value !== "object") return undefined;
+    const source = value as Json;
+    if (!names.every((name) => count((source[name] as Json)?.level ?? source[name]) !== null)) return undefined;
+    return Object.fromEntries(names.map((name) => [name, count((source[name] as Json)?.level ?? source[name])!])) as Record<string, number>;
+  };
+  const plan = ((route.execution_plan as Json)?.steps ?? []) as Json[];
+  const assignments = plan.map((step) => {
+    const selected = assignment(route, step.id) ?? {};
+    const profile = (selected.selected_model_profile ?? {}) as Json;
+    return { step_id: step.id, role: step.role, family: step.family,
+      capacity_tier: selected.assigned_capacity_tier,
+      ambiguity_capacity: profile.ambiguity_capacity, rule: selected.rule ?? null };
+  });
+  if (typeof effective.task_type !== "string" || count(effective.ambiguity) === null ||
+      typeof effective.failure_cost !== "string" || typeof effective.semantic_correctness !== "string" ||
+      typeof effective.diagnosis_required !== "boolean" || typeof effective.implementation_scope !== "string" ||
+      !Array.isArray((route.matches as Json)?.effective) || typeof route.fallback_applied !== "boolean" ||
+      assignments.some((item) => typeof item.step_id !== "string" || typeof item.role !== "string" ||
+        typeof item.family !== "string" || typeof item.capacity_tier !== "string" ||
+        count(item.ambiguity_capacity) === null)) return null;
+  return { task_type: effective.task_type, ambiguity: effective.ambiguity,
+    ...(scores(effective.ambiguity_assessment, dimensionNames) ?
+      { ambiguity_dimensions: scores(effective.ambiguity_assessment, dimensionNames) } : {}),
+    ...(scores(effective.work_profile, modeNames) ? { work_profile: scores(effective.work_profile, modeNames) } : {}),
+    failure_cost: effective.failure_cost, semantic_correctness: effective.semantic_correctness,
+    diagnosis_required: effective.diagnosis_required, implementation_scope: effective.implementation_scope,
+    signals: ["assumptions_must_be_explicit", "security_sensitive", "destructive_operation", "cross_layer",
+      "production_feature", "many_routine_decisions"].filter((key) => effective[key] === true).concat(
+      effective.behavior_preservation === "required" ? ["behavior_preservation_required"] : []),
+    matches: (route.matches as Json)?.effective, fallback_applied: route.fallback_applied,
+    assignments };
+}
+
+/** Effort the routed plan assigned to a step; null when the result does not carry one. */
+function assignedEffort(route: Json, stepId: unknown): string | null {
+  const effort = assignment(route, stepId)?.assigned_reasoning_effort;
+  return typeof effort === "string" && REASONING_EFFORTS.includes(effort) ? effort : null;
+}
+
+/** Canonical model bound to a step's assigned capacity tier, whatever tiers the policy defines. */
+function assignedModel(route: Json, step: Json): string | null {
+  const tier = assignment(route, step.id)?.assigned_capacity_tier;
+  const bindings = (route.backend_bindings ?? {}) as Record<string, Json>;
+  const family = typeof step.family === "string" ? bindings[step.family] : undefined;
+  const models = (family?.capacity_models ?? {}) as Record<string, Json>;
+  const model = typeof tier === "string" ? models[tier]?.model : undefined;
+  return typeof model === "string" ? model : null;
+}
+
+/** One routed step the parent may launch a worker for. */
+export type StepApproval = { id: string; family: string; model: string | null; effort: string | null;
+  mode: "read" | "full" };
+/** Per-task approval created by a successful route_task + preflight; replaced only by re-routing that task. */
+export type RouteApproval = { taskId: string; route: string; phase: string; worktreeReady: boolean;
+  taskType: string | null; claudeBackend: Json | null; steps: Map<string, StepApproval> };
+export type Attribution = { taskId: string; stepId: string };
+/** A ClaudeWorker run resolved by the guard from the task's route approval. */
+type WorkerPlan = ClaudeWorkerPlan & { taskId: string; stepId: string; phase: string; canonical: string };
+
+/** Blocker code of a failed ClaudeWorker run; backend text is classified only on explicit evidence. */
+function workerBlocker(outcome: ClaudeWorkerOutcome): string {
+  switch (outcome.error) {
+    case "TIMEOUT": return "WORKER_TIMEOUT";
+    case "ABORTED": return "WORKER_ABORTED";
+    case "OUTPUT_LIMIT": return "WORKER_OUTPUT_LIMIT";
+    case "SPAWN_FAILED": return "MODEL_BACKEND_UNAVAILABLE";
+    default: return classifyClaudeInvocationError(outcome.text);
+  }
+}
+
+/**
+ * Task/step a worker call claims. spawn_subagent uses `label: "<task_id>:<step_id>"`;
+ * ClaudeWorker and AskClaude (which have no label) start their prompt with
+ * `[pico-task <task_id>:<step_id>]`.
+ */
+export function workerAttribution(toolName: string, input: Record<string, unknown>): Attribution | null {
+  const match = toolName === "spawn_subagent" && typeof input.label === "string" ? LABEL_TAG.exec(input.label.trim())
+    : CLAUDE_TOOLS.has(toolName) && typeof input.prompt === "string" ? PROMPT_TAG.exec(input.prompt) : null;
+  return match ? { taskId: match[1], stepId: match[2] } : null;
+}
+
+/** Literal directory prefix of a relative path or glob, as segments; null when the entry is unsafe. */
+function scopePrefix(entry: string): string[] | null {
+  const path = entry.trim().replace(/\\/g, "/").replace(/^\.\//, "");
+  if (!path || path.startsWith("/") || /^[A-Za-z]:/.test(path)) return null;
+  const segments = path.split("/").filter((segment) => segment !== "" && segment !== ".");
+  if (segments.includes("..")) return null;
+  const glob = segments.findIndex((segment) => /[*?[\]{}]/.test(segment));
+  return glob === -1 ? segments : segments.slice(0, glob);
+}
+
+/**
+ * Conservative overlap of two write-scope entries: they overlap when one's
+ * literal prefix contains the other's. `src/a/**` and `src/b/**` are disjoint;
+ * `src/*.ts` overlaps everything under `src/`; `**` overlaps everything.
+ */
+export function scopesOverlap(left: string, right: string): boolean {
+  const a = scopePrefix(left);
+  const b = scopePrefix(right);
+  if (!a || !b) return true;
+  const shorter = a.length <= b.length ? a : b;
+  const longer = shorter === a ? b : a;
+  return shorter.every((segment, index) => longer[index] === segment);
+}
+
+export function runJson(script: string, args: string[], input?: Json, timeoutMs = COMMAND_TIMEOUT_MS): Promise<Json> {
+  return new Promise((resolve) => {
+    const child = spawn(python(), [script, ...args], { cwd: ROOT, stdio: ["pipe", "pipe", "pipe"] });
+    let output = "";
+    let settled = false;
+    const finish = (result: Json) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(result);
+    };
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      finish({ ok: false, component: "orchestration_subprocess",
+        operation: args[0] ?? "preflight", error_category: "Timeout",
+        orchestrator_root: ROOT, resource_path: script });
+    }, timeoutMs);
+    child.stdout.on("data", (part: Buffer) => { output = (output + part.toString("utf8")).slice(0, MAX_OUTPUT); });
+    child.on("error", (error) => finish({ ok: false, component: "orchestration_subprocess",
+      operation: args[0] ?? "preflight", error_category: error.name,
+      orchestrator_root: ROOT, resource_path: script }));
+    child.on("close", (code) => {
+      try {
+        const result = JSON.parse(output) as Json;
+        finish(code === 0 || result.ok === false ? result : { ok: false,
+          component: "orchestration_subprocess", operation: args[0] ?? "preflight",
+          error_category: "NonzeroExit", orchestrator_root: ROOT, resource_path: script });
+      } catch { finish({ ok: false, component: "orchestration_subprocess",
+        operation: args[0] ?? "preflight", error_category: "MalformedOutput",
+        orchestrator_root: ROOT, resource_path: script }); }
+    });
+    child.stdin.end(input === undefined ? "" : JSON.stringify(input));
+  });
+}
+
+export function createOrchestrationLifecycle(command: typeof runJson = runJson) {
+return function orchestrationLifecycle(pi: ExtensionAPI) {
+  let runId: string | null = null;
+  let lastRunId: string | null = null;
+  let lastTerminal: Json | null = null;
+  let parentBlocked = false;
+  let parentFailure: Json | null = null;
+  const claudeCalls = new Map<string, { canonical: string; backend: string }>();
+  // task_id -> the route approval for that task. Routing task B never touches task A.
+  const approvals = new Map<string, RouteApproval>();
+  // route_task toolCallId -> task id it routes, so a failed result clears only that task.
+  const pendingRoutes = new Map<string, string>();
+  // "<task_id>\0<step_id>" -> linked worktree a mutating worker is bound to for this run.
+  const workspaces = new Map<string, string>();
+  // Process lifetime: subagent id -> directory it was spawned in.
+  const spawnedSubagents = new Map<string, string>();
+  // Parent run: subagent id -> task/step it was spawned for.
+  const subagentTasks = new Map<string, Attribution>();
+  // toolCallId -> parent checkout snapshot taken before a worker call.
+  const snapshots = new Map<string, { digest: string; status: string[] }>();
+  // toolCallId -> worker call currently running.
+  const inFlight = new Map<string, { taskId: string | null; stepId: string | null; tool: string }>();
+  // toolCallId -> ClaudeWorker run the guard resolved; consumed by the tool's execute.
+  const workerPlans = new Map<string, WorkerPlan>();
+  let scopeViolation: string | null = null;
+  let lastPhase = "routing";
+  let currentTurn: number | null = null;
+  const messageStarts = new Map<number, number>();
+  let activeWave: { id: string; tasks: Map<string, string[]> } | null = null;
+  let integrating: string | null = null;
+  let batchStart = 0;
+  let batchPeak = 0;
+  let targetCwd: string | null = null;
+  // Session scope: only subagents spawned during this parent run may be continued.
+  const runSubagents = new Set<string>();
+  const workerStarts = new Map<string, number>();
+  let budget: BudgetState | null = null;
+  let recordedPeak = 0;
+  let compactionFailed = false;
+  let sessionId: string | null = null;
+
+  const workspaceKey = (taskId: string, stepId: string) => `${taskId}\u0000${stepId}`;
+  const worktreeReady = () => !parentBlocked && [...approvals.values()].some((approval) => approval.worktreeReady);
+  const anyClaudeBackend = () => [...approvals.values()].find((approval) => approval.claudeBackend)?.claudeBackend ?? null;
+  const blockAllWorktrees = () => { for (const approval of approvals.values()) approval.worktreeReady = false; };
+
+  function persist(active: boolean): void {
+    if (sessionId && lastRunId && targetCwd) pi.appendEntry(SESSION_ENTRY,
+      { run_id: lastRunId, session_id: sessionId, target_cwd: targetCwd, active });
+  }
+
+  async function restore(ctx: ExtensionContext): Promise<void> {
+    const manager = ctx.sessionManager;
+    if (!manager) return;
+    sessionId = manager.getSessionId();
+    const entries = manager.getBranch();
+    const marker = [...entries].reverse().find((entry) => entry.type === "custom" && entry.customType === SESSION_ENTRY);
+    if (!marker || marker.type !== "custom") return;
+    const data = marker.data as Json | undefined;
+    if (!data || data.active !== true || data.session_id !== sessionId) return;
+    if (typeof data.run_id !== "string" || typeof data.target_cwd !== "string") {
+      parentBlocked = true;
+      parentFailure = { ok: false, error_code: "PARENT_SESSION_MARKER_INVALID",
+        error_category: "InvalidSessionEntry" };
+      return;
+    }
+    if (!samePath(data.target_cwd, ctx.cwd)) {
+      lastRunId = data.run_id;
+      parentBlocked = true;
+      parentFailure = { ok: false, error_code: "SESSION_REPOSITORY_MISMATCH",
+        error_category: "TargetWorktreeChanged", run_id: data.run_id };
+      return;
+    }
+    targetCwd = ctx.cwd;
+    const args = ["status", data.run_id, "--worktree", ctx.cwd];
+    if (process.env.PI_TARGET_REPOSITORY) args.push("--repo", process.env.PI_TARGET_REPOSITORY);
+    const result = await command(PARENT, args);
+    if (result.status !== "IN_PROGRESS" || result.run_id !== data.run_id) {
+      if (result.ok === false) { parentBlocked = true; parentFailure = result; lastRunId = data.run_id; }
+      else { lastRunId = data.run_id; lastTerminal = result; persist(false); }
+      return;
+    }
+    runId = data.run_id;
+    lastRunId = runId;
+    targetCwd = ctx.cwd;
+    parentBlocked = false;
+    parentFailure = null;
+    // Runtime permissions, waves, and worker handles are deliberately not restored.
+    resetRunState();
+    budget = initialBudgetState();
+  }
+
+  function diagnose(operation: string, result: Json): void {
+    const diagnostic = { component: result.component ?? "parent_orchestration",
+      operation, run_id: result.run_id ?? runId, event_kind: result.event_kind ?? null,
+      lifecycle_state: result.lifecycle_state ?? (parentBlocked ? "BLOCKED" : "IN_PROGRESS"),
+      error_code: result.error_code ?? result.blocker_code ?? "PARENT_OPERATION_FAILED",
+      error_category: result.error_category ?? "OperationRejected",
+      error: result.error ?? null, validation_path: result.validation_path ?? null,
+      orchestrator_commit: result.orchestrator_commit ?? null,
+      orchestrator_root: ROOT, resource_path: result.resource_path ?? PARENT };
+    process.stderr.write(`[orchestration-lifecycle] ${JSON.stringify(diagnostic)}\n`);
+  }
+
+  async function event(data: Json): Promise<boolean> {
+    if (!runId) return false;
+    const result = await command(PARENT, ["event", runId], data);
+    if (result.ok === false) {
+      diagnose("event", result); parentFailure = result;
+      parentBlocked = true; blockAllWorktrees(); return false;
+    }
+    return true;
+  }
+  /** Telemetry is observational: a failed write is diagnosed but never blocks the run. */
+  async function observe(data: Json): Promise<void> {
+    if (!runId) return;
+    const result = await command(PARENT, ["event", runId], data);
+    if (result.ok === false) diagnose("telemetry", result);
+  }
+  function resetRunState(): void {
+    approvals.clear(); pendingRoutes.clear(); workspaces.clear(); snapshots.clear();
+    subagentTasks.clear(); inFlight.clear(); claudeCalls.clear(); workerPlans.clear();
+    scopeViolation = null; activeWave = null; integrating = null; lastPhase = "routing";
+    currentTurn = null; messageStarts.clear();
+    batchStart = 0; batchPeak = 0;
+  }
+  async function scopeCheck(target: string, worker: string): Promise<Json> {
+    const scope = await command(SESSION_SCOPE, [], { target_cwd: target, worker_cwd: worker });
+    // Outside any Git repository, only the session's own directory is in scope.
+    if (scope.ok !== true && scope.blocker_code === "SESSION_TARGET_UNRESOLVED" && samePath(target, worker)) {
+      return { ok: true };
+    }
+    return scope;
+  }
+  async function snapshot(): Promise<{ digest: string; status: string[] } | null> {
+    if (!targetCwd) return null;
+    const result = await command(SESSION_SCOPE, [], { operation: "snapshot", path: targetCwd });
+    return result.ok === true && typeof result.digest === "string"
+      ? { digest: result.digest, status: Array.isArray(result.status) ? result.status as string[] : [] } : null;
+  }
+
+  /**
+   * Resolve the routed task and step a worker call belongs to. An explicit
+   * attribution (label or prompt tag) is required once more than one task is
+   * routed; with exactly one approval an untagged call resolves to it as long
+   * as its step is unambiguous for the tool's family.
+   */
+  type Resolution = { approval: RouteApproval | null; step: StepApproval | null } | { block: string };
+  function resolveWorker(toolName: string, input: Record<string, unknown>): Resolution {
+    if (toolName === "message_subagent") {
+      // A continuation keeps the spawn's model and thinking; attribute it for wave accounting only.
+      const tag = typeof input.subagent_id === "string" ? subagentTasks.get(input.subagent_id) : undefined;
+      const approval = tag ? approvals.get(tag.taskId) ?? null
+        : approvals.size === 1 ? [...approvals.values()][0] : null;
+      return { approval, step: tag && approval ? approval.steps.get(tag.stepId) ?? null : null };
+    }
+    const family = CLAUDE_TOOLS.has(toolName) ? "claude" : "codex";
+    const tag = workerAttribution(toolName, input);
+    const convention = CLAUDE_TOOLS.has(toolName) ? "start the prompt with [pico-task <task_id>:<step_id>]"
+      : "pass label \"<task_id>:<step_id>\"";
+    // ClaudeWorker has no implicit single-task fallback: it always names its step.
+    if (!tag && toolName === "ClaudeWorker") return { block: `WORKER_TASK_UNATTRIBUTED: ClaudeWorker prompts ${convention}` };
+    if (tag) {
+      const approval = approvals.get(tag.taskId);
+      if (!approval) return { block: `WORKER_TASK_UNROUTED: task ${tag.taskId} has no successful route_task approval in this run` };
+      const step = approval.steps.get(tag.stepId);
+      if (!step) return { block: `WORKER_STEP_UNKNOWN: the routed plan of task ${tag.taskId} has no step ${tag.stepId}` };
+      if (step.family !== family) {
+        return { block: `MODEL_BACKEND_MISMATCH: step ${tag.stepId} of task ${tag.taskId} is a ${step.family} step` };
+      }
+      return { approval, step };
+    }
+    if (approvals.size === 0) return { approval: null, step: null };
+    if (approvals.size > 1) {
+      return { block: `WORKER_TASK_UNATTRIBUTED: several tasks are routed; ${convention} so the worker resolves to its task's approval` };
+    }
+    const approval = [...approvals.values()][0];
+    const candidates = [...approval.steps.values()].filter((step) => step.family === family);
+    if (candidates.length === 0) {
+      return { block: `MODEL_BACKEND_MISMATCH: the routed plan of task ${approval.taskId} has no ${family} step` };
+    }
+    const [first] = candidates;
+    if (candidates.every((step) => step.model === first.model && step.effort === first.effort && step.mode === first.mode)) {
+      return { approval, step: first };
+    }
+    return { block: `WORKER_STEP_UNATTRIBUTED: task ${approval.taskId} has several ${family} steps with different assignments; ${convention}` };
+  }
+
+  /**
+   * Always-on session isolation, also between parent runs: a follow-up turn
+   * after /orchestrate must not resume a shared Claude session, hand Claude the
+   * Pi conversation, or continue a subagent from another repository.
+   */
+  async function guardOutsideRun(call: { toolName: string; input: Record<string, unknown> }, cwd: string): Promise<Guard> {
+    if (call.toolName === "ClaudeWorker") {
+      return { block: true, reason: "WORKER_TASK_UNROUTED: ClaudeWorker runs only for a routed Claude step of an active /orchestrate run" };
+    }
+    if (call.toolName === "AskClaude") {
+      if (call.input.isolated === false) {
+        return { block: true, reason: "SESSION_ISOLATION_REQUIRED: AskClaude runs isolated while the orchestrator is loaded; pass state through explicit artifacts" };
+      }
+      const scope = await scopeCheck(cwd, process.cwd());
+      if (scope.ok !== true) {
+        return { block: true, reason: `${String(scope.blocker_code ?? "SESSION_REPOSITORY_MISMATCH")}: the Claude worker directory is outside this session's repository` };
+      }
+      call.input.isolated = true;
+    }
+    if (call.toolName === "message_subagent") {
+      const id = call.input.subagent_id;
+      const origin = typeof id === "string" ? spawnedSubagents.get(id) : undefined;
+      if (!origin) {
+        return { block: true, reason: "SESSION_SCOPE_UNVERIFIED: this subagent was not spawned in the current Pi process; spawn a fresh worker and pass state through explicit artifacts" };
+      }
+      const scope = await scopeCheck(cwd, origin);
+      if (scope.ok !== true) {
+        return { block: true, reason: "SESSION_REPOSITORY_MISMATCH: this subagent was spawned in another repository" };
+      }
+    }
+    return undefined;
+  }
+  async function settle(): Promise<void> {
+    if (!runId) return;
+    const result = await command(PARENT, ["settle", runId]);
+    if (result.ok === false) {
+      diagnose("settle", result);
+      parentBlocked = true;
+      parentFailure = result;
+      return;
+    }
+    lastTerminal = result;
+    persist(false);
+    runId = null;
+    parentBlocked = false;
+    parentFailure = null;
+    runSubagents.clear();
+    workerStarts.clear();
+    budget = null;
+    recordedPeak = 0;
+    compactionFailed = false;
+    resetRunState();
+  }
+
+  /** Close the concurrency accounting of a worker; emits telemetry when the last one in flight returns. */
+  async function workerFinished(toolCallId: string): Promise<void> {
+    if (!inFlight.delete(toolCallId) || inFlight.size > 0) return;
+    const activeMs = Date.now() - batchStart;
+    const peak = batchPeak;
+    batchPeak = 0;
+    if (runId && !parentBlocked) await observe({ kind: "concurrency", peak_workers: peak, active_ms: activeMs });
+  }
+
+  pi.on("session_start", async (_event, ctx) => { await restore(ctx); });
+
+  pi.on("before_agent_start", async (trigger, ctx) => {
+    compactionFailed = false;
+    if (!trigger.prompt.includes(MARKER)) return;
+    if (parentBlocked && !runId) {
+      const code = String(parentFailure?.error_code ?? "PARENT_PROVENANCE_UNAVAILABLE");
+      return { message: { customType: "orchestration-blocker", display: true,
+        content: `BLOCKED: parent orchestration continuation failed (${code}). Start a new Pi session after resolving the repository mismatch.` } };
+    }
+    await settle();
+    if (runId) {
+      return { message: { customType: "orchestration-blocker", display: true,
+        content: "BLOCKED: the previous parent run could not be settled. Resolve the provenance error before starting another run." } };
+    }
+    const args = ["start", "--worktree", ctx.cwd];
+    targetCwd = ctx.cwd;
+    const explicit = process.env.PI_TARGET_REPOSITORY;
+    if (explicit) args.push("--repo", explicit);
+    const result = await command(PARENT, args);
+    runId = typeof result.run_id === "string" ? result.run_id : null;
+    if (runId) { lastRunId = runId; lastTerminal = null; persist(true); }
+    resetRunState();
+    parentBlocked = !runId || result.status !== "IN_PROGRESS";
+    parentFailure = parentBlocked ? result : null;
+    if (parentBlocked) {
+      diagnose("start", result);
+      const code = typeof result.blocker_code === "string" ? result.blocker_code : "PARENT_PROVENANCE_UNAVAILABLE";
+      ctx.ui.notify(`Parent orchestration blocked: ${code}`, "error");
+      return { message: { customType: "orchestration-blocker", display: true,
+        content: `BLOCKED: parent orchestration initialization failed (${code}). Stop before repository inspection or workers. See orchestration-lifecycle diagnostic log.` } };
+    }
+    const started = await command(CONTEXT, ["start", runId!], { cwd: ctx.cwd });
+    if (started.ok === false) diagnose("context_start", started);
+    budget = initialBudgetState();
+  });
+
+  type ClaudeRoute = { block: string } | { approval: RouteApproval; step: StepApproval; backend: Json;
+    canonical: string; backendModel: string; effort: string };
+  /**
+   * Checks shared by routed Claude calls: the preflighted executable is
+   * unchanged, and model, effort, and mode are the routed step's. `model` may be
+   * omitted only where the tool resolves it from the route (ClaudeWorker).
+   */
+  async function claudeRoute(input: Record<string, unknown>, approval: RouteApproval | null,
+                             step: StepApproval | null, modelRequired: boolean): Promise<ClaudeRoute> {
+    const backend = approval?.claudeBackend ?? null;
+    if (!approval || !backend || !targetCwd) return { block: "MODEL_BACKEND_MISMATCH: no preflighted Claude backend" };
+    const verification = await command(PREFLIGHT, [], { verify_backend: true,
+      backend_identity: backend, cwd: targetCwd });
+    if (verification.ok !== true) {
+      approval.worktreeReady = false;
+      return { block: "MODEL_BACKEND_MISMATCH: Claude bridge runtime changed since preflight" };
+    }
+    const canonical = input.model === undefined && !modelRequired ? step?.model : input.model;
+    if (typeof canonical !== "string") {
+      return { block: "MODEL_IDENTIFIER_UNSUPPORTED: routed Claude calls require an explicit canonical model" };
+    }
+    const mapping = resolveClaudeBackendModel(canonical);
+    if (!mapping.ok) return { block: `${mapping.blocker_code}: no safe Claude Code model invocation` };
+    if (!step || canonical !== step.model) {
+      return { block: "MODEL_BACKEND_MISMATCH: Claude model was not approved by the routed preflight of this task" };
+    }
+    if (input.isolated === false) {
+      return { block: "SESSION_ISOLATION_REQUIRED: routed Claude workers run isolated; pass state through explicit artifacts, not conversation history" };
+    }
+    if (!step.effort) {
+      return { block: "REASONING_EFFORT_UNRESOLVED: the routed result assigns no reasoning effort to the Claude step" };
+    }
+    if (input.thinking !== undefined && input.thinking !== step.effort) {
+      return { block: `REASONING_EFFORT_MISMATCH: the routed Claude step is assigned thinking=${step.effort}` };
+    }
+    if (input.mode !== undefined && input.mode !== step.mode) {
+      return { block: `MUTATION_MODE_MISMATCH: the routed Claude step runs with mode=${step.mode}` };
+    }
+    return { approval, step, backend, canonical, backendModel: mapping.backend_model, effort: step.effort };
+  }
+
+  /**
+   * Checks for a routed AskClaude call; returns a block reason or rewrites the call in place.
+   * The bridge runs Claude Code in the Pi process directory, so only read-only
+   * steps may use it; mutating steps run through ClaudeWorker.
+   */
+  async function guardAskClaude(call: { toolCallId: string; input: Record<string, unknown> },
+                                approval: RouteApproval | null, step: StepApproval | null): Promise<string | undefined> {
+    const route = await claudeRoute(call.input, approval, step, true);
+    if ("block" in route) return route.block;
+    if (route.step.mode === "full") {
+      return `CLAUDE_WORKER_REQUIRED: mutating Claude step ${route.step.id} of task ${route.approval.taskId} runs through ClaudeWorker in its bound worktree; call ClaudeWorker with the same [pico-task ${route.approval.taskId}:${route.step.id}] prompt`;
+    }
+    const scope = await scopeCheck(targetCwd!, process.cwd());
+    if (scope.ok !== true) {
+      const code = typeof scope.blocker_code === "string" ? scope.blocker_code : "SESSION_REPOSITORY_MISMATCH";
+      return `${code}: the Claude worker directory is outside the parent run's target repository`;
+    }
+    call.input.isolated = true;
+    call.input.thinking = route.effort;
+    call.input.mode = route.step.mode;
+    call.input.model = route.backendModel;
+    claudeCalls.set(call.toolCallId, { canonical: route.canonical, backend: route.backendModel });
+    return undefined;
+  }
+
+  /**
+   * Checks for a routed ClaudeWorker call and resolves its run: the pinned
+   * executable, the bound worktree as working directory (read-only steps fall
+   * back to the target checkout), and the routed model and effort.
+   */
+  async function guardClaudeWorker(call: { toolCallId: string; input: Record<string, unknown> },
+                                   approval: RouteApproval | null, step: StepApproval | null): Promise<string | undefined> {
+    const route = await claudeRoute(call.input, approval, step, false);
+    if ("block" in route) return route.block;
+    const { taskId } = route.approval;
+    const workspace = workspaces.get(workspaceKey(taskId, route.step.id));
+    if (route.step.mode === "full" && !workspace) {
+      return `WORKER_WORKSPACE_UNBOUND: bind the prepared worktree first with orchestration_record {"action":"bind_workspace","task_id":"${taskId}","step_id":"${route.step.id}","path":...}`;
+    }
+    if (route.step.mode === "full" && workspace && inGitDirectory(workspace)) {
+      return `WORKER_WORKSPACE_PROTECTED_PATH: bound worktree ${workspace} is inside a .git directory, where Claude Code denies every edit; create the worktree outside .git and bind it again`;
+    }
+    const cwd = workspace ?? targetCwd!;
+    const scope = await scopeCheck(targetCwd!, cwd);
+    if (scope.ok !== true) {
+      const code = typeof scope.blocker_code === "string" ? scope.blocker_code : "SESSION_REPOSITORY_MISMATCH";
+      return `${code}: the Claude worker directory is outside the parent run's target repository`;
+    }
+    // The preflight-pinned file, never a fresh PATH lookup: verify_backend just matched its identity.
+    const executable = route.backend.backend_executable;
+    if (typeof executable !== "string" || !executable) {
+      return "MODEL_BACKEND_MISMATCH: the preflighted Claude identity names no executable";
+    }
+    call.input.model = route.canonical;
+    call.input.thinking = route.effort;
+    workerPlans.set(call.toolCallId, { executable, cwd, backendModel: route.backendModel, effort: route.effort,
+      mode: route.step.mode, taskId, stepId: route.step.id, phase: route.approval.phase, canonical: route.canonical });
+    return undefined;
+  }
+
+  /** Checks for a routed spawn_subagent call: the Codex model and thinking come from the route. */
+  function guardCodex(input: Record<string, unknown>, approval: RouteApproval | null,
+                      step: StepApproval | null): string | undefined {
+    if (!approval || !step) return undefined; // unrouted exploration before any route_task
+    if (!step.model) {
+      return `MODEL_ASSIGNMENT_UNRESOLVED: the routed result binds no model to step ${step.id} of task ${approval.taskId}`;
+    }
+    if (!step.effort) {
+      return `REASONING_EFFORT_UNRESOLVED: the routed result assigns no reasoning effort to step ${step.id}`;
+    }
+    if (input.model !== undefined && input.model !== step.model) {
+      return `MODEL_BACKEND_MISMATCH: routed Codex step ${step.id} is assigned model=${step.model}`;
+    }
+    if (input.thinking !== undefined && input.thinking !== step.effort) {
+      return `REASONING_EFFORT_MISMATCH: routed Codex step ${step.id} is assigned thinking=${step.effort}`;
+    }
+    if (step.mode === "full") {
+      const workspace = workspaces.get(workspaceKey(approval.taskId, step.id));
+      if (!workspace) {
+        return `WORKER_WORKSPACE_UNBOUND: bind the prepared worktree first with orchestration_record {"action":"bind_workspace","task_id":"${approval.taskId}","step_id":"${step.id}","path":...}`;
+      }
+      if (typeof input.task !== "string" || !input.task.includes(workspace)) {
+        return `WORKER_WORKSPACE_UNSTATED: the mutating Codex worker contract must name its bound worktree ${workspace}`;
+      }
+    }
+    input.model = step.model;
+    input.thinking = step.effort;
+    if (input.label === undefined) input.label = `${approval.taskId}:${step.id}`;
+    return undefined;
+  }
+
+  pi.on("tool_call", async (call, ctx) => {
+    if (!runId && !parentBlocked) return guardOutsideRun(call, ctx.cwd);
+    if (parentBlocked && call.toolName !== "orchestration_record") {
+      return { block: true, terminate: true,
+        reason: "Parent orchestration provenance is blocked; only orchestration_record status is available" };
+    }
+    if (scopeViolation && (WORKER_TOOLS.has(call.toolName) || isWorktreeAdd(call))) {
+      return { block: true, reason: `WORKER_SCOPE_VIOLATION: a worker changed the parent checkout (${scopeViolation}); review those changes before launching more workers` };
+    }
+    if (integrating && WORKER_TOOLS.has(call.toolName)) {
+      return { block: true, reason: `INTEGRATION_IN_PROGRESS: wave ${integrating} is integrating; finish with orchestration_record {"action":"integrate_end"} before launching workers` };
+    }
+    if (call.toolName === "message_subagent") {
+      const id = call.input.subagent_id;
+      if (typeof id !== "string" || !runSubagents.has(id)) {
+        return { block: true, reason: "SESSION_SCOPE_VIOLATION: only subagents spawned in this parent run may be continued; spawn a fresh worker and pass state through explicit artifacts" };
+      }
+    }
+    if (WORKER_TOOLS.has(call.toolName)) {
+      const resolved = resolveWorker(call.toolName, call.input);
+      if ("block" in resolved) return { block: true, reason: resolved.block };
+      const { approval, step } = resolved;
+      const taskId = approval?.taskId ?? null;
+      // Workers of different tasks may overlap only inside one declared wave.
+      const others = [...inFlight.values()].filter((worker) => worker.taskId !== taskId);
+      if (others.length > 0) {
+        const wave = activeWave;
+        const inWave = (task: string | null) => task !== null && wave !== null && wave.tasks.has(task);
+        if (!inWave(taskId) || !others.every((worker) => inWave(worker.taskId))) {
+          return { block: true, reason: "WAVE_UNDECLARED: workers of different tasks run concurrently only when every task is in the declared wave; call orchestration_record declare_wave first" };
+        }
+      }
+      if (call.toolName === "AskClaude") {
+        const reason = await guardAskClaude(call, approval, step);
+        if (reason) return { block: true, reason };
+      } else if (call.toolName === "ClaudeWorker") {
+        const reason = await guardClaudeWorker(call, approval, step);
+        if (reason) return { block: true, reason };
+      } else if (call.toolName === "spawn_subagent") {
+        const reason = guardCodex(call.input, approval, step);
+        if (reason) return { block: true, reason };
+      }
+      // Workers must never write to the parent checkout: compare it before and after.
+      const before = await snapshot();
+      if (!before) {
+        claudeCalls.delete(call.toolCallId);
+        workerPlans.delete(call.toolCallId);
+        return { block: true, reason: "WORKER_SCOPE_UNVERIFIABLE: could not snapshot the parent checkout" };
+      }
+      snapshots.set(call.toolCallId, before);
+      if (inFlight.size === 0) batchStart = Date.now();
+      inFlight.set(call.toolCallId, { taskId, stepId: step?.id ?? null, tool: call.toolName });
+      if (runId) await observe({ kind: "activity", status: "started", tool: call.toolName,
+        task_id: taskId, step_id: step?.id ?? null });
+      batchPeak = Math.max(batchPeak, inFlight.size);
+      workerStarts.set(call.toolCallId, Date.now());
+      const plan = workerPlans.get(call.toolCallId);
+      // Observational: the parent still records the worker's terminal status itself.
+      if (plan) await observe({ kind: "worker", phase: plan.phase, step_id: plan.stepId, status: "in_progress",
+        model: plan.canonical, backend: "claude-code", backend_model: plan.backendModel, reasoning_effort: plan.effort });
+    }
+    if (call.toolName === "route_task") {
+      const task = (call.input.classified_task ?? {}) as Json;
+      if (typeof task.id === "string") {
+        // Re-routing a task replaces only that task's approval.
+        approvals.delete(task.id);
+        pendingRoutes.set(call.toolCallId, task.id);
+      }
+    }
+    if (isWorktreeAdd(call) && !worktreeReady()) {
+      return { block: true, reason: "Implementation worktree requires successful routed backend preflight" };
+    }
+    const backend = anyClaudeBackend();
+    if (isWorktreeAdd(call) && backend && targetCwd) {
+      const verification = await command(PREFLIGHT, [], { verify_backend: true,
+        backend_identity: backend, cwd: targetCwd });
+      if (verification.ok !== true) {
+        blockAllWorktrees();
+        return { block: true, reason: "MODEL_BACKEND_MISMATCH: Claude bridge runtime changed since preflight" };
+      }
+    }
+  });
+
+  pi.on("tool_result", async (result, ctx) => {
+    const worker = inFlight.get(result.toolCallId);
+    if (result.toolName === "spawn_subagent" && !result.isError) {
+      const id = ((result.details ?? {}) as Json).subagent_id;
+      if (typeof id === "string") {
+        spawnedSubagents.set(id, ctx.cwd);
+        if (worker?.taskId && worker.stepId) subagentTasks.set(id, { taskId: worker.taskId, stepId: worker.stepId });
+        if (runId && !runSubagents.has(id)) {
+          await observe({ kind: "spawn" });
+          await observe({ kind: "activity", status: "spawned", tool: "spawn_subagent",
+            task_id: worker?.taskId ?? null, step_id: worker?.stepId ?? null, subagent_id: id });
+        }
+      }
+    }
+    await workerFinished(result.toolCallId);
+    if (runId && worker) await observe({ kind: "activity", status: result.isError ? "failed" : "finished",
+      tool: worker.tool, task_id: worker.taskId, step_id: worker.stepId });
+    const before = snapshots.get(result.toolCallId);
+    snapshots.delete(result.toolCallId);
+    if (runId && before) {
+      const after = await snapshot();
+      if (!after || after.digest !== before.digest) {
+        const changed = after ? after.status.filter((entry) => !before.status.includes(entry)) : [];
+        scopeViolation = changed.slice(0, 5).join(", ") || "unattributed changes";
+        blockAllWorktrees();
+        const phase = (worker?.taskId && approvals.get(worker.taskId)?.phase) || lastPhase;
+        await event({ kind: "phase", phase, status: "blocked", blocker_code: "WORKER_SCOPE_VIOLATION" });
+        claudeCalls.delete(result.toolCallId);
+        return { content: [...result.content, { type: "text" as const,
+          text: `Orchestration blocker: WORKER_SCOPE_VIOLATION. The parent checkout changed during this worker call (${scopeViolation}). Workers may only write in their bound worktree. Nothing was reverted; inspect the changes before continuing.` }] };
+      }
+    }
+    if (runId && !parentBlocked && WORKER_TOOLS.has(result.toolName)) {
+      const started = workerStarts.get(result.toolCallId);
+      workerStarts.delete(result.toolCallId);
+      const details = (result.details ?? {}) as Json;
+      if (result.toolName === "AskClaude") {
+        if (claudeCalls.has(result.toolCallId)) {
+          await observe({ kind: "usage", backend: "claude-code",
+            duration_ms: count(details.executionTime) ?? (started ? Date.now() - started : null) });
+        }
+      } else if (result.toolName === "ClaudeWorker") {
+        // Only a run the guard resolved reports usage; a blocked call never started Claude Code.
+        if (typeof details.task_id === "string") {
+          const usage = (details.usage ?? {}) as Json;
+          const cost = usage.cost_usd;
+          await observe({ kind: "usage", backend: "claude-code",
+            duration_ms: count(details.elapsed_ms) ?? (started ? Date.now() - started : null),
+            input_tokens: count(usage.input_tokens), output_tokens: count(usage.output_tokens),
+            cached_tokens: count(usage.cached_tokens), total_tokens: count(usage.total_tokens),
+            ...(typeof cost === "number" && Number.isFinite(cost) && cost >= 0 ? { estimated_cost_usd: cost } : {}) });
+        }
+      } else {
+        if (result.toolName === "spawn_subagent" && typeof details.subagent_id === "string" && !result.isError) {
+          runSubagents.add(details.subagent_id);
+        }
+        const usage = (details.usage ?? {}) as Json;
+        await observe({ kind: "usage", backend: "pi-subagent",
+          duration_ms: count(details.elapsedMs) ?? (started ? Date.now() - started : null),
+          input_tokens: count(usage.input), output_tokens: count(usage.output),
+          cached_tokens: count(usage.cacheRead), total_tokens: count(usage.totalTokens) });
+      }
+    }
+    if (result.toolName === "AskClaude") {
+      const models = claudeCalls.get(result.toolCallId);
+      claudeCalls.delete(result.toolCallId);
+      if (!models) return;
+      const details = result.details as { error?: boolean } | undefined;
+      if (details?.error === true || result.isError) {
+        const message = result.content.filter((item) => item.type === "text").map((item) => item.text).join(" ");
+        const code = classifyClaudeInvocationError(message);
+        return { content: [...result.content, { type: "text" as const,
+          text: `Orchestration blocker: ${code}. Canonical model: ${models?.canonical ?? "unknown"}; Claude Code model: ${models?.backend ?? "unknown"}. Do not infer entitlement from an ambiguous backend error.` }] };
+      }
+      return;
+    }
+    if (!runId || parentBlocked || result.toolName !== "route_task") return;
+    const pending = pendingRoutes.get(result.toolCallId);
+    pendingRoutes.delete(result.toolCallId);
+    const details = result.details as { result?: Json; blocker_code?: unknown } | undefined;
+    const route = details?.result;
+    if (!route || route.ok !== true || details?.blocker_code !== undefined) {
+      if (pending) approvals.delete(pending);
+      const reported = typeof details?.blocker_code === "string" ? details.blocker_code
+        : typeof route?.blocker_code === "string" ? route.blocker_code : "ROUTING_FAILED";
+      const code = /^[A-Z][A-Z0-9_]{0,99}$/.test(reported) ? reported : "ROUTING_FAILED";
+      await event({ kind: "phase", phase: "routing", status: "blocked", blocker_code: code });
+      return;
+    }
+    const classification = route.classification as { base?: { id?: string }; effective?: { task_type?: string } } | undefined;
+    const phase = classification?.base?.id ?? pending ?? "routing";
+    const taskId = phase;
+    approvals.delete(taskId);
+    lastPhase = phase;
+    const summary = routingSummary(route);
+    if (!await event({ kind: "phase", phase, status: "in_progress", route: route.selected_route,
+                       policy_version: route.policy_version, ...(summary ? { routing: summary } : {}) })) {
+      return { content: [...result.content, { type: "text" as const,
+        text: "Parent provenance update failed. Implementation is blocked." }] };
+    }
+    const check = await command(PREFLIGHT, [], {
+      route_task_result: route,
+      available_tools: pi.getActiveTools(),
+      cwd: targetCwd,
+    });
+    if (check.ok !== true) {
+      const code = typeof check.blocker_code === "string" ? check.blocker_code : "MODEL_BACKEND_UNAVAILABLE";
+      await event({ kind: "phase", phase, status: "blocked", blocker_code: code });
+      if (typeof check.step_id === "string") {
+        await event({ kind: "worker", phase, step_id: check.step_id, model: check.model,
+                      backend_model: check.backend_model ?? null,
+                      status: "blocked", blocker_code: code,
+                      installed_backend_version: check.installed_backend_version ?? null,
+                      required_backend_version: check.required_backend_version ?? null });
+      }
+      return { content: [...result.content, { type: "text" as const,
+        text: `Backend preflight BLOCKED: ${code}. No implementation worktree may be created.` }] };
+    }
+    const checked = (Array.isArray(check.checked_steps) ? check.checked_steps : []) as Json[];
+    const claude = checked.find((step) => step.backend === "claude");
+    const steps = new Map<string, StepApproval>();
+    const plannedSteps = ((route.execution_plan as Json | undefined)?.steps ?? []) as Json[];
+    for (const planned of plannedSteps) {
+      if (typeof planned.id !== "string" || typeof planned.family !== "string") continue;
+      const preflighted = checked.find((item) => item.step_id === planned.id);
+      steps.set(planned.id, { id: planned.id, family: planned.family,
+        model: typeof preflighted?.model === "string" ? preflighted.model : assignedModel(route, planned),
+        effort: assignedEffort(route, planned.id),
+        mode: planned.mutation_permission === "allowed" ? "full" : "read" });
+    }
+    approvals.set(taskId, { taskId, route: String(route.selected_route), phase, worktreeReady: !parentBlocked,
+      taskType: typeof classification?.effective?.task_type === "string" ? classification.effective.task_type : null,
+      claudeBackend: claude ? { backend_executable: claude.backend_executable,
+        backend_version_output: claude.backend_version_output,
+        backend_device: claude.backend_device, backend_inode: claude.backend_inode } : null,
+      steps });
+    const claudeEffort = claude ? assignedEffort(route, claude.step_id) : null;
+    if (claude) await event({ kind: "worker", phase, step_id: claude.step_id,
+      status: "not_started", model: claude.model, backend: "claude-code",
+      backend_model: claude.backend_model,
+      ...(claudeEffort ? { reasoning_effort: claudeEffort } : {}),
+      installed_backend_version: claude.installed_backend_version });
+    return { content: [...result.content, { type: "text" as const,
+      text: `Backend preflight READY for task ${taskId} with the exact routed models and tools. Model entitlement remains unverified until invocation. Attribute its workers as "${taskId}:<step_id>".` }] };
+  });
+
+  function reply(ok: boolean, text: string, result: Json = {}) {
+    return { content: [{ type: "text" as const, text }],
+             details: { ok, active: runId !== null, run_id: runId, result } };
+  }
+
+  async function declareWave(waveId: string, tasks: { task_id: string; write_scope: string[] }[]) {
+    if (integrating) return reply(false, `BLOCKED: INTEGRATION_IN_PROGRESS: wave ${integrating} is still integrating.`);
+    if (inFlight.size > 0) return reply(false, "BLOCKED: WAVE_WORKERS_IN_FLIGHT: wait for running workers before declaring the next wave.");
+    const ids = tasks.map((task) => task.task_id);
+    if (ids.length === 0 || new Set(ids).size !== ids.length) {
+      return reply(false, "BLOCKED: WAVE_SCOPE_INVALID: a wave lists one or more distinct task ids.");
+    }
+    const unsafe = tasks.flatMap((task) => task.write_scope.filter((entry) => scopePrefix(entry) === null));
+    if (unsafe.length > 0) {
+      return reply(false, `BLOCKED: WAVE_SCOPE_INVALID: write scopes are repository-relative paths or globs without "..": ${unsafe.slice(0, 3).join(", ")}`);
+    }
+    const unrouted = ids.filter((id) => !approvals.has(id));
+    if (unrouted.length > 0) {
+      return reply(false, `BLOCKED: WAVE_TASK_UNROUTED: route every wave task first (${unrouted.join(", ")}).`);
+    }
+    const limits = await command(AUTONOMY, ["limits", "--worktree", targetCwd ?? "."]);
+    if (limits.ok === false) {
+      return reply(false, `BLOCKED: ${String(limits.blocker_code ?? "AUTONOMY_POLICY_INVALID")}: .pi/autonomy.yaml could not be read.`, limits);
+    }
+    const limit = count(limits.parallel_tasks) || DEFAULT_PARALLEL_TASKS;
+    if (tasks.length > limit) {
+      return reply(false, `BLOCKED: WAVE_LIMIT_EXCEEDED: the wave has ${tasks.length} tasks; limits.parallel_tasks is ${limit}. Defer the rest to the next wave.`);
+    }
+    for (let left = 0; left < tasks.length; left += 1) {
+      for (let right = left + 1; right < tasks.length; right += 1) {
+        for (const a of tasks[left].write_scope) {
+          const b = tasks[right].write_scope.find((entry) => scopesOverlap(a, entry));
+          if (b !== undefined) {
+            return reply(false, `BLOCKED: WAVE_SCOPE_OVERLAP: ${tasks[left].task_id} (${a}) and ${tasks[right].task_id} (${b}) may write the same paths; run them in different waves.`);
+          }
+        }
+      }
+    }
+    if (!await event({ kind: "wave", wave_id: waveId, task_ids: ids, status: "declared" })) {
+      return reply(false, "BLOCKED: parent provenance update failed; see diagnostic log.", parentFailure ?? {});
+    }
+    activeWave = { id: waveId, tasks: new Map(tasks.map((task) => [task.task_id, task.write_scope])) };
+    return reply(true, `Wave ${waveId} declared with ${ids.length} task(s) (limit ${limit}). Launch all their ready workers in one tool batch, each attributed "<task_id>:<step_id>".`,
+      { wave_id: waveId, task_ids: ids, parallel_tasks: limit });
+  }
+
+  async function integration(action: "integrate_begin" | "integrate_end", waveId: string) {
+    if (action === "integrate_begin") {
+      if (!activeWave || activeWave.id !== waveId) return reply(false, `BLOCKED: WAVE_UNKNOWN: ${waveId} is not the declared wave.`);
+      if (integrating) return reply(true, `Wave ${waveId} is already integrating.`);
+      if (inFlight.size > 0) {
+        return reply(false, `BLOCKED: INTEGRATION_WORKERS_IN_FLIGHT: ${inFlight.size} worker call(s) are still running; integrate only between waves.`);
+      }
+      if (!await event({ kind: "wave", wave_id: waveId, task_ids: [...activeWave.tasks.keys()], status: "integrating" })) {
+        return reply(false, "BLOCKED: parent provenance update failed; see diagnostic log.", parentFailure ?? {});
+      }
+      integrating = waveId;
+      return reply(true, `Integration of wave ${waveId} started. Worker launches are refused until integrate_end.`);
+    }
+    if (integrating !== waveId || !activeWave) return reply(false, `BLOCKED: INTEGRATION_NOT_STARTED: wave ${waveId} is not integrating.`);
+    // Re-base: the parent's own merges are the new reference for later worker snapshots.
+    const rebased = await snapshot();
+    if (!rebased) return reply(false, "BLOCKED: WORKER_SCOPE_UNVERIFIABLE: could not snapshot the parent checkout.");
+    snapshots.clear();
+    if (!await event({ kind: "wave", wave_id: waveId, task_ids: [...activeWave.tasks.keys()], status: "integrated" })) {
+      return reply(false, "BLOCKED: parent provenance update failed; see diagnostic log.", parentFailure ?? {});
+    }
+    integrating = null;
+    activeWave = null;
+    return reply(true, `Wave ${waveId} integrated; the parent checkout snapshot is re-based. Plan the next dependency-ready wave.`,
+      { wave_id: waveId, digest: rebased.digest });
+  }
+
+  pi.registerTool({
+    name: "orchestration_record",
+    label: "Record parent orchestration outcome",
+    description: "Parent only: record phases, workers, child runs, mutation counts, concise numbered interaction summaries, or final status; bind mutating steps to prepared worktrees; declare waves; and bracket integration. Interaction events describe directives, feedback, and decisions with task/step ids and optional reply_to. Never include prompts, raw outputs, transcripts, or issue bodies.",
+    parameters: Type.Union([
+      Type.Object({ action: Type.Literal("status") }, { additionalProperties: false }),
+      Type.Object({ action: Type.Literal("bind_workspace"), task_id: Type.Optional(Type.String()),
+        step_id: Type.String(), path: Type.String() }, { additionalProperties: false }),
+      Type.Object({ action: Type.Literal("declare_wave"), wave_id: Type.String({ pattern: `^${TAG_ID}$` }),
+        tasks: Type.Array(Type.Object({ task_id: Type.String({ pattern: `^${TAG_ID}$` }),
+          write_scope: Type.Array(Type.String()) }, { additionalProperties: false }), { minItems: 1 }) },
+        { additionalProperties: false }),
+      Type.Object({ action: Type.Literal("integrate_begin"), wave_id: Type.String() }, { additionalProperties: false }),
+      Type.Object({ action: Type.Literal("integrate_end"), wave_id: Type.String() }, { additionalProperties: false }),
+      Type.Object({ action: Type.Literal("event"), event: EVENT }, { additionalProperties: false }),
+      Type.Object({ action: Type.Literal("finish"),
+        status: Type.Union([Type.Literal("COMPLETED"), Type.Literal("BLOCKED"),
+                            Type.Literal("FAILED"), Type.Literal("PARTIAL")]),
+        blocker_code: Type.Optional(Type.String()) }, { additionalProperties: false }),
+    ]),
+    async execute(_id, params) {
+      if (!runId) {
+        if (params.action === "status" && lastRunId && lastTerminal && !parentFailure) {
+          return { content: [{ type: "text", text: `Parent orchestration run ${lastRunId} finalized (ok: false, active: false).` }],
+                   details: { ok: false, active: false, run_id: lastRunId, result: lastTerminal } };
+        }
+        const result = parentFailure ?? { ok: false, error_category: "NoActiveParentRun" };
+        diagnose(params.action, result);
+        return { content: [{ type: "text", text: "BLOCKED: no active parent orchestration record; see diagnostic log." }],
+                 details: { ok: false, active: false, run_id: null as string | null, result } };
+      }
+      if (params.action === "bind_workspace") {
+        const taskId = params.task_id ?? (approvals.size === 1 ? [...approvals.keys()][0] : null);
+        if (!taskId) {
+          return reply(false, "BLOCKED: WORKER_TASK_UNATTRIBUTED: pass task_id; several (or no) tasks are routed.");
+        }
+        const checked = targetCwd
+          ? await command(SESSION_SCOPE, [], { operation: "worktree", target_cwd: targetCwd, path: params.path })
+          : { ok: false };
+        const ok = checked.ok === true && typeof checked.path === "string";
+        if (ok) workspaces.set(workspaceKey(taskId, params.step_id), checked.path as string);
+        return reply(ok, ok
+          ? `Step ${params.step_id} of task ${taskId} is bound to worktree ${String(checked.path)}.`
+          : checked.blocker_code === "WORKER_WORKSPACE_PROTECTED_PATH"
+            ? "BLOCKED: WORKER_WORKSPACE_PROTECTED_PATH: the worktree is inside a .git directory, where Claude Code denies every edit; create it outside .git (for example .pi/worktrees/<task>) and bind that path."
+            : "BLOCKED: WORKER_WORKSPACE_INVALID: the path must be a linked worktree of the target repository, not the parent checkout.",
+          checked);
+      }
+      if (params.action === "declare_wave") return declareWave(params.wave_id, params.tasks);
+      if (params.action === "integrate_begin" || params.action === "integrate_end") {
+        return integration(params.action, params.wave_id);
+      }
+      const args = params.action === "status" ? ["status", runId]
+        : params.action === "event" ? ["event", runId]
+        : ["finish", runId, params.status,
+           ...(params.blocker_code ? ["--blocker-code", params.blocker_code] : [])];
+      const result = await command(PARENT, args,
+        params.action === "event" ? params.event as Json : undefined);
+      const observedRunId = runId;
+      const ok = result.ok !== false && (params.action !== "status" || result.status === "IN_PROGRESS");
+      if (!ok) { diagnose(params.action, result); parentFailure = result; parentBlocked = true; blockAllWorktrees(); }
+      if (params.action === "status" && ok) { parentFailure = null; parentBlocked = false; }
+      if (params.action === "finish" && ok) {
+        lastTerminal = result;
+        persist(false);
+        runId = null;
+        blockAllWorktrees();
+      }
+      const code = typeof result.blocker_code === "string" ? result.blocker_code
+        : typeof result.error_code === "string" ? result.error_code : null;
+      // The model reads only this text, never `details`, so the status line states ok/active explicitly.
+      const message = ok ? (params.action === "status"
+          ? `Parent orchestration record ${observedRunId} is ready (ok: true, active: ${runId !== null}).`
+        : params.action === "finish" ? completionSummary(result, observedRunId)
+        : "Parent orchestration trace updated.")
+        : `BLOCKED: parent orchestration ${params.action} failed${code ? ` (${code})` : ""}` +
+          // Completion refusals carry only phase/step ids and fixed wording, so the model may read them.
+          ((code === "PARENT_COMPLETION_INCOMPLETE" || code === "PARENT_REVIEW_MISSING") && typeof result.error === "string"
+            ? `: ${result.error.slice(0, 600)}` : "; see diagnostic log.");
+      return { content: [{ type: "text", text: message }],
+               details: { ok, active: runId !== null, run_id: observedRunId, result } };
+    },
+  });
+
+  pi.registerTool({
+    name: "ClaudeWorker",
+    label: "Claude Code worker",
+    description: "Run a routed Claude step as a headless Claude Code subprocess. Its working directory is the step's bound worktree (a read-only step without one runs read-only tools in the target checkout); model and thinking come from the routed capacity assignment. Start the prompt with [pico-task <task_id>:<step_id>] and give the complete worker contract. Several ClaudeWorker calls in one tool batch run concurrently.",
+    promptSnippet: "Run a routed Claude step headless in its bound worktree.",
+    parameters: Type.Object({
+      prompt: Type.String({ description: "Complete worker contract, starting with [pico-task <task_id>:<step_id>]." }),
+      model: Type.Optional(Type.String({ description: "Routed canonical model; omit to use the route's." })),
+      thinking: Type.Optional(EFFORT),
+    }, { additionalProperties: false }),
+    executionMode: "parallel",
+    async execute(toolCallId, params, signal) {
+      const plan = workerPlans.get(toolCallId);
+      workerPlans.delete(toolCallId);
+      if (!plan) {
+        return { content: [{ type: "text" as const, text: "BLOCKED: WORKER_TASK_UNROUTED: ClaudeWorker runs only for a routed Claude step the orchestration lifecycle resolved." }],
+                 details: { ok: false } as Json, isError: true };
+      }
+      const outcome = await runClaudeWorker(plan, params.prompt, signal);
+      const notes = [outcome.text];
+      if (outcome.permissionDenials > 0) {
+        const denied = outcome.deniedCalls.length ? `: ${outcome.deniedCalls.join("; ")}` : ".";
+        notes.push(`Claude Code denied ${outcome.permissionDenials} tool call(s) outside the worker's permissions${denied}`);
+      }
+      if (!outcome.ok) {
+        notes.push(`Orchestration blocker: ${workerBlocker(outcome)}. Canonical model: ${plan.canonical}; Claude Code model: ${plan.backendModel}. Do not infer entitlement from an ambiguous backend error.`);
+      }
+      return { content: [{ type: "text" as const, text: notes.filter(Boolean).join("\n\n") }], isError: !outcome.ok,
+        details: { ok: outcome.ok, task_id: plan.taskId, step_id: plan.stepId, mode: plan.mode, cwd: plan.cwd,
+          model: plan.canonical, backend: "claude-code", backend_model: plan.backendModel,
+          reasoning_effort: plan.effort, exit_code: outcome.exitCode, error: outcome.error, usage: outcome.usage,
+          duration_ms: outcome.durationMs, elapsed_ms: outcome.elapsedMs, session_id: outcome.sessionId,
+          permission_denials: outcome.permissionDenials, denied_calls: outcome.deniedCalls } as Json };
+    },
+  });
+
+  pi.on("turn_end", async (_event, ctx) => {
+    // Worker tools block within one turn: anything still marked in flight never reported a result.
+    for (const id of [...inFlight.keys()]) { snapshots.delete(id); await workerFinished(id); }
+    workerPlans.clear();
+    if (!runId || parentBlocked || !budget) return;
+    const tokens = ctx.getContextUsage()?.tokens;
+    if (typeof tokens !== "number") return;
+    const firstObservation = budget.baseline === null;
+    const observed = observeContext(budget, tokens);
+    budget = observed.state;
+    if (firstObservation) {
+      await observe({ kind: "context", baseline_tokens: tokens, context_tokens: tokens, working_tokens: 0 });
+    } else if (observed.working >= recordedPeak + 1000) {
+      recordedPeak = observed.working;
+      await observe({ kind: "context", context_tokens: tokens, working_tokens: observed.working });
+    }
+  });
+
+  pi.on("turn_start", (event) => { if (runId) currentTurn = event.turnIndex; });
+  pi.on("message_start", (event) => {
+    if (runId && event.message.role === "assistant") messageStarts.set(event.message.timestamp, Date.now());
+  });
+
+  pi.on("message_end", async (event) => {
+    if (!runId || event.message.role !== "assistant") return;
+    const message = event.message;
+    const model = `${message.provider}/${message.model}`;
+    if (!/^[A-Za-z0-9_.:/-]{1,128}$/.test(model)) return;
+    const started = messageStarts.get(message.timestamp);
+    messageStarts.delete(message.timestamp);
+    const approval = approvals.size === 1 ? approvals.get(lastPhase) : undefined;
+    await observe({ kind: "lead_usage", model, phase: lastPhase,
+      task_type: approval?.taskType ?? null, turn_index: currentTurn,
+      duration_ms: started === undefined ? null : Math.max(0, Date.now() - started),
+      input_tokens: count(message.usage?.input), output_tokens: count(message.usage?.output),
+      cached_tokens: count(message.usage?.cacheRead), total_tokens: count(message.usage?.totalTokens) });
+  });
+
+  pi.on("session_compact", async (event) => {
+    compactionFailed = false;
+    if (!runId || parentBlocked) return;
+    // Observe Pi's compaction without changing its summary, cut point, or run state.
+    await observe({ kind: "context", compaction: { reason: event.reason, structured: false,
+      tokens_before: count(event.compactionEntry?.tokensBefore) } });
+  });
+
+  pi.on("session_compact_failed", async () => { compactionFailed = true; });
+
+  pi.on("session_shutdown", async (event) => {
+    if (event.reason === "quit" || event.reason === "new" || event.reason === "fork") await settle();
+    // Reload and explicit resume preserve the durable identity in this session.
+  });
+  pi.on("agent_before_settle", async (event, ctx) => {
+    if (event.outcome === "aborted" && !event.continue && !compactionFailed &&
+        !ctx.hasPendingMessages?.()) await settle();
+    compactionFailed = false;
+  });
+}
+}
+
+export default createOrchestrationLifecycle();

@@ -1,0 +1,794 @@
+version: 1
+
+# Model-independent task-classification benchmark.
+#
+# The classifier predicts only gold_classification. task_facts are fixed
+# outputs of decomposition and are not scored as classifier decisions.
+
+cases:
+  - id: classifier-001-debugging-race
+    request: >
+      Fix the race condition that intermittently causes persisted metadata edits
+      to disappear, and add a regression test.
+    repository_evidence:
+      - The failure occurs in src/metadata/persistence.
+      - The defect is intermittent and the root cause has not been established.
+      - Existing persisted behavior must remain unchanged except for the bug.
+    task_facts:
+      id: classifier-001-debugging-race
+      goal: Fix a subtle race condition causing persisted metadata edits to disappear.
+      dependencies: []
+      acceptance_criteria:
+        - Race condition no longer causes lost metadata edits.
+        - Regression test reproduces and verifies the fix.
+      files_or_areas:
+        - src/metadata/persistence
+    gold_classification:
+      task_type: debugging
+      failure_cost: high
+      semantic_correctness: normal
+      ambiguity: 5
+      implementation_scope: small
+      implementation_required: true
+      cross_layer: false
+      behavior_preservation: required
+      diagnosis_required: true
+      assumptions_must_be_explicit: false
+      many_routine_decisions: false
+      production_feature: false
+      security_sensitive: false
+      destructive_operation: false
+      escalation_evidence:
+        failure_cost: Lost metadata edits silently destroy persisted user data.
+        behavior_preservation: Existing persisted behavior must remain unchanged except for the bug.
+
+  - id: classifier-002-refactor-preservation
+    request: >
+      Refactor the calculation engine for readability without changing any
+      numerical result. Existing outputs must remain bit-identical.
+    repository_evidence:
+      - The calculation engine is localized under src/engine/calculation.py.
+      - A regression corpus exists for exact numerical comparison.
+      - No feature behavior is intended to change.
+    task_facts:
+      id: classifier-002-refactor-preservation
+      goal: Refactor the calculation engine while preserving numerical behavior exactly.
+      dependencies: []
+      acceptance_criteria:
+        - Refactored engine produces bit-identical numerical output for the existing test corpus.
+      files_or_areas:
+        - src/engine/calculation.py
+    gold_classification:
+      task_type: refactor
+      failure_cost: low
+      semantic_correctness: normal
+      ambiguity: 2
+      implementation_scope: small
+      implementation_required: true
+      cross_layer: false
+      behavior_preservation: required
+      diagnosis_required: false
+      assumptions_must_be_explicit: false
+      many_routine_decisions: false
+      production_feature: false
+      security_sensitive: false
+      destructive_operation: false
+      escalation_evidence:
+        behavior_preservation: Refactor must keep numerical output bit-identical to the regression corpus.
+
+  - id: classifier-003-cross-layer-settings
+    request: >
+      Add the specified settings feature end to end: UI form, API endpoint and
+      persistence. The interface contract is already agreed.
+    repository_evidence:
+      - Work spans UI, API, and persistence modules.
+      - Requirements and field semantics are explicit.
+      - This is production functionality.
+    task_facts:
+      id: classifier-003-cross-layer-settings
+      goal: Build a settings feature spanning UI, API and persistence from a clear specification.
+      dependencies: []
+      acceptance_criteria:
+        - Settings are readable and writable end to end through UI, API and persistence.
+      files_or_areas:
+        - src/settings
+    gold_classification:
+      task_type: broad_feature
+      failure_cost: medium
+      semantic_correctness: normal
+      ambiguity: 2
+      implementation_scope: broad
+      implementation_required: true
+      cross_layer: true
+      behavior_preservation: preferred
+      diagnosis_required: false
+      assumptions_must_be_explicit: false
+      many_routine_decisions: false
+      production_feature: true
+      security_sensitive: false
+      destructive_operation: false
+
+  - id: classifier-004-ui-polish
+    request: >
+      Clean up spacing, alignment and responsive layout across the administration
+      UI. Do not change backend behavior.
+    repository_evidence:
+      - Changes are confined to src/admin/ui.
+      - No API, persistence, security, or data semantics are involved.
+      - The work consists of many small presentation decisions.
+    task_facts:
+      id: classifier-004-ui-polish
+      goal: Improve spacing, layout and usability across the administration UI.
+      dependencies: []
+      acceptance_criteria:
+        - Administration UI spacing and layout are visibly more consistent.
+      files_or_areas:
+        - src/admin/ui
+    gold_classification:
+      task_type: ui_ux
+      failure_cost: low
+      semantic_correctness: normal
+      ambiguity: 2
+      implementation_scope: small
+      implementation_required: true
+      cross_layer: false
+      behavior_preservation: preferred
+      diagnosis_required: false
+      assumptions_must_be_explicit: false
+      many_routine_decisions: true
+      production_feature: false
+      security_sensitive: false
+      destructive_operation: false
+
+  - id: classifier-005-scientific-semantics
+    request: >
+      Implement the new normalization semantics for scientific measurements
+      across ingestion, storage and analysis. The interpretation of existing
+      datasets must remain scientifically correct and the change needs an
+      independent verification.
+    repository_evidence:
+      - The change alters scientific data semantics.
+      - Multiple layers consume the normalized values.
+      - Incorrect behavior could silently change scientific conclusions.
+    task_facts:
+      id: classifier-005-scientific-semantics
+      goal: Implement a broad feature that changes correctness-critical scientific data semantics.
+      dependencies: []
+      acceptance_criteria:
+        - New scientific data semantics are implemented and independently verified.
+      files_or_areas:
+        - src/science
+    gold_classification:
+      task_type: scientific_semantics
+      failure_cost: high
+      semantic_correctness: critical
+      ambiguity: 5
+      implementation_scope: broad
+      implementation_required: true
+      cross_layer: true
+      behavior_preservation: required
+      diagnosis_required: false
+      assumptions_must_be_explicit: true
+      many_routine_decisions: false
+      production_feature: true
+      security_sensitive: false
+      destructive_operation: false
+      escalation_evidence:
+        failure_cost: Incorrect normalization could silently change scientific conclusions.
+        semantic_correctness: Normalization semantics change how stored scientific measurements are interpreted.
+        behavior_preservation: Interpretation of existing datasets must be preserved.
+        assumptions_must_be_explicit: Normalization units and definitions must be decided and stated before implementation.
+
+  - id: classifier-006-routine-adapters
+    request: >
+      Generate the routine adapters described by the existing interface
+      specification and wire them into the current plumbing.
+    repository_evidence:
+      - The interface specification is explicit and complete.
+      - The work is localized to src/adapters.
+      - There are many repetitive implementation choices but little semantic risk.
+    task_facts:
+      id: classifier-006-routine-adapters
+      goal: Create routine adapters and plumbing from an explicit interface specification.
+      dependencies: []
+      acceptance_criteria:
+        - Adapters conform exactly to the given interface specification.
+      files_or_areas:
+        - src/adapters
+    gold_classification:
+      task_type: plumbing
+      failure_cost: low
+      semantic_correctness: normal
+      ambiguity: 2
+      implementation_scope: small
+      implementation_required: true
+      cross_layer: false
+      behavior_preservation: preferred
+      diagnosis_required: false
+      assumptions_must_be_explicit: false
+      many_routine_decisions: true
+      production_feature: false
+      security_sensitive: false
+      destructive_operation: false
+
+  - id: classifier-007-security-review
+    request: >
+      Audit authorization logic for privilege-escalation paths. Do not modify
+      production code; report exploitable paths and evidence.
+    repository_evidence:
+      - Scope is src/auth.
+      - The task is an audit, not an implementation request.
+      - Determining whether a vulnerability exists requires diagnosis.
+    task_facts:
+      id: classifier-007-security-review
+      goal: Audit authorization logic for privilege escalation vulnerabilities.
+      dependencies: []
+      acceptance_criteria:
+        - Privilege escalation paths in authorization logic are enumerated and reported.
+      files_or_areas:
+        - src/auth
+    gold_classification:
+      task_type: security_review
+      failure_cost: high
+      semantic_correctness: normal
+      ambiguity: 5
+      implementation_scope: small
+      implementation_required: false
+      cross_layer: false
+      behavior_preservation: preferred
+      diagnosis_required: true
+      assumptions_must_be_explicit: true
+      many_routine_decisions: false
+      production_feature: false
+      security_sensitive: true
+      destructive_operation: false
+      escalation_evidence:
+        failure_cost: A missed privilege-escalation path leaves an exploitable authorization flaw.
+        assumptions_must_be_explicit: The intended authorization model must be stated to judge exploitability.
+        security_sensitive: Audits authorization logic for privilege escalation.
+
+  - id: classifier-008-architectural-ambiguity
+    request: >
+      Build the new multi-layer workflow. Product requirements describe the
+      outcome but leave ownership, persistence boundaries and API shape
+      unresolved; establish those decisions before implementation.
+    repository_evidence:
+      - Work spans several layers.
+      - Architectural boundaries are unresolved.
+      - The feature is intended for production.
+    task_facts:
+      id: classifier-008-architectural-ambiguity
+      goal: Build a major multi-layer feature where requirements contain unresolved architectural ambiguity.
+      dependencies: []
+      acceptance_criteria:
+        - Architectural ambiguity is resolved into an explicit contract before implementation.
+      files_or_areas:
+        - src
+    gold_classification:
+      task_type: broad_feature
+      failure_cost: high
+      semantic_correctness: normal
+      ambiguity: 8
+      implementation_scope: broad
+      implementation_required: true
+      cross_layer: true
+      behavior_preservation: preferred
+      diagnosis_required: false
+      assumptions_must_be_explicit: false
+      many_routine_decisions: false
+      production_feature: true
+      security_sensitive: false
+      destructive_operation: false
+      escalation_evidence:
+        failure_cost: A wrong multi-layer architecture for a production workflow is costly to reverse.
+        ambiguity: Ownership, persistence boundaries and API shape are unresolved.
+
+  - id: classifier-009-analysis-note
+    request: >
+      Summarize the completed exploration spike in a short internal note. No
+      code or configuration changes are requested.
+    repository_evidence:
+      - The exploration is already complete.
+      - The output is documentation only.
+      - No implementation decision is required.
+    task_facts:
+      id: classifier-009-analysis-note
+      goal: Write a short internal note summarizing a completed exploration spike, no code changes.
+      dependencies: []
+      acceptance_criteria:
+        - Note is written and accurately reflects the spike findings.
+      files_or_areas:
+        - docs/notes
+    gold_classification:
+      task_type: documentation
+      failure_cost: low
+      semantic_correctness: normal
+      ambiguity: 5
+      implementation_scope: small
+      implementation_required: false
+      cross_layer: false
+      behavior_preservation: not_required
+      diagnosis_required: false
+      assumptions_must_be_explicit: false
+      many_routine_decisions: false
+      production_feature: false
+      security_sensitive: false
+      destructive_operation: false
+
+  - id: classifier-010-data-migration
+    request: >
+      Rewrite persisted records from the legacy schema to the current schema.
+      The migration will run against real stored data and must be reversible
+      through the documented backup/rollback procedure.
+    repository_evidence:
+      - Existing persisted records will be rewritten.
+      - The target schema is known.
+      - Incorrect transformation could corrupt production data.
+    task_facts:
+      id: classifier-010-data-migration
+      goal: Implement a data migration that rewrites persisted records to the current schema.
+      dependencies: []
+      acceptance_criteria:
+        - Migration contract is explicit before implementation and the result is independently reviewed.
+      files_or_areas:
+        - migrations
+    gold_classification:
+      task_type: migration
+      failure_cost: high
+      semantic_correctness: normal
+      ambiguity: 2
+      implementation_scope: medium
+      implementation_required: true
+      cross_layer: false
+      behavior_preservation: preferred
+      diagnosis_required: false
+      assumptions_must_be_explicit: true
+      many_routine_decisions: false
+      production_feature: true
+      security_sensitive: false
+      destructive_operation: true
+      escalation_evidence:
+        failure_cost: Incorrect transformation could corrupt production data.
+        assumptions_must_be_explicit: Legacy-to-current field mapping is a data-contract decision that must be stated.
+        destructive_operation: Rewrites real persisted records in place.
+
+  - id: classifier-011-permissions-feature
+    request: >
+      Implement the approved permissions change. The desired authorization
+      matrix is explicit, but a mistake could grant access to the wrong users.
+    repository_evidence:
+      - Specification is clear.
+      - The implementation is localized but affects consequential permissions.
+      - This is production behavior.
+    task_facts:
+      id: classifier-011-permissions-feature
+      goal: Implement a high-consequence permissions change from a clear specification.
+      dependencies: []
+      acceptance_criteria:
+        - High-consequence behavior is specified before implementation and independently reviewed.
+      files_or_areas:
+        - src/permissions
+    gold_classification:
+      task_type: implementation
+      failure_cost: high
+      semantic_correctness: normal
+      ambiguity: 2
+      implementation_scope: medium
+      implementation_required: true
+      cross_layer: false
+      behavior_preservation: preferred
+      diagnosis_required: false
+      assumptions_must_be_explicit: false
+      many_routine_decisions: false
+      production_feature: true
+      security_sensitive: true
+      destructive_operation: false
+      escalation_evidence:
+        failure_cost: A mistake could grant access to the wrong users.
+        security_sensitive: Implements an authorization matrix change.
+
+  - id: classifier-012-destructive-cleanup
+    request: >
+      Remove obsolete generated artifacts and delete the deprecated cache
+      directory as part of the cleanup command. The command will delete files
+      from disk.
+    repository_evidence:
+      - The requested behavior explicitly deletes files.
+      - Scope is localized to the cleanup command.
+      - The list of obsolete paths is specified.
+    task_facts:
+      id: classifier-012-destructive-cleanup
+      goal: Implement cleanup behavior that deletes obsolete generated artifacts.
+      dependencies: []
+      acceptance_criteria:
+        - Only documented obsolete artifacts are deleted.
+        - Existing non-obsolete files are preserved.
+      files_or_areas:
+        - src/cleanup
+    gold_classification:
+      task_type: implementation
+      failure_cost: high
+      semantic_correctness: normal
+      ambiguity: 2
+      implementation_scope: small
+      implementation_required: true
+      cross_layer: false
+      behavior_preservation: required
+      diagnosis_required: false
+      assumptions_must_be_explicit: false
+      many_routine_decisions: false
+      production_feature: true
+      security_sensitive: false
+      destructive_operation: true
+      escalation_evidence:
+        failure_cost: Deleting the wrong paths loses user files irreversibly.
+        behavior_preservation: Existing non-obsolete files must be preserved exactly.
+        destructive_operation: The command deletes files from disk.
+
+  - id: classifier-013-testing-fallback
+    request: >
+      Produce a read-only test plan for the completed spike using the existing
+      fixtures. Do not implement or modify anything.
+    repository_evidence:
+      - The requested output is a test plan only.
+      - No diagnosis, review, migration, or implementation is requested.
+      - Scope is localized and no routing-specialized risk signal is present.
+    task_facts:
+      id: classifier-013-testing-fallback
+      goal: Produce a test plan for a completed exploration without changing code.
+      dependencies: []
+      acceptance_criteria:
+        - Test plan covers the existing fixture scenarios.
+      files_or_areas:
+        - tests
+    gold_classification:
+      task_type: testing
+      failure_cost: low
+      semantic_correctness: normal
+      ambiguity: 5
+      implementation_scope: small
+      implementation_required: false
+      cross_layer: false
+      behavior_preservation: not_required
+      diagnosis_required: false
+      assumptions_must_be_explicit: false
+      many_routine_decisions: false
+      production_feature: false
+      security_sensitive: false
+      destructive_operation: false
+
+  # Operational tasks over-routed in real runs; gold follows the classification rubric
+  # in schemas/task.schema.json (every risk flag at its low-risk value).
+  - id: classifier-014-git-push-main
+    request: Push main to origin.
+    repository_evidence:
+      - main is ahead of origin/main by already-reviewed commits.
+      - No force-push or history rewrite is involved.
+      - The repository is a scientific project whose AGENTS.md says not to invent facts.
+    task_facts:
+      id: classifier-014-git-push-main
+      goal: Push the local main branch to origin.
+      dependencies: []
+      acceptance_criteria:
+        - origin/main equals local main.
+      files_or_areas:
+        - git
+    gold_classification:
+      task_type: vcs_operation
+      failure_cost: low
+      semantic_correctness: normal
+      ambiguity: 2
+      implementation_scope: small
+      implementation_required: true
+      cross_layer: false
+      behavior_preservation: not_required
+      diagnosis_required: false
+      assumptions_must_be_explicit: false
+      many_routine_decisions: false
+      production_feature: false
+      security_sensitive: false
+      destructive_operation: false
+    expected_decision:
+      route: CLAUDE
+      primary_intent: implementation
+      capacities:
+        claude_worker: light
+    notes: Over-routed in real runs (CODEX/CODEX_CLAUDE_CODEX with high effort). Rubric gold is all low-risk;
+      expected_decision reflects policy v6 graduated capacity rules.
+
+  - id: classifier-015-branch-commit-open-pr
+    request: Create a branch, commit the finished changes and open a pull request.
+    repository_evidence:
+      - The changes are complete and tests pass locally.
+      - The PR description can be written from the existing diff.
+    task_facts:
+      id: classifier-015-branch-commit-open-pr
+      goal: Commit the finished changes on a new branch and open a pull request.
+      dependencies: []
+      acceptance_criteria:
+        - A pull request exists for the new branch containing the commit.
+      files_or_areas:
+        - git
+        - github pull requests
+    gold_classification:
+      task_type: vcs_operation
+      failure_cost: low
+      semantic_correctness: normal
+      ambiguity: 2
+      implementation_scope: small
+      implementation_required: true
+      cross_layer: false
+      behavior_preservation: not_required
+      diagnosis_required: false
+      assumptions_must_be_explicit: false
+      many_routine_decisions: false
+      production_feature: false
+      security_sensitive: false
+      destructive_operation: false
+    expected_decision:
+      route: CLAUDE
+      primary_intent: implementation
+      capacities:
+        claude_worker: light
+    notes: Over-routed in real runs (CODEX/CODEX_CLAUDE_CODEX with high effort). Rubric gold is all low-risk;
+      expected_decision reflects policy v6 graduated capacity rules.
+
+  - id: classifier-016-update-and-file-issues
+    request: 'Update GitHub issue #12 with the current status and file a new issue for the follow-up bug.'
+    repository_evidence:
+      - The status and the follow-up bug are already described in the session notes.
+      - No code or repository files change.
+    task_facts:
+      id: classifier-016-update-and-file-issues
+      goal: Update an existing GitHub issue and file one new follow-up issue.
+      dependencies: []
+      acceptance_criteria:
+        - 'Issue #12 shows the current status.'
+        - A new issue describes the follow-up bug.
+      files_or_areas:
+        - github issues
+    gold_classification:
+      task_type: issue_management
+      failure_cost: low
+      semantic_correctness: normal
+      ambiguity: 2
+      implementation_scope: small
+      implementation_required: true
+      cross_layer: false
+      behavior_preservation: not_required
+      diagnosis_required: false
+      assumptions_must_be_explicit: false
+      many_routine_decisions: false
+      production_feature: false
+      security_sensitive: false
+      destructive_operation: false
+    expected_decision:
+      route: CLAUDE
+      primary_intent: implementation
+      capacities:
+        claude_worker: light
+    notes: Over-routed in real runs (CODEX/CODEX_CLAUDE_CODEX with high effort). Rubric gold is all low-risk;
+      expected_decision reflects policy v6 graduated capacity rules.
+
+  - id: classifier-017-allow-push-autonomy-config
+    request: Edit .pi/autonomy.yaml so the orchestrator is allowed to push branches.
+    repository_evidence:
+      - The repository owner explicitly requested the setting.
+      - .pi/autonomy.yaml has a schema that validates the key.
+      - No permission-enforcement code changes.
+    task_facts:
+      id: classifier-017-allow-push-autonomy-config
+      goal: Set the push permission in .pi/autonomy.yaml as requested by the owner.
+      dependencies: []
+      acceptance_criteria:
+        - .pi/autonomy.yaml allows push and validates against schemas/autonomy.schema.json.
+      files_or_areas:
+        - .pi/autonomy.yaml
+    gold_classification:
+      task_type: config_edit
+      failure_cost: low
+      semantic_correctness: normal
+      ambiguity: 2
+      implementation_scope: small
+      implementation_required: true
+      cross_layer: false
+      behavior_preservation: not_required
+      diagnosis_required: false
+      assumptions_must_be_explicit: false
+      many_routine_decisions: false
+      production_feature: false
+      security_sensitive: false
+      destructive_operation: false
+    expected_decision:
+      route: CLAUDE
+      primary_intent: implementation
+      capacities:
+        claude_worker: light
+    notes: Over-routed in real runs (CODEX/CODEX_CLAUDE_CODEX with high effort). Rubric gold is all low-risk;
+      expected_decision reflects policy v6 graduated capacity rules.
+
+  - id: classifier-018-review-agents-md-summarize
+    request: Review AGENTS.md and the .pi configuration and summarize what they require.
+    repository_evidence:
+      - Read-only request; no changes are wanted.
+      - The output is a short summary for the user.
+    task_facts:
+      id: classifier-018-review-agents-md-summarize
+      goal: Read AGENTS.md and .pi configuration and summarize their requirements.
+      dependencies: []
+      acceptance_criteria:
+        - The summary lists the project rules and configured constraints.
+      files_or_areas:
+        - AGENTS.md
+        - .pi
+    gold_classification:
+      task_type: exploration
+      failure_cost: low
+      semantic_correctness: normal
+      ambiguity: 2
+      implementation_scope: small
+      implementation_required: false
+      cross_layer: false
+      behavior_preservation: not_required
+      diagnosis_required: false
+      assumptions_must_be_explicit: false
+      many_routine_decisions: false
+      production_feature: false
+      security_sensitive: false
+      destructive_operation: false
+    expected_decision:
+      route: CODEX
+      primary_intent: analysis
+      capacities:
+        codex_worker: economy
+    notes: Over-routed in real runs (CODEX/CODEX_CLAUDE_CODEX with high effort). Rubric gold is all low-risk;
+      expected_decision reflects policy v6 graduated capacity rules.
+
+  - id: classifier-019-rename-fields-per-review
+    request: Rename the fields the PR reviewer flagged (runId -> run_id, cfg -> config) and update their
+      call sites.
+    repository_evidence:
+      - The reviewer named each field and its new name.
+      - The fields are internal to one module; no persisted or public contract uses them.
+      - Tests cover the module.
+    task_facts:
+      id: classifier-019-rename-fields-per-review
+      goal: Apply the reviewer-requested field renames and update call sites.
+      dependencies: []
+      acceptance_criteria:
+        - Fields are renamed as requested.
+        - Tests pass.
+      files_or_areas:
+        - src/runs
+    gold_classification:
+      task_type: refactor
+      failure_cost: low
+      semantic_correctness: normal
+      ambiguity: 2
+      implementation_scope: small
+      implementation_required: true
+      cross_layer: false
+      behavior_preservation: preferred
+      diagnosis_required: false
+      assumptions_must_be_explicit: false
+      many_routine_decisions: false
+      production_feature: false
+      security_sensitive: false
+      destructive_operation: false
+    expected_decision:
+      route: CODEX
+      primary_intent: implementation
+      capacities:
+        codex_worker: economy
+    notes: Over-routed in real runs (CODEX/CODEX_CLAUDE_CODEX with high effort). Rubric gold is all low-risk;
+      expected_decision reflects policy v6 graduated capacity rules.
+
+  - id: classifier-020-ci-lint-fix-known-cause
+    request: CI fails on ruff F401 unused import in tools/backlog.py; fix it.
+    repository_evidence:
+      - The CI log names the exact rule, file and line.
+      - No other job fails.
+    task_facts:
+      id: classifier-020-ci-lint-fix-known-cause
+      goal: Remove the unused import that fails the CI lint job.
+      dependencies: []
+      acceptance_criteria:
+        - The CI lint job passes.
+      files_or_areas:
+        - tools/backlog.py
+    gold_classification:
+      task_type: ci_fix
+      failure_cost: low
+      semantic_correctness: normal
+      ambiguity: 2
+      implementation_scope: small
+      implementation_required: true
+      cross_layer: false
+      behavior_preservation: not_required
+      diagnosis_required: false
+      assumptions_must_be_explicit: false
+      many_routine_decisions: false
+      production_feature: false
+      security_sensitive: false
+      destructive_operation: false
+    expected_decision:
+      route: CLAUDE
+      primary_intent: implementation
+      capacities:
+        claude_worker: light
+    notes: Over-routed in real runs (CODEX/CODEX_CLAUDE_CODEX with high effort). Rubric gold is all low-risk;
+      expected_decision reflects policy v6 graduated capacity rules.
+
+  - id: classifier-021-scaffold-docs
+    request: Scaffold a README and a docs/ skeleton with section headings for the new package.
+    repository_evidence:
+      - The package has no documentation yet.
+      - Headings only; content will be written later.
+    task_facts:
+      id: classifier-021-scaffold-docs
+      goal: Create README and docs skeleton files with section headings.
+      dependencies: []
+      acceptance_criteria:
+        - README.md and docs/ exist with the agreed section headings.
+      files_or_areas:
+        - README.md
+        - docs
+    gold_classification:
+      task_type: scaffolding
+      failure_cost: low
+      semantic_correctness: normal
+      ambiguity: 2
+      implementation_scope: small
+      implementation_required: true
+      cross_layer: false
+      behavior_preservation: not_required
+      diagnosis_required: false
+      assumptions_must_be_explicit: false
+      many_routine_decisions: false
+      production_feature: false
+      security_sensitive: false
+      destructive_operation: false
+    expected_decision:
+      route: CLAUDE
+      primary_intent: implementation
+      capacities:
+        claude_worker: economy
+    notes: Over-routed in real runs (CODEX/CODEX_CLAUDE_CODEX with high effort). Rubric gold is all low-risk;
+      expected_decision reflects policy v6 graduated capacity rules.
+
+  - id: classifier-022-plan-next-task-record-backlog
+    request: Plan the next task and record the remaining follow-ups as backlog items.
+    repository_evidence:
+      - Follow-ups were identified in the previous run's report.
+      - Backlog items are files under backlog/.
+    task_facts:
+      id: classifier-022-plan-next-task-record-backlog
+      goal: Choose the next task and record remaining follow-ups as backlog items.
+      dependencies: []
+      acceptance_criteria:
+        - Each follow-up exists as a backlog item.
+        - The next task is named.
+      files_or_areas:
+        - backlog
+    gold_classification:
+      task_type: issue_management
+      failure_cost: low
+      semantic_correctness: normal
+      ambiguity: 2
+      implementation_scope: small
+      implementation_required: true
+      cross_layer: false
+      behavior_preservation: not_required
+      diagnosis_required: false
+      assumptions_must_be_explicit: false
+      many_routine_decisions: false
+      production_feature: false
+      security_sensitive: false
+      destructive_operation: false
+    expected_decision:
+      route: CLAUDE
+      primary_intent: implementation
+      capacities:
+        claude_worker: light
+    notes: Over-routed in real runs (CODEX/CODEX_CLAUDE_CODEX with high effort). Rubric gold is all low-risk;
+      expected_decision reflects policy v6 graduated capacity rules.

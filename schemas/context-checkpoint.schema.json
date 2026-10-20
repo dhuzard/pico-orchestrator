@@ -1,0 +1,100 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ContextCheckpoint",
+  "description": "Optional machine-readable operational state for resuming a parent run. Git and orchestration state are collected deterministically. Never contains transcripts, command output, prompts, or secrets.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "run_id", "repository", "sequence", "created_at", "reason", "tokens_before", "git", "orchestration", "files_touched", "state"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "run_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$"},
+    "repository": {"type": ["string", "null"], "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"},
+    "sequence": {"type": "integer", "minimum": 1},
+    "created_at": {"type": "string", "format": "date-time"},
+    "reason": {"type": "string", "enum": ["budget", "threshold", "overflow", "manual"]},
+    "tokens_before": {"type": ["integer", "null"], "minimum": 0},
+    "git": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["branch", "starting_commit", "current_commit", "dirty_files"],
+      "properties": {
+        "branch": {"type": ["string", "null"], "maxLength": 255},
+        "starting_commit": {"type": ["string", "null"], "pattern": "^[0-9a-f]{7,64}$"},
+        "current_commit": {"type": ["string", "null"], "pattern": "^[0-9a-f]{7,64}$"},
+        "dirty_files": {"$ref": "#/$defs/paths"}
+      }
+    },
+    "orchestration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["policy_version", "phases"],
+      "properties": {
+        "policy_version": {"type": ["integer", "null"], "minimum": 1},
+        "phases": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "status", "route"],
+            "properties": {
+              "id": {"type": "string", "maxLength": 128},
+              "status": {"type": "string", "maxLength": 32},
+              "route": {"type": ["string", "null"], "maxLength": 32}
+            }
+          }
+        }
+      }
+    },
+    "files_touched": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["read", "modified"],
+      "properties": {
+        "read": {"$ref": "#/$defs/paths"},
+        "modified": {"$ref": "#/$defs/paths"}
+      }
+    },
+    "state": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["objective", "current_phase", "established_facts", "decisions", "tests_run", "tests_failing", "unresolved_questions", "blockers", "next_actions", "artifacts"],
+      "properties": {
+        "objective": {"type": "string", "minLength": 1, "maxLength": 1000},
+        "current_phase": {"type": "string", "maxLength": 200},
+        "established_facts": {"$ref": "#/$defs/items"},
+        "decisions": {"$ref": "#/$defs/items"},
+        "tests_run": {"$ref": "#/$defs/items"},
+        "tests_failing": {"$ref": "#/$defs/items"},
+        "unresolved_questions": {"$ref": "#/$defs/items"},
+        "blockers": {"$ref": "#/$defs/items"},
+        "next_actions": {"$ref": "#/$defs/items"},
+        "artifacts": {
+          "type": "array",
+          "maxItems": 40,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["path", "purpose"],
+            "properties": {
+              "path": {"type": "string", "minLength": 1, "maxLength": 300},
+              "purpose": {"type": "string", "maxLength": 300}
+            }
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "items": {
+      "type": "array",
+      "maxItems": 40,
+      "items": {"type": "string", "minLength": 1, "maxLength": 500}
+    },
+    "paths": {
+      "type": "array",
+      "maxItems": 200,
+      "items": {"type": "string", "minLength": 1, "maxLength": 300}
+    }
+  }
+}

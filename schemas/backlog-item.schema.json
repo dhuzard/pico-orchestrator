@@ -1,0 +1,274 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "BacklogItem",
+  "description": "A single durable backlog item stored in backlog/backlog.yaml. This is machine-readable task metadata and its dependency graph only -- distinct from GitHub Issues (the human-facing collaboration surface), provenance/runs/<run_id>.json records (append-only execution history), and routing/default-policy.yaml (model/workflow routing decisions). A backlog item never encodes a route, execution plan, or backend binding.",
+  "type": "object",
+  "required": [
+    "id",
+    "title",
+    "description",
+    "status",
+    "version",
+    "priority",
+    "dependencies",
+    "created_at",
+    "updated_at",
+    "acceptance_criteria"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "id": {
+      "type": "string",
+      "description": "Stable orchestrator identifier, e.g. ORCH-001.",
+      "pattern": "^ORCH-[0-9]{3,}$"
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1
+    },
+    "description": {
+      "type": "string"
+    },
+    "status": {
+      "type": "string",
+      "description": "Exactly one of the eight deterministic backlog statuses. See tools/backlog_store.py TRANSITIONS for the valid state-transition table.",
+      "enum": [
+        "proposed",
+        "planned",
+        "ready",
+        "in_progress",
+        "review",
+        "blocked",
+        "completed",
+        "cancelled"
+      ]
+    },
+    "version": {
+      "type": "string",
+      "description": "Milestone/version this item belongs to, e.g. 'v0.3.5'.",
+      "minLength": 1
+    },
+    "priority": {
+      "type": "string",
+      "enum": [
+        "low",
+        "medium",
+        "high",
+        "critical"
+      ]
+    },
+    "dependencies": {
+      "type": "array",
+      "description": "Backlog item ids this item depends on. Must not contain its own id and must not form a cycle (enforced by tools/backlog_store.py, not by this schema).",
+      "items": {
+        "type": "string",
+        "pattern": "^ORCH-[0-9]{3,}$"
+      },
+      "uniqueItems": true
+    },
+    "github_issue": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "description": "Issue number in the repository's GitHub tracker this item is synchronized with, or null if none has been created yet.",
+      "minimum": 1
+    },
+    "github_pr": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "description": "Pull request number in the repository's GitHub tracker associated with this backlog item, or null if none has been created/linked yet.",
+      "minimum": 1
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "acceptance_criteria": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "labels": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "blocked_from": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "The status this item was in immediately before it was moved to 'blocked'. Set automatically by tools/backlog_store.py on entering 'blocked' and cleared on leaving it; enables the 'blocked -> prior state' transition without guessing.",
+      "enum": [
+        "proposed",
+        "planned",
+        "ready",
+        "in_progress",
+        "review",
+        "blocked",
+        "completed",
+        "cancelled",
+        null
+      ]
+    },
+    "blocked_reason": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Required, non-empty whenever status is 'blocked'; explains deterministically why the item is blocked (e.g. an unmet dependency or an external constraint). Null otherwise.",
+      "minLength": 0
+    },
+    "github_sync": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "description": "Last known synchronized snapshot of the associated GitHub issue, used solely to detect local/remote conflicts in tools/backlog.py's github_* functions. Never authoritative for backlog status.",
+      "additionalProperties": false,
+      "properties": {
+        "last_synced_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "remote_title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "remote_state": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "open",
+            "closed",
+            null
+          ]
+        },
+        "remote_labels": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "repo": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
+        },
+        "issue": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "required": [
+        "last_synced_at",
+        "repo",
+        "issue",
+        "remote_title",
+        "remote_state",
+        "remote_labels"
+      ]
+    },
+    "github_pr_sync": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "description": "Last known synchronized snapshot of the associated GitHub pull request, used solely to detect local/remote PR drift. Never authoritative for backlog status.",
+      "additionalProperties": false,
+      "properties": {
+        "last_synced_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "remote_title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "remote_state": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "open",
+            "closed",
+            "merged",
+            null
+          ]
+        },
+        "remote_body": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "head_ref": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "base_ref": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "is_draft": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "repo": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
+        },
+        "pr": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "issue": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "required": [
+        "last_synced_at",
+        "repo",
+        "pr",
+        "issue",
+        "remote_title",
+        "remote_state",
+        "remote_body",
+        "head_ref",
+        "base_ref",
+        "is_draft"
+      ]
+    }
+  }
+}

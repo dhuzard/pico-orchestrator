@@ -1,0 +1,52 @@
+name: Bug report
+description: Report a reproducible defect or regression.
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: dropdown
+    id: severity
+    attributes:
+      label: Severity
+      options: [Blocker, High, Medium, Low]
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What is wrong, and what user or system behavior is affected?
+      placeholder: Describe the observed behavior and impact.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction
+      description: Minimal deterministic steps, command, fixture, or input that reproduces the problem.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: State the contract or behavior that should hold.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence
+      description: Relevant logs, stack traces, failing tests, screenshots, commit SHAs, or provenance references. Remove secrets.
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope and non-scope
+      description: Bound the repair. State explicitly what should not change.
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: Use testable bullets. Include regression coverage and validation commands when known.
+      placeholder: "- [ ] ..."
+    validations:
+      required: true

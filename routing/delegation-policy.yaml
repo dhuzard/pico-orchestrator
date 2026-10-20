@@ -1,0 +1,145 @@
+# Nested lead-agent delegation policy v1.
+#
+# This policy applies AFTER routing/default-policy.yaml has deterministically
+# selected the top-level execution plan. It never changes selected_route,
+# capacity assignment, permissions, independent-review requirements, or project
+# risk floors. It governs whether a Codex/Claude lead execution step should
+# execute directly or use bounded subagents inside its assigned scope.
+version: 1
+
+objective: minimize_wall_clock_tokens_duplication_integration_risk_while_preserving_correctness
+
+allowed_modes:
+  - DIRECT
+  - DELEGATE
+  - PARALLEL
+  - BLOCKED
+  - SEQUENTIAL
+
+utility:
+  positive:
+    - parallelism
+    - context_isolation
+    - specialization
+  negative:
+    - coordination_cost
+    - shared_state_risk
+    - verification_cost
+
+shared:
+  max_parallel_workers: 4
+  prefer_smallest_useful_fanout: true
+  manager_owns_final_response: true
+  large_team_requires_repository_wide_independence: true
+  deterministic_verification_first: true
+  parallel_mutation_requires_isolated_worktrees: true
+  overlapping_write_ownership: forbidden
+  event_driven_coordination: true
+  poll_only_without_event_mechanism: true
+  continue_until_scoped_batch_complete: true
+  ambiguous_requirement_action: lead_or_user
+
+  direct_conditions:
+    - few_tool_calls
+    - shared_file_writes
+    - strongly_sequential
+    - deterministic_tool_can_answer
+    - delegation_overhead_exceeds_execution
+    - duplicate_review
+    - fixed_deterministic_graph
+    - single_slow_external_operation
+
+  delegation_conditions:
+    - independent_parallel_work
+    - substantial_isolated_exploration
+    - specialist_review_improves_correctness
+    - independent_hypotheses
+    - implementation_and_verification_parallelizable
+    - context_isolation_prevents_overload
+    - distinct_specialist_contract
+
+  independent_review_conditions:
+    - security_sensitive
+    - migration
+    - scientific_or_statistical_logic
+    - complex_concurrency
+    - large_architectural_change
+    - subtle_regression_risk
+    - tests_may_share_implementation_assumption
+
+  retry:
+    local_failure: focused_correction_same_worker
+    wrong_architecture: return_to_lead_and_replan
+    repeated_failure: escalate_capability_or_fresh_agent
+    ambiguous_requirement: lead_or_user
+    deterministic_failure: return_exact_error
+    blind_retry_loops: false
+
+families:
+  codex:
+    bias: slight_delegate_when_parallelism_or_context_isolation_exists
+    planning_assignment_min: 3
+    planning_assignment_max: 5
+    max_parallel_workers: 4
+    architecture_owned_by_lead: true
+    continue_existing_for_contextual_followup: true
+    fresh_agent_for_independent_reasoning: true
+    nested_delegation: allowed_with_clear_benefit
+
+  claude:
+    bias: direct_unless_clear_parallelism_isolation_or_specialization_benefit
+    max_parallel_workers: 3
+    architecture_owned_by_lead: true
+    nested_delegation: clear_benefit_required
+    strongest_model_not_default: true
+    worker_architecture_redesign: forbidden_unless_explicitly_assigned
+
+    # Abstract capacity tiers only. Concrete model ids remain centralized in
+    # routing/default-policy.yaml model_profiles.claude.
+    model_tiers:
+      strong_lead: high
+      mid_worker: standard
+      lightweight_worker: economy
+      light_worker: light
+
+metrics:
+  record_where_possible:
+    - lead_model
+    - worker_models
+    - spawned_agents
+    - assigned_tasks
+    - lead_tokens
+    - worker_tokens
+    - cached_tokens
+    - total_tokens
+    - wall_clock_duration
+    - worker_execution_time
+    - coordination_time
+    - conflicting_edits
+    - corrective_turns
+    - failed_attempts
+    - test_outcome
+    - ci_outcome
+    - reviewer_findings
+    - human_corrections_required
+    - final_task_success
+    - estimated_cost
+  derived:
+    - coordination_tax_tokens
+    - coordination_tax_time
+    - quality_gain
+    - parallel_speedup
+
+learning:
+  # Never alter routing/delegation inside a run from observed telemetry.
+  # Accumulated results may only change this policy through a reviewed,
+  # versioned repository change.
+  online_adaptation: false
+  policy_update_mode: offline_reviewed_versioned_change
+  required_benchmark_topologies:
+    - direct
+    - one_worker
+    - two_workers
+    - three_to_four_workers
+    - mixed_model_workers
+    - same_model_workers

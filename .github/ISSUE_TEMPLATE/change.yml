@@ -1,0 +1,52 @@
+name: Feature or change
+description: Propose a bounded capability, behavior change, or architecture improvement.
+title: "[Change] "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / user value
+      description: What concrete limitation or need motivates this change?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: Describe the smallest coherent change that solves the problem.
+    validations:
+      required: true
+  - type: textarea
+    id: constraints
+    attributes:
+      label: Constraints and invariants
+      description: Security, compatibility, provenance, API, data, or behavior-preservation constraints.
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Include simpler options and why they are insufficient.
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: Testable conditions for completion.
+      placeholder: "- [ ] ..."
+    validations:
+      required: true
+  - type: textarea
+    id: validation
+    attributes:
+      label: Validation plan
+      description: Tests, CI, smoke tests, migration checks, or manual validation required.
+  - type: textarea
+    id: risks
+    attributes:
+      label: Risks / rollback
+      description: Failure modes, compatibility risk, and how to disable or revert the change.
+  - type: textarea
+    id: nonscope
+    attributes:
+      label: Non-scope / follow-up
+      description: Explicitly separate deferred work.

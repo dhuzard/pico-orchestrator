@@ -1,0 +1,231 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "WorkspaceExecutionPlan",
+  "description": "A versioned manifest describing one mission that spans several repositories. It is a separate record above the single-repository Mission: each repository keeps its own parent orchestration run, target_repository, worktrees, tests and pull requests. Repository identity is explicit (owner/repository) and execution inputs are immutable: a pinned commit SHA, never a branch name.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "id",
+    "goal",
+    "max_parallel",
+    "repositories",
+    "tasks"
+  ],
+  "additionalProperties": false,
+  "$defs": {
+    "slug": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$"
+    },
+    "sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "contract": {
+      "type": "object",
+      "required": [
+        "contract",
+        "version"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "contract": {
+          "$ref": "#/$defs/slug"
+        },
+        "version": {
+          "type": "string",
+          "pattern": "^[0-9A-Za-z][0-9A-Za-z.+-]{0,63}$"
+        }
+      }
+    },
+    "check": {
+      "type": "object",
+      "required": [
+        "id",
+        "repository",
+        "argv"
+      ],
+      "additionalProperties": false,
+      "description": "A local command run with shell=False in a temporary detached worktree of the repository at the commit under validation. Only the exit status is recorded; output goes to a log in orchestrator state.",
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/slug"
+        },
+        "repository": {
+          "$ref": "#/$defs/slug"
+        },
+        "argv": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096
+          }
+        },
+        "timeout_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 3600,
+          "default": 600
+        }
+      }
+    }
+  },
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "id": {
+      "$ref": "#/$defs/slug"
+    },
+    "goal": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 2000
+    },
+    "max_parallel": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 64
+    },
+    "repositories": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 64,
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "repository",
+          "path",
+          "pinned_commit"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "$ref": "#/$defs/slug"
+          },
+          "repository": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/[A-Za-z0-9._-]{1,100}$"
+          },
+          "path": {
+            "type": "string",
+            "minLength": 1
+          },
+          "pinned_commit": {
+            "$ref": "#/$defs/sha"
+          },
+          "base_branch": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$",
+            "default": "main",
+            "description": "Base branch for this repository's draft PRs."
+          }
+        }
+      }
+    },
+    "tasks": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 256,
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "repository",
+          "title"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "$ref": "#/$defs/slug"
+          },
+          "repository": {
+            "$ref": "#/$defs/slug"
+          },
+          "title": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          },
+          "depends_on": {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/slug"
+            },
+            "uniqueItems": true,
+            "default": []
+          },
+          "readiness": {
+            "description": "Declared readiness of the task. Only ready_for_downstream and merged unblock dependents: implemented (a PR exists) and validated (tests pass) do not assert that the interface is stable.",
+            "type": "string",
+            "enum": [
+              "planned",
+              "implemented",
+              "validated",
+              "ready_for_downstream",
+              "merged"
+            ],
+            "default": "planned"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "implementation",
+              "qualification"
+            ],
+            "default": "implementation",
+            "description": "qualification tasks launch no child run: their checks run once every dependency is validated."
+          },
+          "issue": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Issue in this task's repository that its draft PR references (Refs #N)."
+          },
+          "provides": {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/contract"
+            },
+            "maxItems": 32
+          },
+          "requires": {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/contract"
+            },
+            "maxItems": 32,
+            "description": "Each required contract must be provided, at the same version, by a direct dependency."
+          },
+          "checks": {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/check"
+            },
+            "maxItems": 32
+          }
+        }
+      }
+    },
+    "budget": {
+      "description": "Optional spend limit across the workspace's child runs. The scheduler launches nothing once it is reached; running children are not stopped. max_cost_usd uses backend-reported cost, which only Claude workers report today, so it is a lower bound.",
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "properties": {
+        "max_tokens": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Input plus output tokens across all child runs."
+        },
+        "max_cost_usd": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        }
+      }
+    }
+  }
+}

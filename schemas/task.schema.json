@@ -1,0 +1,244 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AgenticCodingTask",
+  "description": "One classified, executable engineering task. Classify the task itself, not the repository: every risk flag defaults to its low-risk value and is escalated only on concrete task evidence, recorded in escalation_evidence. Repository-wide AGENTS.md guardrails (for example 'do not invent facts' or 'this is a scientific project') govern worker conduct, not task risk.",
+  "type": "object",
+  "required": [
+    "id",
+    "goal",
+    "task_type",
+    "failure_cost",
+    "semantic_correctness",
+    "ambiguity",
+    "implementation_scope",
+    "implementation_required",
+    "cross_layer",
+    "behavior_preservation",
+    "diagnosis_required",
+    "assumptions_must_be_explicit",
+    "many_routine_decisions",
+    "production_feature",
+    "security_sensitive",
+    "destructive_operation",
+    "dependencies",
+    "acceptance_criteria",
+    "files_or_areas"
+  ],
+  "properties": {
+    "id": {
+      "description": "Stable task identifier, unique within the batch.",
+      "type": "string"
+    },
+    "goal": {
+      "description": "One-sentence outcome the task must achieve.",
+      "type": "string"
+    },
+    "task_type": {
+      "description": "Dominant kind of work. Operational types: vcs_operation = branch/commit/push/open or update a PR with already-decided content; issue_management = file, update, label or close issues/backlog items, or plan and record next tasks; config_edit = edit tool/project configuration such as .pi/*.yaml or CI settings with a known intended value; ci_fix = repair a failing CI check (set diagnosis_required only when the cause is not yet known). Use documentation for docs, scaffolding for skeletons, exploration for reading and summarizing existing material, and review/security_review only for adversarial correctness review of code or changes.",
+      "type": "string",
+      "enum": [
+        "exploration",
+        "architecture",
+        "debugging",
+        "root_cause",
+        "invariant_definition",
+        "scientific_semantics",
+        "implementation",
+        "broad_feature",
+        "end_to_end_feature",
+        "ui_ux",
+        "scaffolding",
+        "plumbing",
+        "refactor",
+        "review",
+        "security_review",
+        "migration",
+        "documentation",
+        "testing",
+        "vcs_operation",
+        "issue_management",
+        "config_edit",
+        "ci_fix"
+      ]
+    },
+    "work_profile": {
+      "description": "Optional demand profile for captain decomposition. Scores are 0 (not needed) through 10 (exceptional demand), anchored by docs/work-modes.md. It describes work required, not a model rating or route override. New tasks should provide it; legacy tasks remain valid.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["search", "analysis", "writing", "implementation", "verification", "coordination"],
+      "properties": {
+        "search": {"$ref": "#/$defs/workDemandScore"},
+        "analysis": {"$ref": "#/$defs/workDemandScore"},
+        "writing": {"$ref": "#/$defs/workDemandScore"},
+        "implementation": {"$ref": "#/$defs/workDemandScore"},
+        "verification": {"$ref": "#/$defs/workDemandScore"},
+        "coordination": {"$ref": "#/$defs/workDemandScore"}
+      }
+    },
+    "failure_cost": {
+      "description": "Cost of a wrong result reaching main. low = trivially detected and reverted (docs, config, VCS/issue operations, small local code); medium = a defect could ship in normal production code and need a follow-up fix; high = a defect would be costly or hard to reverse (data loss, released contract break, security exposure). high requires escalation_evidence.",
+      "type": "string",
+      "enum": [
+        "low",
+        "medium",
+        "high"
+      ]
+    },
+    "semantic_correctness": {
+      "description": "How much the task's meaning must be exactly right beyond tests passing. low = wording, layout or operational steps; normal = ordinary code where tests and review catch mistakes; critical = a wrong result would silently corrupt scientific, statistical or user data, or contract semantics. A scientific repository alone is not critical. critical requires escalation_evidence.",
+      "type": "string",
+      "enum": [
+        "low",
+        "normal",
+        "critical"
+      ]
+    },
+    "ambiguity": {
+      "description": "Residual uncertainty after inspecting repository context, scored 0-10. 0-3 = material choices settled; 4-6 = bounded local choices; 7-8 = competing consequential contracts requiring specification; 9-10 = severe unresolved uncertainty, often needing decomposition or an owner decision. Missing investigation, task size, and difficulty alone do not raise this score. Scores 7-10 require escalation_evidence naming the unresolved choice and repository evidence.",
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 10
+    },
+    "ambiguity_assessment": {
+      "description": "Optional structured record of residual ambiguity after repository inspection. New tasks scored 4-10 should provide it; routine 0-3 and legacy tasks may omit it. The overall ambiguity score equals the highest dimension score before project risk floors.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["outcome", "contract", "design", "evidence", "authority"],
+      "properties": {
+        "outcome": {"$ref": "#/$defs/ambiguityDimension"},
+        "contract": {"$ref": "#/$defs/ambiguityDimension"},
+        "design": {"$ref": "#/$defs/ambiguityDimension"},
+        "evidence": {"$ref": "#/$defs/ambiguityDimension"},
+        "authority": {"$ref": "#/$defs/ambiguityDimension"}
+      }
+    },
+    "implementation_scope": {
+      "description": "Breadth of the change. small = one area, a few files; medium = several related files or modules; broad = many modules or an end-to-end feature.",
+      "type": "string",
+      "enum": [
+        "small",
+        "medium",
+        "broad"
+      ]
+    },
+    "implementation_required": {
+      "description": "true when the task changes repository files (code, tests, docs, config, backlog) or performs a mutating operation such as commit, push, PR creation or filing/updating issues; false for read-only analysis, review or summaries.",
+      "type": "boolean"
+    },
+    "cross_layer": {
+      "description": "true only when the change must keep several layers consistent (for example UI + API + persistence).",
+      "type": "boolean"
+    },
+    "behavior_preservation": {
+      "description": "not_required = no existing runtime behavior is constrained (new code, docs, git, issue and config operations); preferred = existing behavior should not change but small, reviewed differences are acceptable; required = a refactor or migration of existing runtime behavior that must stay exactly equivalent. Git, docs and issue operations are never required. required requires escalation_evidence.",
+      "type": "string",
+      "enum": [
+        "not_required",
+        "preferred",
+        "required"
+      ]
+    },
+    "diagnosis_required": {
+      "description": "true only when the root cause of a failure is unknown and must be found before fixing. A failure with a known cause (for example a named lint error) is false.",
+      "type": "boolean"
+    },
+    "assumptions_must_be_explicit": {
+      "description": "true only when the task must decide unverified domain or data-contract assumptions (units, statistical definitions, schema meaning) that the worker cannot confirm from the repository. Generic AGENTS.md rules such as 'do not invent facts' do not count. true requires escalation_evidence.",
+      "type": "boolean"
+    },
+    "many_routine_decisions": {
+      "description": "true when the work consists of many small, low-stakes implementation choices (UI polish, adapters, boilerplate) rather than a few consequential ones.",
+      "type": "boolean"
+    },
+    "production_feature": {
+      "description": "true when the task adds or changes user-facing production functionality; false for tooling, docs, tests, CI, configuration, git and issue work.",
+      "type": "boolean"
+    },
+    "security_sensitive": {
+      "description": "true only when the task changes how authentication, authorization, secrets, permissions or sandboxing are implemented or enforced, or how untrusted input is handled. Filing issues, editing docs and applying an owner-requested setting in project tool configuration (for example .pi/autonomy.yaml) are false. true requires escalation_evidence.",
+      "type": "boolean"
+    },
+    "destructive_operation": {
+      "description": "true only when the task deletes or irreversibly rewrites data, history or resources (data deletion, force-push, dropping tables, deleting branches with unmerged work). A normal push or commit is false. true requires escalation_evidence.",
+      "type": "boolean"
+    },
+    "dependencies": {
+      "description": "Ids of tasks that must complete before this one.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "acceptance_criteria": {
+      "description": "Observable conditions that prove the task is done.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "files_or_areas": {
+      "description": "Files, directories or areas the task touches.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "escalation_evidence": {
+      "description": "Optional map from a classification field name to a one-line, task-specific justification. route_task rejects the classification with CLASSIFICATION_EVIDENCE_MISSING when any of these values lacks an entry: failure_cost=high, semantic_correctness=critical, ambiguity>=7, behavior_preservation=required, assumptions_must_be_explicit=true, security_sensitive=true, destructive_operation=true. Project risk floors from .pi/routing.yaml are exempt.",
+      "type": "object",
+      "propertyNames": {
+        "enum": [
+          "task_type",
+          "failure_cost",
+          "semantic_correctness",
+          "ambiguity",
+          "implementation_scope",
+          "implementation_required",
+          "cross_layer",
+          "behavior_preservation",
+          "diagnosis_required",
+          "assumptions_must_be_explicit",
+          "many_routine_decisions",
+          "production_feature",
+          "security_sensitive",
+          "destructive_operation"
+        ]
+      },
+      "additionalProperties": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 500,
+        "pattern": "\\S"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "workDemandScore": {"type": "integer", "minimum": 0, "maximum": 10},
+    "ambiguityDimension": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["level", "unresolved_choices", "repository_evidence"],
+      "properties": {
+        "level": {"type": "integer", "minimum": 0, "maximum": 10},
+        "unresolved_choices": {
+          "type": "array", "maxItems": 8,
+          "items": {"type": "string", "minLength": 1, "maxLength": 500, "pattern": "\\S"}
+        },
+        "repository_evidence": {
+          "type": "array", "maxItems": 8,
+          "items": {"type": "string", "minLength": 1, "maxLength": 500, "pattern": "\\S"}
+        }
+      },
+      "allOf": [{
+        "if": {"properties": {"level": {"minimum": 4}}, "required": ["level"]},
+        "then": {
+          "properties": {
+            "unresolved_choices": {"minItems": 1},
+            "repository_evidence": {"minItems": 1}
+          }
+        }
+      }]
+    }
+  }
+}

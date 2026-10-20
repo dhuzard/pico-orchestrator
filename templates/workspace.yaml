@@ -1,0 +1,42 @@
+# Workspace execution plan: one mission across several repositories.
+# Validate and plan it, without launching anything, with:
+#   pico plan workspace.yaml
+# Every repository needs an explicit owner/repository that matches a GitHub
+# remote of its checkout, and a full 40-character commit SHA as the pin
+# (quote it: YAML reads an all-digit SHA as a number).
+# Each task may declare a readiness: planned (default), implemented, validated,
+# ready_for_downstream or merged. Only ready_for_downstream and merged unblock
+# dependents: a PR that exists (implemented) or passes tests (validated) is not
+# evidence that its interface is stable. A planned task with no blocking
+# dependency is reported as dispatchable.
+schema_version: 1
+id: evidence-workflow
+goal: Integrate structured claims, source evidence and contributor attribution across repositories.
+max_parallel: 3
+# Optional spend limit across all child runs. Once reached, the scheduler
+# launches nothing new (running children continue). Cost is reported only
+# by Claude workers today, so max_cost_usd is a lower bound on real spend.
+# budget:
+#   max_tokens: 2000000
+#   max_cost_usd: 25
+repositories:
+  - id: producer
+    repository: owner/producer
+    path: ../producer
+    pinned_commit: "0000000000000000000000000000000000000000"
+  - id: consumer
+    repository: owner/consumer
+    path: ../consumer
+    pinned_commit: "0000000000000000000000000000000000000000"
+tasks:
+  - id: claim-adapter
+    repository: producer
+    title: Claim adapter exposing the structured claim contract
+  - id: evidence-extraction
+    repository: consumer
+    title: Evidence extraction producing source evidence records
+    readiness: implemented
+  - id: consume-claims
+    repository: consumer
+    title: Consume validated claim records
+    depends_on: [claim-adapter, evidence-extraction]

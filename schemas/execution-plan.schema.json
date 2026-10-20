@@ -1,0 +1,123 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ExecutionPlan",
+  "description": "A machine-validatable, backend-agnostic execution plan materialized for a selected route and a derived primary intent. Plans describe intent, family, authored capacity, reasoning effort, context strategy, fresh-context/mutation/review requirements and dependencies -- never model or tool names. Models and context-window tiers are resolved separately through routing/default-policy.yaml's model profiles and execution backends.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "independent_review_required",
+    "steps"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": 3
+    },
+    "independent_review_required": {
+      "type": "boolean"
+    },
+    "steps": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 3,
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "order",
+          "role",
+          "family",
+          "intent",
+          "capacity_tier",
+          "reasoning_effort",
+          "context_strategy",
+          "fresh_context",
+          "mutation_permission",
+          "depends_on",
+          "independent_review"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "order": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "role": {
+            "type": "string",
+            "enum": [
+              "specifier",
+              "worker",
+              "reviewer"
+            ]
+          },
+          "family": {
+            "type": "string",
+            "enum": [
+              "codex",
+              "claude"
+            ]
+          },
+          "intent": {
+            "type": "string",
+            "enum": [
+              "analysis",
+              "implementation",
+              "review"
+            ]
+          },
+          "capacity_tier": {
+            "description": "Authored capacity tier (ordered light < economy < standard < high < max). Policy plans author only standard/high/max (the default policy authors max nowhere); validated post-route capacity assignment may separately select light/economy, or escalate a specifier/reviewer to max, without mutating this plan.",
+            "type": "string",
+            "enum": [
+              "light",
+              "economy",
+              "standard",
+              "high",
+              "max"
+            ]
+          },
+          "reasoning_effort": {
+            "type": "string",
+            "enum": [
+              "low",
+              "medium",
+              "high"
+            ]
+          },
+          "context_strategy": {
+            "type": "string",
+            "enum": [
+              "focused",
+              "full"
+            ]
+          },
+          "fresh_context": {
+            "type": "boolean"
+          },
+          "mutation_permission": {
+            "type": "string",
+            "enum": [
+              "forbidden",
+              "allowed"
+            ]
+          },
+          "depends_on": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            },
+            "uniqueItems": true
+          },
+          "independent_review": {
+            "type": "boolean"
+          }
+        }
+      }
+    }
+  }
+}

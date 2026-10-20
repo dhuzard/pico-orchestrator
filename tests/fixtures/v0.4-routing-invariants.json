@@ -1,0 +1,929 @@
+{
+  "description": "Frozen routing, authored-capacity, and execution-safety invariants predating post-route economy assignment.",
+  "fallback_route": "CODEX",
+  "fixture_version": "v0.4",
+  "plans_without_schema_version": {
+    "CLAUDE": {
+      "analysis": {
+        "independent_review_required": false,
+        "steps": [
+          {
+            "capacity_tier": "standard",
+            "context_strategy": "full",
+            "depends_on": [],
+            "family": "claude",
+            "fresh_context": true,
+            "id": "claude_worker",
+            "independent_review": false,
+            "intent": "analysis",
+            "mutation_permission": "forbidden",
+            "order": 1,
+            "reasoning_effort": "medium",
+            "role": "worker"
+          }
+        ]
+      },
+      "implementation": {
+        "independent_review_required": false,
+        "steps": [
+          {
+            "capacity_tier": "standard",
+            "context_strategy": "full",
+            "depends_on": [],
+            "family": "claude",
+            "fresh_context": true,
+            "id": "claude_worker",
+            "independent_review": false,
+            "intent": "implementation",
+            "mutation_permission": "allowed",
+            "order": 1,
+            "reasoning_effort": "medium",
+            "role": "worker"
+          }
+        ]
+      },
+      "review": {
+        "independent_review_required": false,
+        "steps": [
+          {
+            "capacity_tier": "standard",
+            "context_strategy": "full",
+            "depends_on": [],
+            "family": "claude",
+            "fresh_context": true,
+            "id": "claude_worker",
+            "independent_review": false,
+            "intent": "review",
+            "mutation_permission": "forbidden",
+            "order": 1,
+            "reasoning_effort": "medium",
+            "role": "worker"
+          }
+        ]
+      }
+    },
+    "CLAUDE_CODEX": {
+      "analysis": {
+        "independent_review_required": true,
+        "steps": [
+          {
+            "capacity_tier": "standard",
+            "context_strategy": "full",
+            "depends_on": [],
+            "family": "claude",
+            "fresh_context": true,
+            "id": "claude_worker",
+            "independent_review": false,
+            "intent": "analysis",
+            "mutation_permission": "forbidden",
+            "order": 1,
+            "reasoning_effort": "medium",
+            "role": "worker"
+          },
+          {
+            "capacity_tier": "standard",
+            "context_strategy": "focused",
+            "depends_on": [
+              "claude_worker"
+            ],
+            "family": "codex",
+            "fresh_context": true,
+            "id": "codex_reviewer",
+            "independent_review": true,
+            "intent": "review",
+            "mutation_permission": "forbidden",
+            "order": 2,
+            "reasoning_effort": "high",
+            "role": "reviewer"
+          }
+        ]
+      },
+      "implementation": {
+        "independent_review_required": true,
+        "steps": [
+          {
+            "capacity_tier": "standard",
+            "context_strategy": "full",
+            "depends_on": [],
+            "family": "claude",
+            "fresh_context": true,
+            "id": "claude_worker",
+            "independent_review": false,
+            "intent": "implementation",
+            "mutation_permission": "allowed",
+            "order": 1,
+            "reasoning_effort": "medium",
+            "role": "worker"
+          },
+          {
+            "capacity_tier": "standard",
+            "context_strategy": "focused",
+            "depends_on": [
+              "claude_worker"
+            ],
+            "family": "codex",
+            "fresh_context": true,
+            "id": "codex_reviewer",
+            "independent_review": true,
+            "intent": "review",
+            "mutation_permission": "forbidden",
+            "order": 2,
+            "reasoning_effort": "high",
+            "role": "reviewer"
+          }
+        ]
+      },
+      "review": {
+        "independent_review_required": true,
+        "steps": [
+          {
+            "capacity_tier": "standard",
+            "context_strategy": "full",
+            "depends_on": [],
+            "family": "claude",
+            "fresh_context": true,
+            "id": "claude_worker",
+            "independent_review": false,
+            "intent": "review",
+            "mutation_permission": "forbidden",
+            "order": 1,
+            "reasoning_effort": "medium",
+            "role": "worker"
+          },
+          {
+            "capacity_tier": "standard",
+            "context_strategy": "focused",
+            "depends_on": [
+              "claude_worker"
+            ],
+            "family": "codex",
+            "fresh_context": true,
+            "id": "codex_reviewer",
+            "independent_review": true,
+            "intent": "review",
+            "mutation_permission": "forbidden",
+            "order": 2,
+            "reasoning_effort": "high",
+            "role": "reviewer"
+          }
+        ]
+      }
+    },
+    "CODEX": {
+      "analysis": {
+        "independent_review_required": false,
+        "steps": [
+          {
+            "capacity_tier": "standard",
+            "context_strategy": "full",
+            "depends_on": [],
+            "family": "codex",
+            "fresh_context": true,
+            "id": "codex_worker",
+            "independent_review": false,
+            "intent": "analysis",
+            "mutation_permission": "forbidden",
+            "order": 1,
+            "reasoning_effort": "high",
+            "role": "worker"
+          }
+        ]
+      },
+      "implementation": {
+        "independent_review_required": false,
+        "steps": [
+          {
+            "capacity_tier": "standard",
+            "context_strategy": "full",
+            "depends_on": [],
+            "family": "codex",
+            "fresh_context": true,
+            "id": "codex_worker",
+            "independent_review": false,
+            "intent": "implementation",
+            "mutation_permission": "allowed",
+            "order": 1,
+            "reasoning_effort": "high",
+            "role": "worker"
+          }
+        ]
+      },
+      "review": {
+        "independent_review_required": false,
+        "steps": [
+          {
+            "capacity_tier": "standard",
+            "context_strategy": "full",
+            "depends_on": [],
+            "family": "codex",
+            "fresh_context": true,
+            "id": "codex_worker",
+            "independent_review": false,
+            "intent": "review",
+            "mutation_permission": "forbidden",
+            "order": 1,
+            "reasoning_effort": "high",
+            "role": "worker"
+          }
+        ]
+      }
+    },
+    "CODEX_CLAUDE_CODEX": {
+      "analysis": {
+        "independent_review_required": true,
+        "steps": [
+          {
+            "capacity_tier": "high",
+            "context_strategy": "full",
+            "depends_on": [],
+            "family": "codex",
+            "fresh_context": true,
+            "id": "codex_specifier",
+            "independent_review": false,
+            "intent": "analysis",
+            "mutation_permission": "forbidden",
+            "order": 1,
+            "reasoning_effort": "high",
+            "role": "specifier"
+          },
+          {
+            "capacity_tier": "high",
+            "context_strategy": "full",
+            "depends_on": [
+              "codex_specifier"
+            ],
+            "family": "claude",
+            "fresh_context": true,
+            "id": "claude_worker",
+            "independent_review": false,
+            "intent": "analysis",
+            "mutation_permission": "forbidden",
+            "order": 2,
+            "reasoning_effort": "high",
+            "role": "worker"
+          },
+          {
+            "capacity_tier": "high",
+            "context_strategy": "focused",
+            "depends_on": [
+              "codex_specifier",
+              "claude_worker"
+            ],
+            "family": "codex",
+            "fresh_context": true,
+            "id": "codex_reviewer",
+            "independent_review": true,
+            "intent": "review",
+            "mutation_permission": "forbidden",
+            "order": 3,
+            "reasoning_effort": "high",
+            "role": "reviewer"
+          }
+        ]
+      },
+      "implementation": {
+        "independent_review_required": true,
+        "steps": [
+          {
+            "capacity_tier": "high",
+            "context_strategy": "full",
+            "depends_on": [],
+            "family": "codex",
+            "fresh_context": true,
+            "id": "codex_specifier",
+            "independent_review": false,
+            "intent": "analysis",
+            "mutation_permission": "forbidden",
+            "order": 1,
+            "reasoning_effort": "high",
+            "role": "specifier"
+          },
+          {
+            "capacity_tier": "high",
+            "context_strategy": "full",
+            "depends_on": [
+              "codex_specifier"
+            ],
+            "family": "claude",
+            "fresh_context": true,
+            "id": "claude_worker",
+            "independent_review": false,
+            "intent": "implementation",
+            "mutation_permission": "allowed",
+            "order": 2,
+            "reasoning_effort": "high",
+            "role": "worker"
+          },
+          {
+            "capacity_tier": "high",
+            "context_strategy": "focused",
+            "depends_on": [
+              "codex_specifier",
+              "claude_worker"
+            ],
+            "family": "codex",
+            "fresh_context": true,
+            "id": "codex_reviewer",
+            "independent_review": true,
+            "intent": "review",
+            "mutation_permission": "forbidden",
+            "order": 3,
+            "reasoning_effort": "high",
+            "role": "reviewer"
+          }
+        ]
+      },
+      "review": {
+        "independent_review_required": true,
+        "steps": [
+          {
+            "capacity_tier": "high",
+            "context_strategy": "full",
+            "depends_on": [],
+            "family": "codex",
+            "fresh_context": true,
+            "id": "codex_specifier",
+            "independent_review": false,
+            "intent": "analysis",
+            "mutation_permission": "forbidden",
+            "order": 1,
+            "reasoning_effort": "high",
+            "role": "specifier"
+          },
+          {
+            "capacity_tier": "high",
+            "context_strategy": "full",
+            "depends_on": [
+              "codex_specifier"
+            ],
+            "family": "claude",
+            "fresh_context": true,
+            "id": "claude_worker",
+            "independent_review": false,
+            "intent": "review",
+            "mutation_permission": "forbidden",
+            "order": 2,
+            "reasoning_effort": "high",
+            "role": "worker"
+          },
+          {
+            "capacity_tier": "high",
+            "context_strategy": "focused",
+            "depends_on": [
+              "codex_specifier",
+              "claude_worker"
+            ],
+            "family": "codex",
+            "fresh_context": true,
+            "id": "codex_reviewer",
+            "independent_review": true,
+            "intent": "review",
+            "mutation_permission": "forbidden",
+            "order": 3,
+            "reasoning_effort": "high",
+            "role": "reviewer"
+          }
+        ]
+      }
+    }
+  },
+  "precedence": [
+    "CODEX_CLAUDE_CODEX",
+    "CLAUDE_CODEX",
+    "CODEX",
+    "CLAUDE"
+  ],
+  "risk_override_fields": {
+    "ordered": [
+      "failure_cost",
+      "semantic_correctness",
+      "ambiguity",
+      "implementation_scope",
+      "behavior_preservation"
+    ],
+    "safety": [
+      "cross_layer",
+      "diagnosis_required",
+      "assumptions_must_be_explicit",
+      "production_feature",
+      "security_sensitive",
+      "destructive_operation"
+    ]
+  },
+  "routes": {
+    "CLAUDE": {
+      "description": "Broad comparatively low-risk implementation where maintaining a coherent end-to-end objective and resolving routine implementation decisions matters more than adversarial verification.\n",
+      "match": {
+        "all": [
+          {
+            "all": [
+              {
+                "field": "failure_cost",
+                "operator": "IN",
+                "value": [
+                  "low",
+                  "medium"
+                ]
+              },
+              {
+                "field": "semantic_correctness",
+                "operator": "!=",
+                "value": "critical"
+              }
+            ]
+          },
+          {
+            "any": [
+              {
+                "field": "implementation_scope",
+                "operator": "==",
+                "value": "broad"
+              },
+              {
+                "field": "cross_layer",
+                "operator": "==",
+                "value": true
+              },
+              {
+                "field": "task_type",
+                "operator": "IN",
+                "value": [
+                  "ui_ux",
+                  "scaffolding",
+                  "plumbing",
+                  "documentation",
+                  "broad_feature",
+                  "end_to_end_feature",
+                  "vcs_operation",
+                  "issue_management",
+                  "config_edit",
+                  "ci_fix"
+                ]
+              },
+              {
+                "field": "many_routine_decisions",
+                "operator": "==",
+                "value": true
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "CLAUDE_CODEX": {
+      "description": "Normal production work: Claude builds, then a fresh Codex context independently reviews and verifies. Consequential uncertainty signals such as diagnosis, critical semantics, required behavior preservation, explicit-assumption requirements, security sensitivity, or destructive operations are excluded so they remain Codex-led.\n",
+      "match": {
+        "all": [
+          {
+            "all": [
+              {
+                "field": "implementation_required",
+                "operator": "==",
+                "value": true
+              },
+              {
+                "field": "ambiguity",
+                "operator": "!=",
+                "value": "high"
+              },
+              {
+                "field": "failure_cost",
+                "operator": "!=",
+                "value": "high"
+              },
+              {
+                "field": "diagnosis_required",
+                "operator": "==",
+                "value": false
+              },
+              {
+                "field": "semantic_correctness",
+                "operator": "!=",
+                "value": "critical"
+              },
+              {
+                "field": "behavior_preservation",
+                "operator": "!=",
+                "value": "required"
+              },
+              {
+                "field": "assumptions_must_be_explicit",
+                "operator": "==",
+                "value": false
+              },
+              {
+                "field": "security_sensitive",
+                "operator": "==",
+                "value": false
+              },
+              {
+                "field": "destructive_operation",
+                "operator": "==",
+                "value": false
+              },
+              {
+                "field": "task_type",
+                "operator": "!=",
+                "value": "debugging"
+              },
+              {
+                "field": "task_type",
+                "operator": "!=",
+                "value": "root_cause"
+              },
+              {
+                "field": "task_type",
+                "operator": "!=",
+                "value": "review"
+              },
+              {
+                "field": "task_type",
+                "operator": "!=",
+                "value": "security_review"
+              },
+              {
+                "field": "task_type",
+                "operator": "!=",
+                "value": "migration"
+              }
+            ]
+          },
+          {
+            "any": [
+              {
+                "field": "failure_cost",
+                "operator": "==",
+                "value": "medium"
+              },
+              {
+                "field": "production_feature",
+                "operator": "==",
+                "value": true
+              },
+              {
+                "field": "implementation_scope",
+                "operator": "IN",
+                "value": [
+                  "medium",
+                  "broad"
+                ]
+              },
+              {
+                "field": "cross_layer",
+                "operator": "==",
+                "value": true
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "CODEX": {
+      "description": "Verification-oriented, diagnosis-oriented, or correctness-critical work where unjustified assumptions are costly.\n",
+      "match": {
+        "any": [
+          {
+            "field": "diagnosis_required",
+            "operator": "==",
+            "value": true
+          },
+          {
+            "field": "semantic_correctness",
+            "operator": "==",
+            "value": "critical"
+          },
+          {
+            "field": "behavior_preservation",
+            "operator": "==",
+            "value": "required"
+          },
+          {
+            "field": "assumptions_must_be_explicit",
+            "operator": "==",
+            "value": true
+          },
+          {
+            "field": "task_type",
+            "operator": "IN",
+            "value": [
+              "debugging",
+              "root_cause",
+              "review",
+              "security_review",
+              "migration",
+              "invariant_definition",
+              "scientific_semantics"
+            ]
+          }
+        ]
+      }
+    },
+    "CODEX_CLAUDE_CODEX": {
+      "description": "Consequential or ambiguous implementation work. Codex first establishes the contract, Claude implements, and a different fresh Codex context verifies.\n",
+      "match": {
+        "any": [
+          {
+            "all": [
+              {
+                "field": "ambiguity",
+                "operator": "==",
+                "value": "high"
+              },
+              {
+                "field": "implementation_required",
+                "operator": "==",
+                "value": true
+              }
+            ]
+          },
+          {
+            "all": [
+              {
+                "field": "failure_cost",
+                "operator": "==",
+                "value": "high"
+              },
+              {
+                "field": "implementation_required",
+                "operator": "==",
+                "value": true
+              },
+              {
+                "field": "diagnosis_required",
+                "operator": "==",
+                "value": false
+              }
+            ]
+          },
+          {
+            "all": [
+              {
+                "field": "semantic_correctness",
+                "operator": "==",
+                "value": "critical"
+              },
+              {
+                "field": "implementation_required",
+                "operator": "==",
+                "value": true
+              }
+            ]
+          },
+          {
+            "all": [
+              {
+                "field": "behavior_preservation",
+                "operator": "==",
+                "value": "required"
+              },
+              {
+                "field": "implementation_required",
+                "operator": "==",
+                "value": true
+              },
+              {
+                "field": "implementation_scope",
+                "operator": "==",
+                "value": "broad"
+              }
+            ]
+          },
+          {
+            "all": [
+              {
+                "field": "task_type",
+                "operator": "==",
+                "value": "migration"
+              },
+              {
+                "field": "implementation_required",
+                "operator": "==",
+                "value": true
+              }
+            ]
+          },
+          {
+            "all": [
+              {
+                "field": "security_sensitive",
+                "operator": "==",
+                "value": true
+              },
+              {
+                "field": "implementation_required",
+                "operator": "==",
+                "value": true
+              }
+            ]
+          },
+          {
+            "all": [
+              {
+                "field": "destructive_operation",
+                "operator": "==",
+                "value": true
+              },
+              {
+                "field": "implementation_required",
+                "operator": "==",
+                "value": true
+              }
+            ]
+          }
+        ]
+      }
+    }
+  },
+  "task_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "One classified, executable engineering task. Classify the task itself, not the repository: every risk flag defaults to its low-risk value and is escalated only on concrete task evidence, recorded in escalation_evidence. Repository-wide AGENTS.md guardrails (for example 'do not invent facts' or 'this is a scientific project') govern worker conduct, not task risk.",
+    "properties": {
+      "acceptance_criteria": {
+        "description": "Observable conditions that prove the task is done.",
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "ambiguity": {
+        "description": "Uncertainty in what to build. low = request and acceptance criteria are explicit; medium = some routine choices are open; high = the intended outcome or design is genuinely undecided and must be established first. high requires escalation_evidence.",
+        "enum": [
+          "low",
+          "medium",
+          "high"
+        ],
+        "type": "string"
+      },
+      "assumptions_must_be_explicit": {
+        "description": "true only when the task must decide unverified domain or data-contract assumptions (units, statistical definitions, schema meaning) that the worker cannot confirm from the repository. Generic AGENTS.md rules such as 'do not invent facts' do not count. true requires escalation_evidence.",
+        "type": "boolean"
+      },
+      "behavior_preservation": {
+        "description": "not_required = no existing runtime behavior is constrained (new code, docs, git, issue and config operations); preferred = existing behavior should not change but small, reviewed differences are acceptable; required = a refactor or migration of existing runtime behavior that must stay exactly equivalent. Git, docs and issue operations are never required. required requires escalation_evidence.",
+        "enum": [
+          "not_required",
+          "preferred",
+          "required"
+        ],
+        "type": "string"
+      },
+      "cross_layer": {
+        "description": "true only when the change must keep several layers consistent (for example UI + API + persistence).",
+        "type": "boolean"
+      },
+      "dependencies": {
+        "description": "Ids of tasks that must complete before this one.",
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "destructive_operation": {
+        "description": "true only when the task deletes or irreversibly rewrites data, history or resources (data deletion, force-push, dropping tables, deleting branches with unmerged work). A normal push or commit is false. true requires escalation_evidence.",
+        "type": "boolean"
+      },
+      "diagnosis_required": {
+        "description": "true only when the root cause of a failure is unknown and must be found before fixing. A failure with a known cause (for example a named lint error) is false.",
+        "type": "boolean"
+      },
+      "escalation_evidence": {
+        "additionalProperties": {
+          "maxLength": 500,
+          "minLength": 1,
+          "pattern": "\\S",
+          "type": "string"
+        },
+        "description": "Optional map from a classification field name to a one-line, task-specific justification. route_task rejects the classification with CLASSIFICATION_EVIDENCE_MISSING when any of these values lacks an entry: failure_cost=high, semantic_correctness=critical, ambiguity=high, behavior_preservation=required, assumptions_must_be_explicit=true, security_sensitive=true, destructive_operation=true. Project risk floors from .pi/routing.yaml are exempt.",
+        "propertyNames": {
+          "enum": [
+            "task_type",
+            "failure_cost",
+            "semantic_correctness",
+            "ambiguity",
+            "implementation_scope",
+            "implementation_required",
+            "cross_layer",
+            "behavior_preservation",
+            "diagnosis_required",
+            "assumptions_must_be_explicit",
+            "many_routine_decisions",
+            "production_feature",
+            "security_sensitive",
+            "destructive_operation"
+          ]
+        },
+        "type": "object"
+      },
+      "failure_cost": {
+        "description": "Cost of a wrong result reaching main. low = trivially detected and reverted (docs, config, VCS/issue operations, small local code); medium = a defect could ship in normal production code and need a follow-up fix; high = a defect would be costly or hard to reverse (data loss, released contract break, security exposure). high requires escalation_evidence.",
+        "enum": [
+          "low",
+          "medium",
+          "high"
+        ],
+        "type": "string"
+      },
+      "files_or_areas": {
+        "description": "Files, directories or areas the task touches.",
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "goal": {
+        "description": "One-sentence outcome the task must achieve.",
+        "type": "string"
+      },
+      "id": {
+        "description": "Stable task identifier, unique within the batch.",
+        "type": "string"
+      },
+      "implementation_required": {
+        "description": "true when the task changes repository files (code, tests, docs, config, backlog) or performs a mutating operation such as commit, push, PR creation or filing/updating issues; false for read-only analysis, review or summaries.",
+        "type": "boolean"
+      },
+      "implementation_scope": {
+        "description": "Breadth of the change. small = one area, a few files; medium = several related files or modules; broad = many modules or an end-to-end feature.",
+        "enum": [
+          "small",
+          "medium",
+          "broad"
+        ],
+        "type": "string"
+      },
+      "many_routine_decisions": {
+        "description": "true when the work consists of many small, low-stakes implementation choices (UI polish, adapters, boilerplate) rather than a few consequential ones.",
+        "type": "boolean"
+      },
+      "production_feature": {
+        "description": "true when the task adds or changes user-facing production functionality; false for tooling, docs, tests, CI, configuration, git and issue work.",
+        "type": "boolean"
+      },
+      "security_sensitive": {
+        "description": "true only when the task changes how authentication, authorization, secrets, permissions or sandboxing are implemented or enforced, or how untrusted input is handled. Filing issues, editing docs and applying an owner-requested setting in project tool configuration (for example .pi/autonomy.yaml) are false. true requires escalation_evidence.",
+        "type": "boolean"
+      },
+      "semantic_correctness": {
+        "description": "How much the task's meaning must be exactly right beyond tests passing. low = wording, layout or operational steps; normal = ordinary code where tests and review catch mistakes; critical = a wrong result would silently corrupt scientific, statistical or user data, or contract semantics. A scientific repository alone is not critical. critical requires escalation_evidence.",
+        "enum": [
+          "low",
+          "normal",
+          "critical"
+        ],
+        "type": "string"
+      },
+      "task_type": {
+        "description": "Dominant kind of work. Operational types: vcs_operation = branch/commit/push/open or update a PR with already-decided content; issue_management = file, update, label or close issues/backlog items, or plan and record next tasks; config_edit = edit tool/project configuration such as .pi/*.yaml or CI settings with a known intended value; ci_fix = repair a failing CI check (set diagnosis_required only when the cause is not yet known). Use documentation for docs, scaffolding for skeletons, exploration for reading and summarizing existing material, and review/security_review only for adversarial correctness review of code or changes.",
+        "enum": [
+          "exploration",
+          "architecture",
+          "debugging",
+          "root_cause",
+          "invariant_definition",
+          "scientific_semantics",
+          "implementation",
+          "broad_feature",
+          "end_to_end_feature",
+          "ui_ux",
+          "scaffolding",
+          "plumbing",
+          "refactor",
+          "review",
+          "security_review",
+          "migration",
+          "documentation",
+          "testing",
+          "vcs_operation",
+          "issue_management",
+          "config_edit",
+          "ci_fix"
+        ],
+        "type": "string"
+      }
+    },
+    "required": [
+      "id",
+      "goal",
+      "task_type",
+      "failure_cost",
+      "semantic_correctness",
+      "ambiguity",
+      "implementation_scope",
+      "implementation_required",
+      "cross_layer",
+      "behavior_preservation",
+      "diagnosis_required",
+      "assumptions_must_be_explicit",
+      "many_routine_decisions",
+      "production_feature",
+      "security_sensitive",
+      "destructive_operation",
+      "dependencies",
+      "acceptance_criteria",
+      "files_or_areas"
+    ],
+    "title": "AgenticCodingTask",
+    "type": "object"
+  }
+}

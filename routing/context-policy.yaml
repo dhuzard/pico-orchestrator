@@ -1,0 +1,5 @@
+# Optional structured checkpoint output size. Pi owns all automatic context
+# management. This policy cannot trigger compaction or gate active work.
+schema_version: 1
+checkpoint:
+  max_output_tokens: 4096

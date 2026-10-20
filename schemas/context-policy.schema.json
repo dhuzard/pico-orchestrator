@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ContextPolicy",
+  "description": "Optional structured checkpoint settings. Pi owns automatic context management.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "checkpoint"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "checkpoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_output_tokens"],
+      "properties": {
+        "max_output_tokens": {"type": "integer", "minimum": 512, "maximum": 16384}
+      }
+    }
+  }
+}

@@ -1,0 +1,857 @@
+# Policy contract v7. Route topology remains stable; ambiguity uses 0..10 scores.
+# (the CLAUDE route's task_type list includes the operational task types
+# vcs_operation, issue_management, config_edit and ci_fix).
+#
+# v6 introduces five capacity tiers, ordered cheapest -> strongest:
+#   light < economy < standard < high < max
+# Execution plans author only standard/high (max is authorable but authored
+# nowhere). light/economy are reached only through downward post-route
+# capacity assignment; max only through the strict critical-escalation rule.
+# Capacity rules are ordered and graduated: per step, the first rule whose
+# step_match selects the step and whose classification guard fully holds
+# wins. Every assignment records deterministic decision evidence (rule,
+# guard/blocking predicates and the selected model profile). Reasoning effort
+# is only ever kept or lowered, never raised.
+version: 7
+
+# Centralized family capabilities and capacity-to-model/context-window mapping.
+# Cost-first defaults (per 1M input/output tokens): gpt-6-luna $0.10/$0.50,
+# gpt-6.1-sol $2/$10, gpt-6-astra $10/$50. Concrete models are user-overridable
+# through `pico models set`.
+model_profiles:
+  codex:
+    family: codex
+    reasoning_efforts: [low, medium, high]
+    context_strategies: [focused, full]
+    capacity_models:
+      light:
+        ambiguity_capacity: 3
+        model: openai-codex/gpt-6-luna
+        context_window_tier: standard
+      economy:
+        ambiguity_capacity: 3
+        model: openai-codex/gpt-6-luna
+        context_window_tier: standard
+      standard:
+        ambiguity_capacity: 6
+        model: openai-codex/gpt-6-luna
+        context_window_tier: standard
+      high:
+        ambiguity_capacity: 8
+        model: openai-codex/gpt-6.1-sol
+        context_window_tier: extended
+      max:
+        ambiguity_capacity: 10
+        model: openai-codex/gpt-6-astra
+        context_window_tier: extended
+
+  claude:
+    family: claude
+    reasoning_efforts: [low, medium, high]
+    context_strategies: [focused, full]
+    capacity_models:
+      light:
+        ambiguity_capacity: 3
+        model: haiku
+        context_window_tier: standard
+      economy:
+        ambiguity_capacity: 3
+        model: haiku
+        context_window_tier: standard
+      standard:
+        ambiguity_capacity: 6
+        model: sonnet
+        context_window_tier: standard
+      high:
+        ambiguity_capacity: 9
+        model: anthropic/claude-opus-5-5
+        context_window_tier: extended
+      max:
+        ambiguity_capacity: 9
+        model: anthropic/claude-opus-5-5
+        context_window_tier: extended
+
+# Post-route capacity assignment: an ordered list of graduated rules. For
+# each authored plan step the first rule whose `step_match` selects the step
+# and whose `match` guard holds wins; otherwise the authored tier is kept.
+# Hard invariants (validated centrally in tools/routing_engine.py):
+#   - every `down` rule's guard contains security_sensitive == false and
+#     destructive_operation == false, targets only non-independent-review
+#     worker/specifier steps of analysis/implementation intent, and assigns a
+#     tier strictly lower than every authored tier it selects;
+#   - the single `up` rule's guard is exactly failure_cost == high,
+#     semantic_correctness == critical, ambiguity >= 7; it targets only
+#     specifier/reviewer steps and assigns only `max`;
+#   - independent-review steps are never lowered; effort is never raised.
+capacity_assignment:
+  rules:
+    # Routine operational/documentation work: push, branch/PR, issue update,
+    # small config edit, CI lint fix, docs. Any route, any family worker.
+    - name: ops-light
+      direction: down
+      match:
+        all:
+          - field: task_type
+            operator: IN
+            value: [vcs_operation, issue_management, config_edit, documentation, ci_fix]
+          - field: failure_cost
+            operator: IN
+            value: [low, medium]
+          - field: implementation_scope
+            operator: "=="
+            value: small
+          - field: ambiguity
+            operator: "<="
+            value: 6
+          - field: semantic_correctness
+            operator: "!="
+            value: critical
+          - field: diagnosis_required
+            operator: "=="
+            value: false
+          - field: security_sensitive
+            operator: "=="
+            value: false
+          - field: destructive_operation
+            operator: "=="
+            value: false
+      step_match:
+        role: worker
+        intent: [analysis, implementation]
+        capacity_tier: [standard, high]
+        independent_review: false
+      assigned_capacity_tier: light
+      assigned_reasoning_effort: low
+
+    # The historical (v4/v5) low-risk guard, verbatim.
+    - name: low-risk-worker
+      direction: down
+      match:
+        all:
+          - field: failure_cost
+            operator: "=="
+            value: low
+          - field: semantic_correctness
+            operator: "!="
+            value: critical
+          - field: ambiguity
+            operator: "<="
+            value: 3
+          - field: implementation_scope
+            operator: "=="
+            value: small
+          - field: behavior_preservation
+            operator: "!="
+            value: required
+          - field: cross_layer
+            operator: "=="
+            value: false
+          - field: diagnosis_required
+            operator: "=="
+            value: false
+          - field: assumptions_must_be_explicit
+            operator: "=="
+            value: false
+          - field: production_feature
+            operator: "=="
+            value: false
+          - field: security_sensitive
+            operator: "=="
+            value: false
+          - field: destructive_operation
+            operator: "=="
+            value: false
+      step_match:
+        role: worker
+        intent: [analysis, implementation]
+        capacity_tier: standard
+        independent_review: false
+      assigned_capacity_tier: economy
+      assigned_reasoning_effort: low
+
+    # Bounded work authored on a high-tier worker (the CODEX_CLAUDE_CODEX
+    # claude_worker) runs on the standard tier; the reviewer stays high.
+    - name: bounded-implementation-worker
+      direction: down
+      match:
+        all:
+          - field: implementation_scope
+            operator: IN
+            value: [small, medium]
+          - field: ambiguity
+            operator: "<="
+            value: 6
+          - field: failure_cost
+            operator: "!="
+            value: high
+          - field: security_sensitive
+            operator: "=="
+            value: false
+          - field: destructive_operation
+            operator: "=="
+            value: false
+      step_match:
+        role: worker
+        intent: [analysis, implementation]
+        capacity_tier: high
+        independent_review: false
+      assigned_capacity_tier: standard
+      assigned_reasoning_effort: medium
+
+    # A small, unambiguous specification does not need the high tier.
+    - name: bounded-specifier
+      direction: down
+      match:
+        all:
+          - field: implementation_scope
+            operator: "=="
+            value: small
+          - field: ambiguity
+            operator: "<="
+            value: 3
+          - field: failure_cost
+            operator: "!="
+            value: high
+          - field: security_sensitive
+            operator: "=="
+            value: false
+          - field: destructive_operation
+            operator: "=="
+            value: false
+      step_match:
+        role: specifier
+        intent: analysis
+        capacity_tier: high
+        independent_review: false
+      assigned_capacity_tier: standard
+      assigned_reasoning_effort: medium
+
+    # The only upward rule: critical, ambiguous, high-cost work escalates the
+    # specifier and the independent reviewer to max. Workers are never raised.
+    - name: critical-escalation
+      direction: up
+      match:
+        all:
+          - field: failure_cost
+            operator: "=="
+            value: high
+          - field: semantic_correctness
+            operator: "=="
+            value: critical
+          - field: ambiguity
+            operator: ">="
+            value: 7
+      step_match:
+        role: [specifier, reviewer]
+        intent: [analysis, review]
+        capacity_tier: high
+        independent_review: [false, true]
+      assigned_capacity_tier: max
+      assigned_reasoning_effort: high
+
+principles:
+  - Route by uncertainty, failure cost, semantic risk, and implementation breadth.
+  - Never route primarily by programming language, file extension, frontend, or backend.
+  - Model choice and permissions are independent decisions.
+  - Independent review must use a fresh context.
+  - Passing tests alone does not establish semantic correctness.
+
+# Match expressions are structured, not free-form strings.
+#
+# An expression node is exactly one of:
+#   - {all: [expr, expr, ...]}   true iff every child is true; children list must be non-empty
+#   - {any: [expr, expr, ...]}   true iff at least one child is true; children list must be non-empty
+#   - {field: <task field>, operator: "==" | "!=" | "IN", value: <literal|array>}
+#
+# Operators:
+#   ==   type-sensitive JSON equality
+#   !=   negation of ==
+#   IN   value must be a non-empty array; true if the field's value equals any member
+#
+# Every "field" must exist in schemas/task.schema.json, and every "value" must be
+# type/enum-compatible with that field's declared type.
+#
+# All four routes are evaluated independently against the same task. If more than
+# one route matches, the earliest route in `precedence` is selected. If no route
+# matches, `fallback_route` is selected.
+
+routes:
+
+  CODEX:
+    description: >
+      Verification-oriented, diagnosis-oriented, or correctness-critical work
+      where unjustified assumptions are costly.
+    match:
+      any:
+        - field: diagnosis_required
+          operator: "=="
+          value: true
+        - field: semantic_correctness
+          operator: "=="
+          value: critical
+        - field: behavior_preservation
+          operator: "=="
+          value: required
+        - field: assumptions_must_be_explicit
+          operator: "=="
+          value: true
+        - field: task_type
+          operator: IN
+          value:
+            - debugging
+            - root_cause
+            - review
+            - security_review
+            - migration
+            - invariant_definition
+            - scientific_semantics
+
+  CLAUDE:
+    description: >
+      Broad comparatively low-risk implementation where maintaining a coherent
+      end-to-end objective and resolving routine implementation decisions
+      matters more than adversarial verification.
+    match:
+      all:
+        - all:
+            - field: failure_cost
+              operator: IN
+              value: [low, medium]
+            - field: semantic_correctness
+              operator: "!="
+              value: critical
+        - any:
+            - field: implementation_scope
+              operator: "=="
+              value: broad
+            - field: cross_layer
+              operator: "=="
+              value: true
+            - field: task_type
+              operator: IN
+              value:
+                - ui_ux
+                - scaffolding
+                - plumbing
+                - documentation
+                - broad_feature
+                - end_to_end_feature
+                # Operational task types. They never match a Codex-only
+                # predicate by type alone; a ci_fix with an unknown cause sets
+                # diagnosis_required and is still taken by CODEX via precedence.
+                - vcs_operation
+                - issue_management
+                - config_edit
+                - ci_fix
+            - field: many_routine_decisions
+              operator: "=="
+              value: true
+
+  CLAUDE_CODEX:
+    description: >
+      Normal production work: Claude builds, then a fresh Codex context
+      independently reviews and verifies. Consequential uncertainty signals
+      such as diagnosis, critical semantics, required behavior preservation,
+      explicit-assumption requirements, security sensitivity, or destructive
+      operations are excluded so they remain Codex-led.
+    match:
+      all:
+        - all:
+            - field: implementation_required
+              operator: "=="
+              value: true
+            - field: ambiguity
+              operator: "<="
+              value: 6
+            - field: failure_cost
+              operator: "!="
+              value: high
+            - field: diagnosis_required
+              operator: "=="
+              value: false
+            - field: semantic_correctness
+              operator: "!="
+              value: critical
+            - field: behavior_preservation
+              operator: "!="
+              value: required
+            - field: assumptions_must_be_explicit
+              operator: "=="
+              value: false
+            - field: security_sensitive
+              operator: "=="
+              value: false
+            - field: destructive_operation
+              operator: "=="
+              value: false
+            - field: task_type
+              operator: "!="
+              value: debugging
+            - field: task_type
+              operator: "!="
+              value: root_cause
+            - field: task_type
+              operator: "!="
+              value: review
+            - field: task_type
+              operator: "!="
+              value: security_review
+            - field: task_type
+              operator: "!="
+              value: migration
+        - any:
+            - field: failure_cost
+              operator: "=="
+              value: medium
+            - field: production_feature
+              operator: "=="
+              value: true
+            - field: implementation_scope
+              operator: IN
+              value: [medium, broad]
+            - field: cross_layer
+              operator: "=="
+              value: true
+
+  CODEX_CLAUDE_CODEX:
+    description: >
+      Consequential or ambiguous implementation work. Codex first establishes
+      the contract, Claude implements, and a different fresh Codex context
+      verifies.
+    match:
+      any:
+        - all:
+            - field: ambiguity
+              operator: ">="
+              value: 7
+            - field: implementation_required
+              operator: "=="
+              value: true
+        - all:
+            - field: failure_cost
+              operator: "=="
+              value: high
+            - field: implementation_required
+              operator: "=="
+              value: true
+            - field: diagnosis_required
+              operator: "=="
+              value: false
+        - all:
+            - field: semantic_correctness
+              operator: "=="
+              value: critical
+            - field: implementation_required
+              operator: "=="
+              value: true
+        - all:
+            - field: behavior_preservation
+              operator: "=="
+              value: required
+            - field: implementation_required
+              operator: "=="
+              value: true
+            - field: implementation_scope
+              operator: "=="
+              value: broad
+        - all:
+            - field: task_type
+              operator: "=="
+              value: migration
+            - field: implementation_required
+              operator: "=="
+              value: true
+        - all:
+            - field: security_sensitive
+              operator: "=="
+              value: true
+            - field: implementation_required
+              operator: "=="
+              value: true
+        - all:
+            - field: destructive_operation
+              operator: "=="
+              value: true
+            - field: implementation_required
+              operator: "=="
+              value: true
+
+# Deterministic precedence used when more than one route matches. Contains every
+# route exactly once; map/YAML ordering elsewhere is never relied upon.
+precedence:
+  - CODEX_CLAUDE_CODEX
+  - CLAUDE_CODEX
+  - CODEX
+  - CLAUDE
+
+# Selected when no route's match expression is true.
+fallback_route: CODEX
+
+# Centralized family -> backend/profile mapping. A runtime binding resolves
+# only family/capacity tiers selected by post-route assignment. `mutation_modes`
+# remains the concrete Claude permission mapping. Every Claude step runs through
+# the lifecycle's ClaudeWorker (headless Claude Code in the step's bound
+# worktree), so mutating Claude steps of one wave run concurrently.
+execution_backends:
+  codex:
+    tool: spawn_subagent
+    model_profile_ref: codex
+
+  claude:
+    tool: ClaudeWorker
+    model_profile_ref: claude
+    mutation_modes:
+      forbidden: read
+      allowed: full
+
+# Explicit, schema-validated execution plans (schemas/execution-plan.schema.json)
+# per route. Route topology (steps, roles, families, dependencies) is fixed;
+# `primary_intents.<analysis|review|implementation>` is selected at runtime
+# from the effective classification (see tools/routing_engine.py
+# `derive_primary_intent`) and changes only the worker step's `intent` and
+# `mutation_permission` -- never topology or authored capacity/reasoning/context metadata.
+execution:
+
+  CODEX:
+    primary_intents:
+      analysis:
+        schema_version: 3
+        independent_review_required: false
+        steps:
+          - id: codex_worker
+            order: 1
+            role: worker
+            family: codex
+            capacity_tier: standard
+            reasoning_effort: high
+            context_strategy: full
+            intent: analysis
+            fresh_context: true
+            mutation_permission: forbidden
+            depends_on: []
+            independent_review: false
+      review:
+        schema_version: 3
+        independent_review_required: false
+        steps:
+          - id: codex_worker
+            order: 1
+            role: worker
+            family: codex
+            capacity_tier: standard
+            reasoning_effort: high
+            context_strategy: full
+            intent: review
+            fresh_context: true
+            mutation_permission: forbidden
+            depends_on: []
+            independent_review: false
+      implementation:
+        schema_version: 3
+        independent_review_required: false
+        steps:
+          - id: codex_worker
+            order: 1
+            role: worker
+            family: codex
+            capacity_tier: standard
+            reasoning_effort: high
+            context_strategy: full
+            intent: implementation
+            fresh_context: true
+            mutation_permission: allowed
+            depends_on: []
+            independent_review: false
+
+  CLAUDE:
+    primary_intents:
+      analysis:
+        schema_version: 3
+        independent_review_required: false
+        steps:
+          - id: claude_worker
+            order: 1
+            role: worker
+            family: claude
+            capacity_tier: standard
+            reasoning_effort: medium
+            context_strategy: full
+            intent: analysis
+            fresh_context: true
+            mutation_permission: forbidden
+            depends_on: []
+            independent_review: false
+      review:
+        schema_version: 3
+        independent_review_required: false
+        steps:
+          - id: claude_worker
+            order: 1
+            role: worker
+            family: claude
+            capacity_tier: standard
+            reasoning_effort: medium
+            context_strategy: full
+            intent: review
+            fresh_context: true
+            mutation_permission: forbidden
+            depends_on: []
+            independent_review: false
+      implementation:
+        schema_version: 3
+        independent_review_required: false
+        steps:
+          - id: claude_worker
+            order: 1
+            role: worker
+            family: claude
+            capacity_tier: standard
+            reasoning_effort: medium
+            context_strategy: full
+            intent: implementation
+            fresh_context: true
+            mutation_permission: allowed
+            depends_on: []
+            independent_review: false
+
+  CLAUDE_CODEX:
+    primary_intents:
+      analysis:
+        schema_version: 3
+        independent_review_required: true
+        steps:
+          - id: claude_worker
+            order: 1
+            role: worker
+            family: claude
+            capacity_tier: standard
+            reasoning_effort: medium
+            context_strategy: full
+            intent: analysis
+            fresh_context: true
+            mutation_permission: forbidden
+            depends_on: []
+            independent_review: false
+          - id: codex_reviewer
+            order: 2
+            role: reviewer
+            family: codex
+            capacity_tier: standard
+            reasoning_effort: high
+            context_strategy: focused
+            intent: review
+            fresh_context: true
+            mutation_permission: forbidden
+            depends_on: [claude_worker]
+            independent_review: true
+      review:
+        schema_version: 3
+        independent_review_required: true
+        steps:
+          - id: claude_worker
+            order: 1
+            role: worker
+            family: claude
+            capacity_tier: standard
+            reasoning_effort: medium
+            context_strategy: full
+            intent: review
+            fresh_context: true
+            mutation_permission: forbidden
+            depends_on: []
+            independent_review: false
+          - id: codex_reviewer
+            order: 2
+            role: reviewer
+            family: codex
+            capacity_tier: standard
+            reasoning_effort: high
+            context_strategy: focused
+            intent: review
+            fresh_context: true
+            mutation_permission: forbidden
+            depends_on: [claude_worker]
+            independent_review: true
+      implementation:
+        schema_version: 3
+        independent_review_required: true
+        steps:
+          - id: claude_worker
+            order: 1
+            role: worker
+            family: claude
+            capacity_tier: standard
+            reasoning_effort: medium
+            context_strategy: full
+            intent: implementation
+            fresh_context: true
+            mutation_permission: allowed
+            depends_on: []
+            independent_review: false
+          - id: codex_reviewer
+            order: 2
+            role: reviewer
+            family: codex
+            capacity_tier: standard
+            reasoning_effort: high
+            context_strategy: focused
+            intent: review
+            fresh_context: true
+            mutation_permission: forbidden
+            depends_on: [claude_worker]
+            independent_review: true
+
+  CODEX_CLAUDE_CODEX:
+    primary_intents:
+      analysis:
+        schema_version: 3
+        independent_review_required: true
+        steps:
+          - id: codex_specifier
+            order: 1
+            role: specifier
+            family: codex
+            capacity_tier: high
+            reasoning_effort: high
+            context_strategy: full
+            intent: analysis
+            fresh_context: true
+            mutation_permission: forbidden
+            depends_on: []
+            independent_review: false
+          - id: claude_worker
+            order: 2
+            role: worker
+            family: claude
+            capacity_tier: high
+            reasoning_effort: high
+            context_strategy: full
+            intent: analysis
+            fresh_context: true
+            mutation_permission: forbidden
+            depends_on: [codex_specifier]
+            independent_review: false
+          - id: codex_reviewer
+            order: 3
+            role: reviewer
+            family: codex
+            capacity_tier: high
+            reasoning_effort: high
+            context_strategy: focused
+            intent: review
+            fresh_context: true
+            mutation_permission: forbidden
+            depends_on: [codex_specifier, claude_worker]
+            independent_review: true
+      review:
+        schema_version: 3
+        independent_review_required: true
+        steps:
+          - id: codex_specifier
+            order: 1
+            role: specifier
+            family: codex
+            capacity_tier: high
+            reasoning_effort: high
+            context_strategy: full
+            intent: analysis
+            fresh_context: true
+            mutation_permission: forbidden
+            depends_on: []
+            independent_review: false
+          - id: claude_worker
+            order: 2
+            role: worker
+            family: claude
+            capacity_tier: high
+            reasoning_effort: high
+            context_strategy: full
+            intent: review
+            fresh_context: true
+            mutation_permission: forbidden
+            depends_on: [codex_specifier]
+            independent_review: false
+          - id: codex_reviewer
+            order: 3
+            role: reviewer
+            family: codex
+            capacity_tier: high
+            reasoning_effort: high
+            context_strategy: focused
+            intent: review
+            fresh_context: true
+            mutation_permission: forbidden
+            depends_on: [codex_specifier, claude_worker]
+            independent_review: true
+      implementation:
+        schema_version: 3
+        independent_review_required: true
+        steps:
+          - id: codex_specifier
+            order: 1
+            role: specifier
+            family: codex
+            capacity_tier: high
+            reasoning_effort: high
+            context_strategy: full
+            intent: analysis
+            fresh_context: true
+            mutation_permission: forbidden
+            depends_on: []
+            independent_review: false
+          - id: claude_worker
+            order: 2
+            role: worker
+            family: claude
+            capacity_tier: high
+            reasoning_effort: high
+            context_strategy: full
+            intent: implementation
+            fresh_context: true
+            mutation_permission: allowed
+            depends_on: [codex_specifier]
+            independent_review: false
+          - id: codex_reviewer
+            order: 3
+            role: reviewer
+            family: codex
+            capacity_tier: high
+            reasoning_effort: high
+            context_strategy: focused
+            intent: review
+            fresh_context: true
+            mutation_permission: forbidden
+            depends_on: [codex_specifier, claude_worker]
+            independent_review: true
+
+review_findings:
+  blocking:
+    - BLOCKER
+    - CORRECTNESS
+    - REGRESSION
+
+  repair_required:
+    - TEST_GAP
+
+  advisory:
+    - ARCHITECTURAL_DEBT
+    - STYLE_ONLY
+
+fallbacks:
+  - If uncertain between Claude and Codex, prefer Codex.
+  - Broad plus consequential work is not a tie; use CODEX_CLAUDE_CODEX.
+  - If Claude implementation fails twice, route to fresh Codex diagnosis.
+  - If Codex cannot establish root cause, request independent Claude analysis.
+  - Never silently downgrade a high-risk workflow.
+
+completion:
+  require:
+    - acceptance criteria addressed
+    - relevant invariants preserved
+    - targeted validation executed when available
+    - relevant regression tests executed when practical
+    - no unresolved BLOCKER
+    - no unresolved CORRECTNESS
+    - no unresolved REGRESSION
+    - no unresolved TEST_GAP
+    - final diff inspected for unintended changes

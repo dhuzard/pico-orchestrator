@@ -1,0 +1,376 @@
+#!/usr/bin/env python3
+"""Deterministic tests for the headless single-repository execution interface.
+
+`pi` is a fake on PATH that behaves like the lifecycle extension would in print
+mode: it creates (or restores) the parent run through tools/parent_orchestration.py,
+stores the run id in a session entry, and then finishes, settles, crashes, or hangs
+according to FAKE_PI_BEHAVIOR.
+"""
+from __future__ import annotations
+
+import io
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+import unittest.mock
+from contextlib import redirect_stdout
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT / "tools"))
+
+import headless_run as hr  # noqa: E402
+import provenance  # noqa: E402
+import session_scope  # noqa: E402
+
+FAKE_PI = r'''#!/usr/bin/env python3
+import json, os, subprocess, sys, time, glob
+args = sys.argv[1:]
+sid = args[args.index("--session-id") + 1]
+sdir = args[args.index("--session-dir") + 1]
+prompt = args[args.index("--") + 1]
+assert ("PI_ORCHESTRATION_RUN_V1" in prompt) or glob.glob(os.path.join(sdir, f"*_{sid}.jsonl")), \
+    "a new session needs the orchestration marker"
+assert "--print" in args and "--mode" in args
+tools = os.environ["FAKE_PI_TOOLS"]
+behavior = os.environ.get("FAKE_PI_BEHAVIOR_" + os.path.basename(os.getcwd()), os.environ.get("FAKE_PI_BEHAVIOR", "finish"))
+log = os.environ.get("FAKE_PI_LOG")
+def note(event):
+    if log:
+        with open(log, "a") as f:
+            f.write(f"{time.monotonic():.6f} {event} {os.path.basename(os.getcwd())}\n")
+parent = os.path.join(tools, "parent_orchestration.py")
+def pcmd(*a):
+    out = subprocess.run([sys.executable, parent, *a], capture_output=True, text=True)
+    return json.loads(out.stdout)
+existing = glob.glob(os.path.join(sdir, f"*_{sid}.jsonl"))
+run_id = None
+marker = "PI_ORCHESTRATION_RUN_V1" in prompt
+if existing and marker:
+    # Real lifecycle: before_agent_start settles the restored run and starts anew.
+    for line in open(existing[0]):
+        e = json.loads(line)
+        if e.get("type") == "custom" and e.get("customType") == "pi-orchestration-parent-v1":
+            pcmd("settle", e["data"]["run_id"])
+    existing = []
+    os.remove(glob.glob(os.path.join(sdir, f"*_{sid}.jsonl"))[0])
+if existing:
+    for line in open(existing[0]):
+        e = json.loads(line)
+        if e.get("type") == "custom" and e.get("customType") == "pi-orchestration-parent-v1":
+            run_id = e["data"]["run_id"]
+    st = pcmd("status", run_id, "--worktree", os.getcwd(), "--repo", os.environ["PI_TARGET_REPOSITORY"])
+    assert st.get("status") == "IN_PROGRESS", st
+    session_file = existing[0]
+else:
+    started = pcmd("start", "--worktree", os.getcwd(), "--repo", os.environ["PI_TARGET_REPOSITORY"])
+    run_id = started["run_id"]
+    session_file = os.path.join(sdir, f"20261019T000000_{sid}.jsonl")
+    with open(session_file, "a") as f:
+        f.write(json.dumps({"type": "custom", "customType": "pi-orchestration-parent-v1",
+                            "data": {"run_id": run_id, "session_id": sid, "target_cwd": os.getcwd(), "active": True}}) + "\n")
+print(json.dumps({"type": "fake", "run_id": run_id, "behavior": behavior}))
+sys.stdout.flush()
+note("start")
+if os.environ.get("FAKE_PI_MESS"):
+    # What real leads did: switch the parent checkout to a batch branch and leave a worker worktree.
+    subprocess.run(["git", "switch", "-q", "-c", "pico/batch-1"], capture_output=True)
+    subprocess.run(["git", "worktree", "add", "-q", "-b", "pico/task-1", os.path.join(sdir, "..", "wt-task-1")], capture_output=True)
+    if os.environ["FAKE_PI_MESS"] == "dirty":
+        open(os.path.join(sdir, "..", "wt-task-1", "scratch.txt"), "w").write("uncommitted\n")
+usage = os.environ.get("FAKE_PI_USAGE")  # "<input>,<output>[,<cost>]": report worker usage like a real child
+if usage:
+    numbers = usage.split(",")
+    event = {"kind": "usage", "backend": "claude-code", "input_tokens": int(numbers[0]), "output_tokens": int(numbers[1]),
+             "total_tokens": int(numbers[0]) + int(numbers[1])}
+    if len(numbers) > 2:
+        event["estimated_cost_usd"] = float(numbers[2])
+    subprocess.run([sys.executable, parent, "event", run_id], input=json.dumps(event), capture_output=True, text=True)
+if behavior == "slow":
+    time.sleep(float(os.environ.get("FAKE_PI_SLEEP", "0.4")))
+    behavior = "finish"
+if behavior == "finish":
+    pcmd("finish", run_id, "PARTIAL")
+elif behavior == "settle":
+    pcmd("settle", run_id)
+elif behavior == "crash":
+    note("end")
+    sys.exit(3)
+elif behavior == "hang":
+    time.sleep(60)
+note("end")
+'''
+
+
+def git(*args: str) -> str:
+    return subprocess.run(["git", *args], check=True, capture_output=True, text=True).stdout.strip()
+
+
+class HeadlessRunTest(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        base = Path(self._tmp.name)
+        self.target = base / "target"
+        self.target.mkdir()
+        git("-C", str(self.target), "init", "-q")
+        git("-C", str(self.target), "remote", "add", "origin", "git@github.com:acme/target.git")
+        (self.target / "README.md").write_text("# target\n")
+        git("-C", str(self.target), "add", "README.md")
+        git("-C", str(self.target), "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "-m", "init")
+        self.state = base / "state"
+        self.bin = base / "bin"
+        self.bin.mkdir()
+        self.pi = self.bin / "pi"
+        self.pi.write_text(FAKE_PI)
+        self.pi.chmod(0o755)
+        self._env = dict(os.environ)
+        os.environ[provenance.STATE_ENV] = str(self.state)
+        os.environ["FAKE_PI_TOOLS"] = str(REPO_ROOT / "tools")
+        os.environ["PI_CODING_AGENT_DIR"] = str(base / "agent")
+        os.environ["PATH"] = f"{self.bin}{os.pathsep}{os.environ.get('PATH', '')}"
+        os.environ.pop("FAKE_PI_BEHAVIOR", None)
+
+    def tearDown(self):
+        os.environ.clear()
+        os.environ.update(self._env)
+        self._tmp.cleanup()
+
+    def start(self, execution_id="exec-1", behavior="finish", **kwargs):
+        os.environ["FAKE_PI_BEHAVIOR"] = behavior
+        return hr.start(target=self.target, explicit_repo="acme/target", execution_id=execution_id,
+                        objective="Inspect the repository and report", pi_executable=str(self.pi), **kwargs)
+
+    def status(self, execution_id="exec-1"):
+        return hr.status(target=self.target, explicit_repo="acme/target", execution_id=execution_id)
+
+    def test_finished_run_is_recorded_and_target_untouched(self):
+        before = session_scope.snapshot(str(self.target))["digest"]
+        record = self.start()
+        self.assertEqual(record["status"], "exited")
+        self.assertEqual(record["exit_code"], 0)
+        self.assertEqual(record["run"]["status"], "PARTIAL")
+        self.assertTrue(record["run_id"].startswith("run-"))
+        self.assertEqual(record["launches"], 1)
+        self.assertEqual(record["target_repository"], "acme/target")
+        self.assertEqual(session_scope.snapshot(str(self.target))["digest"], before)
+        path = self.state / "executions"
+        self.assertEqual(len(list(path.rglob("exec-1.json"))), 1)
+        self.assertTrue(Path(record["log_path"]).is_file())
+        self.assertTrue(Path(record["log_path"]).read_text().startswith('{"type": "fake"'))
+        self.assertTrue(Path(record["run"]["trace_path"]).is_file())
+        self.assertFalse((self.target / ".pi").exists())
+        self.assertEqual(sorted(p.name for p in self.target.iterdir()), [".git", "README.md"])
+
+    def test_repeated_start_is_idempotent(self):
+        first = self.start()
+        second = self.start()
+        self.assertEqual(second["outcome"], "already_finished")
+        self.assertEqual(second["launches"], 1)
+        self.assertEqual(second["run_id"], first["run_id"])
+        runs = list((self.state / "runs").glob("run-*.json"))
+        self.assertEqual(len(runs), 1)
+
+    def test_exit_without_outcome_is_blocked(self):
+        record = self.start(behavior="settle")
+        self.assertEqual(record["run"]["status"], "BLOCKED")
+        self.assertEqual(record["run"]["blocker_code"], "ORCHESTRATION_OUTCOME_UNRECORDED")
+
+    def test_crash_requires_explicit_resume_into_same_run(self):
+        crashed = self.start(behavior="crash")
+        self.assertEqual(crashed["status"], "interrupted")
+        self.assertEqual(crashed["exit_code"], 3)
+        self.assertEqual(crashed["run"]["status"], "IN_PROGRESS")
+        # A crashed execution never relaunches implicitly.
+        again = self.start(behavior="finish")
+        self.assertEqual(again["outcome"], "resume_required")
+        self.assertEqual(again["launches"], 1)
+        resumed = self.start(behavior="finish", resume=True)
+        self.assertEqual(resumed["outcome"], "resumed")
+        self.assertEqual(resumed["launches"], 2)
+        self.assertEqual(resumed["run_id"], crashed["run_id"])
+        self.assertEqual(resumed["run"]["status"], "PARTIAL")
+        self.assertEqual(len(list((self.state / "runs").glob("run-*.json"))), 1)
+        # A finished run cannot be resumed again.
+        final = self.start(behavior="finish", resume=True)
+        self.assertEqual(final["outcome"], "already_finished")
+        self.assertEqual(final["launches"], 2)
+
+    def test_interrupted_process_is_detected_and_resumable(self):
+        launched = self.start(behavior="hang", wait=False)
+        self.assertEqual(launched["status"], "launched")
+        self.assertTrue(hr.pid_alive(launched["pid"]))
+        running = self.start(behavior="hang", wait=False)
+        self.assertEqual(running["outcome"], "already_running")
+        self.assertEqual(running["launches"], 1)
+        deadline = time.monotonic() + 5
+        while hr.discover_run_id(Path(launched["session_dir"]), launched["session_id"]) is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        os.killpg(launched["pid"], 9)
+        deadline = time.monotonic() + 5
+        while hr.pid_alive(launched["pid"]) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        # Reap so the pid is not a zombie that still answers signal 0.
+        try:
+            os.waitpid(launched["pid"], 0)
+        except ChildProcessError:
+            pass
+        observed = self.status()
+        self.assertEqual(observed["status"], "interrupted")
+        blocked = self.start(behavior="finish")
+        self.assertEqual(blocked["outcome"], "resume_required")
+        resumed = self.start(behavior="finish", resume=True)
+        self.assertEqual(resumed["run"]["status"], "PARTIAL")
+        self.assertEqual(resumed["run_id"], observed["run_id"])
+
+    def test_cancel_stops_the_process_and_closes_the_run(self):
+        launched = self.start(behavior="hang", wait=False)
+        deadline = time.monotonic() + 5
+        while hr.discover_run_id(Path(launched["session_dir"]), launched["session_id"]) is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        cancelled = hr.cancel(target=self.target, explicit_repo="acme/target", execution_id="exec-1", grace=2)
+        try:
+            os.waitpid(launched["pid"], 0)
+        except ChildProcessError:
+            pass
+        self.assertEqual(cancelled["status"], "cancelled")
+        self.assertFalse(hr.pid_alive(launched["pid"]))
+        self.assertEqual(cancelled["run"]["status"], "BLOCKED")
+        self.assertEqual(cancelled["run"]["blocker_code"], "EXECUTION_CANCELLED")
+        again = self.start(behavior="finish")
+        self.assertEqual(again["outcome"], "already_finished")
+
+    def test_mutating_policy_requires_explicit_authorization(self):
+        (self.target / ".pi").mkdir()
+        shutil.copy(REPO_ROOT / "templates" / "autonomy.yaml", self.target / ".pi" / "autonomy.yaml")
+        with self.assertRaises(hr.HeadlessError) as ctx:
+            self.start()
+        self.assertEqual(ctx.exception.code, "MUTATION_NOT_AUTHORIZED")
+        self.assertIn("commit", ctx.exception.detail)
+        self.assertEqual(len(list((self.state / "runs").glob("run-*.json"))) if (self.state / "runs").exists() else 0, 0)
+        record = self.start(allow_mutation=True)
+        self.assertEqual(record["run"]["status"], "PARTIAL")
+        self.assertTrue(record["mutation_allowed"])
+
+    def test_repository_identity_fails_closed(self):
+        with self.assertRaises(hr.HeadlessError) as ctx:
+            hr.start(target=self.target, explicit_repo="acme/other", execution_id="exec-1", objective="x",
+                     pi_executable=str(self.pi))
+        self.assertEqual(ctx.exception.code, "TARGET_REPOSITORY_CONFLICT")
+        with self.assertRaises(hr.HeadlessError) as ctx:
+            hr.start(target=self.target, explicit_repo="acme/target", execution_id="../escape", objective="x",
+                     pi_executable=str(self.pi))
+        self.assertEqual(ctx.exception.code, "EXECUTION_ID_INVALID")
+        with self.assertRaises(hr.HeadlessError) as ctx:
+            hr.start(target=self.target, explicit_repo="acme/target", execution_id="exec-1",
+                     objective="use ghp_abcdefghijklmnopqrstuvwxyz1234 please", pi_executable=str(self.pi))
+        self.assertEqual(ctx.exception.code, "OBJECTIVE_INVALID")
+        with self.assertRaises(hr.HeadlessError) as ctx:
+            self.status("never-started")
+        self.assertEqual(ctx.exception.code, "EXECUTION_UNKNOWN")
+        with self.assertRaises(hr.HeadlessError) as ctx:
+            self.start(resume=True)
+        self.assertEqual(ctx.exception.code, "EXECUTION_UNKNOWN")
+
+    def test_execution_id_is_bound_to_one_repository(self):
+        self.start()
+        other = Path(self._tmp.name) / "other"
+        other.mkdir()
+        git("-C", str(other), "init", "-q")
+        git("-C", str(other), "remote", "add", "origin", "git@github.com:acme/other.git")
+        # A different repository has a different state key, so the same id is simply unknown there.
+        with self.assertRaises(hr.HeadlessError) as ctx:
+            hr.status(target=other, explicit_repo="acme/other", execution_id="exec-1")
+        self.assertEqual(ctx.exception.code, "EXECUTION_UNKNOWN")
+
+    def test_checkout_is_restored_and_clean_worktrees_removed(self):
+        os.environ["FAKE_PI_MESS"] = "clean"
+        record = self.start()
+        cleanup = record["checkout"]
+        self.assertTrue(cleanup["restored"])
+        self.assertEqual(cleanup["branch_after"], cleanup["branch_before"])
+        self.assertFalse(cleanup["branch_before"].startswith("pico/"))
+        self.assertEqual(git("-C", str(self.target), "branch", "--show-current"), cleanup["branch_before"])
+        self.assertEqual(len(cleanup["removed_worktrees"]), 1)
+        self.assertEqual(len(git("-C", str(self.target), "worktree", "list").splitlines()), 1)
+        branches = git("-C", str(self.target), "branch", "--format=%(refname:short)").split()
+        self.assertIn("pico/batch-1", branches)  # the work is kept on its branches
+        self.assertIn("pico/task-1", branches)
+
+    def test_dirty_worktrees_and_checkouts_are_never_touched(self):
+        os.environ["FAKE_PI_MESS"] = "dirty"
+        record = self.start()
+        self.assertEqual((len(record["checkout"]["kept_worktrees"]), record["checkout"]["removed_worktrees"]), (1, []))
+        self.assertTrue(record["checkout"]["restored"])  # the parent checkout itself was clean
+        os.environ["FAKE_PI_MESS"] = "clean"
+        git("-C", str(self.target), "branch", "-D", "pico/batch-1")
+        (self.target / "README.md").write_text("edited but not committed\n")
+        os.environ["FAKE_PI_BEHAVIOR"] = "finish"
+        record = hr.start(target=self.target, explicit_repo="acme/target", execution_id="exec-dirty",
+                          objective="Inspect", pi_executable=str(self.pi))
+        self.assertFalse(record["checkout"]["restored"])
+        self.assertEqual(record["checkout"]["left_reason"], "uncommitted changes in the checkout")
+
+    def test_resume_prompt_never_carries_the_run_marker(self):
+        self.assertNotIn("PI_ORCHESTRATION_RUN_V1", hr.RESUME_PROMPT)
+        self.assertIn("orchestration_record", hr.RESUME_PROMPT)
+        # The model must be able to match the lifecycle's visible status text.
+        self.assertIn("is ready", hr.RESUME_PROMPT)
+        self.assertIn("explicit outcome", hr.RESUME_PROMPT)
+
+    def test_cancel_closes_run_before_a_graceful_shutdown_can_settle_it(self):
+        launched = self.start(behavior="hang", wait=False)
+        deadline = time.monotonic() + 5
+        while hr.discover_run_id(Path(launched["session_dir"]), launched["session_id"]) is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        run_id = hr.discover_run_id(Path(launched["session_dir"]), launched["session_id"])
+        signals = []
+        real_killpg = os.killpg
+        def observe(pid, sig):
+            # At signal time the run must already be terminal with the cancellation code.
+            signals.append(hr.run_status(run_id)["blocker_code"])
+            real_killpg(pid, sig)
+        with unittest.mock.patch.object(hr.os, "killpg", side_effect=observe):
+            hr.cancel(target=self.target, explicit_repo="acme/target", execution_id="exec-1", grace=2)
+        try:
+            os.waitpid(launched["pid"], 0)
+        except ChildProcessError:
+            pass
+        self.assertEqual(signals[0], "EXECUTION_CANCELLED")
+
+    def test_prompt_carries_marker_and_objective(self):
+        prompt = hr.build_prompt("Review the parser")
+        self.assertIn("PI_ORCHESTRATION_RUN_V1", prompt)
+        self.assertIn("Review the parser", prompt)
+        self.assertNotIn("$ARGUMENTS", prompt)
+        self.assertFalse(prompt.startswith("---"))
+
+    def test_cli(self):
+        def run(args):
+            out = io.StringIO()
+            with redirect_stdout(out):
+                rc = hr.main(args)
+            return rc, json.loads(out.getvalue())
+        os.environ["FAKE_PI_BEHAVIOR"] = "settle"
+        rc, data = run(["start", "--target", str(self.target), "--repo", "acme/target", "--execution-id", "cli-1",
+                        "--objective", "inspect", "--pi", str(self.pi)])
+        self.assertEqual(rc, 1)
+        self.assertEqual(data["run"]["blocker_code"], "ORCHESTRATION_OUTCOME_UNRECORDED")
+        os.environ["FAKE_PI_BEHAVIOR"] = "finish"
+        rc, data = run(["start", "--target", str(self.target), "--repo", "acme/target", "--execution-id", "cli-2",
+                        "--objective", "inspect", "--pi", str(self.pi)])
+        self.assertEqual(rc, 0)
+        self.assertTrue(data["ok"])
+        rc, data = run(["status", "--target", str(self.target), "--repo", "acme/target", "--execution-id", "cli-2"])
+        self.assertEqual(rc, 0)
+        rc, data = run(["status", "--target", str(self.target), "--repo", "acme/target", "--execution-id", "nope"])
+        self.assertEqual(rc, 1)
+        self.assertEqual(data["error_code"], "EXECUTION_UNKNOWN")
+
+
+if __name__ == "__main__":
+    unittest.main()

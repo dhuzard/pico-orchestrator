@@ -1,0 +1,8 @@
+{
+  "remotes": {
+    "origin": "https://github.com/Examplecorp/examplelab.git",
+    "oss": "git@github.com:Examplecorp/examplelab-oss.git"
+  },
+  "explicit": "Examplecorp/examplelab",
+  "resolved_repository": "Examplecorp/examplelab"
+}
