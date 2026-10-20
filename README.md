@@ -58,8 +58,8 @@ PICO runs on Linux and macOS, and on Windows through WSL2. You need:
 
 - **Git.**
 - **Node.js.** CI uses Node.js 24. Pi itself requires Node.js 22.19 or later.
-- **Python 3** with `PyYAML` and `jsonschema` (see `requirements-dev.txt`). CI
-  tests Python 3.12; older versions are not tested.
+- **Python 3.10 or later** with `PyYAML` and `jsonschema` (see
+  `requirements-dev.txt`). CI tests Python 3.12; older versions are not tested.
 - **Pi**, installed with `npm install -g @earendil-works/pi-coding-agent`.
   PICO is developed against Pi 1.0. Codex workers run through the model
   provider configured in Pi (by default `openai-codex/...` models; see
@@ -649,7 +649,13 @@ pico run . -- --help
 
 For a reproducible project, commit `.pi/orchestrator.lock`. `pico run .`
 then uses that exact commit unless `PI_CODING_ORCHESTRATOR_REF` explicitly
-overrides it. To advance the project deliberately:
+overrides it. Because the lock comes from the repository, the launcher reviews
+it first: it runs only a commit on the default branch or contained in a release
+tag, or one you approved for that checkout with `pico pin`. Anything else fails
+closed with `PIN_NOT_ON_RELEASE_HISTORY`. Set
+`PI_CODING_ORCHESTRATOR_ALLOW_UNREVIEWED_PIN=1` to run it anyway. A lock that
+differs from the commit you last approved prints a warning. To advance the
+project deliberately:
 
 ```sh
 pico update .
@@ -758,6 +764,7 @@ checkpoints. Backend conversation history is never reused.
 | `WORKER_TASK_UNATTRIBUTED` / `WORKER_TASK_UNROUTED` / `WORKER_STEP_UNKNOWN` | Several tasks are routed and the worker call names none, names an unrouted task, or names a step outside its plan. |
 | `WAVE_UNDECLARED` | Workers of different tasks would overlap outside one declared wave. |
 | `INTEGRATION_IN_PROGRESS` | A worker launch while the parent integrates a wave. |
+| `WORKER_CONFIG_INVALID` | `PI_ORCHESTRATOR_WORKER_ENV_ALLOW` names an invalid variable, or `PI_ORCHESTRATOR_WORKER_SANDBOX` is not `0` or `1`. The worker is not started. |
 | `WORKER_SCOPE_VIOLATION` | The parent checkout changed during a worker call. Further workers are blocked; nothing is reverted. |
 | `MUTATION_MODE_MISMATCH` | The `AskClaude` `mode` differs from the routed step's mutation permission. |
 | `WORKER_TIMEOUT` / `WORKER_ABORTED` / `WORKER_OUTPUT_LIMIT` | A `ClaudeWorker` run exceeded `PI_CLAUDE_WORKER_TIMEOUT_MS` (default 30 min), was aborted, or exceeded its output cap; its Claude Code process is killed. |

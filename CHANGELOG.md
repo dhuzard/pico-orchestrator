@@ -19,12 +19,35 @@ All notable changes to PICO are recorded here. The format follows
 
 ### Security
 
+- Claude workers receive an allowlisted environment instead of the parent's
+  full environment. GitHub, SSH-agent and npm credentials are withheld unless
+  named in `PI_ORCHESTRATOR_WORKER_ENV_ALLOW`, and the worker result records the
+  names (never the values) of dropped variables. More bypass forms of `git`
+  and `gh` are denied, and `PI_ORCHESTRATOR_WORKER_SANDBOX=1` opts into the
+  Claude Code sandbox.
+- The launcher runs a repository's `.pi/orchestrator.lock` only when the
+  commit is on the default branch, in a release tag, or approved for that
+  checkout with `pico pin`; otherwise it fails with
+  `PIN_NOT_ON_RELEASE_HISTORY`. A changed pin prints a warning.
+- Garden: policy writes refuse symlinked `.pi` paths, `/api/controls` and
+  `/api/branches` require the controls token when controls are on, and a
+  malformed `Content-Length` returns 400.
+- CI actions are pinned to commit SHAs without persisted credentials, and
+  CodeQL and Dependabot are configured.
 - `SECURITY.md`: report vulnerabilities privately through GitHub private
   vulnerability reporting. It lists the supported versions and the
   PICO-specific scope.
 
 ### Changed
 
+- State files are written through one atomic writer (unique temp file, fsync).
+  It refuses to write through symlinks, including a symlinked user model
+  config.
+- `pico exec` records are locked across start, status and cancel, so two
+  concurrent starts launch one child, and a cancel is not overwritten when the
+  child exits.
+- CI also runs `tools/validate_routing.py` and `ruff`. Python 3.10 is the
+  minimum supported version.
 - Documentation no longer points at issue numbers from the pre-public
   repository. `backlog/backlog.yaml` notes that entries before v1.0.0 cite
   that repository and its commits.

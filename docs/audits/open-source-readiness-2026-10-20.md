@@ -51,6 +51,36 @@ These remain for later: signed release tags (they need a maintainer signing
 key), `pico demo`, the mission dispatcher (A1), the run lease (A3), Q5 to Q9,
 and the feature roadmap below.
 
+### Remediation result
+
+All four workstreams are integrated on `claude/pico-open-source-audit-12i2v8`
+together with `main` after #18, #19 and #20.
+
+| Finding | Status |
+| --- | --- |
+| Q1 validator in CI | Fixed. `validate_routing.py` runs in CI. |
+| Q10 lint | Fixed. `ruff` (E9, F, B) runs in CI, and all 17 findings are fixed (one intentional `noqa` with its reason). |
+| S6 action pinning | Fixed. Actions are pinned to SHAs, each checked against its upstream tag, with `persist-credentials: false`. CodeQL and Dependabot are added. Neither has run on GitHub yet. |
+| S3 Garden symlink write | Fixed. Symlinked `.pi` and `autonomy.yaml` are refused with `AUTONOMY_POLICY_PATH_UNSAFE`. Writes go through the shared atomic writer. Regression tests reproduce the attack. |
+| S4 token on reads | Partly fixed. `/api/controls` and `/api/branches` need the token when controls are on. `/api/runs` and `/api/workspace` are still open; the viewer would have to send the token on every poll. |
+| S5 Content-Length | Fixed. A malformed value returns 400 `CONTROL_BODY_INVALID`. |
+| Q2 headless lock | Fixed. Locks are held across start, status and cancel. A concurrency regression test fails without the lock. |
+| Q3 atomic writes | Fixed for the five fixed-temp-name writers. The four `mkstemp` writers are unchanged; they lack `fsync` but are otherwise safe. |
+| Q4 state directory | Open. Unifying it would change provenance's repo-local fallback, so it needs a maintainer decision. |
+| S1 worker isolation | Mitigated. Workers get an allowlisted environment with credentials withheld, and dropped variable names are recorded. More `git`/`gh` bypass forms are denied. The Claude Code sandbox can be enabled with `PI_ORCHESTRATOR_WORKER_SANDBOX=1`. It has not been run against a real worker, so it stays off by default. Workers still load the target repository's own `.claude/settings.json`, hooks included; that needs a follow-up review. |
+| S2 launcher pins | Mitigated. A repository pin must be on the default branch, in a release tag, or approved with `pico pin` for that checkout; otherwise `PIN_NOT_ON_RELEASE_HISTORY`. Pin changes print a warning. Signed tags and protection against downgrades along the default branch are still open. |
+| Community files | Added: SECURITY, CONTRIBUTING, CODE_OF_CONDUCT, CODEOWNERS and issue contact links. Discussions and private vulnerability reporting must be turned on in the repository settings for the links to work. |
+| Stale references | Fixed. `issue #5` was correct, and now links to the public issue. |
+| README newcomer path | Added: what PICO and Pi are, a diagram, prerequisites (Python 3.10+, Node 24), and a docs index. The large advanced sections have not moved yet. |
+
+Behaviour changes users may notice:
+
+- `pico models set` refuses a symlinked user model config.
+- Opening the Garden with controls on but without the token hides the control
+  panels.
+- A repository pin outside the release history fails closed until it is
+  approved with `pico pin`.
+
 ## Checks run
 
 | Check | Result |
