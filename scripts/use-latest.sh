@@ -535,8 +535,8 @@ EOF
     exec pi -e "$RUNTIME/extensions/model-router.ts" -e "$RUNTIME/extensions/workflow-commands.ts" -e "$RUNTIME/extensions/mission-controller.ts" -e "$RUNTIME/extensions/orchestration-lifecycle.ts" ${pi_args[@]+"${pi_args[@]}"}
     ;;
   watch)
-    target="${1:-.}"
-    if [[ $# -gt 0 && "$1" != --* ]]; then shift; fi
+    target="."
+    if [[ $# -gt 0 && "$1" != --* ]]; then target="$1"; shift; fi
     apply_project_pin "$target"
     ensure_repo
     exec python3 "$RUNTIME/tools/watch.py" "$target" --state-dir "$STATE_DIR" "$@"

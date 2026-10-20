@@ -98,7 +98,7 @@ class WorkspaceRunTest(unittest.TestCase):
         workspace = json.loads(Path(results["a1"]["workspace_record"]).read_text())
         self.assertEqual(sorted(workspace["tasks"]), ["a1", "b1", "g1"])
         self.assertEqual(workspace["tasks"]["b1"]["run_id"], results["b1"]["task"]["run_id"])
-        self.assertNotIn("objective", json.dumps(workspace))
+        self.assertNotIn('"objective":', json.dumps(workspace))
         self.assertNotIn("prompt", json.dumps(workspace))
         # Each execution is bound to its own repository's state key.
         for name, (path, _) in self.repos.items():
@@ -126,6 +126,41 @@ class WorkspaceRunTest(unittest.TestCase):
         self.assertEqual(resumed["task"]["run_status"], "PARTIAL")
         self.assertEqual(resumed["task"]["launches"], 2)
         self.assertEqual(len(list((self.state / "runs").glob("run-*.json"))), 2)
+
+    def test_scoped_objective_is_immutable_and_excludes_workspace_goal(self):
+        tasks = [{"id": "a1", "repository": "alpha", "title": "Alpha adapter",
+                  "objective": "Implement the alpha adapter using only this checkout."},
+                 {"id": "b1", "repository": "beta", "title": "Private beta title"}]
+        manifest = self.manifest(tasks)
+        result = self.launch(manifest, "a1")
+        execution = hr.status(target=self.repos["alpha"][0], explicit_repo="acme/alpha", execution_id="ws--a1")
+        self.assertIn(tasks[0]["objective"], execution["objective"])
+        self.assertNotIn("Private beta title", execution["objective"])
+        self.assertNotIn("Cross-repo goal", execution["objective"])
+        self.assertEqual(result["task"]["objective_sha256"], __import__("hashlib").sha256(execution["objective"].encode()).hexdigest())
+        tasks[0]["objective"] = "Change the alpha adapter behavior."
+        self.manifest(tasks)
+        with self.assertRaises(wr.WorkspaceRunError) as rejected:
+            self.launch(manifest, "a1")
+        self.assertEqual(rejected.exception.code, "EXECUTION_OBJECTIVE_MISMATCH")
+        self.assertEqual(self.launch(self.manifest(tasks=[{"id": "new", "repository": "alpha", "title": "Changed",
+                                                   "objective": tasks[0]["objective"]}]), "new")["task"]["execution_id"], "ws--new")
+
+    def test_legacy_execution_resumes_with_its_original_objective(self):
+        manifest = self.manifest(tasks=[{"id": "a1", "repository": "alpha", "title": "Alpha adapter"}])
+        plan = wr._plan(manifest, access_check=ok_access)
+        task, repo = wr._task(plan, "a1")
+        inputs = wr.dispatch_inputs(plan, task, repo)
+        legacy = wr.objective_for(plan, task, repo, inputs).replace(
+            "Repository-scoped objective: Alpha adapter\n", "Workspace goal: Cross-repo goal\n", 1)
+        os.environ["FAKE_PI_BEHAVIOR"] = "crash"
+        hr.start(target=self.repos["alpha"][0], explicit_repo="acme/alpha", execution_id="ws--a1",
+                 objective=legacy, pi_executable=str(self.pi))
+        os.environ["FAKE_PI_BEHAVIOR"] = "finish"
+        resumed = self.launch(manifest, "a1", resume=True)
+        self.assertEqual(resumed["task"]["launches"], 2)
+        saved = hr.status(target=self.repos["alpha"][0], explicit_repo="acme/alpha", execution_id="ws--a1")
+        self.assertEqual(saved["objective"], legacy)
 
     def test_blocked_task_is_refused_until_upstream_is_ready(self):
         tasks = [{"id": "a1", "repository": "alpha", "title": "Adapter"},
