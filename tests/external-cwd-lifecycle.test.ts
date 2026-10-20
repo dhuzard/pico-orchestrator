@@ -225,6 +225,28 @@ test("canonical launcher loads every extension from a local cache and preserves 
     const relaunched = launch();
     assert.equal(relaunched.status, 0,
       `a generated parent record must not block cache updates\nstdout:\n${relaunched.stdout}\nstderr:\n${relaunched.stderr}`);
+    const python = spawnSync("which", ["python3"], { encoding: "utf8" }).stdout.trim();
+    const fakePython = join(binary, "python3");
+    writeFileSync(fakePython, `#!/usr/bin/env bash\nif [[ "$1" == */tools/watch.py ]]; then printf 'WATCH_ARG=%s\\n' "$@"; exit 0; fi\nexec ${python} "$@"\n`);
+    chmodSync(fakePython, 0o755);
+    for (const args of [["--workspace", "workspace.yaml"], [".", "--workspace", "workspace.yaml"],
+      ["--workspace", "/tmp/workspace.yaml"], [".", "--workspace", "workspace.yaml", "--controls"], ["."]]) {
+      const watched = spawnSync("bash", [join(SOURCE, "scripts/use-latest.sh"), "watch", ...args], {
+        cwd: target, encoding: "utf8", env: { ...process.env, PATH: `${binary}:${process.env.PATH}`,
+          PI_CODING_ORCHESTRATOR_REPO_URL: bare, PI_CODING_ORCHESTRATOR_HOME: cache,
+          PI_CODING_AGENT_DIR: join(base, "agent") },
+      });
+      assert.equal(watched.status, 0, watched.stderr);
+      assert.match(watched.stdout, /WATCH_ARG=\.\n/);
+      for (const arg of args.slice(args[0] === "." ? 1 : 0)) assert.ok(watched.stdout.includes(`WATCH_ARG=${arg}\n`));
+    }
+    const missingWorkspace = spawnSync("bash", [join(SOURCE, "scripts/use-latest.sh"), "watch", "--workspace"], {
+      cwd: target, encoding: "utf8", env: { ...process.env,
+        PI_CODING_ORCHESTRATOR_REPO_URL: bare, PI_CODING_ORCHESTRATOR_HOME: cache,
+        PI_CODING_AGENT_DIR: join(base, "agent") },
+    });
+    assert.equal(missingWorkspace.status, 2);
+    assert.match(missingWorkspace.stderr, /argument --workspace: expected one argument/);
     assert.ok(existsSync(generated), "cache update must preserve the parent record");
     writeFileSync(join(cache, "repo/unrelated.txt"), "do not discard\n");
     const dirty = launch();
