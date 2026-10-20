@@ -55,6 +55,7 @@ Usage:
   use-latest.sh sync [target-repo] [--copy-extension] [--github-templates] [--overwrite]
   use-latest.sh models show|validate|set|reset [...]
   use-latest.sh prompt
+  use-latest.sh report --title "..." --body-file report.md [--apply --plan-hash <hash>]
 
 Environment:
   PI_CODING_ORCHESTRATOR_REPO_URL  Git URL to clone/pull.
@@ -79,6 +80,7 @@ Examples:
   pico pin .
   pico models show                 # light, economy, standard, high, max
   pico models set codex high openai-codex/gpt-6.1-sol
+  pico report --title "PICO bug" --body-file report.md   # preview issue in PICO repository
   PI_CODING_ORCHESTRATOR_REF=v1.2.3 pico run ../my-project -- --model claude
 EOF
 }
@@ -596,6 +598,10 @@ EOF
   prompt)
     ensure_repo
     cat "$RUNTIME/prompts/orchestrate-core.md"
+    ;;
+  report)
+    ensure_repo
+    exec python3 "$RUNTIME/tools/report_pico_issue.py" "$@"
     ;;
   *)
     echo "Unknown command: $cmd" >&2
