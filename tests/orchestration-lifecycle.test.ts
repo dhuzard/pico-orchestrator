@@ -783,8 +783,9 @@ test("a worker environment keeps only what Claude Code needs and never a GitHub 
   assert.deepEqual(Object.keys(env).sort(), ["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "HOME", "LANG", "LC_ALL",
     "NODE_EXTRA_CA_CERTS", "NO_PROXY", "PATH", "TMPDIR", "USER", "XDG_CONFIG_HOME", "https_proxy"]);
   assert.equal(env.CLAUDE_CODE_OAUTH_TOKEN, "c");
-  assert.deepEqual(dropped, ["AWS_SECRET_ACCESS_KEY", "GH_ENTERPRISE_TOKEN", "GH_TOKEN", "GITHUB_TOKEN", "GIT_ASKPASS",
-    "GIT_DIR", "MY_SERVICE_API_KEY", "NPM_TOKEN", "PI_ORCHESTRATOR_STATE_DIR", "SSH_AUTH_SOCK"]);
+  // Known credentials first, then everything else; each group sorted.
+  assert.deepEqual(dropped, ["GH_ENTERPRISE_TOKEN", "GH_TOKEN", "GITHUB_TOKEN", "GIT_ASKPASS", "NPM_TOKEN",
+    "SSH_AUTH_SOCK", "AWS_SECRET_ACCESS_KEY", "GIT_DIR", "MY_SERVICE_API_KEY", "PI_ORCHESTRATOR_STATE_DIR"]);
   for (const name of WORKER_ENV_CREDENTIALS) assert.ok(!(name in buildWorkerEnv({ [name]: "x" }).env), name);
   // A prefix rule never forwards a listed credential name.
   assert.ok(!WORKER_ENV_CREDENTIALS.some((name) => WORKER_ENV_NAMES.includes(name)));
@@ -830,9 +831,12 @@ test("ClaudeWorker withholds credentials from the worker process and records onl
     assert.equal(echoed.env.PATH, process.env.PATH);
     assert.equal(echoed.env.ANTHROPIC_BASE_URL, "http://127.0.0.1:9");
     assert.ok(!echoed.args.includes("--settings"));
-    for (const name of ["GH_TOKEN", "GITHUB_TOKEN", "SSH_AUTH_SOCK", "PICO_TEST_EXTRA"]) {
+    // The record keeps at most 100 names (CI runners carry more): credentials
+    // come first so they are always named; other names are in the full list.
+    for (const name of ["GH_TOKEN", "GITHUB_TOKEN", "SSH_AUTH_SOCK"]) {
       assert.ok(plain.details.env_dropped.includes(name), name);
     }
+    assert.ok(buildWorkerEnv().dropped.includes("PICO_TEST_EXTRA"));
     assert.equal(plain.details.env_dropped_count, buildWorkerEnv().dropped.length);
     assert.ok(!JSON.stringify(plain.details).includes("secret-gh"), "values are never recorded");
 

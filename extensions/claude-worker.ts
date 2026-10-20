@@ -88,8 +88,10 @@ export class WorkerConfigError extends Error {}
  * Environment of one worker: allowlisted names from `source`, plus the exact
  * names listed in PI_ORCHESTRATOR_WORKER_ENV_ALLOW. Everything else (GitHub
  * tokens, SSH agent, Git overrides such as GIT_DIR, cloud and registry
- * credentials) is withheld; `dropped` lists the withheld names, sorted, never
- * their values. An invalid name in the extension list throws WorkerConfigError.
+ * credentials) is withheld; `dropped` lists the withheld names, never their
+ * values: known credentials first (so a truncated record still names them),
+ * then the rest sorted. An invalid name in the extension list throws
+ * WorkerConfigError.
  */
 export function buildWorkerEnv(source: NodeJS.ProcessEnv = process.env):
     { env: Record<string, string>; dropped: string[] } {
@@ -111,7 +113,9 @@ export function buildWorkerEnv(source: NodeJS.ProcessEnv = process.env):
     if (builtIn || extra.has(name)) env[name] = value;
     else dropped.push(name);
   }
-  return { env, dropped: dropped.sort() };
+  const credential = (name: string) => WORKER_ENV_CREDENTIALS.includes(name);
+  dropped.sort((a, b) => Number(credential(b)) - Number(credential(a)) || (a < b ? -1 : a > b ? 1 : 0));
+  return { env, dropped };
 }
 
 /** Whether worker Bash runs in Claude Code's sandbox: unset, empty or `0` is off, `1` is on, anything else throws. */
