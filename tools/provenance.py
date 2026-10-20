@@ -609,9 +609,9 @@ def run_lock(repo_root: Path, run_id: str, *, wait_seconds: float | None = None)
                     import fcntl
                     fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
                 break
-            except (BlockingIOError, OSError):
+            except (BlockingIOError, OSError) as error:
                 if time.monotonic() >= deadline:
-                    raise RunLockTimeout(f"run {run_id!r} is busy")
+                    raise RunLockTimeout(f"run {run_id!r} is busy") from error
                 time.sleep(0.02)
         try:
             yield

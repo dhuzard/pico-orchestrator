@@ -445,7 +445,7 @@ class EngineCasesTest(unittest.TestCase):
         self.assertEqual(self.assets.policy["version"], 7)
         for route in engine.ROUTES:
             plans = self.assets.policy["execution"][route]["primary_intents"]
-            for intent, plan in plans.items():
+            for _intent, plan in plans.items():
                 self.assertEqual(plan["schema_version"], 3)
                 for step in plan["steps"]:
                     profile = self.assets.policy["model_profiles"][step["family"]]
@@ -815,7 +815,7 @@ class EngineCasesTest(unittest.TestCase):
                 result = engine.build_result(resolution, self.assets.policy, None, self.assets.execution_plan_schema)
                 if not result["ok"]:
                     continue
-                for step, assignment in zip(result["execution_plan"]["steps"], result["capacity_assignments"]):
+                for step, assignment in zip(result["execution_plan"]["steps"], result["capacity_assignments"], strict=True):
                     self.assertEqual(assignment["authored_reasoning_effort"], step["reasoning_effort"])
                     if assignment["rule"] is None:
                         self.assertEqual(assignment["assigned_reasoning_effort"], step["reasoning_effort"])
@@ -1217,7 +1217,7 @@ class GraduatedCapacityTest(unittest.TestCase):
                         self.assets.policy, self.assets.execution_plan_schema, route, intent
                     )
                     task = dict(GIT_PUSH_TASK, **{field: True})
-                    for step, assignment in zip(plan["steps"], engine.assign_capacities(self.assets.policy, plan, task)):
+                    for step, assignment in zip(plan["steps"], engine.assign_capacities(self.assets.policy, plan, task), strict=True):
                         self.assertEqual(assignment["assigned_capacity_tier"], step["capacity_tier"])
                         self.assertIsNone(assignment["rule"])
 

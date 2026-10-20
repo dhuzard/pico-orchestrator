@@ -125,4 +125,4 @@ if __name__ == "__main__":
         print(json.dumps(configure_host(Path(sys.argv[1]).resolve())))
     except (OSError, ValueError, json.JSONDecodeError) as error:
         print(f"Claude backend configuration failed: {error}", file=sys.stderr)
-        raise SystemExit(1)
+        raise SystemExit(1) from None

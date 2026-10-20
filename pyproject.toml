@@ -1,0 +1,11 @@
+# Tool configuration only. PICO is not packaged as a Python distribution, so
+# this file intentionally has no [build-system] or [project] table.
+
+[tool.ruff]
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E9", "F", "B"]
+# E501: long lines are tolerated. E402: tools/tests/benchmarks insert the repo
+# root into sys.path before importing sibling modules.
+ignore = ["E501", "E402"]

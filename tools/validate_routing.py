@@ -138,7 +138,7 @@ def validate_prompt(prompt_text, task_schema, policy, errors):
     if headings != ROUTES:
         errors.add(f"prompts/orchestrate.md route headings must be exactly {sorted(ROUTES)}, got {sorted(headings)}")
 
-    if f"(CODEX)" not in prompt_text or "fallback_route" not in prompt_text:
+    if "(CODEX)" not in prompt_text or "fallback_route" not in prompt_text:
         errors.add("prompts/orchestrate.md must document fallback_route (CODEX)")
 
     for literal in ("escalation_evidence", engine.CLASSIFICATION_EVIDENCE_MISSING):

@@ -30,7 +30,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import subprocess
 import sys
 import time
@@ -43,7 +42,6 @@ import github_integration  # noqa: E402
 import github_sync as gh  # noqa: E402
 import headless_run  # noqa: E402
 import provenance  # noqa: E402
-import workspace_plan  # noqa: E402
 import workspace_run  # noqa: E402
 
 WorkspaceRunError = workspace_run.WorkspaceRunError

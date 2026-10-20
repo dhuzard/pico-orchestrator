@@ -570,7 +570,7 @@ class LifecycleTest(unittest.TestCase):
         self.assertEqual(visible["assignments"][1]["ambiguity_capacity"], 9)
         self.assertNotIn("goal", visible)
         self.assertNotIn("repository_evidence", visible)
-        with self.assertRaises(Exception):
+        with self.assertRaises(po.ParentRunError):
             po.record_event(run_id, {"kind": "phase", "phase": "proof", "status": "in_progress",
                                      "route": self.route["selected_route"],
                                      "routing": {**routing, "goal": "private task text"}}, repo_root=self.records)
