@@ -124,8 +124,9 @@ performs no Git or GitHub mutation. An ambiguous checkout, an identity absent
 from the remotes, two entries naming the same repository, a missing commit, a
 dependency cycle or denied access all fail closed. Add `--json` for
 machine-readable output or `--no-access-check` to plan offline (the plan then
-records that access was not verified). Execution of such a plan is tracked in
-issue #49; each repository keeps its own parent run and `target_repository`.
+records that access was not verified). To execute a plan, use `pico workspace
+schedule` (below); each repository keeps its own parent run and
+`target_repository`.
 
 ### Schedule a workspace across repositories
 
@@ -181,7 +182,7 @@ The child is an ordinary single-repository run with its own
 `target_repository`; the launcher links its run id into the workspace record
 in orchestrator state. `pico workspace status` reconciles every task and
 `pico workspace cancel --task <id>` stops one child. Ordering and concurrency
-across tasks belong to the scheduler (#54).
+across tasks belong to the scheduler (`pico workspace schedule`).
 
 ### Run one bounded orchestration headless
 

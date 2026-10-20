@@ -1248,13 +1248,15 @@ you the exact `provenance/runs/<run-id>.json` path. Metrics and token/cost
 fields are observational only: they appear when a backend persisted them, and
 otherwise render as `unknown`/`null` rather than being estimated.
 
-Sample text output for a `CODEX_CLAUDE_CODEX` run:
+Sample text output for a `CODEX_CLAUDE_CODEX` run (illustrative: the run and
+backlog identifiers come from development before the public repository, and
+no GitHub issue was recorded for this run):
 
 ```text
 Run: run-2026-09-23-orch011
 Trace: provenance/runs/run-2026-09-23-orch011.json
 Status: completed
-References: backlog ORCH-011; GitHub issue #11
+References: backlog ORCH-011; GitHub issue unknown
 Objective: Implement end-of-run orchestration trace and user-facing summary.
 
 Route:
@@ -1398,14 +1400,14 @@ tasks with `depends_on`, `blocks`, `wave`, `readiness`, `blocked_by` and
 (`WORKSPACE_MANIFEST_INVALID`). Blockers never stop validation of the
 remaining entries, so one report lists everything to fix. Execution of a plan
 (headless child runs, scheduling, contracts, PR coordination, Garden) is
-tracked in epic #49.
+described in the sections that follow.
 
 ### Headless single-repository execution
 
 `tools/headless_run.py` (launcher: `pico exec`) starts, observes, resumes and
 cancels one bounded orchestration run without an interactive terminal. It is
 the programmatic execution interface that repository-scoped child launchers
-and the cross-repository scheduler (#53, #54) build on.
+and the cross-repository scheduler build on.
 
 ```sh
 python3 tools/headless_run.py start  --target . --repo owner/repository --execution-id <id> --objective "..." [--allow-mutation] [--resume] [--no-wait]
