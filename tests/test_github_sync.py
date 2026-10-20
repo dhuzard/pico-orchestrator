@@ -244,10 +244,10 @@ class GithubSyncBoundaryTest(unittest.TestCase):
         with patch.object(gh.shutil, "which", return_value="/usr/bin/gh"), \
              patch.object(gh.subprocess, "run", return_value=fake_proc()) as mock_run:
             gh.edit_pr(8, title="Revised", body="## Summary\nDone", repo="acme/repo")
-        argv = mock_run.call_args.args[0]
-        self.assertEqual(argv[:4], ["gh", "pr", "edit", "8"])
-        self.assertEqual(argv[argv.index("--title") + 1], "Revised")
-        self.assertEqual(argv[argv.index("--repo") + 1], "acme/repo")
+        self.assertEqual(mock_run.call_args.args[0], [
+            "gh", "api", "-X", "PATCH", "repos/acme/repo/pulls/8",
+            "-f", "title=Revised", "-f", "body=## Summary\nDone",
+        ])
         self.assertEqual(mock_run.call_args.kwargs.get("shell"), False)
 
         with patch.object(gh.shutil, "which", return_value="/usr/bin/gh"), \
@@ -271,6 +271,213 @@ class GithubSyncBoundaryTest(unittest.TestCase):
         for verb in ("merge", "checkout", "ready"):
             with self.assertRaises(gh.GithubSyncError):
                 gh._run(["gh", "pr", verb, "1"])
+
+
+class EditPrRestPatchTest(unittest.TestCase):
+    """edit_pr uses the fixed REST shape `gh api -X PATCH repos/.../pulls/N`
+    instead of `gh pr edit` (which fails on gh 2.45 via classic Projects
+    GraphQL). The allowlist accepts only that exact argv shape."""
+
+    def run_edit(self, number, **kwargs):
+        with patch.object(gh.shutil, "which", return_value="/usr/bin/gh"), \
+             patch.object(gh.subprocess, "run", return_value=fake_proc(stdout="{}")) as mock_run:
+            result = gh.edit_pr(number, **kwargs)
+        self.assertIsNone(result)
+        mock_run.assert_called_once()
+        self.assertEqual(mock_run.call_args.kwargs.get("shell"), False)
+        return mock_run.call_args.args[0]
+
+    def assert_rejected_before_subprocess(self, argv):
+        with patch.object(gh.shutil, "which", return_value="/usr/bin/gh"), \
+             patch.object(gh.subprocess, "run") as mock_run:
+            with self.assertRaises(gh.GithubSyncError, msg=repr(argv)):
+                gh._run(argv)
+            mock_run.assert_not_called()
+
+    # -- exact argv ---------------------------------------------------------
+
+    def test_explicit_repo_title_and_body(self):
+        self.assertEqual(self.run_edit(8, title="Revised", body="## Summary\nDone", repo="acme/repo"), [
+            "gh", "api", "-X", "PATCH", "repos/acme/repo/pulls/8",
+            "-f", "title=Revised", "-f", "body=## Summary\nDone",
+        ])
+
+    def test_implicit_repo_uses_literal_gh_placeholders(self):
+        self.assertEqual(self.run_edit(8, title="Revised", body="## Summary\nDone"), [
+            "gh", "api", "-X", "PATCH", "repos/{owner}/{repo}/pulls/8",
+            "-f", "title=Revised", "-f", "body=## Summary\nDone",
+        ])
+
+    def test_title_only(self):
+        self.assertEqual(self.run_edit(8, title="Revised", repo="acme/repo"), [
+            "gh", "api", "-X", "PATCH", "repos/acme/repo/pulls/8", "-f", "title=Revised",
+        ])
+
+    def test_body_only(self):
+        self.assertEqual(self.run_edit(8, body="Done"), [
+            "gh", "api", "-X", "PATCH", "repos/{owner}/{repo}/pulls/8", "-f", "body=Done",
+        ])
+
+    def test_empty_body_is_allowed(self):
+        self.assertEqual(self.run_edit(8, body="", repo="acme/repo"), [
+            "gh", "api", "-X", "PATCH", "repos/acme/repo/pulls/8", "-f", "body=",
+        ])
+
+    def test_values_are_passed_verbatim_as_raw_strings(self):
+        for value in ("@/etc/passwd", "true", "false", "null", "123", "-1.5",
+                      "$(rm -rf /); `id` | && > x ' \"", "line1\nline2\r\n\tline3",
+                      "a=b=c", "=leading", "--repo other/repo", "-F body=x"):
+            argv = self.run_edit(3, title=value, body=value, repo="acme/repo")
+            self.assertEqual(argv, [
+                "gh", "api", "-X", "PATCH", "repos/acme/repo/pulls/3",
+                "-f", f"title={value}", "-f", f"body={value}",
+            ])
+            self.assertNotIn("-F", argv[:5] + argv[5::2])
+
+    # -- argument validation (unchanged semantics) --------------------------
+
+    def test_argument_validation_rejects_before_subprocess(self):
+        cases = [
+            ((0,), {"title": "t"}),
+            ((-1,), {"title": "t"}),
+            ((True,), {"title": "t"}),
+            (("8",), {"title": "t"}),
+            ((8,), {}),
+            ((8,), {"title": ""}),
+            ((8,), {"title": "  \n\t"}),
+            ((8,), {"title": 5}),
+            ((8,), {"body": None, "title": None}),
+            ((8,), {"body": b"bytes"}),
+            ((8,), {"title": "t", "repo": "acme"}),
+            ((8,), {"title": "t", "repo": "acme/repo/pulls"}),
+            ((8,), {"title": "t", "repo": "../repo"}),
+            ((8,), {"title": "t", "repo": "{owner}/{repo}"}),
+            ((8,), {"title": "t", "repo": "acme/repo?x=1"}),
+        ]
+        for args, kwargs in cases:
+            with patch.object(gh.shutil, "which", return_value="/usr/bin/gh"), \
+                 patch.object(gh.subprocess, "run") as mock_run:
+                with self.assertRaises(ValueError, msg=(args, kwargs)):
+                    gh.edit_pr(*args, **kwargs)
+                mock_run.assert_not_called()
+
+    # -- existing error handling preserved ----------------------------------
+
+    def test_nonzero_exit_raises_command_error(self):
+        with patch.object(gh.shutil, "which", return_value="/usr/bin/gh"), \
+             patch.object(gh.subprocess, "run", return_value=fake_proc(returncode=1, stderr="gh: Not Found (HTTP 404)")):
+            with self.assertRaises(gh.GhCommandError) as ctx:
+                gh.edit_pr(8, title="t", repo="acme/repo")
+        self.assertEqual(ctx.exception.argv[:5], ["gh", "api", "-X", "PATCH", "repos/acme/repo/pulls/8"])
+
+    def test_auth_failure_raises_auth_error(self):
+        with patch.object(gh.shutil, "which", return_value="/usr/bin/gh"), \
+             patch.object(gh.subprocess, "run", return_value=fake_proc(returncode=1, stderr="not logged in")):
+            with self.assertRaises(gh.GhAuthError):
+                gh.edit_pr(8, title="t")
+
+    def test_gh_unavailable_raises_before_subprocess(self):
+        with patch.object(gh.shutil, "which", return_value=None), \
+             patch.object(gh.subprocess, "run") as mock_run:
+            with self.assertRaises(gh.GhUnavailableError):
+                gh.edit_pr(8, title="t")
+            mock_run.assert_not_called()
+
+    def test_timeout_raises_timeout_error(self):
+        with patch.object(gh.shutil, "which", return_value="/usr/bin/gh"), \
+             patch.object(gh.subprocess, "run", side_effect=subprocess.TimeoutExpired(["gh"], 30)):
+            with self.assertRaises(gh.GhTimeoutError):
+                gh.edit_pr(8, title="t")
+
+    # -- allowlist: only the whole fixed PATCH shape -------------------------
+
+    def test_allowlist_accepts_exact_shapes(self):
+        for argv in (
+            ["gh", "api", "-X", "PATCH", "repos/acme/repo/pulls/8", "-f", "title=t"],
+            ["gh", "api", "-X", "PATCH", "repos/acme/repo/pulls/8", "-f", "body="],
+            ["gh", "api", "-X", "PATCH", "repos/{owner}/{repo}/pulls/12", "-f", "title=t", "-f", "body=b=c"],
+            ["gh", "api", "-X", "PATCH", "repos/Acme-1/re.po_x/pulls/1", "-f", "title=@x", "-f", "body=true"],
+        ):
+            gh._validate_allowlisted(argv)
+
+    def test_old_pr_edit_is_no_longer_allowlisted(self):
+        self.assertNotIn(("pr", "edit"), gh.ALLOWED_COMMANDS)
+        self.assert_rejected_before_subprocess(["gh", "pr", "edit", "8", "--title", "t"])
+
+    def test_allowlist_rejects_everything_but_the_fixed_shape(self):
+        ok_head = ["gh", "api", "-X", "PATCH"]
+        ep = "repos/acme/repo/pulls/8"
+        rejected = [
+            # generic api use
+            ["gh", "api", "repos/x/y"],
+            ["gh", "api", "user"],
+            ["gh", "api", "graphql", "-f", "query=mutation{}"],
+            ["gh", "api", ep],
+            ["gh", "api", "-X", "PATCH"],
+            ["gh", "api", "-X", "PATCH", ep],
+            # wrong method
+            ["gh", "api", "-X", "POST", ep, "-f", "title=t"],
+            ["gh", "api", "-X", "DELETE", ep, "-f", "title=t"],
+            ["gh", "api", "-X", "patch", ep, "-f", "title=t"],
+            ["gh", "api", "--method", "PATCH", ep, "-f", "title=t"],
+            ["gh", "api", "-XPATCH", ep, "-f", "title=t", "-f", "body=b"],
+            ["gh", "api", ep, "-X", "PATCH", "-f", "title=t"],
+            # wrong resource / number
+            ok_head + ["repos/acme/repo/issues/8", "-f", "title=t"],
+            ok_head + ["repos/acme/repo/pulls/8/merge", "-f", "title=t"],
+            ok_head + ["repos/acme/repo/pulls/8/", "-f", "title=t"],
+            ok_head + ["/repos/acme/repo/pulls/8", "-f", "title=t"],
+            ok_head + ["https://api.github.com/repos/acme/repo/pulls/8", "-f", "title=t"],
+            ok_head + ["repos/acme/repo/pulls/8?state=closed", "-f", "title=t"],
+            ok_head + ["repos/acme/repo/pulls/8#x", "-f", "title=t"],
+            ok_head + ["repos/acme/repo/pulls/8\n", "-f", "title=t"],
+            ok_head + ["repos/acme/repo/pulls/0", "-f", "title=t"],
+            ok_head + ["repos/acme/repo/pulls/08", "-f", "title=t"],
+            ok_head + ["repos/acme/repo/pulls/-8", "-f", "title=t"],
+            ok_head + ["repos/acme/repo/pulls/x", "-f", "title=t"],
+            ok_head + ["repos/acme/repo/pulls/", "-f", "title=t"],
+            ok_head + ["repos/acme/pulls/8", "-f", "title=t"],
+            ok_head + ["repos/a/b/c/pulls/8", "-f", "title=t"],
+            ok_head + ["repos/acme/../pulls/8", "-f", "title=t"],
+            ok_head + ["repos/acme/re..po/pulls/8", "-f", "title=t"],
+            ok_head + ["repos/-acme/repo/pulls/8", "-f", "title=t"],
+            ok_head + ["repos/ac me/repo/pulls/8", "-f", "title=t"],
+            # partial / malformed placeholders
+            ok_head + ["repos/{owner}/repo/pulls/8", "-f", "title=t"],
+            ok_head + ["repos/acme/{repo}/pulls/8", "-f", "title=t"],
+            ok_head + ["repos/{repo}/{owner}/pulls/8", "-f", "title=t"],
+            ok_head + ["repos/{owner}x/{repo}/pulls/8", "-f", "title=t"],
+            ok_head + ["repos/{owner/{repo}/pulls/8", "-f", "title=t"],
+            ok_head + ["repos/{branch}/{repo}/pulls/8", "-f", "title=t"],
+            # fields: duplicates, unknown keys, ordering, typed/unknown flags
+            ok_head + [ep, "-f", "title=a", "-f", "title=b"],
+            ok_head + [ep, "-f", "body=a", "-f", "body=b"],
+            ok_head + [ep, "-f", "body=b", "-f", "title=t"],
+            ok_head + [ep, "-f", "state=closed"],
+            ok_head + [ep, "-f", "title=t", "-f", "base=main"],
+            ok_head + [ep, "-f", "Title=t"],
+            ok_head + [ep, "-f", " title=t"],
+            ok_head + [ep, "-f", "title"],
+            ok_head + [ep, "-f", "=t"],
+            ok_head + [ep, "-F", "title=t"],
+            ok_head + [ep, "--raw-field", "title=t"],
+            ok_head + [ep, "--field", "title=t"],
+            ok_head + [ep, "-f", "title=t", "--input", "file.json"],
+            ok_head + [ep, "-f", "title=t", "-H", "Accept: x"],
+            ok_head + [ep, "-f", "title=t", "--hostname", "evil.example"],
+            ok_head + [ep, "-f", "title=t", "-f"],
+            ok_head + [ep, "-f", "title=t", "-f", "body=b", "-f", "title=u"],
+            ok_head + [ep, "title=t"],
+            # title content rules
+            ok_head + [ep, "-f", "title="],
+            ok_head + [ep, "-f", "title=   "],
+            ok_head + [ep, "-f", "title=\n", "-f", "body=b"],
+            # non-string elements
+            ok_head + [ep, "-f", None],
+            ok_head + [ep, "-f", 5],
+        ]
+        for argv in rejected:
+            self.assert_rejected_before_subprocess(argv)
 
 
 # ---------------------------------------------------------------------------

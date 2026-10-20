@@ -1857,9 +1857,26 @@ choke point (`_run`):
   shell string.
 - A fixed allowlist of `(noun, verb)` pairs: `repo view`, `issue list`,
   `issue view`, `issue create`, `issue edit`, `issue close`, `issue reopen`,
-  `pr view`, `pr create`, and `auth status`. No `gh api`, no `gh pr merge`,
-  no `gh pr checkout`, no `gh pr ready`, and no caller-supplied arbitrary
-  flags — every wrapper function builds its own fixed argv shape.
+  `issue comment`, `label list`, `label create`, `pr view`, `pr list`,
+  `pr create`, `pr comment`, and `auth status`. No `gh pr edit`, no
+  `gh pr merge`, no `gh pr checkout`, no `gh pr ready`, and no caller-supplied
+  arbitrary flags — every wrapper function builds its own fixed argv shape.
+- Generic `gh api` is not allowlisted. The one exception is the PR title/body
+  edit performed by `edit_pr`, which uses the REST pulls endpoint because
+  `gh pr edit` fails on some `gh` versions (e.g. 2.45) while querying
+  deprecated classic Projects over GraphQL:
+  `gh api -X PATCH repos/<owner>/<repo>/pulls/<n> -f title=<title> -f body=<body>`.
+  Only supplied fields are sent (title, then body; at least one). The
+  allowlist accepts that whole argv shape only: exact `-X PATCH`, an endpoint
+  that fully matches `repos/<owner>/<repo>/pulls/<positive number>` with a
+  validated `owner/repo` (or, when no repository is given, exactly the
+  `{owner}/{repo}` placeholders that `gh` resolves from the current
+  directory), and one or two unique `title`/`body` fields passed with `-f`
+  (raw strings, so values such as `@file`, `true`, `null` or numbers are
+  sent verbatim, never typed or read from files). The title must be
+  non-blank; the body may be empty. Any other method, endpoint, query
+  string, URL, placeholder, key, duplicate or flag (including typed `-F`)
+  raises `GithubSyncError` before a subprocess is started.
 - `gh` unavailable, not authenticated, and malformed/non-JSON output are all
   distinct, explicit error types (`GhUnavailableError`, `GhAuthError`,
   `GhOutputError`, `GhCommandError`, `GhTimeoutError`), never silently
