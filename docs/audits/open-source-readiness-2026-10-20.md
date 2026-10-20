@@ -23,6 +23,34 @@ The gaps are in what a public project needs around that core:
 
 All of them are fixable in about a week.
 
+## Status update — later on 20 October 2026
+
+Changes on `main` since the audit:
+
+- **#17** (route escalation provenance) fixed the validator's README check.
+  `python tools/validate_routing.py` now passes, so Q1 is reduced to "not run
+  in CI".
+- **#19** (watch argument forwarding) merged. Both PRs touched audited files;
+  no other finding changed.
+- **#18** (workspace task objectives) and **#20** (`pico report`, which files
+  a bug in the PICO repository through a plan-hash dry run) were green and are
+  being merged once their branches are up to date with `main`. Branch
+  protection requires this.
+
+Remediation is underway in four parallel workstreams. Each one runs the
+checks listed in AGENTS.md:
+
+| Workstream | Findings |
+| --- | --- |
+| A. CI gates and supply chain | Q1 (validator in CI), Q10 (ruff), S6 (SHA pins, `persist-credentials: false`), Dependabot, CodeQL, `engines` and `.nvmrc` |
+| B. Storage safety and Garden | Q3 (shared atomic writer), S3 (symlink write), Q2 (headless lock), S4 (token on read endpoints), S5 (Content-Length), Q4 if it stays small |
+| C. Community and newcomer docs | SECURITY, CONTRIBUTING, CODE_OF_CONDUCT, CODEOWNERS, issue contact links, stale references, README newcomer path |
+| D. Worker and launcher hardening | S1 (worker env allowlist, deny-list wording, sandbox follow-up), S2 (pins must be on release history, warning when a pin changes) |
+
+These remain for later: signed release tags (they need a maintainer signing
+key), `pico demo`, the mission dispatcher (A1), the run lease (A3), Q5 to Q9,
+and the feature roadmap below.
+
 ## Checks run
 
 | Check | Result |
