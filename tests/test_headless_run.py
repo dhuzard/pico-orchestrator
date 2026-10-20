@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import unittest.mock
@@ -243,6 +244,46 @@ class HeadlessRunTest(unittest.TestCase):
         self.assertEqual(cancelled["run"]["blocker_code"], "EXECUTION_CANCELLED")
         again = self.start(behavior="finish")
         self.assertEqual(again["outcome"], "already_finished")
+
+    def test_concurrent_starts_with_one_id_launch_at_most_one_child(self):
+        # Widen the window between reading the record and launching, where an
+        # unlocked start would let both callers see "not running".
+        original = hr.mutation_permitted
+
+        def slow_check(worktree):
+            time.sleep(0.3)
+            return original(worktree)
+
+        barrier = threading.Barrier(2)
+        results, errors = [], []
+
+        def launch():
+            barrier.wait()
+            try:
+                results.append(self.start(behavior="hang", wait=False))
+            except Exception as exc:  # surfaced below
+                errors.append(exc)
+
+        os.environ["FAKE_PI_BEHAVIOR"] = "hang"
+        with unittest.mock.patch.object(hr, "mutation_permitted", slow_check):
+            threads = [threading.Thread(target=launch) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(30)
+        pids = {r["pid"] for r in results if r.get("outcome") == "launched"}
+        try:
+            self.assertEqual(errors, [])
+            self.assertEqual(sorted(r["outcome"] for r in results), ["already_running", "launched"])
+            self.assertEqual(len(pids), 1)
+            self.assertEqual(self.status()["launches"], 1)
+        finally:
+            for pid in pids:
+                try:
+                    os.killpg(pid, 9)
+                    os.waitpid(pid, 0)
+                except (ProcessLookupError, ChildProcessError):
+                    pass
 
     def test_mutating_policy_requires_explicit_authorization(self):
         (self.target / ".pi").mkdir()

@@ -24,6 +24,8 @@ Exit codes: 0 ok, 1 blocked or refused, 2 invalid invocation.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
 import hashlib
 import json
 import os
@@ -39,6 +41,7 @@ from pathlib import Path
 import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import atomic_io  # noqa: E402
 import autonomy_policy  # noqa: E402
 import github_integration  # noqa: E402
 import parent_orchestration  # noqa: E402
@@ -111,9 +114,23 @@ def load_record(path: Path) -> dict | None:
 def save_record(path: Path, record: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     record["updated_at"] = _now()
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
-    os.replace(tmp, path)
+    atomic_io.atomic_write_json(path, record, indent=2, sort_keys=True)
+
+
+@contextlib.contextmanager
+def locked_record(path: Path):
+    """Exclusive read-modify-write of one execution record across threads and processes.
+
+    Not re-entrant (flock is per open file). Never held while waiting for the
+    child to exit, so status and cancel stay responsive during a run.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path.with_name(path.name + ".lock"), "a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
 
 
 def build_prompt(objective: str, prompt_path: Path = PROMPT_PATH) -> str:
@@ -289,6 +306,40 @@ def start(*, target: Path, explicit_repo: str, execution_id: str, objective: str
         raise HeadlessError("OBJECTIVE_INVALID", "objective looks like it contains a secret")
     worktree, identity, common = _target(target, explicit_repo)
     path = execution_path(common, execution_id)
+    # Deciding and launching happen under the record lock, so two starts with
+    # the same id cannot both see "not running" and both start Pi.
+    with locked_record(path):
+        launched = _launch_locked(path, worktree=worktree, identity=identity, common=common,
+                                  execution_id=execution_id, objective=objective, allow_mutation=allow_mutation,
+                                  resume=resume, pi_executable=pi_executable, python=python)
+    if isinstance(launched, dict):
+        return launched
+    record, child, log, before = launched
+    if not wait:
+        log.close()
+        return record
+    try:
+        exit_code = child.wait()
+    finally:
+        log.close()
+    with locked_record(path):
+        current = load_record(path) or {}
+        record["exit_code"] = exit_code
+        record["status"] = "exited"
+        record["pid"] = None
+        # Leave the checkout as the run found it, so the next task in this repository can launch.
+        record["checkout"] = restore_checkout(worktree, before)
+        refresh(record)  # downgrades to "interrupted" when the run is still open
+        if current.get("status") == "cancelled":
+            # A cancel recorded while the child ran stays the outcome of this execution.
+            record["status"] = record["outcome"] = "cancelled"
+        save_record(path, record)
+    return record
+
+
+def _launch_locked(path: Path, *, worktree: Path, identity: str, common: Path, execution_id: str, objective: str,
+                   allow_mutation: bool, resume: bool, pi_executable: str, python: str):
+    """Return the settled record, or (record, child, log, checkout_before) for a new launch. Caller holds the lock."""
     record = load_record(path)
     if record is not None:
         if record["target_repository"].casefold() != identity.casefold():
@@ -357,34 +408,23 @@ def start(*, target: Path, explicit_repo: str, execution_id: str, objective: str
     record.update({"status": "launched", "pid": child.pid, "launches": record["launches"] + 1,
                    "started_at": _now(), "exit_code": None, "outcome": "resumed" if resume else "launched"})
     save_record(path, record)
-    if not wait:
-        log.close()
-        return record
-    try:
-        exit_code = child.wait()
-    finally:
-        log.close()
-    record["exit_code"] = exit_code
-    record["status"] = "exited"
-    record["pid"] = None
-    # Leave the checkout as the run found it, so the next task in this repository can launch.
-    record["checkout"] = restore_checkout(worktree, before)
-    refresh(record)  # downgrades to "interrupted" when the run is still open
-    save_record(path, record)
-    return record
+    return record, child, log, before
 
 
 def status(*, target: Path, explicit_repo: str, execution_id: str) -> dict:
     _, identity, common = _target(target, explicit_repo)
     path = execution_path(common, execution_id)
-    record = load_record(path)
-    if record is None:
+    if not path.is_file():
         raise HeadlessError("EXECUTION_UNKNOWN", "no execution record for this id")
-    if record["target_repository"].casefold() != identity.casefold():
-        raise HeadlessError("EXECUTION_TARGET_MISMATCH", "execution id belongs to another repository")
-    refresh(record)
-    save_record(path, record)
-    return record
+    with locked_record(path):
+        record = load_record(path)
+        if record is None:
+            raise HeadlessError("EXECUTION_UNKNOWN", "no execution record for this id")
+        if record["target_repository"].casefold() != identity.casefold():
+            raise HeadlessError("EXECUTION_TARGET_MISMATCH", "execution id belongs to another repository")
+        refresh(record)
+        save_record(path, record)
+        return record
 
 
 def _finish_cancelled(run_id: str | None) -> None:
@@ -400,42 +440,45 @@ def cancel(*, target: Path, explicit_repo: str, execution_id: str, grace: float 
     """Stop the process if it is alive and close the parent run explicitly as cancelled."""
     _, identity, common = _target(target, explicit_repo)
     path = execution_path(common, execution_id)
-    record = load_record(path)
-    if record is None:
+    if not path.is_file():
         raise HeadlessError("EXECUTION_UNKNOWN", "no execution record for this id")
-    if record["target_repository"].casefold() != identity.casefold():
-        raise HeadlessError("EXECUTION_TARGET_MISMATCH", "execution id belongs to another repository")
-    refresh(record)
-    if record.get("run_id") is None:
-        record["run_id"] = discover_run_id(Path(record["session_dir"]), record["session_id"])
-    # Close the run before signalling, so a graceful Pi shutdown that settles
-    # the parent finds it already terminal with the cancellation code.
-    _finish_cancelled(record.get("run_id"))
-    pid = record.get("pid")
-    if record["status"] == "launched" and pid_alive(pid):
-        try:
-            os.killpg(pid, signal.SIGTERM)
-        except (ProcessLookupError, PermissionError):
-            pass
-        deadline = time.monotonic() + grace
-        while pid_alive(pid) and time.monotonic() < deadline:
-            time.sleep(0.05)
-        if pid_alive(pid):
+    with locked_record(path):
+        record = load_record(path)
+        if record is None:
+            raise HeadlessError("EXECUTION_UNKNOWN", "no execution record for this id")
+        if record["target_repository"].casefold() != identity.casefold():
+            raise HeadlessError("EXECUTION_TARGET_MISMATCH", "execution id belongs to another repository")
+        refresh(record)
+        if record.get("run_id") is None:
+            record["run_id"] = discover_run_id(Path(record["session_dir"]), record["session_id"])
+        # Close the run before signalling, so a graceful Pi shutdown that settles
+        # the parent finds it already terminal with the cancellation code.
+        _finish_cancelled(record.get("run_id"))
+        pid = record.get("pid")
+        if record["status"] == "launched" and pid_alive(pid):
             try:
-                os.killpg(pid, signal.SIGKILL)
+                os.killpg(pid, signal.SIGTERM)
             except (ProcessLookupError, PermissionError):
                 pass
-    record["pid"] = None
-    if record.get("run_id") is None:
-        # The process may have created its run between discovery and the signal.
-        record["run_id"] = discover_run_id(Path(record["session_dir"]), record["session_id"])
-        _finish_cancelled(record.get("run_id"))
-    record["status"] = "cancelled"
-    record["outcome"] = "cancelled"
-    refresh(record)
-    record["status"] = "cancelled"
-    save_record(path, record)
-    return record
+            deadline = time.monotonic() + grace
+            while pid_alive(pid) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            if pid_alive(pid):
+                try:
+                    os.killpg(pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+        record["pid"] = None
+        if record.get("run_id") is None:
+            # The process may have created its run between discovery and the signal.
+            record["run_id"] = discover_run_id(Path(record["session_dir"]), record["session_id"])
+            _finish_cancelled(record.get("run_id"))
+        record["status"] = "cancelled"
+        record["outcome"] = "cancelled"
+        refresh(record)
+        record["status"] = "cancelled"
+        save_record(path, record)
+        return record
 
 
 def main(argv: list[str] | None = None) -> int:
