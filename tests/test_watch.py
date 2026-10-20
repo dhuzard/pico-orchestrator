@@ -38,6 +38,15 @@ class WatchTest(unittest.TestCase):
         self.assertEqual(visible["interactions"][0]["summary"], "Review the save path.")
         self.assertNotIn("private_prompt", json.dumps(visible))
 
+    def test_escalated_phase_displays_current_route_and_retains_initial_route(self):
+        record = {"run_id": "run-123", "parent_orchestration": {"target_repository": "owner/one",
+                  "phases": [{"id": "repair", "status": "in_progress", "route": "CODEX",
+                              "escalations": [{"from_route": "CODEX", "to_route": "CLAUDE_CODEX",
+                                               "reason": "REVIEW_FINDINGS", "at": "2026-10-20T12:00:00Z"}]}]}}
+        phase = watch.public_run(record)["phases"][0]
+        self.assertEqual(phase["initial_route"], "CODEX")
+        self.assertEqual(phase["route"], "CLAUDE_CODEX")
+
     def test_parent_run_exposes_only_links_from_matching_publication_children(self):
         with tempfile.TemporaryDirectory() as directory:
             runs = Path(directory)

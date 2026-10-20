@@ -106,12 +106,20 @@ def public_run(record: dict, directory: Path | None = None) -> dict:
             continue
         interactions.append({key: item.get(key) for key in (
             "sequence", "at", "type", "summary", "task_id", "step_id", "subagent_id", "reply_to")})
+    phases = []
+    for phase in parent.get("phases") or []:
+        if not isinstance(phase, dict):
+            continue
+        current = (phase.get("escalations") or [{}])[-1]
+        phases.append({**phase, "initial_route": phase.get("route"),
+                       "route": current.get("to_route") or phase.get("route"),
+                       "routing": current.get("routing") or phase.get("routing")})
     return {
         "id": record.get("run_id"), "repository": parent.get("target_repository"),
         "started_at": record.get("started_at"), "ended_at": record.get("ended_at"),
         "status": parent.get("final_status") or record.get("outcome"),
         "blocker_code": parent.get("blocker_code"),
-        "phases": parent.get("phases") or [], "waves": parent.get("waves") or [],
+        "phases": phases, "waves": parent.get("waves") or [],
         "activity": parent.get("activity") or [],
         "interactions": interactions,
         "links": publication_links(record, directory) if directory else [],
