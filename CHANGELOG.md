@@ -6,6 +6,29 @@ All notable changes to PICO are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `CONTRIBUTING.md` with the development checks, the rules for routing and
+  policy changes, pull request expectations and the licensing stance.
+- `CODE_OF_CONDUCT.md` (Contributor Covenant 2.1).
+- `.github/CODEOWNERS`, and issue-form contact links for security reports
+  and questions.
+- A newcomer path at the top of the README: what PICO and Pi are, a diagram,
+  prerequisites, a documentation index, and links to the contributing,
+  security and conduct files.
+
+### Security
+
+- `SECURITY.md`: report vulnerabilities privately through GitHub private
+  vulnerability reporting. It lists the supported versions and the
+  PICO-specific scope.
+
+### Changed
+
+- Documentation no longer points at issue numbers from the pre-public
+  repository. `backlog/backlog.yaml` notes that entries before v1.0.0 cite
+  that repository and its commits.
+
 ## [1.0.0] - 2026-10-20
 
 First public release. See `docs/releases/v1.0.0.md` for the full notes.
