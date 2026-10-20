@@ -14,12 +14,15 @@ type Handler = (event: any, context?: any) => Promise<any> | any;
 function harness(preflight: Record<string, unknown>, failEvent = false, verifyOk = true,
                  options: { scopeOk?: boolean; worktreeOk?: boolean; worktreeBlocker?: string; entries?: any[];
                    parentStatus?: string; sessionId?: string; settleFails?: boolean; completionDetail?: string;
-                   completionError?: string; limits?: Record<string, unknown>; executable?: string } = {}) {
+                   completionError?: string; limits?: Record<string, unknown>; executable?: string;
+                   routeConflict?: boolean; reroutePhases?: string[];
+                   escalationWorkerConflict?: boolean } = {}) {
   const handlers = new Map<string, Handler>();
   const tools = new Map<string, any>();
   const calls: { script: string; args: string[]; input?: Record<string, unknown> }[] = [];
   // Parent checkout state as seen by the fake snapshot operation.
   const checkout = { digest: "clean", status: [] as string[] };
+  let escalated = false;
   const command = async (script: string, args: string[], input?: Record<string, unknown>) => {
     calls.push({ script, args, input });
     if (script.endsWith("session_scope.py")) {
@@ -43,9 +46,15 @@ function harness(preflight: Record<string, unknown>, failEvent = false, verifyOk
           backend_version_output: "2.1.287 (Claude Code)", backend_device: 1, backend_inode: 2 }], ...preflight }
       : preflight;
     if (args[0] === "start") return { run_id: "parent-test", status: "IN_PROGRESS" };
-    if (args[0] === "status") return { run_id: args[1], status: options.parentStatus ?? "IN_PROGRESS" };
+    if (args[0] === "status") return { run_id: args[1], status: options.parentStatus ?? "IN_PROGRESS",
+      reroute_phases: options.reroutePhases ?? [] };
     if (args[0] === "settle" && options.settleFails) return { ok: false, error_code: "PARENT_STORAGE_UNAVAILABLE" };
     if (args[0] === "event" && failEvent) return { ok: false };
+    if (args[0] === "event" && options.routeConflict && !escalated && input?.kind === "phase" && input.route === "CLAUDE_CODEX")
+      return { ok: false, error_code: "PARENT_EVENT_CONFLICT" };
+    if (args[0] === "event" && options.escalationWorkerConflict && input?.kind === "escalation")
+      return { ok: false, error_code: "PARENT_ESCALATION_WORKERS_IN_FLIGHT" };
+    if (args[0] === "event" && input?.kind === "escalation") escalated = true;
     if (args[0] === "finish" && args[2] === "COMPLETED" && options.completionError) {
       return { ok: false, error_code: options.completionError, lifecycle_state: "IN_PROGRESS",
         error: options.completionDetail ?? null };
@@ -205,6 +214,79 @@ test("rejected completion names its code and the run can still finish honestly",
   assert.equal(partial.details.active, false);
 });
 
+test("route conflict remains blocked until an explicit escalation event", async () => {
+  const h = harness({ ok: true, status: "READY" }, false, true, { routeConflict: true });
+  await h.handlers.get("before_agent_start")!({ prompt: "PI_ORCHESTRATION_RUN_V1" });
+  const tool = h.tools.get("orchestration_record");
+  assert.equal((await tool.execute("initial", { action: "event", event: {
+    kind: "phase", phase: "repair", status: "in_progress", route: "CODEX" } })).details.ok, true);
+  assert.equal((await tool.execute("changed", { action: "event", event: {
+    kind: "phase", phase: "repair", status: "in_progress", route: "CLAUDE_CODEX" } })).details.ok, false);
+  assert.equal((await tool.execute("status", { action: "status" })).details.ok, false);
+  assert.equal((await tool.execute("escalate", { action: "event", event: {
+    kind: "escalation", phase: "repair", from_route: "CODEX", to_route: "CLAUDE_CODEX",
+    reason: "REVIEW_FINDINGS" } })).details.ok, true);
+  assert.equal((await tool.execute("status", { action: "status" })).details.ok, false);
+  const reroute = routeFor("repair") as any;
+  reroute.details.result.selected_route = "CLAUDE_CODEX";
+  await h.handlers.get("tool_call")!({ toolName: "route_task", toolCallId: reroute.toolCallId,
+    input: { classified_task: { id: "repair" } } });
+  await h.handlers.get("tool_result")!(reroute);
+  assert.equal((await tool.execute("status", { action: "status" })).details.ok, true);
+});
+
+test("recorder before /orchestrate refuses writes and names the start command", async () => {
+  const h = harness({ ok: true, status: "READY" });
+  const result = await h.tools.get("orchestration_record").execute("early", { action: "event",
+    event: { kind: "phase", phase: "inspection", status: "in_progress" } });
+  assert.equal(result.details.ok, false);
+  assert.match(result.content[0].text, /\/orchestrate <objective>/);
+  assert.equal(h.parentCalls("event").length, 0);
+});
+
+test("explicit escalation revokes the task's old worker approval", async () => {
+  const h = harness({ ok: true, status: "READY" });
+  await h.handlers.get("before_agent_start")!({ prompt: "PI_ORCHESTRATION_RUN_V1" });
+  const route = routeFor("repair");
+  await h.handlers.get("tool_call")!({ toolName: "route_task", toolCallId: route.toolCallId,
+    input: { classified_task: { id: "repair" } } });
+  await h.handlers.get("tool_result")!(route);
+  const escalation = await h.tools.get("orchestration_record").execute("escalate", { action: "event", event: {
+    kind: "escalation", phase: "repair", from_route: "CODEX", to_route: "CLAUDE_CODEX",
+    reason: "REVIEW_FINDINGS" } });
+  assert.equal(escalation.details.ok, true);
+  const worker = await h.handlers.get("tool_call")!({ toolName: "spawn_subagent", toolCallId: "old",
+    input: { label: "repair:codex_specifier", prompt: "read only" } });
+  assert.match(worker.reason, /PARENT_ROUTE_RECHECK_REQUIRED/);
+});
+
+test("escalation waits for an active worker of the same task", async () => {
+  const h = harness({ ok: true, status: "READY" });
+  await h.handlers.get("before_agent_start")!({ prompt: "PI_ORCHESTRATION_RUN_V1" });
+  await h.handlers.get("tool_result")!(routeFor("repair"));
+  const call = { toolName: "spawn_subagent", toolCallId: "running",
+    input: { label: "repair:codex_specifier", prompt: "read only" } };
+  assert.equal(await h.handlers.get("tool_call")!(call), undefined);
+  const before = h.parentCalls("event").length;
+  const blocked = await h.tools.get("orchestration_record").execute("escalate", { action: "event", event: {
+    kind: "escalation", phase: "repair", from_route: "CODEX", to_route: "CLAUDE_CODEX",
+    reason: "REVIEW_FINDINGS" } });
+  assert.equal(blocked.details.ok, false);
+  assert.match(blocked.content[0].text, /PARENT_ESCALATION_WORKERS_IN_FLIGHT/);
+  assert.equal(h.parentCalls("event").length, before);
+});
+
+test("a worker-in-flight escalation rejection cannot be cleared by status", async () => {
+  const h = harness({ ok: true, status: "READY" }, false, true, { escalationWorkerConflict: true });
+  await h.handlers.get("before_agent_start")!({ prompt: "PI_ORCHESTRATION_RUN_V1" });
+  const tool = h.tools.get("orchestration_record");
+  const rejected = await tool.execute("escalate", { action: "event", event: {
+    kind: "escalation", phase: "repair", from_route: "CLAUDE_CODEX",
+    to_route: "CODEX_CLAUDE_CODEX", reason: "REVIEW_FINDINGS" } });
+  assert.equal(rejected.details.ok, false);
+  assert.equal((await tool.execute("status", { action: "status" })).details.ok, false);
+});
+
 test("parent survives a turn, compaction, reload, and process restart in the same session", async () => {
   const entries: any[] = [];
   const context = { cwd: process.cwd(), ui: { notify() {} },
@@ -238,6 +320,39 @@ test("parent survives a turn, compaction, reload, and process restart in the sam
   assert.equal(restarted.parentCalls("start").length, 0);
   assert.equal(restarted.parentCalls("settle").length, 0);
   assert.equal(entries.at(-1).data.active, false);
+});
+
+test("restart with an unfinished routed phase requires route preflight again", async () => {
+  const cwd = process.cwd();
+  const entries: any[] = [{ type: "custom", customType: "pi-orchestration-parent-v1",
+    data: { run_id: "parent-test", session_id: "session-a", target_cwd: cwd, active: true } }];
+  const h = harness({ ok: true, status: "READY" }, false, true,
+    { entries, reroutePhases: ["repair"] });
+  await h.handlers.get("session_start")!({ reason: "startup" }, { cwd,
+    sessionManager: { getSessionId: () => "session-a", getBranch: () => entries } });
+  const status = await h.tools.get("orchestration_record").execute("status", { action: "status" });
+  assert.equal(status.details.ok, false);
+  assert.match(status.content[0].text, /rerun route_task/);
+});
+
+test("rerouting one restored phase does not clear another phase's recovery", async () => {
+  const cwd = process.cwd();
+  const entries: any[] = [{ type: "custom", customType: "pi-orchestration-parent-v1",
+    data: { run_id: "parent-test", session_id: "session-a", target_cwd: cwd, active: true } }];
+  const h = harness({ ok: true, status: "READY" }, false, true,
+    { entries, reroutePhases: ["A", "B"] });
+  await h.handlers.get("session_start")!({ reason: "startup" }, { cwd,
+    sessionManager: { getSessionId: () => "session-a", getBranch: () => entries } });
+  const route = routeFor("A");
+  await h.handlers.get("tool_call")!({ toolName: "route_task", toolCallId: route.toolCallId,
+    input: { classified_task: { id: "A" } } });
+  await h.handlers.get("tool_result")!(route);
+  const premature = await h.handlers.get("tool_call")!({ toolName: "spawn_subagent", toolCallId: "premature",
+    input: { label: "A:codex_specifier", prompt: "read only" } });
+  assert.match(premature.reason, /PARENT_ROUTE_RECHECK_REQUIRED/);
+  const status = await h.tools.get("orchestration_record").execute("status", { action: "status" });
+  assert.equal(status.details.ok, false);
+  assert.match(status.content[0].text, /for B before/);
 });
 
 test("terminal and cross-session markers cannot restore a parent", async () => {

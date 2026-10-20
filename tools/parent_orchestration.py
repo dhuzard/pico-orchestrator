@@ -28,6 +28,12 @@ STATUSES = {"COMPLETED", "BLOCKED", "FAILED", "PARTIAL"}
 PHASE_STATUSES = {"not_started", "in_progress", "completed", "blocked", "failed", "partial"}
 WORKER_STATUSES = {"not_started", "in_progress", "completed", "blocked", "failed"}
 ROUTES = {"CODEX", "CLAUDE", "CLAUDE_CODEX", "CODEX_CLAUDE_CODEX"}
+ESCALATION_TARGETS = {
+    "CODEX": {"CLAUDE_CODEX", "CODEX_CLAUDE_CODEX"},
+    "CLAUDE": {"CLAUDE_CODEX", "CODEX_CLAUDE_CODEX"},
+    "CLAUDE_CODEX": {"CODEX_CLAUDE_CODEX"},
+    "CODEX_CLAUDE_CODEX": set(),
+}
 CODE_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,99}$")
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 MODEL_RE = re.compile(r"^[A-Za-z0-9_.:/-]{1,128}$")
@@ -95,8 +101,11 @@ def _missing_reviews(phases: list[dict]) -> list[str]:
         # Blocked or failed attempts may remain in a repaired run; they claim no result.
         if phase["route"] is None or phase["status"] in {"blocked", "failed"}:
             continue
-        completed = {worker["step_id"] for worker in phase["workers"] if worker["status"] == "completed"}
-        missing += [f"{phase['id']}:{step}" for step in sorted(required_review_steps(phase["route"]) - completed)]
+        epoch = len(phase.get("escalations") or [])
+        completed = {worker["step_id"] for worker in phase["workers"]
+                     if worker["status"] == "completed" and worker.get("route_epoch", 0) == epoch}
+        effective_route = (phase.get("escalations") or [{}])[-1].get("to_route") or phase["route"]
+        missing += [f"{phase['id']}:{step}" for step in sorted(required_review_steps(effective_route) - completed)]
     return missing
 
 
@@ -150,7 +159,9 @@ def status(run_id: str, *, repo_root: Path = ROOT, worktree: Path | None = None,
         if target != parent["target_repository"]:
             raise ParentRunError("target repository changed", error_code="SESSION_REPOSITORY_MISMATCH")
     return {"run_id": run_id, "target_repository": parent["target_repository"],
-            "status": parent["final_status"], "blocker_code": parent["blocker_code"]}
+            "status": parent["final_status"], "blocker_code": parent["blocker_code"],
+            "reroute_phases": sorted(phase["id"] for phase in parent["phases"]
+                                     if phase.get("route") is not None and phase.get("status") == "in_progress")}
 
 
 def empty_context() -> dict:
@@ -334,6 +345,7 @@ def _record_event_unlocked(run_id: str, event: dict, *, repo_root: Path = ROOT) 
     kind = event["kind"]
     allowed = {
         "phase": {"kind", "phase", "status", "route", "routing", "policy_version", "blocker_code", "escalation_reason"},
+        "escalation": {"kind", "phase", "from_route", "to_route", "reason"},
         "worker": {"kind", "phase", "step_id", "model", "backend", "backend_model", "reasoning_effort", "status", "blocker_code", "installed_backend_version", "required_backend_version"},
         "child": {"kind", "phase", "run_id"},
         "mutation": {"kind", "github", "code"},
@@ -348,6 +360,7 @@ def _record_event_unlocked(run_id: str, event: dict, *, repo_root: Path = ROOT) 
     }
     required = {
         "phase": {"kind", "phase", "status"},
+        "escalation": {"kind", "phase", "from_route", "to_route", "reason"},
         "worker": {"kind", "phase", "step_id", "status"},
         "child": {"kind", "phase", "run_id"},
         "mutation": {"kind"},
@@ -368,7 +381,20 @@ def _record_event_unlocked(run_id: str, event: dict, *, repo_root: Path = ROOT) 
     if record["outcome"] != "in_progress":
         raise ParentRunError("parent run is terminal")
     parent = _parent(record)
-    if kind == "phase":
+    if kind == "escalation":
+        phase = _phase(parent, event["phase"])
+        current = (phase.get("escalations") or [{}])[-1].get("to_route") or phase["route"]
+        if (phase["status"] in {"completed", "blocked", "failed", "partial"}
+                or event["from_route"] != current
+                or event["to_route"] not in ESCALATION_TARGETS.get(current, set())
+                or event["reason"] not in ESCALATION_REASONS):
+            raise ParentRunError("invalid phase route escalation", error_code="PARENT_ESCALATION_INVALID")
+        if any(worker["status"] == "in_progress" for worker in phase["workers"]):
+            raise ParentRunError("phase workers are still in progress", error_code="PARENT_ESCALATION_WORKERS_IN_FLIGHT")
+        phase.setdefault("escalations", []).append({"from_route": current,
+            "to_route": event["to_route"], "reason": event["reason"],
+            "at": datetime.now(timezone.utc).isoformat(), "confirmed": False})
+    elif kind == "phase":
         phase = _phase(parent, event["phase"])
         status = event.get("status")
         if status not in PHASE_STATUSES:
@@ -379,13 +405,25 @@ def _record_event_unlocked(run_id: str, event: dict, *, repo_root: Path = ROOT) 
         if "route" in event:
             if event["route"] not in ROUTES:
                 raise ParentRunError("invalid route")
-            if phase["route"] is not None and phase["route"] != event["route"]:
+            current = (phase.get("escalations") or [{}])[-1].get("to_route") or phase["route"]
+            if current is not None and current != event["route"]:
                 raise ParentRunError("phase route conflicts with prior event", error_code="PARENT_EVENT_CONFLICT")
-            phase["route"] = event["route"]
+            if phase["route"] is None:
+                phase["route"] = event["route"]
+            elif phase.get("escalations"):
+                phase["escalations"][-1]["confirmed"] = True
         if "routing" in event:
             if "route" not in event or not isinstance(event["routing"], dict):
                 raise ParentRunError("routing metadata requires a selected route")
-            phase["routing"] = event["routing"]
+            if phase.get("escalations"):
+                latest = phase["escalations"][-1]
+                if "routing" in latest and latest["routing"] != event["routing"]:
+                    raise ParentRunError("escalation routing conflicts with prior event", error_code="PARENT_EVENT_CONFLICT")
+                latest["routing"] = event["routing"]
+            elif "routing" in phase and phase["routing"] != event["routing"]:
+                raise ParentRunError("phase routing conflicts with prior event", error_code="PARENT_EVENT_CONFLICT")
+            else:
+                phase["routing"] = event["routing"]
         if "policy_version" in event:
             if type(event["policy_version"]) is not int or event["policy_version"] < 1:
                 raise ParentRunError("invalid policy version")
@@ -406,9 +444,14 @@ def _record_event_unlocked(run_id: str, event: dict, *, repo_root: Path = ROOT) 
         step_id = _safe(event.get("step_id"), ID_RE, "step id")
         if step_id is None or event.get("status") not in WORKER_STATUSES:
             raise ParentRunError("invalid worker event")
-        worker = next((item for item in phase["workers"] if item["step_id"] == step_id), None)
+        epoch = len(phase.get("escalations") or [])
+        worker = next((item for item in phase["workers"]
+                       if item["step_id"] == step_id and item.get("route_epoch", 0) == epoch), None)
         if worker is None:
+            if epoch > 0 and event["status"] in {"completed", "blocked", "failed"}:
+                raise ParentRunError("escalated worker has no recorded start", error_code="PARENT_WORKER_TRANSITION_INVALID")
             worker = {"step_id": step_id, "model": None, "backend": None, "backend_model": None, "status": "not_started",
+                      "route_epoch": epoch,
                       "blocker_code": None, "installed_backend_version": None,
                       "required_backend_version": None}
             phase["workers"].append(worker)
@@ -550,10 +593,17 @@ def _finish_unlocked(run_id: str, status: str, *, blocker_code: str | None = Non
         return record
     if status == "COMPLETED":
         phases = parent["phases"]
+        unconfirmed = [phase["id"] for phase in phases if phase.get("escalations")
+                       and not phase["escalations"][-1].get("confirmed")]
+        if unconfirmed:
+            raise ParentRunError("escalated phases still require a confirmed route: " + ", ".join(unconfirmed[:12]),
+                                 error_code="PARENT_ROUTE_RECHECK_REQUIRED")
         open_states = {"not_started", "in_progress"}
         unfinished = [f"phase {phase['id']} is {phase['status']}" for phase in phases if phase["status"] in open_states]
         unfinished += [f"worker {phase['id']}/{worker['step_id']} is {worker['status']}"
-                       for phase in phases for worker in phase["workers"] if worker["status"] in open_states]
+                       for phase in phases for worker in phase["workers"]
+                       if worker["status"] in open_states
+                       and worker.get("route_epoch", 0) == len(phase.get("escalations") or [])]
         if unfinished:
             # Named so the lead can record each one and finish again in a single step.
             raise ParentRunError("unfinished: " + "; ".join(unfinished[:12]) +

@@ -12,7 +12,10 @@ or its `orchestration_record` tool is unavailable,
 stop and report that parent-run provenance cannot be guaranteed.
 Before inspecting the target repository or spawning workers, call
 `orchestration_record` with `{"action":"status"}`. Continue only when its reply
-says the record is ready with `ok: true`. If the parent is blocked because multiple GitHub
+says the record is ready with `ok: true`. After a saved-session restart or
+escalation, `PARENT_ROUTE_RECHECK_REQUIRED` permits only rerunning `route_task`
+for the unfinished task and its backend preflight; call status again before
+worker dispatch. If the parent is blocked because multiple GitHub
 remotes need disambiguation, stop and ask the launcher to be rerun with the
 parent-authorized `--repo owner/repository` option; do not choose a remote by
 name or let a worker choose the target.
@@ -26,9 +29,11 @@ Worker events require `kind`, `phase`, `step_id`, and `status`; worker statuses
 are `not_started`, `in_progress`, `completed`, `blocked`, and `failed`.
 Child events require `kind`, `phase`, and an existing child `run_id`.
 Mutation events require `kind` and at least one absolute `github` or `code`
-count. A worker event may add the `reasoning_effort` actually requested. When a
-phase is re-routed to a stronger route or capacity, record the phase event with
-an `escalation_reason`: exactly one of `FAILED_ATTEMPTS`, `REVIEW_FINDINGS`,
+count. A worker event may add the `reasoning_effort` actually requested. If
+`route_task` selects a stronger route for a previously routed phase, record
+an explicit `escalation` event with `phase`, `from_route`, `to_route`, and
+`reason`, then rerun `route_task`. The initial phase route stays in the
+record; the escalation is appended. Valid reasons are `FAILED_ATTEMPTS`, `REVIEW_FINDINGS`,
 `AMBIGUITY`, `ARCHITECTURE`, `SECURITY_SENSITIVE`, `SEMANTIC_RISK`, or
 `CONTEXT_BUDGET`. Never escalate without one. Context and worker-usage
 telemetry is recorded by the lifecycle extension itself; do not report it.

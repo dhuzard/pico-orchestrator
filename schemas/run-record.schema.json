@@ -315,6 +315,23 @@
                   }
                 }
               },
+              "escalations": {
+                "type": "array",
+                "description": "Append-only authorized route changes. The phase route and routing fields retain the initial decision.",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["from_route", "to_route", "reason", "at", "confirmed"],
+                  "properties": {
+                    "from_route": {"enum": ["CODEX", "CLAUDE", "CLAUDE_CODEX", "CODEX_CLAUDE_CODEX"]},
+                    "to_route": {"enum": ["CODEX", "CLAUDE", "CLAUDE_CODEX", "CODEX_CLAUDE_CODEX"]},
+                    "reason": {"enum": ["FAILED_ATTEMPTS", "REVIEW_FINDINGS", "AMBIGUITY", "ARCHITECTURE", "SECURITY_SENSITIVE", "SEMANTIC_RISK", "CONTEXT_BUDGET"]},
+                    "at": {"type": "string", "format": "date-time"},
+                    "confirmed": {"type": "boolean"},
+                    "routing": {"$ref": "#/properties/parent_orchestration/properties/phases/items/properties/routing"}
+                  }
+                }
+              },
               "blocker_code": {
                 "type": [
                   "string",
@@ -354,6 +371,11 @@
                   "properties": {
                     "step_id": {
                       "type": "string"
+                    },
+                    "route_epoch": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "description": "Zero for initial routing; increments for each authorized phase escalation. Missing on historical workers means zero."
                     },
                     "model": {
                       "type": [
