@@ -459,8 +459,15 @@ def make_handler(directory: Path, repository: str | None, workspace: WorkspaceSo
                 self._send(self._json(404, {"ok": False, "error_code": "CONTROLS_OFF",
                                             "error": "start pico watch with --workspace <manifest> --controls"}))
                 return
-            length = int(self.headers.get("Content-Length") or 0)
-            body = self.rfile.read(min(length, garden_controls.MAX_BODY + 1)) if length > 0 else b""
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                length = -1
+            if length < 0:
+                self._send(self._json(400, {"ok": False, "error_code": "CONTROL_BODY_INVALID",
+                                            "error": "Content-Length must be a non-negative integer"}))
+                return
+            body = self.rfile.read(min(length, garden_controls.MAX_BODY + 1)) if length else b""
             try:
                 data = controls.authorize(self.headers, body)
                 result = controls.act(data)
@@ -471,11 +478,24 @@ def make_handler(directory: Path, repository: str | None, workspace: WorkspaceSo
                 payload = self._json(422, {"ok": False, "error_code": exc.code, "error": "the action was refused"})
             self._send(payload)
 
+        def _token_ok(self) -> bool:
+            # With controls on, the panels and branch list need the session token too.
+            if controls is None:
+                return True
+            try:
+                controls.check_token(self.headers)
+                return True
+            except garden_controls.ControlError as exc:
+                self._send(self._json(exc.status, {"ok": False, "error_code": exc.code, "error": exc.detail}))
+                return False
+
         def do_GET(self):
             if not self._host_ok():
                 return
             parts = urlsplit(self.path)
             path = parts.path
+            if path in {"/api/controls", "/api/branches"} and not self._token_ok():
+                return
             if path == "/api/controls":
                 if workspace is None or workspace.manifest is None:
                     payload = self._json(404, {"ok": False, "error_code": "WORKSPACE_MANIFEST_REQUIRED",

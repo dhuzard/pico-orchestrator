@@ -1,2 +1,8 @@
 blank_issues_enabled: true
-contact_links: []
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/dhuzard/pico-orchestrator/security/advisories/new
+    about: Report vulnerabilities privately. Do not open a public issue. See SECURITY.md.
+  - name: Ask a question
+    url: https://github.com/dhuzard/pico-orchestrator/discussions
+    about: Ask questions and share ideas in GitHub Discussions.

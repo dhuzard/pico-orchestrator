@@ -1,11 +1,92 @@
 # PICO - Pi Coding Orchestrator
 
+[![CI](https://github.com/dhuzard/pico-orchestrator/actions/workflows/ci.yml/badge.svg)](https://github.com/dhuzard/pico-orchestrator/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Reusable Pi setup for higher-quality multi-agent coding runs and audits. It
 loads a deterministic Claude/Codex router, gives an orchestrator prompt a clear
 execution protocol, and can record traceable run provenance.
 
 Use it when you want to work inside an existing repository with Pi, but want a
 more structured agentic workflow than a single ad-hoc chat.
+
+## What is PICO
+
+[Pi](https://www.npmjs.com/package/@earendil-works/pi-coding-agent) is a
+terminal coding agent, published on npm as `@earendil-works/pi-coding-agent`
+and run with the `pi` command. PICO is a set of Pi extensions, prompts,
+policies and tools that turns one Pi session into a lead that orchestrates
+other coding agents. The lead classifies each bounded engineering task and
+calls `route_task`. A deterministic policy then chooses which Claude and Codex
+workers to use. Workers that change code each run in their own Git worktree,
+and independent reviewers check their work when the policy requires it. PICO
+records what happened as run
+provenance, and Pico Garden shows it in your browser. PICO is a development
+orchestration tool. It does not merge, publish or deploy on its own, and it
+does not judge whether model output is correct.
+
+```text
+ you: /orchestrate <bounded objective>
+          |
+          v
+ +-----------------+   route_task    +---------------------------------+
+ |   lead (Pi)     | --------------> | routing policy (deterministic)  |
+ +-----------------+ <-------------- | route + execution plan          |
+          |              plan        +---------------------------------+
+          | spawns, in waves
+          v
+ +-----------------+  +-----------------+
+ | Claude worker   |  | Codex worker    |   each mutating worker writes only
+ | (own worktree)  |  | (own worktree)  |   inside its own Git worktree
+ +-----------------+  +-----------------+
+          |                   |
+          v                   v
+ +---------------------------------------+
+ | independent reviewers                 |
+ +---------------------------------------+
+          |
+          v
+ +---------------------+      +--------------------------------+
+ | run provenance      | ---> | Pico Garden (pico watch)       |
+ | (local state dir)   |      | local web view on 127.0.0.1    |
+ +---------------------+      +--------------------------------+
+```
+
+## Prerequisites
+
+PICO runs on Linux and macOS, and on Windows through WSL2. You need:
+
+- **Git.**
+- **Node.js.** CI uses Node.js 24. Pi itself requires Node.js 22.19 or later.
+- **Python 3.10 or later** with `PyYAML` and `jsonschema` (see
+  `requirements-dev.txt`). CI tests Python 3.12; older versions are not tested.
+- **Pi**, installed with `npm install -g @earendil-works/pi-coding-agent`.
+  PICO is developed against Pi 1.0. Codex workers run through the model
+  provider configured in Pi (by default `openai-codex/...` models; see
+  [`docs/model-runtime-configuration.md`](docs/model-runtime-configuration.md)).
+- **Optional: [Claude Code](https://docs.anthropic.com/en/docs/claude-code)**,
+  installed and logged in, for routes with a Claude step. Without it, those
+  routes report `MODEL_BACKEND_UNAVAILABLE` and are rerouted when the policy
+  allows it.
+- **Optional: the [GitHub CLI](https://cli.github.com/) (`gh`)**,
+  authenticated, for the GitHub features (issues, draft PRs, CI checks).
+
+`pico doctor .` checks these for a target repository.
+
+## Documentation
+
+- [Technical reference](docs/technical-reference.md): policy architecture,
+  schemas, routing semantics, execution plans, provenance and workspaces.
+- [Model and runtime configuration](docs/model-runtime-configuration.md):
+  choosing concrete Claude and Codex models for each capacity tier.
+- [Task ambiguity and model capacity](docs/ambiguity.md) and
+  [evaluating model capacity](docs/model-ambiguity-evaluation.md).
+- [Work modes](docs/work-modes.md): how the lead decomposes mixed work.
+- [Orchestration guidance](docs/orchestration-guidance.md): how the policy
+  maps to published orchestration guidance.
+- [Release checklist](docs/release-checklist.md) and
+  [v1.0.0 release notes](docs/releases/v1.0.0.md).
+- [Changelog](CHANGELOG.md).
 
 ## Quickstart: use from any repo
 
@@ -125,6 +206,9 @@ the tasks recorded in the workspace record. It serves only ids, states,
 codes, times and counters; it never serves task titles, goals, objectives,
 prompts or logs, and it never opens execution records.
 
+**Advanced: multi-repository workspaces.** The next sections plan, schedule
+and publish work across several repositories; skip them if you work in one.
+
 ### Plan a mission across several repositories (read-only)
 
 A workspace manifest (see `templates/workspace.yaml` and
@@ -137,8 +221,9 @@ performs no Git or GitHub mutation. An ambiguous checkout, an identity absent
 from the remotes, two entries naming the same repository, a missing commit, a
 dependency cycle or denied access all fail closed. Add `--json` for
 machine-readable output or `--no-access-check` to plan offline (the plan then
-records that access was not verified). Execution of such a plan is tracked in
-issue #49; each repository keeps its own parent run and `target_repository`.
+records that access was not verified). To execute a plan, use `pico workspace
+schedule` (below); each repository keeps its own parent run and
+`target_repository`.
 An implementation task may add a single-line `objective` (up to 4000
 characters) with instructions scoped to that task's repository. The child
 receives its own title and objective plus verified upstream contract metadata;
@@ -205,7 +290,7 @@ The child is an ordinary single-repository run with its own
 `target_repository`; the launcher links its run id into the workspace record
 in orchestrator state. `pico workspace status` reconciles every task and
 `pico workspace cancel --task <id>` stops one child. Ordering and concurrency
-across tasks belong to the scheduler (#54).
+across tasks belong to the scheduler (`pico workspace schedule`).
 
 ### Run one bounded orchestration headless
 
@@ -564,7 +649,13 @@ pico run . -- --help
 
 For a reproducible project, commit `.pi/orchestrator.lock`. `pico run .`
 then uses that exact commit unless `PI_CODING_ORCHESTRATOR_REF` explicitly
-overrides it. To advance the project deliberately:
+overrides it. Because the lock comes from the repository, the launcher reviews
+it first: it runs only a commit on the default branch or contained in a release
+tag, or one you approved for that checkout with `pico pin`. Anything else fails
+closed with `PIN_NOT_ON_RELEASE_HISTORY`. Set
+`PI_CODING_ORCHESTRATOR_ALLOW_UNREVIEWED_PIN=1` to run it anyway. A lock that
+differs from the commit you last approved prints a warning. To advance the
+project deliberately:
 
 ```sh
 pico update .
@@ -673,6 +764,7 @@ checkpoints. Backend conversation history is never reused.
 | `WORKER_TASK_UNATTRIBUTED` / `WORKER_TASK_UNROUTED` / `WORKER_STEP_UNKNOWN` | Several tasks are routed and the worker call names none, names an unrouted task, or names a step outside its plan. |
 | `WAVE_UNDECLARED` | Workers of different tasks would overlap outside one declared wave. |
 | `INTEGRATION_IN_PROGRESS` | A worker launch while the parent integrates a wave. |
+| `WORKER_CONFIG_INVALID` | `PI_ORCHESTRATOR_WORKER_ENV_ALLOW` names an invalid variable, or `PI_ORCHESTRATOR_WORKER_SANDBOX` is not `0` or `1`. The worker is not started. |
 | `WORKER_SCOPE_VIOLATION` | The parent checkout changed during a worker call. Further workers are blocked; nothing is reverted. |
 | `MUTATION_MODE_MISMATCH` | The `AskClaude` `mode` differs from the routed step's mutation permission. |
 | `WORKER_TIMEOUT` / `WORKER_ABORTED` / `WORKER_OUTPUT_LIMIT` | A `ClaudeWorker` run exceeded `PI_CLAUDE_WORKER_TIMEOUT_MS` (default 30 min), was aborted, or exceeded its output cap; its Claude Code process is killed. |
@@ -910,6 +1002,15 @@ mapped in [the orchestration guidance comparison](docs/orchestration-guidance.md
 The API beta flags, SDK handoff methods, and native Codex subagent configuration
 are specific to those runtimes; Pi continues to enforce its own route, worker
 model profiles, concurrency limits, and mutation boundaries.
+
+## Contributing, security and conduct
+
+- [Contributing guide](CONTRIBUTING.md): development setup, checks and pull
+  request expectations.
+- [Security policy](SECURITY.md): report vulnerabilities privately, never in
+  a public issue.
+- [Code of Conduct](CODE_OF_CONDUCT.md).
+- [License](LICENSE): MIT.
 
 # Claude Code backend selection
 

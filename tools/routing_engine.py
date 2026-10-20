@@ -1196,7 +1196,7 @@ def validate_policy_execution_plans(policy: dict, execution_plan_schema: dict, i
                     )
                 ))
 
-            for step, canonical in zip(steps, topology):
+            for step, canonical in zip(steps, topology, strict=True):
                 if step["id"] != canonical["id"] or step["role"] != canonical["role"] or step["family"] != canonical["family"]:
                     issues.append(ValidationIssue(
                         message=(
@@ -1265,7 +1265,7 @@ def validate_policy_execution_plans(policy: dict, execution_plan_schema: dict, i
             for other in valid_plans[1:]:
                 if len(other["steps"]) != len(baseline["steps"]):
                     continue
-                for baseline_step, other_step in zip(baseline["steps"], other["steps"]):
+                for baseline_step, other_step in zip(baseline["steps"], other["steps"], strict=True):
                     for field in EXECUTION_METADATA_FIELDS:
                         if baseline_step.get(field) != other_step.get(field):
                             issues.append(ValidationIssue(
@@ -1438,7 +1438,7 @@ def _validated_assignment_tiers(execution_plan: dict, capacity_assignments: list
     if not isinstance(capacity_assignments, list) or len(capacity_assignments) != len(execution_plan["steps"]):
         raise RoutingAssetError("capacity_assignments must contain exactly one entry per execution-plan step")
     tiers: dict[str, str] = {}
-    for step, assignment in zip(execution_plan["steps"], capacity_assignments):
+    for step, assignment in zip(execution_plan["steps"], capacity_assignments, strict=True):
         if not isinstance(assignment, dict) or set(assignment.keys()) != CAPACITY_ASSIGNMENT_KEYS:
             raise RoutingAssetError("capacity assignment has an invalid shape")
         if (assignment["step_id"] != step["id"]
@@ -1678,7 +1678,7 @@ def json_deep_eq(a, b) -> bool:
     if isinstance(a, dict) and isinstance(b, dict):
         return a.keys() == b.keys() and all(json_deep_eq(a[k], b[k]) for k in a)
     if isinstance(a, list) and isinstance(b, list):
-        return len(a) == len(b) and all(json_deep_eq(x, y) for x, y in zip(a, b))
+        return len(a) == len(b) and all(json_deep_eq(x, y) for x, y in zip(a, b, strict=True))
     return json_eq(a, b)
 
 

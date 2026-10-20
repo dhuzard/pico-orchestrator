@@ -7,7 +7,8 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Value } from "typebox/value";
 import { createOrchestrationLifecycle, runJson, scopesOverlap } from "../extensions/orchestration-lifecycle.ts";
 import { classifyClaudeInvocationError, resolveClaudeBackendModel } from "../extensions/claude-backend-adapter.ts";
-import { claudeWorkerArgs, describeDenials, inGitDirectory } from "../extensions/claude-worker.ts";
+import { buildWorkerEnv, claudeWorkerArgs, describeDenials, inGitDirectory, WORKER_ENV_CREDENTIALS, WORKER_ENV_NAMES,
+  WORKER_SANDBOX_SETTINGS, WorkerConfigError, workerSandboxEnabled } from "../extensions/claude-worker.ts";
 
 type Handler = (event: any, context?: any) => Promise<any> | any;
 
@@ -627,7 +628,7 @@ let prompt = "";
 process.stdin.on("data", (part) => { prompt += part; });
 process.stdin.on("end", () => {
   const reply = () => process.stdout.write(JSON.stringify({ type: "result", subtype: "success", is_error: false,
-    result: JSON.stringify({ cwd: process.cwd(), args: process.argv.slice(2), prompt }),
+    result: JSON.stringify({ cwd: process.cwd(), args: process.argv.slice(2), prompt, env: process.env }),
     usage: { input_tokens: 120, output_tokens: 30, cache_read_input_tokens: 400 },
     total_cost_usd: 0.0125, duration_ms: 7, session_id: "fake-session",
     permission_denials: prompt.includes("DENY") ? [{ tool_name: "Write", tool_use_id: "t1",
@@ -662,6 +663,8 @@ test("mutating Claude workers of a wave run concurrently, each in its own bound 
   for (const path of [barrier, ...Object.values(workspaces)]) mkdirSync(path);
   const previousCwd = process.cwd();
   process.env.FAKE_CLAUDE_BARRIER = barrier;
+  // Workers receive only allowlisted variables; the test barrier is forwarded explicitly.
+  process.env.PI_ORCHESTRATOR_WORKER_ENV_ALLOW = "FAKE_CLAUDE_BARRIER";
   try {
     const h = harness({ ok: true, status: "READY" }, false, true, { executable: fakeClaude(dir) });
     await h.handlers.get("before_agent_start")!({ prompt: "PI_ORCHESTRATION_RUN_V1" }, { cwd: dir, ui: { notify() {} } });
@@ -713,6 +716,7 @@ test("mutating Claude workers of a wave run concurrently, each in its own bound 
       reasoning_effort: "high" });
   } finally {
     delete process.env.FAKE_CLAUDE_BARRIER;
+    delete process.env.PI_ORCHESTRATOR_WORKER_ENV_ALLOW;
     rmSync(dir, { recursive: true, force: true });
   }
 });
@@ -756,9 +760,111 @@ test("a mutating Claude worker gets the full edit argv with git and GitHub opera
     "--permission-mode", "acceptEdits", "--tools", "Read,Edit,Write,Glob,Grep,Bash,Agent",
     "--allowedTools", "Read", "Edit", "Write", "Glob", "Grep", "Bash", "Agent",
     "--disallowedTools", "Bash(git push:*)", "Bash(gh:*)", "Bash(git worktree:*)", "Bash(git branch -d:*)",
-    "Bash(git branch -D:*)", "Bash(git branch --delete:*)", "--append-system-prompt",
+    "Bash(git branch -D:*)", "Bash(git branch --delete:*)", "Bash(git -C:*)", "Bash(git -c:*)",
+    "Bash(git --git-dir:*)", "Bash(git --work-tree:*)", "Bash(git --exec-path:*)", "Bash(git remote add:*)",
+    "Bash(git remote set-url:*)", "Bash(env git:*)", "Bash(command git:*)", "Bash(exec git:*)",
+    "Bash(env gh:*)", "Bash(command gh:*)", "Bash(exec gh:*)", "--append-system-prompt",
     "--output-format", "json", "--no-session-persistence"]);
   assert.ok(!args.includes("bypassPermissions") && !args.includes("--dangerously-skip-permissions"));
+  assert.ok(!args.includes("--settings"), "the Claude Code sandbox is opt-in");
+  const sandboxed = claudeWorkerArgs({ executable: "claude", cwd, backendModel: "haiku", effort: "low", mode: "full" }, true);
+  assert.deepEqual(sandboxed.slice(-2), ["--settings", WORKER_SANDBOX_SETTINGS]);
+  assert.deepEqual(JSON.parse(WORKER_SANDBOX_SETTINGS), { sandbox: { enabled: true, failIfUnavailable: true } });
+});
+
+test("a worker environment keeps only what Claude Code needs and never a GitHub or SSH credential", () => {
+  const source = { PATH: "/bin", HOME: "/h", USER: "u", LANG: "C.UTF-8", LC_ALL: "C", TMPDIR: "/t",
+    XDG_CONFIG_HOME: "/h/.config", ANTHROPIC_API_KEY: "a", CLAUDE_CODE_OAUTH_TOKEN: "c", NODE_EXTRA_CA_CERTS: "/ca.pem",
+    https_proxy: "http://proxy:3128", NO_PROXY: "localhost",
+    GH_TOKEN: "g1", GITHUB_TOKEN: "g2", GH_ENTERPRISE_TOKEN: "g3", GIT_ASKPASS: "/askpass", SSH_AUTH_SOCK: "/agent",
+    NPM_TOKEN: "n", AWS_SECRET_ACCESS_KEY: "s", GIT_DIR: "/parent/.git", MY_SERVICE_API_KEY: "k",
+    PI_ORCHESTRATOR_STATE_DIR: "/state" };
+  const { env, dropped } = buildWorkerEnv(source);
+  assert.deepEqual(Object.keys(env).sort(), ["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "HOME", "LANG", "LC_ALL",
+    "NODE_EXTRA_CA_CERTS", "NO_PROXY", "PATH", "TMPDIR", "USER", "XDG_CONFIG_HOME", "https_proxy"]);
+  assert.equal(env.CLAUDE_CODE_OAUTH_TOKEN, "c");
+  // Known credentials first, then everything else; each group sorted.
+  assert.deepEqual(dropped, ["GH_ENTERPRISE_TOKEN", "GH_TOKEN", "GITHUB_TOKEN", "GIT_ASKPASS", "NPM_TOKEN",
+    "SSH_AUTH_SOCK", "AWS_SECRET_ACCESS_KEY", "GIT_DIR", "MY_SERVICE_API_KEY", "PI_ORCHESTRATOR_STATE_DIR"]);
+  for (const name of WORKER_ENV_CREDENTIALS) assert.ok(!(name in buildWorkerEnv({ [name]: "x" }).env), name);
+  // A prefix rule never forwards a listed credential name.
+  assert.ok(!WORKER_ENV_CREDENTIALS.some((name) => WORKER_ENV_NAMES.includes(name)));
+
+  // Extension: exact names, comma-separated, whitespace ignored; the user's explicit choice wins.
+  const extended = buildWorkerEnv({ ...source, PI_ORCHESTRATOR_WORKER_ENV_ALLOW: " JAVA_HOME, MY_SERVICE_API_KEY ,,GH_TOKEN",
+    JAVA_HOME: "/jdk" });
+  assert.equal(extended.env.JAVA_HOME, "/jdk");
+  assert.equal(extended.env.MY_SERVICE_API_KEY, "k");
+  assert.equal(extended.env.GH_TOKEN, "g1");
+  assert.ok(!("GITHUB_TOKEN" in extended.env));
+  for (const bad of ["GH_*", "1ABC", "A-B", "A B", "$(id)"]) {
+    assert.throws(() => buildWorkerEnv({ PI_ORCHESTRATOR_WORKER_ENV_ALLOW: bad }), WorkerConfigError, bad);
+  }
+  assert.equal(workerSandboxEnabled({}), false);
+  assert.equal(workerSandboxEnabled({ PI_ORCHESTRATOR_WORKER_SANDBOX: "0" }), false);
+  assert.equal(workerSandboxEnabled({ PI_ORCHESTRATOR_WORKER_SANDBOX: "1" }), true);
+  for (const bad of ["yes", "true", "2"]) {
+    assert.throws(() => workerSandboxEnabled({ PI_ORCHESTRATOR_WORKER_SANDBOX: bad }), WorkerConfigError, bad);
+  }
+});
+
+test("ClaudeWorker withholds credentials from the worker process and records only their names", async () => {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "pico-claude-env-")));
+  const workspace = join(dir, "wt");
+  mkdirSync(workspace);
+  const names = ["GH_TOKEN", "GITHUB_TOKEN", "SSH_AUTH_SOCK", "PICO_TEST_EXTRA", "PI_ORCHESTRATOR_WORKER_ENV_ALLOW",
+    "PI_ORCHESTRATOR_WORKER_SANDBOX", "ANTHROPIC_BASE_URL"];
+  const previous = Object.fromEntries(names.map((name) => [name, process.env[name]]));
+  Object.assign(process.env, { GH_TOKEN: "secret-gh", GITHUB_TOKEN: "secret-github", SSH_AUTH_SOCK: "/tmp/agent.sock",
+    PICO_TEST_EXTRA: "extra", ANTHROPIC_BASE_URL: "http://127.0.0.1:9" });
+  try {
+    const h = harness({ ok: true, status: "READY" }, false, true, { executable: fakeClaude(dir) });
+    await h.handlers.get("before_agent_start")!({ prompt: "PI_ORCHESTRATION_RUN_V1" }, { cwd: dir, ui: { notify() {} } });
+    await h.handlers.get("tool_result")!(routeFor("A", { workerMutation: "allowed" }));
+    await h.tools.get("orchestration_record").execute("b", { action: "bind_workspace", task_id: "A",
+      step_id: "claude_worker", path: workspace });
+
+    const plain = (await claudeWorkerRun(h, "e1", { prompt: "[pico-task A:claude_worker] go" })).result;
+    assert.equal(plain.isError, false, plain.content[0].text);
+    const echoed = JSON.parse(plain.content[0].text);
+    for (const name of ["GH_TOKEN", "GITHUB_TOKEN", "SSH_AUTH_SOCK", "PICO_TEST_EXTRA"]) assert.ok(!(name in echoed.env), name);
+    assert.equal(echoed.env.PATH, process.env.PATH);
+    assert.equal(echoed.env.ANTHROPIC_BASE_URL, "http://127.0.0.1:9");
+    assert.ok(!echoed.args.includes("--settings"));
+    // The record keeps at most 100 names (CI runners carry more): credentials
+    // come first so they are always named; other names are in the full list.
+    for (const name of ["GH_TOKEN", "GITHUB_TOKEN", "SSH_AUTH_SOCK"]) {
+      assert.ok(plain.details.env_dropped.includes(name), name);
+    }
+    assert.ok(buildWorkerEnv().dropped.includes("PICO_TEST_EXTRA"));
+    assert.equal(plain.details.env_dropped_count, buildWorkerEnv().dropped.length);
+    assert.ok(!JSON.stringify(plain.details).includes("secret-gh"), "values are never recorded");
+
+    process.env.PI_ORCHESTRATOR_WORKER_ENV_ALLOW = "PICO_TEST_EXTRA";
+    process.env.PI_ORCHESTRATOR_WORKER_SANDBOX = "1";
+    const extended = (await claudeWorkerRun(h, "e2", { prompt: "[pico-task A:claude_worker] go" })).result;
+    const echoedExtended = JSON.parse(extended.content[0].text);
+    assert.equal(echoedExtended.env.PICO_TEST_EXTRA, "extra");
+    assert.ok(!("GH_TOKEN" in echoedExtended.env));
+    assert.equal(echoedExtended.args[echoedExtended.args.indexOf("--settings") + 1], WORKER_SANDBOX_SETTINGS);
+
+    // An invalid allowlist fails closed before Claude Code starts.
+    process.env.PI_ORCHESTRATOR_WORKER_ENV_ALLOW = "GH_*";
+    const refused = (await claudeWorkerRun(h, "e3", { prompt: "[pico-task A:claude_worker] go" })).result;
+    assert.equal(refused.isError, true);
+    assert.equal(refused.details.error, "CONFIG_INVALID");
+    assert.match(refused.content[0].text, /not started: PI_ORCHESTRATOR_WORKER_ENV_ALLOW entry "GH_\*" is not a variable name/);
+    assert.match(refused.content[0].text, /Orchestration blocker: WORKER_CONFIG_INVALID/);
+    // Claude Code never started, so no token counts are reported (the fake would report 120 input tokens).
+    const usage = h.calls.filter((call) => call.input?.kind === "usage").at(-1)!.input!;
+    assert.deepEqual([usage.input_tokens, usage.output_tokens, usage.estimated_cost_usd], [null, null, undefined]);
+  } finally {
+    for (const name of names) {
+      if (previous[name] === undefined) delete process.env[name];
+      else process.env[name] = previous[name];
+    }
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("a worktree inside .git is never used for a mutating Claude worker", async () => {

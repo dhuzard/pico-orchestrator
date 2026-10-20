@@ -31,6 +31,14 @@ export PYTHONDONTWRITEBYTECODE=1
 RESOLVED_SHA=""
 RUNTIME=""
 LOCK_HELD=false
+# Set when REF came from a target's .pi/orchestrator.lock (untrusted input)
+# rather than from the user (PI_CODING_ORCHESTRATOR_REF or `pin <target> <ref>`).
+PIN_SOURCE=""
+PIN_LOCK=""
+PIN_TARGET=""
+PIN_APPROVED=false
+# doctor diagnoses with the default branch instead of failing on a rejected pin.
+PIN_FALLBACK=false
 
 usage() {
   cat <<'EOF'
@@ -65,6 +73,9 @@ Environment:
   PI_CODING_ORCHESTRATOR_STATE_DIR Persistent runtime state dir (default: ~/.local/state/pi-coding-orchestrator).
   PI_ORCHESTRATOR_MODEL_CONFIG      User-owned model config path (default: ~/.config/pi-coding-orchestrator/models.yaml when present).
   PI_TARGET_REPOSITORY              Explicit parent target; must match a target GitHub remote.
+  PI_CODING_ORCHESTRATOR_ALLOW_UNREVIEWED_PIN
+                                    1 runs a project pin that is neither on the remote default
+                                    branch nor in a tag, and was not approved with `pin` (warns).
 
 Examples:
   ./scripts/use-latest.sh install
@@ -148,6 +159,10 @@ apply_project_pin() {
   local pin
   if pin="$(read_project_pin "$target")"; then
     REF="$pin"
+    PIN_SOURCE=project
+    PIN_TARGET="$target"
+    PIN_LOCK="$(project_lock_path "$target")"
+    check_pin_approval "$target" "$pin"
     echo "pi-coding-orchestrator: using project pin $pin" >&2
   else
     local rc=$?
@@ -168,6 +183,102 @@ write_project_pin() {
   printf '%s\n' "$sha" > "$tmp"
   mv "$tmp" "$lock"
   echo "Pinned orchestrator: $lock -> $sha"
+}
+
+# -- pin approval and review ----------------------------------------------------
+# A target repository chooses its pin, so the launcher remembers, per target
+# checkout, the last pin the user approved (`pin` or `update`), warns when the
+# lock names another commit, and runs an unapproved pin only when it is on the
+# remote default branch or in a tag. Signature verification of release tags is
+# not implemented.
+
+# State file holding the last approved pin of a target checkout (keyed by its
+# physical path).
+pin_approval_path() {
+  local root
+  root="$(cd -P "$1" 2>/dev/null && pwd)" || return 1
+  printf '%s/approved-pins/%s\n' "$STATE_DIR" "$(printf '%s' "$root" | git hash-object --stdin)"
+}
+
+record_pin_approval() {
+  local target="$1" sha="$2" path root tmp
+  path="$(pin_approval_path "$target")" || { echo "Cannot record pin approval for $target" >&2; return 1; }
+  root="$(cd -P "$target" && pwd)"
+  mkdir -p "$(dirname "$path")"
+  tmp="$(mktemp "${path}.tmp.XXXXXX")"
+  printf '%s\t%s\n' "$sha" "$root" > "$tmp"
+  mv "$tmp" "$path"
+}
+
+# Sets PIN_APPROVED and warns (non-fatal) when the pin is not the one last approved.
+check_pin_approval() {
+  local target="$1" pin="$2" path approved=""
+  PIN_APPROVED=false
+  if path="$(pin_approval_path "$target")" && [[ -f "$path" ]]; then
+    approved="$(cut -f1 "$path" | head -n 1)"
+  fi
+  if [[ "$approved" == "$pin" ]]; then
+    PIN_APPROVED=true
+  elif [[ -n "$approved" ]]; then
+    echo "pi-coding-orchestrator: warning: project pin changed from ${approved:0:12} (last approved) to ${pin:0:12} in $(project_lock_path "$target"); review it, then run 'pico pin $target $pin' to approve it" >&2
+  else
+    echo "pi-coding-orchestrator: warning: project pin ${pin:0:12} in $(project_lock_path "$target") has not been approved on this machine; review it, then run 'pico pin $target $pin' to approve it" >&2
+  fi
+}
+
+refresh_default_head() {
+  git -C "$ORCH_REPO" remote set-head origin --auto >/dev/null 2>&1 || true
+}
+
+# True when a release can contain the commit: it is an ancestor of the remote
+# default branch, or a tag contains it. Uses local refs only (no network).
+pin_on_release_history() {
+  local sha="$1" default
+  default="$(git -C "$ORCH_REPO" symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null || true)"
+  if [[ -n "$default" ]] && git -C "$ORCH_REPO" merge-base --is-ancestor "$sha" "$default" 2>/dev/null; then
+    return 0
+  fi
+  [[ -n "$(git -C "$ORCH_REPO" tag --contains "$sha" 2>/dev/null || true)" ]]
+}
+
+# Decide whether a project pin may run: 0 run it, 1 refuse, 3 refuse but let
+# doctor fall back to the default branch. The check needs only local refs when
+# they already show the pin on release history, so a cached reviewed pin keeps
+# running offline; otherwise remote refs are refreshed once (`fetched` says
+# whether ensure_repo already fetched) and an unverifiable pin is refused.
+review_project_pin() {
+  local sha="$1" fetched="$2" detail=""
+  [[ "$PIN_SOURCE" == project && "$PIN_APPROVED" != true ]] || return 0
+  pin_on_release_history "$sha" && return 0
+  if [[ "$fetched" != true ]] && ! git -C "$ORCH_REPO" fetch -q --tags --prune origin; then
+    detail=" (remote refs could not be refreshed from $REPO_URL, so it could not be checked again)"
+  else
+    refresh_default_head
+    pin_on_release_history "$sha" && return 0
+  fi
+  if [[ "${PI_CODING_ORCHESTRATOR_ALLOW_UNREVIEWED_PIN:-}" == 1 ]]; then
+    echo "pi-coding-orchestrator: warning: running project pin $sha from $PIN_LOCK although it is not on release history (PI_CODING_ORCHESTRATOR_ALLOW_UNREVIEWED_PIN=1)" >&2
+    return 0
+  fi
+  echo "PIN_NOT_ON_RELEASE_HISTORY: project pin $sha from $PIN_LOCK is neither an ancestor of the remote default branch nor contained in a tag$detail. Refusing to run it. Review the commit, then approve it for this repository with 'pico pin $PIN_TARGET $sha', or set PI_CODING_ORCHESTRATOR_ALLOW_UNREVIEWED_PIN=1 for one run." >&2
+  [[ "$PIN_FALLBACK" == true ]] && return 3
+  return 1
+}
+
+# ensure_repo for a resolved project pin: continue, fail, or redo with the default branch.
+apply_pin_review() {
+  local review=0
+  review_project_pin "$RESOLVED_SHA" "$1" || review=$?
+  case "$review" in
+    0) return 0 ;;
+    3)
+      echo "pi-coding-orchestrator: ignoring rejected project pin for diagnosis" >&2
+      REF=""
+      PIN_SOURCE=""
+      return 3
+      ;;
+    *) return 1 ;;
+  esac
 }
 
 # -- cache and runtimes -------------------------------------------------------
@@ -237,6 +348,10 @@ ensure_repo() {
   # A pinned commit that is already cached needs no network access.
   if is_full_sha "$ref" && git -C "$ORCH_REPO" cat-file -e "$ref^{commit}" 2>/dev/null; then
     RESOLVED_SHA="$(git -C "$ORCH_REPO" rev-parse "$ref^{commit}")"
+    local review=0
+    apply_pin_review false || review=$?
+    if [[ "$review" -eq 3 ]]; then ensure_repo; return; fi
+    [[ "$review" -eq 0 ]] || return 1
     echo "pi-coding-orchestrator: using ${RESOLVED_SHA:0:12} (cached, no fetch)" >&2
     materialize_runtime
     return
@@ -277,6 +392,12 @@ ensure_repo() {
     return 1
   fi
   RESOLVED_SHA="$(git -C "$ORCH_REPO" rev-parse "$target_rev^{commit}")"
+  if [[ "$PIN_SOURCE" == project ]]; then
+    local pin_review=0
+    apply_pin_review true || pin_review=$?
+    if [[ "$pin_review" -eq 3 ]]; then ensure_repo; return; fi
+    [[ "$pin_review" -eq 0 ]] || return 1
+  fi
   if [[ "$track_default" == true ]]; then
     git -C "$ORCH_REPO" checkout -q "$ref" 2>/dev/null || git -C "$ORCH_REPO" checkout -q -B "$ref" "origin/$ref"
     git -C "$ORCH_REPO" reset --hard -q "origin/$ref"
@@ -441,6 +562,7 @@ EOF
     ensure_repo
     if [[ -f "$(project_lock_path "$target")" ]]; then
       write_project_pin "$target" "$RESOLVED_SHA"
+      record_pin_approval "$target" "$RESOLVED_SHA"
     fi
     echo "Updated: $ORCH_REPO"
     printf '%s\n' "${RESOLVED_SHA:0:7}"
@@ -462,7 +584,12 @@ EOF
     requested="${1:-}"
     if [[ -n "$requested" ]]; then REF="$requested"; fi
     ensure_repo
+    if ! pin_on_release_history "$RESOLVED_SHA"; then
+      echo "pi-coding-orchestrator: note: $RESOLVED_SHA is neither on the remote default branch nor in a tag; it is approved for $target only" >&2
+    fi
     write_project_pin "$target" "$RESOLVED_SHA"
+    # Pinning is the user's approval of this commit for this target checkout.
+    record_pin_approval "$target" "$RESOLVED_SHA"
     ;;
   unpin)
     target="${1:-.}"
@@ -479,7 +606,8 @@ EOF
   preflight|doctor)
     target="."
     if [[ $# -gt 0 && "$1" != "--json" ]]; then target="$1"; shift; fi
-    # An invalid pin is one of the things doctor reports, so keep going.
+    # An invalid or rejected pin is one of the things doctor reports, so keep going.
+    PIN_FALLBACK=true
     if ! apply_project_pin "$target"; then
       echo "pi-coding-orchestrator: ignoring invalid project pin for diagnosis" >&2
     fi

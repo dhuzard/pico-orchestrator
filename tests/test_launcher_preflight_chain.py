@@ -546,3 +546,151 @@ class PicoAuditRegressionTest(_CacheFixture):
         self.assertTrue(report["checks"]["pi_claude_bridge"])
         self.assertFalse(report["checks"]["pi_subagent_workflows"])
         self.assertFalse(report["ok"])
+
+
+class ProjectPinReviewTest(_CacheFixture):
+    """A target's .pi/orchestrator.lock runs only release-history commits or user-approved pins (S2)."""
+
+    OVERRIDE = "PI_CODING_ORCHESTRATOR_ALLOW_UNREVIEWED_PIN"
+
+    def lock(self) -> Path:
+        return self.target / ".pi" / "orchestrator.lock"
+
+    def write_lock(self, sha: str) -> None:
+        self.lock().parent.mkdir(exist_ok=True)
+        self.lock().write_text(sha + "\n")
+
+    def orphan_commit(self) -> str:
+        """A commit pushed to a non-default branch only; the seed then returns to main."""
+        _git("checkout", "-q", "-b", "experiment", cwd=self.seed)
+        sha = self.commit("unreviewed experiment")
+        _git("push", "-q", "origin", "experiment", cwd=self.seed)
+        _git("checkout", "-q", "main", cwd=self.seed)
+        return sha
+
+    def run_target(self, **env_extra: str) -> subprocess.CompletedProcess:
+        self.capture.unlink(missing_ok=True)
+        return self.use_latest("run", str(self.target), env_extra=env_extra or None)
+
+    def launched(self) -> str:
+        args = json.loads(self.capture.read_text())["args"]
+        return Path(args[args.index("-e") + 1]).parent.parent.name
+
+    def test_ancestor_of_default_branch_runs_with_unapproved_warning(self):
+        self.assertEqual(self.use_latest("update").returncode, 0)
+        self.commit("upstream advance")
+        older = self.commit("upstream advance again")
+        self.commit("upstream head")
+        _git("push", "-q", "origin", "main", cwd=self.seed)
+        self.write_lock(older)
+        # Not cached yet: resolved after a fetch.
+        self.assertNotEqual(subprocess.run(["git", "cat-file", "-e", f"{older}^{{commit}}"],
+                                           cwd=self.cache / "repo").returncode, 0)
+        proc = self.run_target()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.launched(), older)
+        self.assertNotIn("PIN_NOT_ON_RELEASE_HISTORY", proc.stderr)
+        self.assertIn(f"project pin {older[:12]} in {self.lock()} has not been approved", proc.stderr)
+        # Cached and offline: the check uses local refs, so the reviewed pin still runs.
+        self.origin.rename(self.base / "origin.offline")
+        offline = self.run_target()
+        self.assertEqual(offline.returncode, 0, offline.stderr)
+        self.assertIn("cached, no fetch", offline.stderr)
+        self.assertEqual(self.launched(), older)
+
+    def test_orphan_pin_is_rejected_cached_or_not_and_never_launched(self):
+        self.assertEqual(self.use_latest("update").returncode, 0)
+        orphan = self.orphan_commit()
+        self.write_lock(orphan)
+        # Not cached yet: resolved after a fetch.
+        fresh = self.run_target()
+        self.assertEqual(fresh.returncode, 1, fresh.stderr)
+        self.assertIn(f"PIN_NOT_ON_RELEASE_HISTORY: project pin {orphan} from {self.lock()}", fresh.stderr)
+        self.assertIn(self.OVERRIDE, fresh.stderr)
+        self.assertFalse(self.capture.exists(), "the rejected pin must never launch")
+        self.assertFalse((self.cache / "runtimes" / orphan).exists())
+        # The commit is now in the cache (fetched with its branch); it is still rejected.
+        _git("cat-file", "-e", f"{orphan}^{{commit}}", cwd=self.cache / "repo")
+        cached = self.run_target()
+        self.assertEqual(cached.returncode, 1, cached.stderr)
+        self.assertIn("PIN_NOT_ON_RELEASE_HISTORY", cached.stderr)
+        self.assertNotIn("could not be refreshed", cached.stderr)
+        self.origin.rename(self.base / "origin.offline")
+        offline = self.run_target()
+        self.assertEqual(offline.returncode, 1, offline.stderr)
+        self.assertIn("could not be refreshed", offline.stderr)
+        self.assertFalse(self.capture.exists())
+        for command in ("sync", "watch"):
+            refused = self.use_latest(command, str(self.target))
+            self.assertNotEqual(refused.returncode, 0, command)
+            self.assertIn("PIN_NOT_ON_RELEASE_HISTORY", refused.stderr, command)
+
+    def test_tagged_commit_off_the_default_branch_is_release_history(self):
+        orphan = self.orphan_commit()
+        _git("tag", "v9.9.9", orphan, cwd=self.seed)
+        _git("push", "-q", "origin", "v9.9.9", cwd=self.seed)
+        self.write_lock(orphan)
+        proc = self.run_target()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.launched(), orphan)
+
+    def test_override_runs_unreviewed_pin_with_warning(self):
+        orphan = self.orphan_commit()
+        self.write_lock(orphan)
+        for value in ("0", "yes"):
+            self.assertEqual(self.run_target(**{self.OVERRIDE: value}).returncode, 1, value)
+        proc = self.run_target(**{self.OVERRIDE: "1"})
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.launched(), orphan)
+        self.assertIn(f"warning: running project pin {orphan}", proc.stderr)
+
+    def test_explicit_pin_approves_an_off_history_commit_for_that_target_only(self):
+        orphan = self.orphan_commit()
+        pin = self.use_latest("pin", str(self.target), orphan)
+        self.assertEqual(pin.returncode, 0, pin.stderr)
+        self.assertIn("approved for", pin.stderr)
+        self.assertEqual(self.lock().read_text().strip(), orphan)
+        proc = self.run_target()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.launched(), orphan)
+        self.assertNotIn("warning: project pin", proc.stderr)
+        # The same lock in another checkout is not approved there.
+        other = self.base / "other-target"
+        _git("init", "-q", str(other), cwd=self.base)
+        (other / ".pi").mkdir()
+        (other / ".pi" / "orchestrator.lock").write_text(orphan + "\n")
+        refused = self.use_latest("run", str(other))
+        self.assertEqual(refused.returncode, 1, refused.stderr)
+        self.assertIn("PIN_NOT_ON_RELEASE_HISTORY", refused.stderr)
+
+    def test_pin_change_from_last_approved_warns_and_update_records_approval(self):
+        first = _git("rev-parse", "HEAD", cwd=self.seed)
+        self.assertEqual(self.use_latest("pin", str(self.target)).returncode, 0)
+        approved = self.run_target()
+        self.assertEqual(approved.returncode, 0, approved.stderr)
+        self.assertNotIn("warning: project pin", approved.stderr)
+
+        newer = self.commit("upstream advance")
+        _git("push", "-q", "origin", "main", cwd=self.seed)
+        self.write_lock(newer)  # for example, pulled from the target's own remote
+        changed = self.run_target()
+        self.assertEqual(changed.returncode, 0, changed.stderr)
+        self.assertIn(f"project pin changed from {first[:12]} (last approved) to {newer[:12]}", changed.stderr)
+
+        self.write_lock(first)
+        update = self.use_latest("update", str(self.target))
+        self.assertEqual(update.returncode, 0, update.stderr)
+        self.assertEqual(self.lock().read_text().strip(), newer)
+        after = self.run_target()
+        self.assertEqual(after.returncode, 0, after.stderr)
+        self.assertNotIn("warning: project pin", after.stderr)
+
+    def test_doctor_diagnoses_with_default_branch_when_pin_is_rejected(self):
+        orphan = self.orphan_commit()
+        self.write_lock(orphan)
+        doctor = self.use_latest("doctor", str(self.target), "--json")
+        self.assertIn("PIN_NOT_ON_RELEASE_HISTORY", doctor.stderr)
+        self.assertIn("ignoring rejected project pin for diagnosis", doctor.stderr)
+        report = json.loads(doctor.stdout)
+        self.assertEqual(report["orchestrator"]["revision"], _git("rev-parse", "main", cwd=self.seed))
+        self.assertEqual(report["orchestrator"]["project_pin"], orphan)

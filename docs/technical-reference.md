@@ -430,10 +430,51 @@ unbound mutating step; a read-only step without one uses the target
 checkout). The model cannot pass a directory, mode, or executable.
 Mutating steps allow Read, Edit, Write, Glob, Grep, Bash, and Agent;
 read-only steps allow Read, Glob, and Grep. `Bash(git push:*)`,
-`Bash(gh:*)`, `Bash(git worktree:*)`, and `git branch -d/-D/--delete` are
-denied. Other parent-only operations (merges, remote edits, writes outside the
-worktree through shell commands) rely on the worker contract and the
-parent-checkout snapshot comparison. Claude Code protects every `.git`
+`Bash(gh:*)`, `Bash(git worktree:*)`, `git branch -d/-D/--delete`, git
+invocations that redirect or reconfigure git (`git -C`, `git -c`,
+`--git-dir`, `--work-tree`, `--exec-path`), `git remote add/set-url`, and
+`env`/`command`/`exec` wrappers around `git` and `gh` are denied. The deny
+list is best-effort defense in depth, not a boundary: Claude Code matches Bash
+rules by command prefix, so a worker with Bash can still reach the same effect
+through a script, another interpreter, or the network. Other parent-only
+operations (merges, writes outside the worktree through shell commands) rely
+on the worker contract and the parent-checkout snapshot comparison, which sees
+only the parent checkout, not `$HOME`, other repositories, or the network.
+
+The worker process does not inherit Pi's environment. `buildWorkerEnv`
+forwards only `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `LANG`,
+`LANGUAGE`, `LC_*`, `TERM`, `COLORTERM`, `TZ`, `TMPDIR`/`TMP`/`TEMP`,
+`XDG_{CONFIG,DATA,CACHE,STATE}_HOME`, `NODE_EXTRA_CA_CERTS`,
+`SSL_CERT_FILE`, `SSL_CERT_DIR`, the proxy variables
+(`HTTP(S)_PROXY`, `NO_PROXY`, `ALL_PROXY`, upper and lower case), and
+`ANTHROPIC_*` / `CLAUDE_*` (Claude Code configuration and API-key or OAuth
+authentication; a stored `claude` login is found through `HOME`). Everything
+else is withheld, including `GH_TOKEN`, `GITHUB_TOKEN`,
+`GH_ENTERPRISE_TOKEN`, `GIT_ASKPASS`, `SSH_AUTH_SOCK`, `NPM_TOKEN`, Git
+overrides such as `GIT_DIR`, cloud credentials (`AWS_*`, `GOOGLE_*`) and
+PICO's own `PI_*` settings, which the worker does not read. PICO verifies
+Claude authentication only through `claude auth status`, so third-party
+provider modes (Bedrock, Vertex) are not forwarded by default; set
+`PI_ORCHESTRATOR_WORKER_ENV_ALLOW` to a comma-separated list of exact
+variable names (for example `JAVA_HOME,AWS_PROFILE`) to forward more. A name
+in that list is forwarded even if it is a credential: that is the user's
+explicit choice. An entry that is not a variable name blocks the call with
+`WORKER_CONFIG_INVALID` before Claude Code starts. The tool result records
+`env_dropped_count` and `env_dropped` (the withheld names, never values; at
+most 100).
+
+`PI_ORCHESTRATOR_WORKER_SANDBOX=1` adds `--settings
+{"sandbox":{"enabled":true,"failIfUnavailable":true}}`, so Claude Code runs the
+worker's Bash commands in its OS sandbox and exits at startup when the sandbox
+cannot start instead of running them unconfined (any value other than unset,
+`0` or `1` is `WORKER_CONFIG_INVALID`). It is off by default because the
+sandbox restricts network access and needs platform support (bubblewrap on
+Linux), so dependency installs or checks that need the network can fail
+inside it. The settings keys were read from the settings schema of Claude
+Code 2.1.304; the setting has not been exercised end to end against a real
+worker run or older releases. We recommend running workers in
+an OS sandbox limited to the worktree, with this setting, a container, or
+bwrap. Claude Code protects every `.git`
 directory and denies edits there even in `acceptEdits` mode, so a mutating
 step bound to a worktree inside `.git` is refused before Claude starts
 (`WORKER_WORKSPACE_PROTECTED_PATH`); the permission mode is never widened to
@@ -1248,13 +1289,15 @@ you the exact `provenance/runs/<run-id>.json` path. Metrics and token/cost
 fields are observational only: they appear when a backend persisted them, and
 otherwise render as `unknown`/`null` rather than being estimated.
 
-Sample text output for a `CODEX_CLAUDE_CODEX` run:
+Sample text output for a `CODEX_CLAUDE_CODEX` run (illustrative: the run and
+backlog identifiers come from development before the public repository, and
+no GitHub issue was recorded for this run):
 
 ```text
 Run: run-2026-09-23-orch011
 Trace: provenance/runs/run-2026-09-23-orch011.json
 Status: completed
-References: backlog ORCH-011; GitHub issue #11
+References: backlog ORCH-011; GitHub issue unknown
 Objective: Implement end-of-run orchestration trace and user-facing summary.
 
 Route:
@@ -1398,14 +1441,14 @@ tasks with `depends_on`, `blocks`, `wave`, `readiness`, `blocked_by` and
 (`WORKSPACE_MANIFEST_INVALID`). Blockers never stop validation of the
 remaining entries, so one report lists everything to fix. Execution of a plan
 (headless child runs, scheduling, contracts, PR coordination, Garden) is
-tracked in epic #49.
+described in the sections that follow.
 
 ### Headless single-repository execution
 
 `tools/headless_run.py` (launcher: `pico exec`) starts, observes, resumes and
 cancels one bounded orchestration run without an interactive terminal. It is
 the programmatic execution interface that repository-scoped child launchers
-and the cross-repository scheduler (#53, #54) build on.
+and the cross-repository scheduler build on.
 
 ```sh
 python3 tools/headless_run.py start  --target . --repo owner/repository --execution-id <id> --objective "..." [--allow-mutation] [--resume] [--no-wait]
@@ -1779,7 +1822,12 @@ autonomy policy source, profile, PR granularity, the ten boolean permissions,
 ambiguity capacities per family and tier from `model_profiles`. It never
 returns the workspace goal or task titles. `GET /api/branches?task=<id>`
 (controls only) lists the task repository's local `pico/` branches with their
-commit and whether they descend from the pin.
+commit and whether they descend from the pin. With `--controls` on, both
+endpoints also require the session token in `X-Pico-Token` (compared in
+constant time, as for actions) and answer `403 CONTROL_TOKEN_INVALID`
+without it; without `--controls`, `/api/controls` stays a read-only panel. A
+malformed or negative `Content-Length` on `POST /api/action` is answered with
+`400 CONTROL_BODY_INVALID`.
 
 Coverage: `tests/test_garden_controls.py` starts a real server on two
 temporary repositories with a fake GitHub adapter. It covers every gate, the
@@ -1795,7 +1843,7 @@ HMAC confirmation and are audited:
 | `publish` + `grant_once` | plan with `authorization: one_shot_grant` | plan hash (which includes the authorization source) and the grant flag | publishes once under an in-process grant |
 | `cancel` | execution status and run | execution id, run id, status | `workspace_run.cancel` |
 | `schedule` | tasks to launch and resume, cap, mutating permissions per repository | those lists, `allow_mutation`, cap | `workspace_scheduler.run` in a background thread; one at a time |
-| `set_permission` | unified diff of `.pi/autonomy.yaml` (created from the template if absent) | repository, permission, value, SHA-256 of the file before | atomic write, schema-validated, comments kept; not committed |
+| `set_permission` | unified diff of `.pi/autonomy.yaml` (created from the template if absent) | repository, permission, value, SHA-256 of the file before | atomic write (unique temp file, fsync, replace), schema-validated, comments kept; not committed. Refused with `AUTONOMY_POLICY_PATH_UNSAFE` when `.pi` or `.pi/autonomy.yaml` is a symlink or resolves outside the checkout |
 | `set_model` / `reset_model` | current and new model and capacity | family, tier, target, SHA-256 of the user model config | `model_profiles.cmd_set` / `cmd_reset` |
 
 **One-shot publication grant.** `github_integration.publish(..., grant=...)`
@@ -1970,9 +2018,39 @@ Resolution precedence is:
 2. valid project `.pi/orchestrator.lock`;
 3. remote default branch.
 
-`pico run`, `pico setup`, `pico sync`, and `pico doctor` honor the
-project lock. `pico update <target>` is the explicit operation that resolves
-the configured update ref and advances an existing lock to that commit.
+`pico run`, `pico setup`, `pico sync`, `pico watch`, `pico exec`, and
+`pico doctor` honor the project lock. `pico update <target>` is the explicit
+operation that resolves the configured update ref and advances an existing
+lock to that commit.
+
+The lock comes from the target repository, which may not be trusted, so the
+launcher reviews it before building or running its runtime:
+
+- **Release history.** A project pin runs only when it is an ancestor of the
+  remote default branch (`refs/remotes/origin/HEAD`) or a tag contains it. A
+  commit that exists only on another branch fails closed with
+  `PIN_NOT_ON_RELEASE_HISTORY` before a runtime is materialized. The check
+  first uses the cache's local refs, so a cached pin that they already show on
+  release history runs offline as before. Otherwise the launcher refreshes the
+  remote refs once and checks again; when that refresh fails (offline), the
+  pin is refused with that reason in the message.
+  `PI_CODING_ORCHESTRATOR_ALLOW_UNREVIEWED_PIN=1` runs such a pin anyway, with
+  a warning. `pico doctor` reports the refusal and diagnoses with the default
+  branch instead.
+- **Approval.** `pico pin <target> [ref]` and `pico update <target>` record the
+  written commit as the user's approved pin for that target checkout under
+  `$STATE_DIR/approved-pins/` (keyed by the checkout's physical path). When
+  the lock names a different commit, or no approval was recorded on this
+  machine, the launcher prints a non-fatal warning naming the commit and the
+  `pico pin <target> <sha>` command that approves it. An approved pin skips
+  the release-history check: pinning an unreleased commit explicitly is the
+  user's choice for that checkout only.
+- An explicit `PI_CODING_ORCHESTRATOR_REF` or `pico pin <target> <ref>` is
+  the user's own choice and is not reviewed.
+
+Tags are matched by containment, not verified: the launcher does not check
+tag or commit signatures yet, so a pin is only as trustworthy as the
+repository's default branch and tags.
 
 ### Readiness interface
 

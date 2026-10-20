@@ -1,0 +1,16 @@
+# Code owners for PICO. GitHub requests a review from these owners on
+# pull requests that touch the matching paths. Later rules take precedence.
+
+# Default owner for everything.
+* @dhuzard
+
+# Routing policy and the versioned contracts.
+/routing/ @dhuzard
+/schemas/ @dhuzard
+
+# Security-sensitive runtime: the launcher runs cached code, the Claude
+# worker runs with the user's credentials, and the Garden controls write to
+# the target checkout.
+/scripts/use-latest.sh @dhuzard
+/extensions/claude-worker.ts @dhuzard
+/tools/garden_controls.py @dhuzard

@@ -37,6 +37,7 @@ from pathlib import Path
 import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import atomic_io  # noqa: E402
 import autonomy_policy  # noqa: E402
 import difflib  # noqa: E402
 import io  # noqa: E402
@@ -73,6 +74,25 @@ def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _safe_policy_location(path: Path) -> Path:
+    """Fail closed unless `.pi/autonomy.yaml` is a plain path inside its checkout.
+
+    A committed symlink at `.pi` or `.pi/autonomy.yaml` would otherwise let a
+    confirmed permission change read or overwrite a file outside the checkout.
+    Returns the checkout root the policy belongs to.
+    """
+    top = path.parent.parent
+    unsafe = ControlError(409, "AUTONOMY_POLICY_PATH_UNSAFE", "the policy path is a symlink or leaves the checkout")
+    try:
+        atomic_io.check_no_symlinks(path, top)
+    except atomic_io.UnsafePathError as exc:
+        raise unsafe from exc
+    resolved_top = top.resolve()
+    if path.parent.name != ".pi" or path.resolve().parent != resolved_top / ".pi":
+        raise unsafe
+    return top
+
+
 def host_allowed(host: str | None, port: int) -> bool:
     return host in {f"127.0.0.1:{port}", f"localhost:{port}"}
 
@@ -90,13 +110,17 @@ class Controls:
         self.last_schedule: dict | None = None
 
     # -- request checks ----------------------------------------------------
+    def check_token(self, headers) -> None:
+        """Constant-time check of the session token sent as X-Pico-Token."""
+        supplied = headers.get("X-Pico-Token") or ""
+        if not hmac.compare_digest(supplied.encode(), self.token.encode()):
+            raise ControlError(403, "CONTROL_TOKEN_INVALID", "open the Garden from the URL printed at launch")
+
     def authorize(self, headers, body: bytes) -> dict:
         origin = headers.get("Origin")
         if origin not in {f"http://127.0.0.1:{self.port}", f"http://localhost:{self.port}"}:
             raise ControlError(403, "CONTROL_ORIGIN_REJECTED", "actions must come from this Garden page")
-        supplied = headers.get("X-Pico-Token") or ""
-        if not hmac.compare_digest(supplied.encode(), self.token.encode()):
-            raise ControlError(403, "CONTROL_TOKEN_INVALID", "open the Garden from the URL printed at launch")
+        self.check_token(headers)
         if (headers.get("Content-Type") or "").split(";")[0].strip() != "application/json":
             raise ControlError(415, "CONTROL_BODY_INVALID", "actions take a JSON body")
         if len(body) > MAX_BODY:
@@ -420,6 +444,7 @@ class Controls:
         if not isinstance(value, bool):
             raise ControlError(400, "CONTROL_BODY_INVALID", "value must be true or false")
         path = autonomy_policy.policy_path(checkout)
+        top = _safe_policy_location(path)
         root = Path(__file__).resolve().parent.parent
         before = path.read_text(encoding="utf-8") if path.is_file() else ""
         source = before or (root / "templates" / "autonomy.yaml").read_text(encoding="utf-8")
@@ -443,10 +468,12 @@ class Controls:
                                 "note": "Writes the repository's .pi/autonomy.yaml. The change stays uncommitted "
                                         "until you commit it."}}
         self._check_confirm(confirm, expected)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".yaml.garden-tmp")
-        tmp.write_text(after, encoding="utf-8")
-        os.replace(tmp, path)
+        _safe_policy_location(path)
+        path.parent.mkdir(exist_ok=True)
+        try:
+            atomic_io.atomic_write_text(path, after, root=top)
+        except atomic_io.UnsafePathError as exc:
+            raise ControlError(409, "AUTONOMY_POLICY_PATH_UNSAFE", "the policy path is a symlink or leaves the checkout") from exc
         return {"ok": True, "stage": "done", "status": "POLICY_UPDATED",
                 "audit": {"repository": repo["id"], "permission": name, "value": value}}
 

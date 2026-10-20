@@ -142,7 +142,7 @@ def _validate_pr_patch_argv(argv: list[str]) -> None:
         except ValueError:
             reject("invalid owner/repo")
     seen: list[str] = []
-    for flag, field in zip(argv[5::2], argv[6::2]):
+    for flag, field in zip(argv[5::2], argv[6::2], strict=True):
         if flag != "-f":
             reject("fields must use raw-string -f")
         key, sep, value = field.partition("=")

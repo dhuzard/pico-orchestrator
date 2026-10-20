@@ -192,6 +192,7 @@ function workerBlocker(outcome: ClaudeWorkerOutcome): string {
     case "ABORTED": return "WORKER_ABORTED";
     case "OUTPUT_LIMIT": return "WORKER_OUTPUT_LIMIT";
     case "SPAWN_FAILED": return "MODEL_BACKEND_UNAVAILABLE";
+    case "CONFIG_INVALID": return "WORKER_CONFIG_INVALID";
     default: return classifyClaudeInvocationError(outcome.text);
   }
 }
@@ -1144,7 +1145,9 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
           model: plan.canonical, backend: "claude-code", backend_model: plan.backendModel,
           reasoning_effort: plan.effort, exit_code: outcome.exitCode, error: outcome.error, usage: outcome.usage,
           duration_ms: outcome.durationMs, elapsed_ms: outcome.elapsedMs, session_id: outcome.sessionId,
-          permission_denials: outcome.permissionDenials, denied_calls: outcome.deniedCalls } as Json };
+          permission_denials: outcome.permissionDenials, denied_calls: outcome.deniedCalls,
+          // Names only, never values, of parent environment variables withheld from the worker.
+          env_dropped_count: outcome.envDropped.length, env_dropped: outcome.envDropped.slice(0, 100) } as Json };
     },
   });
 

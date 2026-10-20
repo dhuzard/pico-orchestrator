@@ -423,7 +423,7 @@ def mission_update(
     current: dict | None = None,
 ) -> dict:
     missions = load_missions(repo_root)
-    for idx, existing in enumerate(missions):
+    for idx, existing in enumerate(missions):  # noqa: B007 - idx is used after the loop (missions[idx])
         if existing.get("id") == id:
             mission = copy.deepcopy(existing)
             break

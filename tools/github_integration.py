@@ -322,7 +322,7 @@ def execute(*, worktree: Path, proposal_file: Path, explicit_repo: str | None = 
                 raise IntegrationError("GITHUB_STATE_CONFLICT", "GitHub plan changed since dry-run")
             if any(x["destructive"] and not x["noop"] for x in plan) and not allow_destructive:
                 raise IntegrationError("GITHUB_MUTATION_NOT_AUTHORIZED", "destructive operation requires parent authorization")
-            for p, item in zip(proposals, plan):
+            for p, item in zip(proposals, plan, strict=True):
                 if item["noop"]:
                     status = "noop"
                 else:

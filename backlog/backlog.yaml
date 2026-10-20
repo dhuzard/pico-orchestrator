@@ -1,3 +1,9 @@
+# Historical note: entries created before v1.0.0 record work done in the
+# pre-public private repository (dhuzard/pi-coding-orchestrator). Their issue
+# numbers and commit SHAs refer to that repository and are not present in the
+# public history of dhuzard/pico-orchestrator. They are kept unchanged as
+# historical records. tools/backlog_store.py rewrites this file without
+# comments, so restore this note if a backlog command removes it.
 - acceptance_criteria:
   - routing/default-policy.yaml defines all four routes with structured match predicates,
     precedence and fallback_route
