@@ -34,6 +34,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import github_integration  # noqa: E402
 import github_sync as gh  # noqa: E402
 import session_scope  # noqa: E402
+import provenance  # noqa: E402
 
 try:
     import jsonschema
@@ -92,7 +93,12 @@ def load_manifest(path: Path) -> Any:
 def validate_manifest(manifest: Any, schema: dict | None = None) -> list[str]:
     validator = jsonschema.Draft202012Validator(schema or load_schema())
     errors = sorted(validator.iter_errors(manifest), key=lambda e: list(e.absolute_path))
-    return [f"{'/'.join(str(p) for p in e.absolute_path) or '<root>'}: {e.message}" for e in errors]
+    messages = [f"{'/'.join(str(p) for p in e.absolute_path) or '<root>'}: {e.message}" for e in errors]
+    if isinstance(manifest, dict) and isinstance(manifest.get("tasks"), list):
+        for index, task in enumerate(manifest["tasks"]):
+            if isinstance(task, dict) and isinstance(task.get("objective"), str) and provenance._contains_secret_like_content(task["objective"]):
+                messages.append(f"tasks/{index}/objective: instruction looks like it contains a secret")
+    return messages
 
 
 def gh_access(repository: str) -> dict:
@@ -305,7 +311,8 @@ def plan_tasks(tasks: list[dict], repository_ids: set[str],
         kind = task.get("kind") or "implementation"
         enough = QUALIFYING_STATES if kind == "qualification" else UNBLOCKING_STATES
         blocked_by = [dep for dep in deps[task_id] if readiness[dep] not in enough or not contract_ready(task_id, dep)]
-        planned.append({"id": task_id, "repository": task["repository"], "title": task["title"], "kind": kind,
+        planned.append({"id": task_id, "repository": task["repository"], "title": task["title"],
+                        "objective": task.get("objective"), "kind": kind,
                         "issue": task.get("issue"), "provides": task.get("provides") or [],
                         "requires": task.get("requires") or [], "checks": task.get("checks") or [],
                         "depends_on": deps[task_id], "blocks": sorted(dependents[task_id]),

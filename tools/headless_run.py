@@ -344,6 +344,9 @@ def _launch_locked(path: Path, *, worktree: Path, identity: str, common: Path, e
     if record is not None:
         if record["target_repository"].casefold() != identity.casefold():
             raise HeadlessError("EXECUTION_TARGET_MISMATCH", "execution id belongs to another repository")
+        if record["objective"] != objective:
+            raise HeadlessError("EXECUTION_OBJECTIVE_MISMATCH",
+                                "execution id has a different recorded objective; use a new task id for changed instructions")
         refresh(record)
         if record["status"] == "launched":
             record["outcome"] = "already_running"

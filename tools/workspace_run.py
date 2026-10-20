@@ -198,7 +198,7 @@ def objective_for(plan: dict, task: dict, repo: dict, inputs: dict | None = None
     return (f"Workspace {plan['workspace_id']}, task {task['id']} in repository {repo['repository']} "
             f"at pinned commit {repo['pinned_commit']}.\n"
             f"Task: {task['title']}\n"
-            f"Workspace goal: {plan['goal']}\n"
+            f"Repository-scoped objective: {task.get('objective') or task['title']}\n"
             f"Upstream inputs: {upstream}. "
             + (f"Required contracts: {needs}. " if needs else "")
             + (f"Contracts this task must provide: {offers}. " if offers else "") +
@@ -213,6 +213,7 @@ def _entry(record: dict, task: dict, repo: dict, execution: dict, inputs: dict |
         entry["inputs"] = inputs  # first dispatch only: inputs are immutable once recorded
     entry.update({"repository": repo["id"], "target_repository": execution["target_repository"],
                   "pinned_commit": repo["pinned_commit"], "execution_id": execution["execution_id"],
+                  "objective_sha256": hashlib.sha256(execution["objective"].encode("utf-8")).hexdigest(),
                   "execution_status": execution["status"], "outcome": execution.get("outcome"),
                   "launches": execution.get("launches"), "run_id": execution.get("run_id"),
                   "run_status": run.get("status"), "run_blocker_code": run.get("blocker_code"),
@@ -246,11 +247,24 @@ def launch(*, manifest: Path, task_id: str, allow_mutation: bool = False, resume
     if head != repo["pinned_commit"]:
         raise WorkspaceRunError("WORKSPACE_PIN_MISMATCH",
                                 f"checkout HEAD {head or 'unknown'} is not the pinned commit; check it out first")
-    inputs = dispatch_inputs(plan, task, repo)
+    with locked_workspace(plan["workspace_id"]):
+        prior = load_workspace(workspace_record_path(plan["workspace_id"]))
+        saved_inputs = ((prior or {}).get("tasks") or {}).get(task_id, {}).get("inputs")
+    inputs = saved_inputs if saved_inputs is not None else dispatch_inputs(plan, task, repo)
+    objective = objective_for(plan, task, repo, inputs)
+    if task.get("objective") is None:
+        # Pre-extension executions used the workspace goal. Resume only when
+        # the stored text exactly matches that historical deterministic form.
+        old = headless_run.load_record(headless_run.execution_path(
+            Path(repo["git_common_dir"]), execution_id(plan["workspace_id"], task_id)))
+        legacy = objective.replace(f"Repository-scoped objective: {task['title']}\n",
+                                   f"Workspace goal: {plan['goal']}\n", 1)
+        if old is not None and old.get("objective") == legacy:
+            objective = legacy
     try:
         execution = headless_run.start(target=checkout, explicit_repo=repo["repository"],
                                        execution_id=execution_id(plan["workspace_id"], task_id),
-                                       objective=objective_for(plan, task, repo, inputs), allow_mutation=allow_mutation,
+                                       objective=objective, allow_mutation=allow_mutation,
                                        resume=resume, wait=wait, pi_executable=pi_executable)
     except headless_run.HeadlessError as exc:
         raise WorkspaceRunError(exc.code, exc.detail) from exc
