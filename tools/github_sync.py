@@ -10,13 +10,22 @@ integration requires separate parent authorization for destructive changes.
 Safety properties, all enforced here:
   - `shell=False` always; every invocation is an explicit argv list, never a
     shell string. No shell metacharacter can ever be interpreted.
-  - A fixed allowlist of (noun, verb) command pairs. No `gh api`, and no
-    caller-supplied arbitrary flags: every wrapper function below builds its
-    own fixed argv shape and only interpolates validated positional values
-    (issue/PR numbers, titles, bodies, labels, branch refs) as separate argv
-    elements -- never concatenated into a single string. PR support is limited
-    to list/view/create/edit/comment operations; issue comments are also explicit
-    wrappers. No PR merge, checkout, ready, branch push, or `gh api` path exists here.
+  - A fixed allowlist of (noun, verb) command pairs, and no caller-supplied
+    arbitrary flags: every wrapper function below builds its own fixed argv
+    shape and only interpolates validated positional values (issue/PR
+    numbers, titles, bodies, labels, branch refs) as separate argv elements
+    -- never concatenated into a single string. PR support is limited to
+    list/view/create/edit/comment operations; issue comments are also explicit
+    wrappers. No PR merge, checkout, ready, or branch push path exists here.
+  - Generic `gh api` is NOT allowlisted. The single exception is the exact
+    PR title/body edit shape built by `edit_pr` (`gh pr edit` fails on some
+    gh versions because it queries deprecated classic Projects via GraphQL):
+      gh api -X PATCH repos/<owner>/<repo>/pulls/<n> -f title=<t> -f body=<b>
+    `_validate_allowlisted` accepts only that whole argv: method PATCH, a
+    pulls endpoint with a positive PR number and either a validated
+    owner/repo or the exact `{owner}/{repo}` gh placeholders, then one or two
+    unique raw-string (`-f`, never typed `-F`) title/body fields in that
+    order. Any other `gh api` argv fails before a subprocess is started.
   - No secrets/tokens are read, stored, or logged by this module. Whatever
     `gh` itself resolves from its own auth configuration is used implicitly
     by the `gh` binary; this module never inspects or forwards a token.
@@ -38,7 +47,8 @@ from typing import Any
 GH_BINARY = "gh"
 
 # Fixed allowlist of "gh <noun> <verb>" pairs this module may ever invoke.
-# Deliberately excludes `gh api` and any pair not implemented below.
+# Deliberately excludes `gh api` (see _validate_pr_patch_argv for the one
+# fixed REST shape) and any pair not implemented below.
 ALLOWED_COMMANDS = frozenset(
     {
         ("repo", "view"),
@@ -54,7 +64,6 @@ ALLOWED_COMMANDS = frozenset(
         ("pr", "view"),
         ("pr", "list"),
         ("pr", "create"),
-        ("pr", "edit"),
         ("pr", "comment"),
         ("auth", "status"),
     }
@@ -104,11 +113,58 @@ def gh_available() -> bool:
     return shutil.which(GH_BINARY) is not None
 
 
+_PR_PATCH_ENDPOINT_RE = re.compile(r"repos/([^/]+)/([^/]+)/pulls/([1-9][0-9]*)")
+_PR_PATCH_FIELDS = ("title", "body")
+
+
+def _validate_pr_patch_argv(argv: list[str]) -> None:
+    """Accept only the exact argv built by edit_pr:
+    gh api -X PATCH repos/<owner>/<repo>/pulls/<n> -f title=<t> [-f body=<b>]
+    (title and body each optional, at least one, in that order)."""
+    def reject(reason: str) -> None:
+        raise GithubSyncError(f"internal error: gh api argv rejected ({reason}): {argv!r}")
+
+    if not all(isinstance(arg, str) for arg in argv):
+        reject("non-string element")
+    if len(argv) not in (7, 9):
+        reject("unexpected length")
+    if argv[2] != "-X" or argv[3] != "PATCH":
+        reject("method must be exactly -X PATCH")
+    match = _PR_PATCH_ENDPOINT_RE.fullmatch(argv[4])
+    if not match:
+        reject("endpoint must be repos/<owner>/<repo>/pulls/<positive number>")
+    owner, name = match.group(1), match.group(2)
+    if (owner, name) != ("{owner}", "{repo}"):
+        if "{" in owner + name or "}" in owner + name:
+            reject("placeholders must be exactly {owner}/{repo}")
+        try:
+            validate_repo(f"{owner}/{name}")
+        except ValueError:
+            reject("invalid owner/repo")
+    seen: list[str] = []
+    for flag, field in zip(argv[5::2], argv[6::2]):
+        if flag != "-f":
+            reject("fields must use raw-string -f")
+        key, sep, value = field.partition("=")
+        if not sep or key not in _PR_PATCH_FIELDS:
+            reject("field must be title=... or body=...")
+        if key in seen:
+            reject("duplicate field")
+        if seen and _PR_PATCH_FIELDS.index(key) < _PR_PATCH_FIELDS.index(seen[-1]):
+            reject("fields must be ordered title, body")
+        if key == "title" and not value.strip():
+            reject("title must be non-empty")
+        seen.append(key)
+
+
 def _validate_allowlisted(argv: list[str]) -> None:
     if not argv or argv[0] != GH_BINARY:
         raise GithubSyncError(f"internal error: argv must start with {GH_BINARY!r}, got {argv!r}")
     if len(argv) < 3:
         raise GithubSyncError(f"internal error: argv too short to contain a noun/verb pair: {argv!r}")
+    if argv[1] == "api":
+        _validate_pr_patch_argv(argv)
+        return
     pair = (argv[1], argv[2])
     if pair not in ALLOWED_COMMANDS:
         raise GithubSyncError(
@@ -471,19 +527,26 @@ def edit_pr(
     body: str | None = None,
     repo: str | None = None,
 ) -> None:
+    """Update a PR's title and/or body through the REST pulls endpoint.
+    `gh pr edit` is not used: some gh versions (e.g. 2.45) fail it by querying
+    deprecated classic Projects over GraphQL. Fields are passed as raw strings
+    (`-f`, never typed `-F`) so values such as `@file`, `true` or `123` are
+    sent verbatim. Without `repo`, gh resolves the `{owner}/{repo}`
+    placeholders from the current directory, as `gh pr edit` did."""
     _validate_pr_number(number)
-    argv = [GH_BINARY, "pr", "edit", str(number)]
+    fields: list[str] = []
     if title is not None:
         _validate_text(title, "title")
         if not title.strip():
             raise ValueError("title must be non-empty")
-        argv += ["--title", title]
+        fields += ["-f", f"title={title}"]
     if body is not None:
         _validate_text(body, "body")
-        argv += ["--body", body]
-    if len(argv) == 4:
+        fields += ["-f", f"body={body}"]
+    if not fields:
         raise ValueError("edit_pr requires at least one of title/body")
-    argv = _with_repo(argv, repo)
+    target = "{owner}/{repo}" if repo is None else validate_repo(repo)
+    argv = [GH_BINARY, "api", "-X", "PATCH", f"repos/{target}/pulls/{number}", *fields]
     proc = _run(argv)
     _require_success(proc, argv)
 
