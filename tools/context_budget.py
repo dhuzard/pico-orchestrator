@@ -27,6 +27,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import atomic_io  # noqa: E402
 import parent_orchestration  # noqa: E402
 import provenance  # noqa: E402
 import routing_engine as engine  # noqa: E402
@@ -171,9 +172,7 @@ def _checkpoint_unlocked(run_id: str, payload: dict, *, repo_root: Path) -> dict
     reference = f"checkpoints/{_repository_slug(repository)}/{run_id}/{sequence:04d}.json"
     path = _checkpoints_dir(repo_root).parent / reference
     path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_name(path.name + ".tmp")
-    temp.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    temp.replace(path)
+    atomic_io.atomic_write_json(path, document, indent=2, sort_keys=True, trailing_newline=True)
     # The lock is already held; flock is per open file, so it is not re-entrant.
     parent_orchestration._record_event_unlocked(run_id, {"kind": "context", "compaction": {
         "sequence": sequence, "reference": reference, "reason": document["reason"],

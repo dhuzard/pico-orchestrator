@@ -19,6 +19,7 @@ import yaml
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import atomic_io  # noqa: E402
 import routing_engine as engine  # noqa: E402
 
 FAMILIES = ("codex", "claude")
@@ -121,18 +122,15 @@ def _write(path: Path, config: dict) -> None:
             path.unlink()
         return
     path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_name(path.name + ".tmp")
-    temp.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
-    try:
+
+    def validate(temp: Path) -> None:
         # Validate the exact serialized candidate, then validate its effective
         # policy/backend contract, before the atomic replacement.
         validated = engine.load_model_runtime_config(ROOT, temp)
         assert validated is not None
         _effective(validated)
-        temp.replace(path)
-    except Exception:
-        temp.unlink(missing_ok=True)
-        raise
+
+    atomic_io.atomic_write_text(path, yaml.safe_dump(config, sort_keys=False), validate=validate)
 
 
 def cmd_show(path: Path) -> int:

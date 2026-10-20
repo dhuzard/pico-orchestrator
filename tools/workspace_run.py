@@ -36,6 +36,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import atomic_io  # noqa: E402
 import headless_run  # noqa: E402
 import workspace_plan  # noqa: E402
 
@@ -76,9 +77,7 @@ def load_workspace(path: Path) -> dict | None:
 def save_workspace(path: Path, record: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     record["updated_at"] = _now()
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
-    os.replace(tmp, path)
+    atomic_io.atomic_write_json(path, record, indent=2, sort_keys=True)
 
 
 @contextlib.contextmanager
