@@ -53,6 +53,19 @@ What those commands do:
 - `pico sync .` combines refresh + conservative setup + doctor for an existing repository.
 - `pico pin .` writes the exact orchestrator commit to `.pi/orchestrator.lock`; later `pico run .` honors that reviewed commit. `pico update .` explicitly advances an existing lock to the resolved update revision.
 
+To report a PICO bug while working in any repository, write a short report and
+preview the issue before sending it to `dhuzard/pico-orchestrator`:
+
+```sh
+pico report --title "PICO bug: short summary" --body-file report.md
+pico report --title "PICO bug: short summary" --body-file report.md --apply --plan-hash <preview-plan-hash>
+```
+
+Only the title and report file are sent. PICO never attaches the current
+project's code, remotes, paths, logs, or run records. The report file must be
+unchanged between preview and apply; `gh` must be installed and authenticated
+for the apply step. The current directory does not choose the issue repository.
+
 For later sessions in the same repo, the normal command is simply:
 
 ```sh
