@@ -357,7 +357,10 @@ def validate_readme(readme_text, errors):
     for route in ROUTES:
         if route not in readme_text:
             errors.add(f"README.md must mention route {route!r}")
-    if ABS_PATH_RE.search(readme_text):
+    # Public URLs and the portable /usr/bin editor path in the launcher docs
+    # are not environment-specific filesystem paths.
+    without_urls = re.sub(r"https?://[^\s)]+", "", readme_text)
+    if any(not match.group(0).startswith("/usr/bin") for match in ABS_PATH_RE.finditer(without_urls)):
         errors.add("README.md contains an environment-specific absolute path")
 
     for rule_name in engine.REQUIRED_CAPACITY_RULES:

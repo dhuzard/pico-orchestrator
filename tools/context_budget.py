@@ -154,7 +154,8 @@ def _checkpoint_unlocked(run_id: str, payload: dict, *, repo_root: Path) -> dict
         "git": {"starting_commit": context.get("starting_commit"), **git_state(cwd)},
         "orchestration": {
             "policy_version": parent.get("policy_version"),
-            "phases": [{"id": phase["id"], "status": phase["status"], "route": phase["route"]}
+            "phases": [{"id": phase["id"], "status": phase["status"],
+                        "route": (phase.get("escalations") or [{}])[-1].get("to_route") or phase["route"]}
                        for phase in parent.get("phases") or []],
         },
         "files_touched": {"read": _bounded_paths(files.get("read"), cwd),
