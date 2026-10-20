@@ -57,6 +57,8 @@ const ROUTING_SUMMARY = Type.Object({
     rule: Type.Union([Type.String(), Type.Null()]) }, { additionalProperties: false })),
 }, { additionalProperties: false });
 const EVENT = Type.Union([
+  Type.Object({ kind: Type.Literal("escalation"), phase: Type.String(),
+    from_route: ROUTE, to_route: ROUTE, reason: ESCALATION }, { additionalProperties: false }),
   Type.Object({ kind: Type.Literal("phase"), phase: Type.String(), status: PHASE_STATUS,
     route: Type.Optional(ROUTE), policy_version: Type.Optional(Type.Integer({ minimum: 1 })),
     routing: Type.Optional(ROUTING_SUMMARY), blocker_code: Type.Optional(Type.String()),
@@ -271,6 +273,7 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
   let lastTerminal: Json | null = null;
   let parentBlocked = false;
   let parentFailure: Json | null = null;
+  const pendingReroutes = new Set<string>();
   const claudeCalls = new Map<string, { canonical: string; backend: string }>();
   // task_id -> the route approval for that task. Routing task B never touches task A.
   const approvals = new Map<string, RouteApproval>();
@@ -353,6 +356,9 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
     parentFailure = null;
     // Runtime permissions, waves, and worker handles are deliberately not restored.
     resetRunState();
+    for (const phase of Array.isArray(result.reroute_phases) ? result.reroute_phases : []) {
+      if (typeof phase === "string") pendingReroutes.add(phase);
+    }
     budget = initialBudgetState();
   }
 
@@ -389,6 +395,7 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
     scopeViolation = null; activeWave = null; integrating = null; lastPhase = "routing";
     currentTurn = null; messageStarts.clear();
     batchStart = 0; batchPeak = 0;
+    pendingReroutes.clear();
   }
   async function scopeCheck(target: string, worker: string): Promise<Json> {
     const scope = await command(SESSION_SCOPE, [], { target_cwd: target, worker_cwd: worker });
@@ -690,6 +697,10 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
       return { block: true, terminate: true,
         reason: "Parent orchestration provenance is blocked; only orchestration_record status is available" };
     }
+    if (pendingReroutes.size > 0 && (WORKER_TOOLS.has(call.toolName) || isWorktreeAdd(call))) {
+      return { block: true,
+        reason: `PARENT_ROUTE_RECHECK_REQUIRED: rerun route_task and backend preflight for ${[...pendingReroutes].sort().join(", ")} before worker dispatch` };
+    }
     if (scopeViolation && (WORKER_TOOLS.has(call.toolName) || isWorktreeAdd(call))) {
       return { block: true, reason: `WORKER_SCOPE_VIOLATION: a worker changed the parent checkout (${scopeViolation}); review those changes before launching more workers` };
     }
@@ -864,6 +875,7 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
     const summary = routingSummary(route);
     if (!await event({ kind: "phase", phase, status: "in_progress", route: route.selected_route,
                        policy_version: route.policy_version, ...(summary ? { routing: summary } : {}) })) {
+      if (parentFailure?.error_code === "PARENT_EVENT_CONFLICT") pendingReroutes.add(taskId);
       return { content: [...result.content, { type: "text" as const,
         text: "Parent provenance update failed. Implementation is blocked." }] };
     }
@@ -903,6 +915,7 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
         backend_version_output: claude.backend_version_output,
         backend_device: claude.backend_device, backend_inode: claude.backend_inode } : null,
       steps });
+    pendingReroutes.delete(taskId);
     const claudeEffort = claude ? assignedEffort(route, claude.step_id) : null;
     if (claude) await event({ kind: "worker", phase, step_id: claude.step_id,
       status: "not_started", model: claude.model, backend: "claude-code",
@@ -1014,8 +1027,19 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
         }
         const result = parentFailure ?? { ok: false, error_category: "NoActiveParentRun" };
         diagnose(params.action, result);
-        return { content: [{ type: "text", text: "BLOCKED: no active parent orchestration record; see diagnostic log." }],
+        return { content: [{ type: "text", text: "BLOCKED: no active parent orchestration record. Start with /orchestrate <objective> in this Pi session, or resume the saved session; recorder writes outside that run are prohibited. See diagnostic log." }],
                  details: { ok: false, active: false, run_id: null as string | null, result } };
+      }
+      if (params.action === "status" && pendingReroutes.size > 0 && !parentBlocked) {
+        return { content: [{ type: "text", text: `BLOCKED: rerun route_task and complete backend preflight for ${[...pendingReroutes].sort().join(", ")} before the parent is ready.` }],
+          details: { ok: false, active: true, run_id: runId,
+            result: { error_code: "PARENT_ROUTE_RECHECK_REQUIRED" } } };
+      }
+      if (params.action === "event" && params.event.kind === "escalation") {
+        const phase = params.event.phase;
+        if ([...inFlight.values()].some((worker) => worker.taskId === phase)) {
+          return reply(false, "BLOCKED: PARENT_ESCALATION_WORKERS_IN_FLIGHT: wait for this task's workers to finish before escalating.");
+        }
       }
       if (params.action === "bind_workspace") {
         const taskId = params.task_id ?? (approvals.size === 1 ? [...approvals.keys()][0] : null);
@@ -1045,8 +1069,24 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
       const result = await command(PARENT, args,
         params.action === "event" ? params.event as Json : undefined);
       const observedRunId = runId;
-      const ok = result.ok !== false && (params.action !== "status" || result.status === "IN_PROGRESS");
-      if (!ok) { diagnose(params.action, result); parentFailure = result; parentBlocked = true; blockAllWorktrees(); }
+      const unresolvedRoute = parentBlocked &&
+        (parentFailure?.error_code === "PARENT_EVENT_CONFLICT" || parentFailure?.error_code === "PARENT_ESCALATION_INVALID"
+         || parentFailure?.error_code === "PARENT_ESCALATION_WORKERS_IN_FLIGHT");
+      const ok = result.ok !== false && (params.action !== "status" || result.status === "IN_PROGRESS")
+        && !(params.action === "status" && unresolvedRoute);
+      if (!ok) {
+        const failure = params.action === "status" && parentBlocked ? parentFailure ?? result : result;
+        diagnose(params.action, failure);
+        parentFailure = failure; parentBlocked = true; blockAllWorktrees();
+      }
+      if (params.action === "event" && params.event.kind === "escalation" && ok) {
+        parentFailure = null; parentBlocked = false;
+        pendingReroutes.add(params.event.phase);
+        approvals.delete(params.event.phase);
+        for (const key of workspaces.keys()) {
+          if (key.startsWith(`${params.event.phase}\u0000`)) workspaces.delete(key);
+        }
+      }
       if (params.action === "status" && ok) { parentFailure = null; parentBlocked = false; }
       if (params.action === "finish" && ok) {
         lastTerminal = result;
@@ -1054,14 +1094,16 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
         runId = null;
         blockAllWorktrees();
       }
-      const code = typeof result.blocker_code === "string" ? result.blocker_code
-        : typeof result.error_code === "string" ? result.error_code : null;
+      const effectiveResult = ok ? result : parentFailure ?? result;
+      const code = typeof effectiveResult.blocker_code === "string" ? effectiveResult.blocker_code
+        : typeof effectiveResult.error_code === "string" ? effectiveResult.error_code : null;
       // The model reads only this text, never `details`, so the status line states ok/active explicitly.
       const message = ok ? (params.action === "status"
           ? `Parent orchestration record ${observedRunId} is ready (ok: true, active: ${runId !== null}).`
         : params.action === "finish" ? completionSummary(result, observedRunId)
         : "Parent orchestration trace updated.")
         : `BLOCKED: parent orchestration ${params.action} failed${code ? ` (${code})` : ""}` +
+          (code === "PARENT_EVENT_CONFLICT" ? ". Record an explicit valid escalation event, then rerun route_task" : "") +
           // Completion refusals carry only phase/step ids and fixed wording, so the model may read them.
           ((code === "PARENT_COMPLETION_INCOMPLETE" || code === "PARENT_REVIEW_MISSING") && typeof result.error === "string"
             ? `: ${result.error.slice(0, 600)}` : "; see diagnostic log.");

@@ -20,6 +20,14 @@ pico doctor .
 pico run .
 ```
 
+Inside Pi, start an authorized parent run with `/orchestrate <bounded engineering
+objective>`. Merely opening `pico run .` does not start one: the
+`orchestration_record` tool rejects writes until that command initializes a
+parent. Continue in the same saved Pi session to retain its run identity; an
+explicit session resume restores the active record after a reload. A new
+session needs a new `/orchestrate` command. Use `pico run . --repo
+owner/repository` when GitHub remotes are ambiguous.
+
 Read the script before piping it to a shell if you prefer: it only clones this repository into the cache and installs `pico`. With the GitHub CLI, the same bootstrap is `gh api -H "Accept: application/vnd.github.raw+json" repos/dhuzard/pico-orchestrator/contents/scripts/use-latest.sh | bash -s -- install`, which also works for a private fork. The GitHub CLI is still needed, authenticated, for PICO's GitHub features (issues, draft PRs, CI checks).
 
 The launcher installs a command named `pico`. Many systems also ship the `pico` text editor in `/usr/bin`; while `~/.local/bin` comes first on your `PATH`, `pico` runs PICO, and the editor stays available as `/usr/bin/pico` (or `nano`). By default `pico` is installed in `~/.local/bin`; add that directory to `PATH` if your shell does not already include it. The launcher keeps immutable code in `~/.cache/pi-coding-orchestrator/repo` and mutable runtime state in `~/.local/state/pi-coding-orchestrator`, so provenance cannot dirty or block updates of the cached Git checkout.
