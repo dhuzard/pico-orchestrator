@@ -471,6 +471,74 @@ class LifecycleTest(unittest.TestCase):
                                  "status": "completed"}, repo_root=self.records)
         po.finish(run_id, "COMPLETED", repo_root=self.records)
 
+    def test_explicit_route_escalation_preserves_history_and_review(self):
+        run_id = po.start(worktree=self.target, repo_root=self.records)["run_id"]
+        def event(data):
+            return po.record_event(run_id, data, repo_root=self.records)
+        event({"kind": "phase", "phase": "repair", "status": "in_progress", "route": "CODEX"})
+        event({"kind": "worker", "phase": "repair", "step_id": "codex_reviewer", "status": "in_progress"})
+        event({"kind": "worker", "phase": "repair", "step_id": "codex_reviewer", "status": "completed"})
+        self.assertEqual(po.status(run_id, repo_root=self.records)["reroute_phases"], ["repair"])
+        before = provenance.run_path(self.records, run_id).read_bytes()
+        with self.assertRaises(po.ParentRunError) as conflict:
+            event({"kind": "phase", "phase": "repair", "status": "in_progress", "route": "CLAUDE_CODEX"})
+        self.assertEqual(conflict.exception.error_code, "PARENT_EVENT_CONFLICT")
+        self.assertEqual(provenance.run_path(self.records, run_id).read_bytes(), before)
+        escalation = {"kind": "escalation", "phase": "repair", "from_route": "CODEX",
+                      "to_route": "CLAUDE_CODEX", "reason": "REVIEW_FINDINGS"}
+        event(escalation)
+        with self.assertRaises(po.ParentRunError) as pending:
+            po.finish(run_id, "COMPLETED", repo_root=self.records)
+        self.assertEqual(pending.exception.error_code, "PARENT_ROUTE_RECHECK_REQUIRED")
+        event({"kind": "phase", "phase": "repair", "status": "completed", "route": "CLAUDE_CODEX"})
+        self.assertEqual(po.status(run_id, repo_root=self.records)["reroute_phases"], [])
+        phase = provenance.get_run(self.records, run_id)["parent_orchestration"]["phases"][0]
+        self.assertEqual(phase["route"], "CODEX")
+        self.assertEqual(phase["escalations"][0]["to_route"], "CLAUDE_CODEX")
+        with self.assertRaises(po.ParentRunError) as review:
+            po.finish(run_id, "COMPLETED", repo_root=self.records)
+        self.assertEqual(review.exception.error_code, "PARENT_REVIEW_MISSING")
+        with self.assertRaises(po.ParentRunError) as missing_start:
+            event({"kind": "worker", "phase": "repair", "step_id": "codex_reviewer", "status": "completed"})
+        self.assertEqual(missing_start.exception.error_code, "PARENT_WORKER_TRANSITION_INVALID")
+        event({"kind": "worker", "phase": "repair", "step_id": "codex_reviewer", "status": "in_progress"})
+        event({"kind": "worker", "phase": "repair", "step_id": "codex_reviewer", "status": "completed"})
+        reviewers = [w for w in provenance.get_run(self.records, run_id)["parent_orchestration"]["phases"][0]["workers"]
+                     if w["step_id"] == "codex_reviewer"]
+        self.assertEqual([w["route_epoch"] for w in reviewers], [0, 1])
+        po.finish(run_id, "COMPLETED", repo_root=self.records)
+
+    def test_invalid_escalation_does_not_change_route(self):
+        run_id = po.start(worktree=self.target, repo_root=self.records)["run_id"]
+        po.record_event(run_id, {"kind": "phase", "phase": "repair", "status": "in_progress",
+                                 "route": "CODEX"}, repo_root=self.records)
+        before = provenance.run_path(self.records, run_id).read_bytes()
+        for to_route, reason in (("CLAUDE", "AMBIGUITY"), ("CLAUDE_CODEX", "INVENTED")):
+            with self.assertRaises(po.ParentRunError) as error:
+                po.record_event(run_id, {"kind": "escalation", "phase": "repair", "from_route": "CODEX",
+                                         "to_route": to_route, "reason": reason}, repo_root=self.records)
+            self.assertEqual(error.exception.error_code, "PARENT_ESCALATION_INVALID")
+            self.assertEqual(provenance.run_path(self.records, run_id).read_bytes(), before)
+
+    def test_escalation_refuses_in_flight_worker_without_changing_provenance(self):
+        run_id = po.start(worktree=self.target, repo_root=self.records)["run_id"]
+        po.record_event(run_id, {"kind": "phase", "phase": "repair", "status": "in_progress",
+                                 "route": "CLAUDE_CODEX"}, repo_root=self.records)
+        po.record_event(run_id, {"kind": "worker", "phase": "repair", "step_id": "codex_reviewer",
+                                 "status": "in_progress"}, repo_root=self.records)
+        before = provenance.run_path(self.records, run_id).read_bytes()
+        with self.assertRaises(po.ParentRunError) as blocked:
+            po.record_event(run_id, {"kind": "escalation", "phase": "repair",
+                                     "from_route": "CLAUDE_CODEX", "to_route": "CODEX_CLAUDE_CODEX",
+                                     "reason": "REVIEW_FINDINGS"}, repo_root=self.records)
+        self.assertEqual(blocked.exception.error_code, "PARENT_ESCALATION_WORKERS_IN_FLIGHT")
+        self.assertEqual(provenance.run_path(self.records, run_id).read_bytes(), before)
+        po.record_event(run_id, {"kind": "worker", "phase": "repair", "step_id": "codex_reviewer",
+                                 "status": "completed"}, repo_root=self.records)
+        po.record_event(run_id, {"kind": "escalation", "phase": "repair",
+                                 "from_route": "CLAUDE_CODEX", "to_route": "CODEX_CLAUDE_CODEX",
+                                 "reason": "REVIEW_FINDINGS"}, repo_root=self.records)
+
     def test_routing_scores_and_worker_capacity_reach_viewer_without_task_prose(self):
         run_id = po.start(worktree=self.target, repo_root=self.records)["run_id"]
         effective = self.route["classification"]["effective"]
