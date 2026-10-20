@@ -105,6 +105,15 @@ class WorkspacePlanTest(unittest.TestCase):
         second = wp.plan(self.manifest(), access_check=ok_access)
         self.assertEqual(json.dumps(first, sort_keys=True), json.dumps(second, sort_keys=True))
 
+    def test_manifest_objectives_are_strictly_validated(self):
+        task = {"id": "a1", "repository": "alpha", "title": "Adapter", "objective": "Implement alpha only."}
+        self.assertEqual(wp.plan(self.manifest(tasks=[task]), access_check=ok_access)["tasks"][0]["objective"],
+                         "Implement alpha only.")
+        for value in ("", "one\ntwo", "x" * 4001, "ghp_" + "x" * 40):
+            task["objective"] = value
+            with self.subTest(value=value[:20]):
+                self.assertTrue(wp.validate_manifest(wp.load_manifest(self.manifest(tasks=[task]))))
+
     def test_readiness_defaults_to_planned_and_roots_are_dispatchable(self):
         result = wp.plan(self.manifest(), access_check=ok_access)
         by_id = {t["id"]: t for t in result["tasks"]}

@@ -126,6 +126,17 @@ dependency cycle or denied access all fail closed. Add `--json` for
 machine-readable output or `--no-access-check` to plan offline (the plan then
 records that access was not verified). Execution of such a plan is tracked in
 issue #49; each repository keeps its own parent run and `target_repository`.
+An implementation task may add a single-line `objective` (up to 4000
+characters) with instructions scoped to that task's repository. The child
+receives its own title and objective plus verified upstream contract metadata;
+the workspace goal and other task titles are not sent to it. Older manifests
+use the task title as the objective. After first dispatch the generated child
+objective is immutable for that execution id: changing it requires a new task
+id. The workspace record stores its SHA-256 digest, while the repository's
+headless execution record retains the original text for restart and resume.
+Executions created before this extension resume with their exact historical
+objective when the manifest still reproduces it; changed instructions require
+a new task id.
 
 ### Schedule a workspace across repositories
 
