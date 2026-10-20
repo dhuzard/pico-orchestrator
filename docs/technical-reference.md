@@ -2018,9 +2018,39 @@ Resolution precedence is:
 2. valid project `.pi/orchestrator.lock`;
 3. remote default branch.
 
-`pico run`, `pico setup`, `pico sync`, and `pico doctor` honor the
-project lock. `pico update <target>` is the explicit operation that resolves
-the configured update ref and advances an existing lock to that commit.
+`pico run`, `pico setup`, `pico sync`, `pico watch`, `pico exec`, and
+`pico doctor` honor the project lock. `pico update <target>` is the explicit
+operation that resolves the configured update ref and advances an existing
+lock to that commit.
+
+The lock comes from the target repository, which may not be trusted, so the
+launcher reviews it before building or running its runtime:
+
+- **Release history.** A project pin runs only when it is an ancestor of the
+  remote default branch (`refs/remotes/origin/HEAD`) or a tag contains it. A
+  commit that exists only on another branch fails closed with
+  `PIN_NOT_ON_RELEASE_HISTORY` before a runtime is materialized. The check
+  first uses the cache's local refs, so a cached pin that they already show on
+  release history runs offline as before. Otherwise the launcher refreshes the
+  remote refs once and checks again; when that refresh fails (offline), the
+  pin is refused with that reason in the message.
+  `PI_CODING_ORCHESTRATOR_ALLOW_UNREVIEWED_PIN=1` runs such a pin anyway, with
+  a warning. `pico doctor` reports the refusal and diagnoses with the default
+  branch instead.
+- **Approval.** `pico pin <target> [ref]` and `pico update <target>` record the
+  written commit as the user's approved pin for that target checkout under
+  `$STATE_DIR/approved-pins/` (keyed by the checkout's physical path). When
+  the lock names a different commit, or no approval was recorded on this
+  machine, the launcher prints a non-fatal warning naming the commit and the
+  `pico pin <target> <sha>` command that approves it. An approved pin skips
+  the release-history check: pinning an unreleased commit explicitly is the
+  user's choice for that checkout only.
+- An explicit `PI_CODING_ORCHESTRATOR_REF` or `pico pin <target> <ref>` is
+  the user's own choice and is not reviewed.
+
+Tags are matched by containment, not verified: the launcher does not check
+tag or commit signatures yet, so a pin is only as trustworthy as the
+repository's default branch and tags.
 
 ### Readiness interface
 
