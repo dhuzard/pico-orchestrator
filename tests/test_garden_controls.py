@@ -6,7 +6,9 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import shutil
 import sys
+import tempfile
 import threading
 import unittest
 from http.server import ThreadingHTTPServer
@@ -52,11 +54,11 @@ class GardenControlsTest(unittest.TestCase):
     def request(self, method, path, body=None, *, host=None, origin="default", token="default", ctype="application/json"):
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=30)
         headers = {"Host": host or f"127.0.0.1:{self.port}"}
+        if token:
+            headers["X-Pico-Token"] = self.controls.token if token == "default" else token
         if method == "POST":
             if origin:
                 headers["Origin"] = f"http://127.0.0.1:{self.port}" if origin == "default" else origin
-            if token:
-                headers["X-Pico-Token"] = self.controls.token if token == "default" else token
             if ctype:
                 headers["Content-Type"] = ctype
         payload = json.dumps(body).encode() if body is not None else None
@@ -90,6 +92,90 @@ class GardenControlsTest(unittest.TestCase):
         self.assertEqual(data["error_code"], "CONTROL_TASK_INVALID")
         record = wr.load_workspace(wr.workspace_record_path("ws")) or {}
         self.assertEqual(record.get("garden_actions", []), [])
+
+    def test_controls_reads_need_the_session_token(self):
+        for path in ("/api/controls", "/api/branches?task=a1"):
+            for token in (None, "x" * 43):
+                status, data = self.request("GET", path, token=token)
+                self.assertEqual((status, data["error_code"]), (403, "CONTROL_TOKEN_INVALID"), path)
+                self.assertNotIn("repositories", data)
+                self.assertNotIn("branches", data)
+        status, data = self.request("GET", "/api/controls")
+        self.assertEqual((status, data["enabled"]), (200, True))
+        status, data = self.request("GET", "/api/branches?task=a1")
+        self.assertEqual(status, 200)
+        # The plain read-only views are unchanged.
+        status, _ = self.request("GET", "/api/workspace", token=None)
+        self.assertEqual(status, 200)
+
+    def raw_post(self, content_length):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        conn.putrequest("POST", "/api/action", skip_host=True)
+        conn.putheader("Host", f"127.0.0.1:{self.port}")
+        conn.putheader("Origin", f"http://127.0.0.1:{self.port}")
+        conn.putheader("X-Pico-Token", self.controls.token)
+        conn.putheader("Content-Type", "application/json")
+        conn.putheader("Content-Length", content_length)
+        conn.endheaders()
+        response = conn.getresponse()
+        status, data = response.status, json.loads(response.read())
+        conn.close()
+        return status, data
+
+    def test_malformed_content_length_is_a_json_400(self):
+        for value in ("abc", "-5", "1e3", ""):
+            status, data = self.raw_post(value)
+            if value == "":
+                # An empty header still reads as no body, like before.
+                self.assertEqual(data["error_code"], "CONTROL_ACTION_UNKNOWN")
+                continue
+            self.assertEqual((status, data["ok"], data["error_code"]), (400, False, "CONTROL_BODY_INVALID"), value)
+
+    def _victim(self):
+        outside = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, outside, True)
+        victim = outside / "autonomy.yaml"
+        victim.write_text("victim: untouched\n")
+        return outside, victim
+
+    def test_permission_write_ignores_a_planted_temp_symlink(self):
+        _, victim = self._victim()
+        checkout = self.repos["alpha"][0]
+        (checkout / ".pi").mkdir()
+        (checkout / ".pi" / "autonomy.yaml.garden-tmp").symlink_to(victim)
+        _, preview = self.act(action="set_permission", repository="alpha", permission="push_branch", value=True)
+        _, done = self.act(action="set_permission", repository="alpha", permission="push_branch", value=True,
+                           confirm=preview["confirm"])
+        self.assertEqual(done["status"], "POLICY_UPDATED", done)
+        self.assertEqual(victim.read_text(), "victim: untouched\n")
+        policy = checkout / ".pi" / "autonomy.yaml"
+        self.assertFalse(policy.is_symlink())
+        self.assertIn("  push_branch: true", policy.read_text())
+        self.assertEqual(sorted(p.name for p in (checkout / ".pi").iterdir()), ["autonomy.yaml", "autonomy.yaml.garden-tmp"])
+
+    def test_permission_write_refuses_symlinked_policy_paths(self):
+        outside, victim = self._victim()
+        checkout = self.repos["alpha"][0]
+        # A symlinked .pi directory: refused at preview (nothing read from outside) and at confirm.
+        (checkout / ".pi").mkdir()
+        _, preview = self.act(action="set_permission", repository="alpha", permission="push_branch", value=True)
+        (checkout / ".pi").rmdir()
+        (checkout / ".pi").symlink_to(outside, target_is_directory=True)
+        _, refused = self.act(action="set_permission", repository="alpha", permission="push_branch", value=True,
+                              confirm=preview["confirm"])
+        self.assertEqual(refused["error_code"], "AUTONOMY_POLICY_PATH_UNSAFE", refused)
+        _, refused = self.act(action="set_permission", repository="alpha", permission="push_branch", value=True)
+        self.assertEqual((refused["stage"], refused["error_code"]), ("refused", "AUTONOMY_POLICY_PATH_UNSAFE"))
+        self.assertNotIn("victim", json.dumps(refused))
+        self.assertEqual(victim.read_text(), "victim: untouched\n")
+        self.assertEqual(sorted(p.name for p in outside.iterdir()), ["autonomy.yaml"])
+        # A symlinked policy file inside a real .pi directory.
+        (checkout / ".pi").unlink()
+        (checkout / ".pi").mkdir()
+        (checkout / ".pi" / "autonomy.yaml").symlink_to(victim)
+        _, refused = self.act(action="set_permission", repository="alpha", permission="push_branch", value=True)
+        self.assertEqual(refused["error_code"], "AUTONOMY_POLICY_PATH_UNSAFE")
+        self.assertEqual(victim.read_text(), "victim: untouched\n")
 
     def test_actions_are_off_without_controls(self):
         source = watch.WorkspaceSource(self.state, self.path)

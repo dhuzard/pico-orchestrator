@@ -1781,7 +1781,12 @@ autonomy policy source, profile, PR granularity, the ten boolean permissions,
 ambiguity capacities per family and tier from `model_profiles`. It never
 returns the workspace goal or task titles. `GET /api/branches?task=<id>`
 (controls only) lists the task repository's local `pico/` branches with their
-commit and whether they descend from the pin.
+commit and whether they descend from the pin. With `--controls` on, both
+endpoints also require the session token in `X-Pico-Token` (compared in
+constant time, as for actions) and answer `403 CONTROL_TOKEN_INVALID`
+without it; without `--controls`, `/api/controls` stays a read-only panel. A
+malformed or negative `Content-Length` on `POST /api/action` is answered with
+`400 CONTROL_BODY_INVALID`.
 
 Coverage: `tests/test_garden_controls.py` starts a real server on two
 temporary repositories with a fake GitHub adapter. It covers every gate, the
@@ -1797,7 +1802,7 @@ HMAC confirmation and are audited:
 | `publish` + `grant_once` | plan with `authorization: one_shot_grant` | plan hash (which includes the authorization source) and the grant flag | publishes once under an in-process grant |
 | `cancel` | execution status and run | execution id, run id, status | `workspace_run.cancel` |
 | `schedule` | tasks to launch and resume, cap, mutating permissions per repository | those lists, `allow_mutation`, cap | `workspace_scheduler.run` in a background thread; one at a time |
-| `set_permission` | unified diff of `.pi/autonomy.yaml` (created from the template if absent) | repository, permission, value, SHA-256 of the file before | atomic write, schema-validated, comments kept; not committed |
+| `set_permission` | unified diff of `.pi/autonomy.yaml` (created from the template if absent) | repository, permission, value, SHA-256 of the file before | atomic write (unique temp file, fsync, replace), schema-validated, comments kept; not committed. Refused with `AUTONOMY_POLICY_PATH_UNSAFE` when `.pi` or `.pi/autonomy.yaml` is a symlink or resolves outside the checkout |
 | `set_model` / `reset_model` | current and new model and capacity | family, tier, target, SHA-256 of the user model config | `model_profiles.cmd_set` / `cmd_reset` |
 
 **One-shot publication grant.** `github_integration.publish(..., grant=...)`

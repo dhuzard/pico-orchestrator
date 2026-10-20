@@ -566,6 +566,8 @@ function renderWorkspace(data) { renderWorkspaceOverview(data); renderWorkspaceB
 // Controls (pico watch --controls): every action previews first and runs only after confirmation.
 // The session token arrives in the launch URL's fragment and is kept in memory only.
 const controlState = { token: null, enabled: false, panels: null, fetchedAt: 0 };
+// With controls on, the server also requires the token to read panels and branches.
+const tokenHeaders = () => controlState.token ? { "X-Pico-Token": controlState.token } : {};
 (() => {
   const match = /(?:^#|&)token=([A-Za-z0-9_-]{20,})/.exec(location.hash);
   if (match) { controlState.token = match[1]; history.replaceState(null, "", location.pathname); }
@@ -574,7 +576,7 @@ async function refreshControls(force = false) {
   if (!force && Date.now() - controlState.fetchedAt < 10000) return;
   controlState.fetchedAt = Date.now();
   try {
-    const response = await fetch("/api/controls", { cache: "no-store" });
+    const response = await fetch("/api/controls", { cache: "no-store", headers: tokenHeaders() });
     const data = await response.json();
     controlState.panels = data.ok ? data : null;
     controlState.enabled = Boolean(data.ok && data.enabled && controlState.token);
@@ -801,7 +803,7 @@ async function startAction(action, task) {
   openDialog(action, task);
   const body = { action, task: task.id };
   if (action === "validate" && task.kind !== "qualification") {
-    const response = await fetch(`/api/branches?task=${encodeURIComponent(task.id)}`, { cache: "no-store" });
+    const response = await fetch(`/api/branches?task=${encodeURIComponent(task.id)}`, { cache: "no-store", headers: tokenHeaders() });
     const data = await response.json().catch(() => ({ ok: false }));
     const branches = (data.branches || []).filter((branch) => branch.descends_from_pin);
     const content = $("action-content"); content.replaceChildren();
