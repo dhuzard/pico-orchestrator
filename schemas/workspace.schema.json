@@ -151,6 +151,13 @@
             "minLength": 1,
             "maxLength": 200
           },
+          "objective": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4000,
+            "pattern": "^[^\\u0000-\\u001f\\u007f]+$",
+            "description": "Optional repository-scoped, single-line instruction for this task. Existing manifests fall back to title. It is immutable for a dispatched execution id."
+          },
           "depends_on": {
             "type": "array",
             "items": {
