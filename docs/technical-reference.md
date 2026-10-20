@@ -430,10 +430,51 @@ unbound mutating step; a read-only step without one uses the target
 checkout). The model cannot pass a directory, mode, or executable.
 Mutating steps allow Read, Edit, Write, Glob, Grep, Bash, and Agent;
 read-only steps allow Read, Glob, and Grep. `Bash(git push:*)`,
-`Bash(gh:*)`, `Bash(git worktree:*)`, and `git branch -d/-D/--delete` are
-denied. Other parent-only operations (merges, remote edits, writes outside the
-worktree through shell commands) rely on the worker contract and the
-parent-checkout snapshot comparison. Claude Code protects every `.git`
+`Bash(gh:*)`, `Bash(git worktree:*)`, `git branch -d/-D/--delete`, git
+invocations that redirect or reconfigure git (`git -C`, `git -c`,
+`--git-dir`, `--work-tree`, `--exec-path`), `git remote add/set-url`, and
+`env`/`command`/`exec` wrappers around `git` and `gh` are denied. The deny
+list is best-effort defense in depth, not a boundary: Claude Code matches Bash
+rules by command prefix, so a worker with Bash can still reach the same effect
+through a script, another interpreter, or the network. Other parent-only
+operations (merges, writes outside the worktree through shell commands) rely
+on the worker contract and the parent-checkout snapshot comparison, which sees
+only the parent checkout, not `$HOME`, other repositories, or the network.
+
+The worker process does not inherit Pi's environment. `buildWorkerEnv`
+forwards only `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `LANG`,
+`LANGUAGE`, `LC_*`, `TERM`, `COLORTERM`, `TZ`, `TMPDIR`/`TMP`/`TEMP`,
+`XDG_{CONFIG,DATA,CACHE,STATE}_HOME`, `NODE_EXTRA_CA_CERTS`,
+`SSL_CERT_FILE`, `SSL_CERT_DIR`, the proxy variables
+(`HTTP(S)_PROXY`, `NO_PROXY`, `ALL_PROXY`, upper and lower case), and
+`ANTHROPIC_*` / `CLAUDE_*` (Claude Code configuration and API-key or OAuth
+authentication; a stored `claude` login is found through `HOME`). Everything
+else is withheld, including `GH_TOKEN`, `GITHUB_TOKEN`,
+`GH_ENTERPRISE_TOKEN`, `GIT_ASKPASS`, `SSH_AUTH_SOCK`, `NPM_TOKEN`, Git
+overrides such as `GIT_DIR`, cloud credentials (`AWS_*`, `GOOGLE_*`) and
+PICO's own `PI_*` settings, which the worker does not read. PICO verifies
+Claude authentication only through `claude auth status`, so third-party
+provider modes (Bedrock, Vertex) are not forwarded by default; set
+`PI_ORCHESTRATOR_WORKER_ENV_ALLOW` to a comma-separated list of exact
+variable names (for example `JAVA_HOME,AWS_PROFILE`) to forward more. A name
+in that list is forwarded even if it is a credential: that is the user's
+explicit choice. An entry that is not a variable name blocks the call with
+`WORKER_CONFIG_INVALID` before Claude Code starts. The tool result records
+`env_dropped_count` and `env_dropped` (the withheld names, never values; at
+most 100).
+
+`PI_ORCHESTRATOR_WORKER_SANDBOX=1` adds `--settings
+{"sandbox":{"enabled":true,"failIfUnavailable":true}}`, so Claude Code runs the
+worker's Bash commands in its OS sandbox and exits at startup when the sandbox
+cannot start instead of running them unconfined (any value other than unset,
+`0` or `1` is `WORKER_CONFIG_INVALID`). It is off by default because the
+sandbox restricts network access and needs platform support (bubblewrap on
+Linux), so dependency installs or checks that need the network can fail
+inside it. The settings keys were read from the settings schema of Claude
+Code 2.1.304; the setting has not been exercised end to end against a real
+worker run or older releases. We recommend running workers in
+an OS sandbox limited to the worktree, with this setting, a container, or
+bwrap. Claude Code protects every `.git`
 directory and denies edits there even in `acceptEdits` mode, so a mutating
 step bound to a worktree inside `.git` is refused before Claude starts
 (`WORKER_WORKSPACE_PROTECTED_PATH`); the permission mode is never widened to
