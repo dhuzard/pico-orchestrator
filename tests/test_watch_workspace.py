@@ -33,7 +33,7 @@ def usage(lead_in, lead_out, worker_in, worker_out, *, complete=True):
         {"sequence": 1, "model": "lead-model", "input_tokens": lead_in, "output_tokens": lead_out}]}
 
 
-class WorkspaceViewTest(unittest.TestCase):
+class WorkspaceViewFixture(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.base = Path(self._tmp.name)
@@ -121,6 +121,8 @@ class WorkspaceViewTest(unittest.TestCase):
     def tasks(self, view):
         return {task["id"]: task for repo in view["repositories"] for task in repo["tasks"]}
 
+
+class WorkspaceViewTest(WorkspaceViewFixture):
     def test_groups_tasks_by_repository_in_manifest_order(self):
         view = self.view(manifest=self.manifest)
         self.assertEqual(view["workspace_id"], "garden")
@@ -317,6 +319,24 @@ class WorkspaceViewTest(unittest.TestCase):
         base = self.serve(None)
         status, body = self.get(f"{base}/api/workspace")
         self.assertEqual((status, json.loads(body)["error_code"]), (404, "WORKSPACE_MODE_OFF"))
+
+
+
+class GardenTimeLimitTest(WorkspaceViewFixture):
+    def test_garden_task_carries_the_limit_and_remaining_time_as_plain_numbers(self):
+        import time
+        self.entries["web-3"].update({"max_duration_seconds": 600, "deadline_at": "2026-10-20T10:10:00Z",
+                                      "deadline_epoch": time.time() + 120})
+        self.entries["api-2"].update({"max_duration_seconds": 300, "stop_reason": "EXECUTION_TIME_LIMIT",
+                                      "time_limit": {"max_duration_seconds": 300, "elapsed_seconds": 301.5}})
+        self.write_record()
+        tasks = self.tasks(self.view(manifest=self.manifest))
+        running = tasks["web-3"]["time_limit"]
+        self.assertEqual((running["max_duration_seconds"], running["stop_reason"]), (600, None))
+        self.assertTrue(100 <= running["remaining_seconds"] <= 120)
+        stopped = tasks["api-2"]["time_limit"]
+        self.assertEqual((stopped["stop_reason"], stopped["elapsed_seconds"]), ("EXECUTION_TIME_LIMIT", 301.5))
+        self.assertIsNone(tasks["api-1"]["time_limit"])
 
 
 if __name__ == "__main__":

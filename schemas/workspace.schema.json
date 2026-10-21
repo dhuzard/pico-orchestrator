@@ -158,6 +158,11 @@
             "pattern": "^[^\\u0000-\\u001f\\u007f]+$",
             "description": "Optional repository-scoped, single-line instruction for this task. Existing manifests fall back to title. It is immutable for a dispatched execution id."
           },
+          "max_duration_seconds": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Optional wall-clock limit for this task's child execution, in seconds; overrides the manifest default. Omitted: the manifest default, else no limit."
+          },
           "depends_on": {
             "type": "array",
             "items": {
@@ -220,6 +225,11 @@
           }
         }
       }
+    },
+    "max_duration_seconds": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Optional default wall-clock limit for each child execution, in seconds. A task's own max_duration_seconds overrides it. When a child reaches it, the launcher stops the child and ends the execution as cancelled with EXECUTION_TIME_LIMIT. Omitted: no limit. Unrelated to a check's timeout_seconds."
     },
     "budget": {
       "description": "Optional spend limit across the workspace's child runs. The scheduler launches nothing once it is reached; running children are not stopped. max_cost_usd uses backend-reported cost, which only Claude workers report today, so it is a lower bound.",

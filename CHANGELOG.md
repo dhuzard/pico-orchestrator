@@ -31,6 +31,21 @@ All notable changes to PICO are recorded here. The format follows
 
 ### Added
 
+- Optional wall-clock limit per child execution: `pico exec start
+  --max-duration SECONDS`, `max_duration_seconds` on a workspace task and a
+  manifest-level default. A child that reaches it is stopped through the
+  cancel path (pid start time checked), its parent run is finished `BLOCKED`
+  with `EXECUTION_TIME_LIMIT`, and the execution ends `cancelled` with
+  `stop_reason: EXECUTION_TIME_LIMIT`, the limit and the elapsed time. Enforced
+  by a waiting launcher and by `status`, scheduler and repeat-`start` checks, with
+  no background process. The scheduler and the Garden show the limit and the
+  time left. The limit is per launch; a stopped execution is final, so continuing
+  needs a new execution id. Compatibility: `schemas/workspace.schema.json` gains
+  optional `max_duration_seconds` (top level and per task) and execution records
+  gain optional `max_duration_seconds`, `deadline_at`, `deadline_epoch`,
+  `stop_reason`, `time_limit`; existing manifests and records are valid and
+  unchanged when the field is not set. Closes #46.
+
 - Single-owner run lease (`tools/run_lease.py`: `acquire`, `heartbeat`,
   `release`, `status`, `takeover`). A second process that resumes a run with
   a live lease fails with `RUN_LEASE_HELD`. A stale lease is recovered only by

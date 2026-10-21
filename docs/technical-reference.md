@@ -1634,6 +1634,11 @@ Each `repositories[]` entry requires an explicit `owner/repository`, a checkout
 `path` (relative to the manifest) and a 40-character `pinned_commit`; a branch
 name is not a pin. Each `tasks[]` entry names its owning repository id,
 `depends_on` task ids and an optional `readiness` (default `planned`).
+Optional `max_duration_seconds` (positive integer) on the manifest sets a
+default wall-clock limit for every child execution and on a task overrides that
+default; omitted everywhere means no limit (see "Execution time limit" under
+"Headless single-repository execution"). It is unrelated to a check's
+`timeout_seconds`. Manifests without the field are valid and behave as before.
 
 ```sh
 python3 tools/workspace_plan.py workspace.yaml [--json] [--no-access-check]
@@ -1687,7 +1692,7 @@ the programmatic execution interface that repository-scoped child launchers
 and the cross-repository scheduler build on.
 
 ```sh
-python3 tools/headless_run.py start  --target . --repo owner/repository --execution-id <id> --objective "..." [--allow-mutation] [--resume [--takeover-stale-lease]] [--no-wait]
+python3 tools/headless_run.py start  --target . --repo owner/repository --execution-id <id> --objective "..." [--allow-mutation] [--resume [--takeover-stale-lease]] [--no-wait] [--max-duration SECONDS]
 python3 tools/headless_run.py status --target . --repo owner/repository --execution-id <id>
 python3 tools/headless_run.py cancel --target . --repo owner/repository --execution-id <id>
 ```
@@ -1744,6 +1749,43 @@ run as the execution's lease owner; a run another owner has taken over is not
 closed (`cancel_error_code`). The execution records the child's pid start time; `status`, `cancel` and the workspace runner treat a live pid with another start time as a gone child (`child_gone_reason: PID_REUSED`), and `cancel` never signals it. `status` and the execution's `run` block show
 the lease holder (`run.lease`: state, stale reason, holder alive, owner, pid,
 host, heartbeat, expiry), as does Garden for each run.
+
+**Execution time limit.** `start --max-duration SECONDS` (`max_duration_seconds`,
+a positive integer; anything else is refused with `MAX_DURATION_INVALID` before
+a child exists) limits the wall-clock time of the child. The launch records
+`max_duration_seconds`, `deadline_at` (UTC, for people) and `deadline_epoch`
+(what the code compares). Without the flag nothing is recorded and nothing
+changes. The limit is enforced by the code that already looks at the child, not
+by a watchdog process: a launcher that waits slices its wait and checks the
+deadline, and `status` (hence `pico workspace status`, the scheduler's
+observation of children it did not start) checks it
+on every refresh. Both call the same stop path as `cancel`: the parent run is
+finished `BLOCKED` with `EXECUTION_TIME_LIMIT` as the lease owner (so a run
+another owner has taken over is not closed), then the child's process group
+gets SIGTERM and, after the grace period, SIGKILL, only while the pid and its
+recorded start time still match (`execution_alive`; a reused pid is never
+signalled). **Clock.** Where `/proc` is available, elapsed time is the boot-clock
+time since the child's recorded `pid_start` (against `/proc/uptime`), so a
+wall-clock jump (NTP step, WSL2 resuming from host sleep) does not stop a child
+early or late. Elsewhere it falls back to the wall clock (`deadline_epoch`), which
+can then be off by such a jump; displays computed from the workspace record
+always use `deadline_epoch`. A killed child records its real signal status
+as `exit_code` (negative), never 0. The execution ends `status: cancelled`, `outcome: time_limit`,
+`stop_reason: EXECUTION_TIME_LIMIT` with a `time_limit` block
+(`max_duration_seconds`, `elapsed_seconds`, `deadline_at`, `stopped_at`). A
+child that ended on its own before the check keeps its own outcome, and the
+limit is not claimed for it. Limits of a `--no-wait` child are only enforced
+when something looks at it (`status`, the scheduler, or a
+later `start` of the same id): there is deliberately no background process, so
+a detached child nobody observes keeps running until someone does. A child
+stopped before it created its parent run has no run to settle; the stop still
+ends the execution `cancelled` with the reason. **Resume and the limit.** A
+time-limit stop closes the run `BLOCKED`, a terminal state, so `start` and
+`--resume` of that execution id return `already_finished` and launch nothing;
+continuing the work is an explicit new launch with a new execution id (a new
+run). The limit is per launch and is not inherited: an interrupted (crashed)
+execution resumed with `--resume --max-duration N` gets a fresh N-second window
+starting at the resume, and a resume without `--max-duration` runs unlimited.
 
 **Checkout hygiene.** Before launching, the runner records the target's
 branch (or detached `HEAD`) and its linked worktrees. After the child exits it
@@ -2222,6 +2264,26 @@ references, the token on `/api/issues`, `/api/runs` and
 `/api/workspace` with controls on and off, and that hostile issue text is
 served verbatim. `tests/garden-issues.test.ts` renders hostile titles and
 labels with a DOM stub that throws on `innerHTML`.
+
+### Workspace time limit
+
+`pico workspace launch` and the scheduler launch each child with the task's
+`max_duration_seconds`, else the manifest's, else none. The task entry in the
+workspace record carries `max_duration_seconds`, `deadline_at` and
+`deadline_epoch` for that launch, and, after a stop, `stop_reason:
+EXECUTION_TIME_LIMIT` and `time_limit`; `run_blocker_code` is
+`EXECUTION_TIME_LIMIT`. A scheduler-launched child waits in its worker thread,
+which enforces the deadline; children it only observes are checked on each poll
+through `workspace_run.status`. A stopped task is a `cancelled` task, so it
+blocks its dependents like any other failure and the run exits 1. The
+scheduler text shows `(limit 600s, 411s left)` for a running child and
+`(stopped after 601.2s of a 600s limit)` for a stopped one; `--json` rows carry
+`time_limit`. The Garden task card shows the same as text (it only reads the
+workspace record and never stops anything, so the remaining time is as fresh as
+the last `status` or scheduler poll). Relaunching a stopped task does nothing
+(`already_finished`, the stop reason is kept); resume the work with a new task
+or execution id. Unlike the budget, which gates launches, this limit stops a
+running child.
 
 ### Workspace budget
 
