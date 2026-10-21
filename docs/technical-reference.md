@@ -1886,10 +1886,19 @@ autonomy policy source, profile, PR granularity, the ten boolean permissions,
 ambiguity capacities per family and tier from `model_profiles`. It never
 returns the workspace goal or task titles. `GET /api/branches?task=<id>`
 (controls only) lists the task repository's local `pico/` branches with their
-commit and whether they descend from the pin. With `--controls` on, both
-endpoints also require the session token in `X-Pico-Token` (compared in
-constant time, as for actions) and answer `403 CONTROL_TOKEN_INVALID`
-without it; without `--controls`, `/api/controls` stays a read-only panel. A
+commit and whether they descend from the pin. With `--controls` on, every
+data endpoint (`/api/controls`, `/api/branches`, `/api/runs`,
+`/api/workspace` and `/api/issues`) requires the session token in
+`X-Pico-Token` (compared in constant time, as for actions) and answers `403
+CONTROL_TOKEN_INVALID` without it. The page sends the token on every poll; a
+page opened without it shows "Open the URL printed at launch". The static
+page, script and stylesheet are served without the token, since the token
+reaches the page only in the URL fragment. The page keeps the token in memory
+only and removes it from the address bar, so a reload or a second tab opened
+from the address bar has no token and shows only that message. Open the full
+launch URL printed in the terminal again to recover. The token is deliberately
+not kept in `sessionStorage` or any other browser storage. Without `--controls` nothing needs
+a token, and `/api/controls` stays a read-only panel. A
 malformed or negative `Content-Length` on `POST /api/action` is answered with
 `400 CONTROL_BODY_INVALID`.
 
@@ -1928,6 +1937,93 @@ single plain `name: true|false` line returns `AUTONOMY_POLICY_UNEDITABLE`.
 `set_model` offers only models already bound in that family (current tiers or
 the base policy), so no unknown Claude backend mapping can be introduced;
 `cmd_set` still enforces the tier's ambiguity floor.
+
+### Garden issues panel
+
+`tools/garden_issues.py` serves `GET /api/issues`, a read-only list of the
+open issues waiting in the watched repository. The panel sits under the run
+and workspace views (`viewer/issues.js`). It never changes GitHub or Git, and
+it has no queue action yet; the issue queue (#34) is a separate slice.
+
+**Targets.** With `pico watch .` the target is the checkout the viewer was
+started on. With `pico watch --workspace <manifest>` it is every repository
+in the manifest, one block per repository in manifest order, because a
+workspace mission draws its work from all of them. A workspace id without a
+manifest, and `pico watch --all`, have no checkout to resolve, so the
+endpoint answers `404 ISSUES_TARGET_NONE` and the panel stays hidden. On
+every request each repository's identity is re-resolved with
+`github_integration.resolve_target` (the `--repo` value, or the manifest's
+declared `repository`, is the explicit target). `TARGET_REPOSITORY_AMBIGUOUS`,
+`TARGET_REPOSITORY_UNRESOLVED` and `TARGET_REPOSITORY_CONFLICT` (the remotes
+no longer match the watched identity) fail closed: no `gh` call is made and
+the repository shows the code. A manifest repository with a planner blocker
+shows that blocker code instead.
+
+**Data and cache.** `gh` is reached only through two fixed-argv read
+wrappers in `tools/github_sync.py`: `list_issue_summaries` (`gh issue list
+--state open --json number,title,state,labels,assignees,updatedAt,url --limit
+51 --repo <identity>`) and `list_open_prs` (`gh pr list --state open --json
+number,headRefName,body,isDraft --limit 101 --repo <identity>`). At most
+`CAP = 50` issues are served, in `gh`'s order (newest first), and `truncated`
+says when more exist. Each `gh` call has a 10-second timeout (`GH_TIMEOUT`;
+the CLI default is 30). Each repository's result, including a failure, is
+cached for 60 seconds, and each request drops expired entries and
+repositories that are no longer watched. The cache lock is never held while
+`git` or `gh` runs. A repository already being fetched is not fetched again:
+a concurrent request gets its expired entry as `cached: true`, or
+`ISSUES_FETCH_IN_PROGRESS` when none exists yet. Workspace repositories are
+read in parallel (up to 4 at a time), so one hung repository does not delay
+the others. The page polls every 30 seconds without blocking the live run
+view.
+
+**Response.** `{ok: true, mode ("repository"|"workspace"), cap,
+cache_ttl_seconds, reference_rules, repositories[]}`. Each repository is
+`{id (manifest id or null), repository, available, error_code, error,
+fetched_at, cached, truncated, issues, pull_requests {available, error_code,
+scanned, truncated}, branches {available, scanned}}`. `issues` is `null`
+whenever `available` is false, so an unavailable list is never shown as an
+empty one. Each issue is `{number, title, labels [names], assignees [logins],
+updated_at, url, references {branches, pull_requests}}`. The URL is rebuilt
+from the verified identity and the number, not taken from `gh`.
+
+**References**, each `null` when it could not be determined:
+`branches` are local `refs/heads/pico/*` branches whose name has an
+`issue-<n>`, `issues-<n>` or `gh-<n>` token (for example `pico/issue-33`;
+`pico/batch-1` does not refer to issue 1). `pull_requests` are open PRs, the
+first 100, whose body uses a GitHub closing keyword for the issue (`Closes
+#33`, or `fixes owner/repo#33` for the same repository) or whose head branch
+has the same token. `gh` 2.45 has no `closingIssuesReferences` field, so PRs
+linked only in the GitHub UI, and mentions such as `Refs #33`, are not seen.
+
+**Errors.** Per repository: `GH_UNAVAILABLE` (no `gh` on PATH),
+`GH_UNAUTHENTICATED`, `GH_RATE_LIMITED`, `GH_TIMEOUT`, `GH_OUTPUT_INVALID`,
+`GH_COMMAND_FAILED`, the identity codes above,
+`TARGET_REPOSITORY_UNREADABLE` (`git` is missing or timed out while resolving
+the identity), `ISSUES_FETCH_IN_PROGRESS`, or a manifest blocker code.
+`error` is a fixed sentence per code; `gh`'s own output is never served. A
+failed PR listing leaves the issues available and sets
+`pull_requests.error_code`, with every issue's `references.pull_requests`
+`null`. Endpoint level: `404 ISSUES_TARGET_NONE`, `422
+WORKSPACE_MANIFEST_INVALID`, `403 CONTROL_TOKEN_INVALID` (controls on, no
+token) and `421 HOST_REJECTED`.
+
+**Rendering.** Issue titles, labels and logins come from GitHub users. The
+API serves them verbatim as JSON strings, and `viewer/issues.js` writes them
+only with `textContent`; links are made only for `https://github.com/` URLs.
+Each row carries `data-repository` and `data-issue`, and
+`PicoIssues.render(container, data, {rowAction})` accepts a callback that
+returns a control for each row. The queue slice can use it for "add to
+queue".
+
+Coverage: `tests/test_garden_issues.py` (fake `gh` adapter, real temporary
+Git checkouts and a real HTTP server) covers the shape, the cap, every `gh`
+failure code, the cache and its pruning, a `git` timeout or missing `git`
+on one repository, a hung `gh` that blocks neither other repositories nor
+other requests, ambiguous and conflicting identities, workspace blockers,
+references, the token on `/api/issues`, `/api/runs` and
+`/api/workspace` with controls on and off, and that hostile issue text is
+served verbatim. `tests/garden-issues.test.ts` renders hostile titles and
+labels with a DOM stub that throws on `innerHTML`.
 
 ### Workspace budget
 

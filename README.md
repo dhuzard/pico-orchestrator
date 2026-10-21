@@ -184,6 +184,14 @@ pause updates in the browser. Use `pico watch . --repo owner/repository` when
 the checkout has multiple GitHub remotes, or `pico watch . --all` to see every
 repository in the state directory. `--port <number>` changes the local port.
 
+Under the run view, an **Open issues** panel lists up to 50 open issues of the
+watched repository: number, title, labels, assignees, last update, and any
+local `pico/issue-<n>` branch or open PR that closes the issue. It reads them
+through `gh`, at most once a minute, and never changes anything. When `gh` is
+missing, not logged in or rate-limited, or the repository identity is
+ambiguous, the panel says so instead of showing an empty list. In workspace
+mode it shows one list per manifest repository.
+
 The viewer binds only to `127.0.0.1`. Its API exposes display metadata and
 brief, explicitly recorded interaction summaries, not prompts, raw outputs,
 or full trace files. Activity entries are recorded for runs
@@ -318,8 +326,11 @@ a PR gets **Check CI** and **Promote**. Every button first shows a preview: the
 branch, commit and checks; or the publication plan and full PR body; or the
 current CI state. The action runs only after you confirm, and only if nothing
 changed since the preview. The launch URL carries a one-session token, so open
-the Garden from that URL and keep it private. Without `--controls` the Garden
-stays read-only.
+the Garden from that URL and keep it private. With `--controls` on, the page
+sends the token on every poll, and the runs, workspace and issues data are
+not served without it. The page keeps the token in memory only, so after a
+reload, or in a second tab, it shows "Open the URL printed at launch"; open
+the full launch URL from the terminal again. Without `--controls` the Garden stays read-only.
 
 The buttons call the same commands as the terminal, so the autonomy policy
 still decides. When **Request PR** is refused because `.pi/autonomy.yaml` does
