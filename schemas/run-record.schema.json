@@ -63,6 +63,55 @@
             "null"
           ]
         },
+        "worker_overrides": {
+          "type": "array",
+          "maxItems": 200,
+          "description": "Each time the lead replaced a terminal worker record (completed -> failed/blocked, failed -> blocked, or a failed/blocked worker restated with a different blocker code). The earlier status and blocker code are kept here; the worker holds the current ones.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["phase_id", "step_id", "route_epoch", "from_status", "from_blocker_code", "to_status", "blocker_code", "phase_status", "by", "at"],
+            "properties": {
+              "phase_id": {"type": "string"},
+              "step_id": {"type": "string"},
+              "route_epoch": {"type": "integer", "minimum": 0},
+              "from_status": {"enum": ["completed", "blocked", "failed"]},
+              "from_blocker_code": {"type": ["string", "null"]},
+              "from_details": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "installed_backend_version": {"type": "string"},
+                  "required_backend_version": {"type": "string"}
+                }
+              },
+              "to_status": {"enum": ["failed", "blocked"]},
+              "blocker_code": {"type": "string"},
+              "phase_status": {"type": "string", "description": "Status of the worker's phase when the override was recorded; a terminal value flags a phase outcome recorded before the override."},
+              "by": {"const": "lead"},
+              "at": {"type": "string"}
+            }
+          }
+        },
+        "reconciled": {
+          "type": "array",
+          "description": "Phases and workers that were still open when the run ended without COMPLETED. Each is set to abandoned; from_status keeps what was recorded. Absent on records that ended with nothing open.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "phase_id", "from_status", "to", "reason", "at"],
+            "properties": {
+              "kind": {"enum": ["phase", "worker"]},
+              "phase_id": {"type": "string"},
+              "step_id": {"type": "string"},
+              "route_epoch": {"type": "integer", "minimum": 0, "description": "Route epoch of a reconciled worker."},
+              "from_status": {"enum": ["not_started", "in_progress"]},
+              "to": {"const": "abandoned"},
+              "reason": {"type": "string", "maxLength": 120},
+              "at": {"type": "string"}
+            }
+          }
+        },
         "mutations": {
           "type": "object",
           "additionalProperties": false,
@@ -107,7 +156,8 @@
                   "completed",
                   "blocked",
                   "failed",
-                  "partial"
+                  "partial",
+                  "abandoned"
                 ]
               },
               "route": {
@@ -414,7 +464,8 @@
                         "in_progress",
                         "completed",
                         "blocked",
-                        "failed"
+                        "failed",
+                        "abandoned"
                       ]
                     },
                     "blocker_code": {

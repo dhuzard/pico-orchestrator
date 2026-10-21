@@ -28,8 +28,14 @@ import routing_engine as engine
 import run_lease
 
 STATUSES = {"COMPLETED", "BLOCKED", "FAILED", "PARTIAL"}
+# "abandoned" is written only by `_reconcile_open` when a run ends without a COMPLETED outcome;
+# it is never accepted from an event.
 PHASE_STATUSES = {"not_started", "in_progress", "completed", "blocked", "failed", "partial"}
 WORKER_STATUSES = {"not_started", "in_progress", "completed", "blocked", "failed"}
+RECONCILED_STATUS = "abandoned"
+# Bounds on `worker_overrides` (the schema carries the same global limit).
+MAX_WORKER_OVERRIDES = 200
+MAX_OVERRIDES_PER_WORKER = 8
 ROUTES = {"CODEX", "CLAUDE", "CLAUDE_CODEX", "CODEX_CLAUDE_CODEX"}
 ESCALATION_TARGETS = {
     "CODEX": {"CLAUDE_CODEX", "CODEX_CLAUDE_CODEX"},
@@ -520,7 +526,7 @@ def _record_event_unlocked(run_id: str, event: dict, *, repo_root: Path = ROOT) 
     allowed = {
         "phase": {"kind", "phase", "status", "route", "routing", "policy_version", "blocker_code", "escalation_reason"},
         "escalation": {"kind", "phase", "from_route", "to_route", "reason"},
-        "worker": {"kind", "phase", "step_id", "model", "backend", "backend_model", "reasoning_effort", "status", "blocker_code", "installed_backend_version", "required_backend_version"},
+        "worker": {"kind", "phase", "step_id", "only_if_open", "model", "backend", "backend_model", "reasoning_effort", "status", "blocker_code", "installed_backend_version", "required_backend_version"},
         "child": {"kind", "phase", "run_id"},
         "mutation": {"kind", "github", "code"},
         "context": {"kind", "starting_commit", "baseline_tokens", "context_tokens", "working_tokens", "compaction"},
@@ -632,23 +638,64 @@ def _record_event_unlocked(run_id: str, event: dict, *, repo_root: Path = ROOT) 
                       "blocker_code": None, "installed_backend_version": None,
                       "required_backend_version": None}
             phase["workers"].append(worker)
-        if worker["status"] in {"completed", "blocked", "failed"} and event["status"] != worker["status"]:
-            raise ParentRunError("worker is already terminal", error_code="PARENT_WORKER_TRANSITION_INVALID")
+        prior = worker["status"]
+        # Validate every field before anything can return or change, including the automatic no-op.
+        if "only_if_open" in event and event["only_if_open"] is not True:
+            raise ParentRunError("invalid worker event")
+        if "reasoning_effort" in event and event["reasoning_effort"] not in REASONING_EFFORTS:
+            raise ParentRunError("invalid reasoning effort")
+        values = {key: _safe(event[key], pattern, key) for key, pattern in (
+            ("model", MODEL_RE), ("backend", MODEL_RE), ("backend_model", MODEL_RE), ("blocker_code", CODE_RE),
+            ("installed_backend_version", VERSION_RE), ("required_backend_version", VERSION_RE)) if key in event}
+        if event.get("only_if_open") is True and prior not in {"not_started", "in_progress"}:
+            # The lifecycle's automatic record of a worker's raw result: never overrides a recorded status.
+            return parent
+        terminal = {"completed", "blocked", "failed"}
+        override = None
+        if prior in terminal:
+            # The lead's judgment wins over an earlier record, but never silently: each override is
+            # appended to `worker_overrides` with what it replaced. Allowed: completed -> failed/blocked
+            # and failed -> blocked (each with a blocker code), and a failed/blocked worker restated with
+            # a different blocker code. Nothing else reopens or changes a terminal worker.
+            reclassified = event["status"] != prior
+            recoded = (not reclassified and prior in {"failed", "blocked"} and "blocker_code" in values
+                       and values["blocker_code"] != worker.get("blocker_code"))
+            if reclassified and not ((prior, event["status"]) in {("completed", "failed"), ("completed", "blocked"),
+                                                                  ("failed", "blocked")}
+                                     and values.get("blocker_code") is not None):
+                raise ParentRunError("worker is already terminal", error_code="PARENT_WORKER_TRANSITION_INVALID")
+            if reclassified or recoded:
+                history = [item for item in parent.get("worker_overrides") or []
+                           if (item["phase_id"], item["step_id"], item["route_epoch"]) == (phase["id"], step_id, epoch)]
+                seen = {worker.get("blocker_code")} | {code for item in history
+                                                       for code in (item["from_blocker_code"], item["blocker_code"])}
+                if recoded and values["blocker_code"] in seen:
+                    raise ParentRunError("worker was already recorded with this blocker code in this route epoch",
+                                         error_code="PARENT_WORKER_RECODE_REPEATED")
+                if (len(history) >= MAX_OVERRIDES_PER_WORKER
+                        or len(parent.get("worker_overrides") or []) >= MAX_WORKER_OVERRIDES):
+                    raise ParentRunError("too many overrides recorded for this worker or run",
+                                         error_code="PARENT_WORKER_OVERRIDE_LIMIT")
+                override = {"phase_id": phase["id"], "step_id": step_id, "route_epoch": epoch,
+                            "from_status": prior, "from_blocker_code": worker.get("blocker_code")}
+                details = {key: worker[key] for key in ("installed_backend_version", "required_backend_version")
+                           if worker.get(key) is not None}
+                if details:
+                    override["from_details"] = details
+                override.update(to_status=event["status"], blocker_code=values["blocker_code"],
+                                phase_status=phase["status"], by="lead", at=_now())
         worker["status"] = event["status"]
         if "reasoning_effort" in event:
-            if event["reasoning_effort"] not in REASONING_EFFORTS:
-                raise ParentRunError("invalid reasoning effort")
             if worker.get("reasoning_effort") is not None and worker["reasoning_effort"] != event["reasoning_effort"]:
                 raise ParentRunError("worker field conflicts with prior event", error_code="PARENT_EVENT_CONFLICT")
             worker["reasoning_effort"] = event["reasoning_effort"]
-        for key, pattern in (("model", MODEL_RE), ("backend", MODEL_RE), ("backend_model", MODEL_RE), ("blocker_code", CODE_RE),
-                             ("installed_backend_version", VERSION_RE),
-                             ("required_backend_version", VERSION_RE)):
-            if key in event:
-                value = _safe(event[key], pattern, key)
-                if worker.get(key) is not None and value != worker[key]:
-                    raise ParentRunError("worker field conflicts with prior event", error_code="PARENT_EVENT_CONFLICT")
-                worker[key] = value
+        for key, value in values.items():
+            replaced = key == "blocker_code" and override is not None
+            if worker.get(key) is not None and value != worker[key] and not replaced:
+                raise ParentRunError("worker field conflicts with prior event", error_code="PARENT_EVENT_CONFLICT")
+            worker[key] = value
+        if override is not None:
+            parent.setdefault("worker_overrides", []).append(override)
     elif kind == "child":
         phase = _phase(parent, event["phase"])
         child_id = _safe(event.get("run_id"), ID_RE, "child run id")
@@ -812,11 +859,43 @@ def _finish_unlocked(run_id: str, status: str, *, blocker_code: str | None = Non
             raise ParentRunError("mandatory independent review not completed for phase " + ", ".join(missing[:12]) +
                                  ". Run and record the review, or finish as PARTIAL",
                                  error_code="PARENT_REVIEW_MISSING")
+    else:
+        _reconcile_open(parent, status)
     parent["final_status"] = status
     parent["blocker_code"] = _safe(blocker_code, CODE_RE, "blocker code")
     return provenance.finish_run(repo_root, run_id, outcome=status.lower(),
                                  parent_orchestration=parent,
                                  orchestration_metrics=delegation_metrics(record, parent))
+
+
+def _reconcile_open(parent: dict, status: str) -> None:
+    """A run that ends without COMPLETED leaves no phase or worker open.
+
+    Each phase, and each worker of the phase's current route epoch, still not_started or in_progress becomes `abandoned`, and the
+    transition is appended to `parent.reconciled` with its prior status. Events, activity
+    and every other field stay as recorded. A reconciled item is no longer open, so a
+    repeated call adds nothing.
+    """
+    open_states = {"not_started", "in_progress"}
+    at = _now()
+    reason = f"run finished {status}"
+    entries = parent.setdefault("reconciled", [])
+    for phase in parent["phases"]:
+        epoch = len(phase.get("escalations") or [])
+        if phase["status"] in open_states:
+            entries.append({"kind": "phase", "phase_id": phase["id"], "from_status": phase["status"],
+                            "to": RECONCILED_STATUS, "reason": reason, "at": at})
+            phase["status"] = RECONCILED_STATUS
+        for worker in phase["workers"]:
+            # Workers of an earlier route epoch were superseded by an escalation; like the COMPLETED
+            # check, they are left exactly as recorded.
+            if worker["status"] in open_states and worker.get("route_epoch", 0) == epoch:
+                entries.append({"kind": "worker", "phase_id": phase["id"], "step_id": worker["step_id"],
+                                "route_epoch": epoch, "from_status": worker["status"],
+                                "to": RECONCILED_STATUS, "reason": reason, "at": at})
+                worker["status"] = RECONCILED_STATUS
+    if not entries:
+        del parent["reconciled"]
 
 
 def settle(run_id: str, *, owner_id: str | None = None, repo_root: Path = ROOT) -> dict:

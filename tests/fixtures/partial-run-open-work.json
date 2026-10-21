@@ -1,0 +1,14 @@
+{
+  "description": "Phases and workers of a real pilot run that ended PARTIAL with open work (ids anonymized; no paths, objectives or routing text).",
+  "outcome_was": "partial",
+  "phases": [
+    {"id": "phase-1", "status": "completed", "route": null, "blocker_code": null, "workers": [], "child_run_ids": []},
+    {"id": "phase-2", "status": "partial", "route": "CODEX_CLAUDE_CODEX", "blocker_code": "APPROVED_INPUTS_UNAVAILABLE",
+     "wave_id": "wave-1", "child_run_ids": [],
+     "workers": [{"step_id": "claude_worker", "model": "sonnet", "backend": "claude-code", "backend_model": "sonnet",
+                  "status": "in_progress", "route_epoch": 0, "reasoning_effort": "medium", "blocker_code": null,
+                  "installed_backend_version": "2.1.287", "required_backend_version": null}]},
+    {"id": "phase-3", "status": "in_progress", "route": "CODEX", "blocker_code": null, "wave_id": "wave-2",
+     "workers": [], "child_run_ids": []}
+  ]
+}

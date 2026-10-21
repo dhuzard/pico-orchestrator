@@ -270,7 +270,10 @@ class LifecycleTest(unittest.TestCase):
         self.assertEqual(trace["policy_version"], 4)
         self.assertEqual(trace["mutations"], {"github": 0, "code": 0})
         self.assertEqual(trace["phases"][0]["child_run_ids"], [child["run_id"]])
-        self.assertEqual(trace["phases"][1]["workers"][2]["status"], "not_started")
+        # A worker never started when the run ended is reconciled, not left open (issue #42).
+        self.assertEqual(trace["phases"][1]["workers"][2]["status"], "abandoned")
+        self.assertEqual([(e["kind"], e["step_id"], e["route_epoch"], e["from_status"]) for e in trace["reconciled"]],
+                         [("worker", "codex_reviewer", 0, "not_started")])
         report = provenance.build_trace_report(self.records, record)
         self.assertEqual(report["parent_orchestration"], trace)
         rendered = provenance.render_trace_text(report)

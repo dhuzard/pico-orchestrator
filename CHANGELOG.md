@@ -8,6 +8,24 @@ All notable changes to PICO are recorded here. The format follows
 
 ### Fixed
 
+- A run that ends PARTIAL, BLOCKED, FAILED or settled no longer leaves phases or
+  workers `in_progress`. Finishing without COMPLETED sets each still-open phase
+  and worker (`not_started` or `in_progress`) to `abandoned` and appends it to
+  the new `parent_orchestration.reconciled` list (`kind`, `phase_id`, `step_id`,
+  `from_status`, `to`, `reason`, `at`); events, activity and every other field
+  stay as recorded, and a repeated finish adds nothing. COMPLETED still refuses
+  open work. The lifecycle extension now records a ClaudeWorker's terminal status
+  (`completed`, `failed`, or `blocked` on abort) when its result arrives, so the
+  lead no longer has to; the lead's judgment wins (completed -> failed/blocked, failed -> blocked,
+  or its own blocker code on a failed/blocked worker), and every such override is
+  appended to the new `parent_orchestration.worker_overrides` with the status and
+  blocker code it replaced. The list is bounded: a recode to a code the worker
+  already had in that route epoch is refused (`PARENT_WORKER_RECODE_REPEATED`), as
+  is more than 8 overrides per worker or 200 per run (`PARENT_WORKER_OVERRIDE_LIMIT`);
+  neither blocks the run. The Garden shows it as "Abandoned (run ended PARTIAL)", not
+  running; workers of an earlier route epoch are left as recorded. Older records still validate and display; records written by this
+  version carry `reconciled` and `abandoned`, which older PICO versions reject
+  (`additionalProperties: false`, status enums). Fixes #42.
 - `pico workspace launch` now refuses with `WORKSPACE_BUDGET_EXHAUSTED` when the
   workspace budget is exhausted (it previously spent past it; only the
   scheduler and the Garden checked). `--ignore-budget` overrides explicitly and

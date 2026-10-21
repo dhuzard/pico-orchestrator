@@ -31,6 +31,8 @@ const LEASE_LOST = new Set(["RUN_LEASE_LOST", "RUN_LEASE_NOT_HELD", "RUN_LEASE_P
 const LEASE_OWNER = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
 const LEASE_STATE = Symbol.for("pico.orchestration.lease");
 const OWNER_ENV = "PI_ORCHESTRATION_LEASE_OWNER";
+/** Parent refusals of a worker override that leave the record unchanged; they must never block the run. */
+const HARMLESS_REFUSALS = new Set(["PARENT_WORKER_RECODE_REPEATED", "PARENT_WORKER_OVERRIDE_LIMIT"]);
 const WORKER_TOOLS = new Set(["AskClaude", "ClaudeWorker", "spawn_subagent", "message_subagent"]);
 const CLAUDE_TOOLS = new Set(["AskClaude", "ClaudeWorker"]);
 const MARKER = "PI_ORCHESTRATION_RUN_V1";
@@ -334,7 +336,7 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
   // toolCallId -> parent checkout snapshot taken before a worker call.
   const snapshots = new Map<string, { digest: string; status: string[] }>();
   // toolCallId -> worker call currently running.
-  const inFlight = new Map<string, { taskId: string | null; stepId: string | null; tool: string }>();
+  const inFlight = new Map<string, { taskId: string | null; stepId: string | null; tool: string; phase?: string }>();
   // toolCallId -> ClaudeWorker run the guard resolved; consumed by the tool's execute.
   const workerPlans = new Map<string, WorkerPlan>();
   let scopeViolation: string | null = null;
@@ -871,13 +873,14 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
       }
       snapshots.set(call.toolCallId, before);
       if (inFlight.size === 0) batchStart = Date.now();
-      inFlight.set(call.toolCallId, { taskId, stepId: step?.id ?? null, tool: call.toolName });
+      inFlight.set(call.toolCallId, { taskId, stepId: step?.id ?? null, tool: call.toolName,
+        phase: workerPlans.get(call.toolCallId)?.phase });
       if (runId) await observe({ kind: "activity", status: "started", tool: call.toolName,
         task_id: taskId, step_id: step?.id ?? null });
       batchPeak = Math.max(batchPeak, inFlight.size);
       workerStarts.set(call.toolCallId, Date.now());
       const plan = workerPlans.get(call.toolCallId);
-      // Observational: the parent still records the worker's terminal status itself.
+      // Observational: the lead may record the worker itself; the tool_result handler records its terminal status.
       if (plan) await observe({ kind: "worker", phase: plan.phase, step_id: plan.stepId, status: "in_progress",
         model: plan.canonical, backend: "claude-code", backend_model: plan.backendModel, reasoning_effort: plan.effort });
     }
@@ -955,6 +958,16 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
             cached_tokens: count(usage.cached_tokens), total_tokens: count(usage.total_tokens),
             ...(count(usage.cache_write_tokens) === null ? {} : { cache_write_tokens: count(usage.cache_write_tokens) }),
             ...(typeof cost === "number" && Number.isFinite(cost) && cost >= 0 ? { estimated_cost_usd: cost } : {}) });
+          // The worker's own terminal status, so a lead that never records it leaves nothing in_progress.
+          // An abort (lease loss, user stop) is blocked; any other failure is failed. `only_if_open` makes this
+          // the raw result only: it never overrides a status the lead already recorded, and the lead may later
+          // record a different judgment (completed -> failed/blocked with a blocker code) or add its own code.
+          if (worker?.phase && worker.stepId) {
+            const code = typeof details.blocker_code === "string" ? details.blocker_code : "WORKER_FAILED";
+            await observe({ kind: "worker", phase: worker.phase, step_id: worker.stepId, only_if_open: true,
+              ...(result.isError ? { status: details.error === "ABORTED" ? "blocked" : "failed", blocker_code: code }
+                                 : { status: "completed" }) });
+          }
         }
       } else {
         if (result.toolName === "spawn_subagent" && typeof details.subagent_id === "string" && !result.isError) {
@@ -1208,7 +1221,10 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
          || parentFailure?.error_code === "PARENT_ESCALATION_WORKERS_IN_FLIGHT");
       const ok = result.ok !== false && (params.action !== "status" || result.status === "IN_PROGRESS")
         && !(params.action === "status" && unresolvedRoute);
-      if (!ok) {
+      // A refused repeat or excess override of an already-terminal worker changes nothing: it is reported to the
+      // lead and never blocks the run.
+      const harmless = params.action === "event" && result.ok === false && HARMLESS_REFUSALS.has(String(result.error_code));
+      if (!ok && !harmless) {
         const failure = params.action === "status" && parentBlocked ? parentFailure ?? result : result;
         diagnose(params.action, failure);
         parentFailure = failure; parentBlocked = true; blockAllWorktrees();
@@ -1233,7 +1249,8 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
       const code = typeof effectiveResult.blocker_code === "string" ? effectiveResult.blocker_code
         : typeof effectiveResult.error_code === "string" ? effectiveResult.error_code : null;
       // The model reads only this text, never `details`, so the status line states ok/active explicitly.
-      const message = ok ? (params.action === "status"
+      const message = harmless ? `Worker override refused (${code}); nothing changed and the run is not blocked. Record a different judgment or leave the worker as recorded.`
+        : ok ? (params.action === "status"
           ? `Parent orchestration record ${observedRunId} is ready (ok: true, active: ${runId !== null}).`
         : params.action === "finish" ? completionSummary(result, observedRunId)
         : "Parent orchestration trace updated.")
@@ -1286,7 +1303,8 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
       return { content: [{ type: "text" as const, text: notes.filter(Boolean).join("\n\n") }], isError: !outcome.ok,
         details: { ok: outcome.ok, task_id: plan.taskId, step_id: plan.stepId, mode: plan.mode, cwd: plan.cwd,
           model: plan.canonical, backend: "claude-code", backend_model: plan.backendModel,
-          reasoning_effort: plan.effort, exit_code: outcome.exitCode, error: outcome.error, usage: outcome.usage,
+          reasoning_effort: plan.effort, exit_code: outcome.exitCode, error: outcome.error,
+          blocker_code: outcome.ok ? null : workerBlocker(outcome), usage: outcome.usage,
           duration_ms: outcome.durationMs, elapsed_ms: outcome.elapsedMs, session_id: outcome.sessionId,
           permission_denials: outcome.permissionDenials, denied_calls: outcome.deniedCalls,
           // Names only, never values, of parent environment variables withheld from the worker.
