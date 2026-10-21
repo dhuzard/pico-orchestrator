@@ -216,6 +216,63 @@ class WorkspaceRunTest(unittest.TestCase):
         self.assertEqual(overall["tasks"]["g1"]["execution_status"], "cancelled")
         self.assertNotIn("b1", overall["tasks"])
 
+    def budget_manifest(self, budget):
+        path = self.manifest()
+        data = yaml.safe_load(path.read_text())
+        if budget is not None:
+            data["budget"] = budget
+        path.write_text(yaml.safe_dump(data))
+        return path
+
+    def test_direct_launch_is_refused_when_budget_exhausted(self):
+        os.environ["FAKE_PI_USAGE"] = "600,500"
+        manifest = self.budget_manifest({"max_tokens": 1000})
+        self.launch(manifest, "a1")  # the first child spends past the limit
+        with self.assertRaises(wr.WorkspaceRunError) as ctx:
+            self.launch(manifest, "b1")
+        self.assertEqual(ctx.exception.code, "WORKSPACE_BUDGET_EXHAUSTED")
+        self.assertIn("--ignore-budget", ctx.exception.detail)
+        self.assertIn("1000", ctx.exception.detail)
+        self.assertNotIn("b1", wr.status(manifest=manifest, access_check=None)["tasks"])
+        with self.assertRaises(wr.WorkspaceRunError) as ctx:
+            self.launch(manifest, "a1", resume=True)
+        self.assertEqual(ctx.exception.code, "WORKSPACE_BUDGET_EXHAUSTED")
+
+    def test_ignore_budget_launches_and_records_the_override(self):
+        os.environ["FAKE_PI_USAGE"] = "600,500"
+        manifest = self.budget_manifest({"max_tokens": 1000})
+        first = self.launch(manifest, "a1")
+        self.assertNotIn("budget_override", first["task"])
+        result = self.launch(manifest, "b1", ignore_budget=True)
+        override = result["task"]["budget_override"]
+        self.assertEqual(override["reasons"], ["tokens"])
+        self.assertEqual(override["max_tokens"], 1000)
+        self.assertTrue(override["at"])
+        record = wr.load_workspace(wr.workspace_record_path("ws"))
+        self.assertIn("budget_override", record["tasks"]["b1"])
+
+    def test_launch_allowed_without_budget_or_under_budget(self):
+        plain = self.launch(self.manifest(), "a1")
+        self.assertNotIn("budget_override", plain["task"])
+        roomy = self.launch(self.budget_manifest({"max_tokens": 1000000}), "b1")
+        self.assertNotIn("budget_override", roomy["task"])
+
+    def test_cli_ignore_budget(self):
+        os.environ["FAKE_PI_USAGE"] = "600,500"
+        manifest = self.budget_manifest({"max_tokens": 1000})
+        self.launch(manifest, "a1")
+        def run(args):
+            out = io.StringIO()
+            with redirect_stdout(out):
+                rc = wr.main(args)
+            return rc, json.loads(out.getvalue())
+        base = ["launch", str(manifest), "--task", "b1", "--no-access-check", "--pi", str(self.pi)]
+        rc, data = run(base)
+        self.assertEqual((rc, data["error_code"]), (1, "WORKSPACE_BUDGET_EXHAUSTED"))
+        rc, data = run(base + ["--ignore-budget"])
+        self.assertEqual(rc, 0, data)
+        self.assertIn("budget_override", data["task"])
+
     def test_cli(self):
         manifest = self.manifest()
         def run(args):
