@@ -2,9 +2,12 @@
 """Observed token and cost usage of child runs, shared by the Garden and the scheduler.
 
 Counts come from each parent run's recorded context: the lead's usage plus
-every worker backend. estimated_cost_usd is the backend-reported list-price
-estimate, which today only Claude workers report, so it is a lower bound on
-real spend; token counts cover every participant that reported them.
+every worker backend. estimated_cost_usd is the sum of the list-price
+estimates participants reported (Claude workers, and the lead when Pi reports
+a per-message cost). A participant with tokens but no reported cost is listed
+in `unpriced` and makes `cost_complete` false: the cost is then a lower bound.
+Spend (the budgeted quantity) is input + output + cache-write tokens; cache
+reads are reported separately and never counted against a budget.
 """
 from __future__ import annotations
 
@@ -12,12 +15,33 @@ import json
 import re
 from pathlib import Path
 
-TOKEN_FIELDS = ("input_tokens", "output_tokens", "cached_tokens", "total_tokens")
+TOKEN_FIELDS = ("input_tokens", "output_tokens", "cached_tokens", "cache_write_tokens", "total_tokens")
+COUNTED = ("input_tokens", "output_tokens", "cached_tokens", "cache_write_tokens")
 RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 
 
 def _count(value):
     return value if type(value) is int and value >= 0 else None
+
+
+def _cost(value):
+    return value if type(value) in (int, float) and value >= 0 else None
+
+
+def _has_tokens(part: dict) -> bool:
+    return any((_count(part.get(field)) or 0) > 0 for field in (*COUNTED, "total_tokens"))
+
+
+def cost_coverage(context: dict) -> tuple[float | None, list[str]]:
+    """Reported cost of one run's participants and the names of those with tokens but no cost."""
+    lead = context.get("lead_usage") if isinstance(context.get("lead_usage"), dict) else {}
+    usage = context.get("worker_usage") if isinstance(context.get("worker_usage"), dict) else {}
+    named = [(str(lead.get("model") or "lead"), lead)] + [(str(name), entry) for name, entry in usage.items()
+                                                           if isinstance(entry, dict)]
+    costs = [_cost(part.get("estimated_cost_usd")) for _, part in named]
+    unpriced = sorted({name for (name, part), cost in zip(named, costs, strict=True) if cost is None and _has_tokens(part)})
+    known = [cost for cost in costs if cost is not None]
+    return (round(sum(known), 6) if known else None), unpriced
 
 
 def run_tokens(parent: dict) -> dict:
@@ -32,7 +56,7 @@ def run_tokens(parent: dict) -> dict:
     usage = context.get("worker_usage") if isinstance(context.get("worker_usage"), dict) else {}
     workers = [entry for entry in usage.values() if isinstance(entry, dict)]
     tokens: dict = {}
-    for field in ("input_tokens", "output_tokens", "cached_tokens"):
+    for field in COUNTED:
         observed = [_count(part.get(field)) for part in (lead, *workers)]
         observed = [value for value in observed if value is not None]
         tokens[field] = sum(observed) if observed else None
@@ -40,9 +64,8 @@ def run_tokens(parent: dict) -> dict:
                 and all(entry.get("total_tokens_complete") is True and _count(entry.get("total_tokens")) is not None
                         for entry in workers))
     tokens["total_tokens"] = lead["total_tokens"] + sum(entry["total_tokens"] for entry in workers) if complete else None
-    costs = [entry["estimated_cost_usd"] for entry in workers
-             if type(entry.get("estimated_cost_usd")) in (int, float) and entry["estimated_cost_usd"] >= 0]
-    tokens["estimated_cost_usd"] = round(sum(costs), 6) if costs else None
+    tokens["estimated_cost_usd"], tokens["unpriced"] = cost_coverage(context)
+    tokens["cost_complete"] = not tokens["unpriced"]
     return tokens
 
 
@@ -54,23 +77,34 @@ def sum_tokens(parts: list[dict]) -> dict:
         total = sum(observed) if observed else None
         result[field] = round(total, 6) if field == "estimated_cost_usd" and total is not None else total
     result["total_complete"] = bool(parts) and all(part.get("total_tokens") is not None for part in parts)
+    # Blocks from before these fields carry no `unpriced` list and add nothing to it.
+    result["unpriced"] = sorted({name for part in parts for name in part.get("unpriced") or []})
+    result["cost_complete"] = not result["unpriced"]
     return result
 
 
 
 def spent(tokens: dict) -> int:
-    """Input plus output tokens, the quantity a workspace token budget limits."""
-    return (tokens.get("input_tokens") or 0) + (tokens.get("output_tokens") or 0)
+    """Billed tokens (input, output and cache writes), the quantity a workspace token budget limits.
+
+    Cache reads are excluded: they are reported separately as cached_tokens.
+    """
+    return sum(tokens.get(field) or 0 for field in ("input_tokens", "output_tokens", "cache_write_tokens"))
 
 
-def workspace_usage(runs_dir: Path, record: dict) -> dict:
-    """Summed usage of every child run linked from a workspace record."""
+def workspace_usage(runs_dir: Path, record: dict, extra_run_ids=()) -> dict:
+    """Summed usage of every child run linked from a workspace record.
+
+    extra_run_ids adds runs not yet linked (children still running).
+    """
     parts = []
     tasks = record.get("tasks") if isinstance(record.get("tasks"), dict) else {}
-    for entry in tasks.values():
-        run_id = entry.get("run_id") if isinstance(entry, dict) else None
-        if not isinstance(run_id, str) or not RUN_ID.fullmatch(run_id):
+    linked = [entry.get("run_id") for entry in tasks.values() if isinstance(entry, dict)]
+    seen: set = set()
+    for run_id in (*linked, *extra_run_ids):
+        if not isinstance(run_id, str) or not RUN_ID.fullmatch(run_id) or run_id in seen:
             continue
+        seen.add(run_id)
         try:
             run = json.loads((runs_dir / f"{run_id}.json").read_text(encoding="utf-8"))
         except (OSError, ValueError):

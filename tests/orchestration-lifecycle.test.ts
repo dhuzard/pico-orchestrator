@@ -7,7 +7,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Value } from "typebox/value";
 import { createOrchestrationLifecycle, runJson, scopesOverlap } from "../extensions/orchestration-lifecycle.ts";
 import { classifyClaudeInvocationError, resolveClaudeBackendModel } from "../extensions/claude-backend-adapter.ts";
-import { buildWorkerEnv, claudeWorkerArgs, describeDenials, inGitDirectory, WORKER_ENV_CREDENTIALS, WORKER_ENV_NAMES,
+import { buildWorkerEnv, claudeWorkerArgs, describeDenials, inGitDirectory, parseClaudeResult, WORKER_ENV_CREDENTIALS, WORKER_ENV_NAMES,
   WORKER_SANDBOX_SETTINGS, WorkerConfigError, workerSandboxEnabled } from "../extensions/claude-worker.ts";
 
 type Handler = (event: any, context?: any) => Promise<any> | any;
@@ -1167,6 +1167,43 @@ test("Pi compaction keeps its native summary and cut point without checkpoint wo
   assert.equal(h.handlers.has("session_before_compact"), false);
   assert.equal(h.calls.some((call) => call.args[0] === "checkpoint"), false);
   assert.equal(event.preparation.firstKeptEntryId, "e2");
+});
+
+test("Claude result usage maps cache writes to billed input and keeps cache reads separate", () => {
+  const stdout = JSON.stringify({ type: "result", total_cost_usd: 0.42, usage: { input_tokens: 22, output_tokens: 900,
+    cache_creation_input_tokens: 31000, cache_read_input_tokens: 250000 } });
+  const parsed = parseClaudeResult(stdout)!;
+  assert.deepEqual(parsed.usage, { input_tokens: 22, output_tokens: 900, cached_tokens: 250000,
+    cache_write_tokens: 31000, cost_usd: 0.42 });
+  const old = parseClaudeResult(JSON.stringify({ type: "result", usage: { input_tokens: 5, output_tokens: 1 } }))!;
+  assert.equal(old.usage.cache_write_tokens, null, "an absent counter stays unknown, never zero");
+});
+
+test("the lead's own Pi-reported message cost is forwarded only when valid", async () => {
+  const h = harness({ ok: true, status: "READY" });
+  await h.handlers.get("before_agent_start")!({ prompt: "PI_ORCHESTRATION_RUN_V1" });
+  await h.handlers.get("turn_start")!({ turnIndex: 0 });
+  const ended = (timestamp: number, cost: unknown) => h.handlers.get("message_end")!({ message: { role: "assistant",
+    provider: "openai-codex", model: "gpt-6.1-sol", timestamp, usage: { input: 10, output: 2, totalTokens: 12, cost } } });
+  await ended(1, { total: 0.0125 });
+  await ended(2, undefined);
+  await ended(3, { total: -1 });
+  const lead = h.parentCalls("event").filter((call) => call.input?.kind === "lead_usage").map((call) => call.input!);
+  assert.equal(lead.length, 3);
+  assert.equal(lead[0].estimated_cost_usd, 0.0125);
+  assert.equal("estimated_cost_usd" in lead[1], false);
+  assert.equal("estimated_cost_usd" in lead[2], false);
+});
+
+test("a Claude worker's cache writes reach the usage event", async () => {
+  const h = harness({ ok: true, status: "READY" });
+  await startRun(h, "/work/examplelab");
+  await h.handlers.get("tool_result")!({ toolName: "ClaudeWorker", toolCallId: "w1", input: {}, content: [],
+    details: { task_id: "t1", elapsed_ms: 10, usage: { input_tokens: 22, output_tokens: 5, cached_tokens: 400,
+      cache_write_tokens: 3000, cost_usd: 0.1 } } });
+  const usage = h.calls.filter((item) => item.input?.kind === "usage").map((item) => item.input!);
+  assert.equal(usage.at(-1)?.cache_write_tokens, 3000);
+  assert.equal(usage.at(-1)?.cached_tokens, 400);
 });
 
 test("worker usage telemetry is recorded from backend results only", async () => {

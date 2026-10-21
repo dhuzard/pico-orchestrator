@@ -672,6 +672,27 @@ class LifecycleTest(unittest.TestCase):
         self.assertEqual(response["trace_path"], str(provenance.run_path(self.records, parent.run_id)))
         self.assertNotIn("trace_path", persisted)
 
+    def test_lead_usage_validates_with_and_without_estimated_cost(self):
+        schema = provenance.load_schema(self.records)
+        for cost in (None, 0.5):
+            with self.subTest(cost=cost):
+                parent = po.ParentRun(worktree=self.target, repo_root=self.records)
+                event = {"kind": "lead_usage", "model": "openai-codex/gpt-6.1-sol", "input_tokens": 10,
+                         "output_tokens": 5, "cached_tokens": 3, "total_tokens": 18}
+                if cost is not None:
+                    event["estimated_cost_usd"] = cost
+                parent.event(event)
+                parent.event({"kind": "usage", "backend": "claude-code", "input_tokens": 4, "output_tokens": 2,
+                              "cache_write_tokens": 7, "cached_tokens": 9})
+                record = parent.finish("PARTIAL")
+                self.assertEqual(provenance.validate_run_record(record, schema), [])
+                context = record["parent_orchestration"]["context"]
+                self.assertEqual(context["lead_usage"].get("estimated_cost_usd"), cost)
+                self.assertEqual(context["worker_usage"]["claude-code"]["cache_write_tokens"], 7)
+        with self.assertRaises(po.ParentRunError):
+            po.ParentRun(worktree=self.target, repo_root=self.records).event(
+                {"kind": "lead_usage", "model": "m/x", "estimated_cost_usd": -1})
+
     def test_partial_worker_usage_does_not_claim_complete_token_total(self):
         record = {"started_at": "2026-10-14T00:00:00Z"}
         parent = {"context": {"lead_usage": {"input_tokens": 10, "output_tokens": 5},

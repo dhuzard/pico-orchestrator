@@ -8,6 +8,12 @@ All notable changes to PICO are recorded here. The format follows
 
 ### Added
 
+- Usage accounting: Claude cache writes are recorded as `cache_write_tokens`
+  and counted in budgeted spend (cache reads are not); the lead's Pi-reported
+  cost is forwarded as optional `estimated_cost_usd`; usage blocks carry
+  `cost_complete` and `unpriced`, shown by the scheduler and the Garden; the
+  scheduler counts the spend of children that are still running. Old records
+  remain valid.
 - `CONTRIBUTING.md` with the development checks, the rules for routing and
   policy changes, pull request expectations and the licensing stance.
 - `CODE_OF_CONDUCT.md` (Contributor Covenant 2.1).

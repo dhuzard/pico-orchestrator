@@ -692,6 +692,11 @@
                 "total_tokens_complete": {
                   "type": "boolean"
                 },
+                "estimated_cost_usd": {
+                  "type": "number",
+                  "minimum": 0,
+                  "description": "Pi-reported list-price estimate of the lead's own calls; absent when unreported."
+                },
                 "input_tokens": {
                   "type": "integer",
                   "minimum": 0
@@ -1551,6 +1556,14 @@
             "null"
           ],
           "minimum": 0
+        },
+        "cache_write_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "Tokens written to the prompt cache, billed as input unlike cache reads; absent in records that predate it."
         },
         "total_tokens": {
           "type": [

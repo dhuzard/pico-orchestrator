@@ -42,7 +42,7 @@ function renderOverview(run) {
   $("input-tokens").textContent = short(observed(metrics.lead_input_tokens, metrics.worker_input_tokens));
   $("output-tokens").textContent = short(observed(metrics.lead_output_tokens, metrics.worker_output_tokens));
   $("speedup").textContent = typeof metrics.parallel_speedup === "number" ? `${metrics.parallel_speedup.toFixed(2)}×` : "—";
-  $("cost").textContent = typeof metrics.estimated_cost_usd === "number" ? `$${metrics.estimated_cost_usd.toFixed(3)}` : "—";
+  $("cost").textContent = costText(metrics.estimated_cost_usd, metrics.cost_complete, metrics.unpriced);
   $("lead-model").textContent = run?.metrics?.lead_model || run?.context?.lead_usage?.model || "Waiting for model";
   const workerCalls = Object.values(run?.context?.worker_usage || {}).reduce((total, entry) => total + (entry?.invocations || 0), 0);
   $("lead-detail").textContent = run ? `${run.phases.length} tasks · ${workerCalls} worker calls observed` : "Ready to coordinate the next run.";
@@ -390,7 +390,10 @@ const wsTone = (value) => {
 };
 const wsLabel = (value) => ({ running: "Running", completed: "Completed", partial: "Partial", failed: "Failed", cancelled: "Cancelled", refused: "Refused at dispatch", needs_reconciliation: "Needs reconciliation", blocked_by_failure: "Blocked by failure", waiting_for_readiness: "Waiting for readiness", not_dispatchable: "Not dispatchable", not_launched: "Not launched", validated: "Validated", ready_for_downstream: "Ready for downstream", merged: "Merged", held_by_budget: "Held by budget" })[value] || (String(value || "").startsWith("declared_") ? `Declared ${cap(value.slice(9))}` : cap(value));
 const wsGlyph = (tone) => tone === "completed" ? "✿" : tone === "failed" ? "×" : tone === "blocked" ? "!" : tone === "active" ? "●" : "○";
-const tokenSum = (tokens) => tokens?.input_tokens == null && tokens?.output_tokens == null ? null : (tokens.input_tokens || 0) + (tokens.output_tokens || 0);
+const tokenSum = (tokens) => tokens?.input_tokens == null && tokens?.output_tokens == null ? null : (tokens.input_tokens || 0) + (tokens.output_tokens || 0) + (tokens.cache_write_tokens || 0);
+// Cost is a lower bound when a participant reported tokens but no cost. Plain text only.
+const costText = (cost, complete, unpriced) => typeof cost !== "number" ? (complete === false ? "unknown" : "—")
+  : `${complete === false ? "≥ " : ""}$${cost.toFixed(3)}${complete === false ? ` (lower bound${unpriced?.length ? `; excludes ${unpriced.join(", ")}` : ""})` : ""}`;
 const stamp = (value) => value ? new Date(value).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "—";
 function runAnchor(runId, text) {
   const anchor = el("a", "ws-run-link", text);
@@ -456,7 +459,7 @@ function renderWorkspaceOverview(data) {
   $("ws-reported").textContent = tokens?.total_tokens == null ? "—" : `${short(tokens.total_tokens)}${tokens.total_complete ? "" : " (partial)"}`;
   $("ws-input").textContent = short(tokens?.input_tokens);
   $("ws-output").textContent = short(tokens?.output_tokens);
-  $("ws-cost").textContent = typeof tokens?.estimated_cost_usd === "number" ? `$${tokens.estimated_cost_usd.toFixed(3)}` : "—";
+  $("ws-cost").textContent = costText(tokens?.estimated_cost_usd, tokens?.cost_complete, tokens?.unpriced);
   $("ws-parallel").textContent = ok && data.max_parallel != null ? number(data.max_parallel) : "—";
   $("ws-plan").textContent = ok ? (data.plan_status ? cap(data.plan_status.toLowerCase()) : "record only") : "—";
   $("ws-wave-count").textContent = ok && data.waves.length ? `${data.waves.length} ${data.waves.length === 1 ? "wave" : "waves"}` : "waves unknown";
@@ -465,8 +468,9 @@ function renderWorkspaceOverview(data) {
   if (budget) {
     const parts = [];
     if (budget.max_tokens) parts.push(`${short(budget.spent_tokens)} / ${short(budget.max_tokens)} tokens`);
-    if (budget.max_cost_usd) parts.push(`$${budget.spent_cost_usd.toFixed(2)} / $${budget.max_cost_usd.toFixed(2)} reported`);
-    $("ws-budget").textContent = parts.join(" · ") + (budget.exhausted ? " · exhausted" : "");
+    if (budget.max_cost_usd) parts.push(`${budget.cost_complete === false ? "≥ " : ""}$${budget.spent_cost_usd.toFixed(2)} / $${budget.max_cost_usd.toFixed(2)} reported`);
+    if (budget.cost_complete === false && budget.unpriced?.length) parts.push(`cost excludes ${budget.unpriced.join(", ")}`);
+    $("ws-budget").textContent = parts.join(" · ") + (budget.exhausted ? " · exhausted" : "") + " · launch gate: running children can overshoot";
     if (budget.max_tokens) {
       $("ws-budget-bar").style.width = `${Math.min(100, 100 * budget.spent_tokens / budget.max_tokens)}%`;
       $("ws-budget-meter").classList.toggle("over", budget.exhausted);
@@ -777,7 +781,7 @@ function showPreview(action, result, onConfirm) {
   } else if (action === "schedule") {
     content.append(factList([["Will launch", p.dispatch?.join(", ") || "nothing"], ["Will resume", p.resume?.join(", ") || "nothing"],
       ["Interrupted", p.interrupted?.join(", ") || "none"], ["Parallel cap", p.cap], ["Allow mutation", p.allow_mutation ? "yes" : "no"],
-      ["Budget", p.budget ? `${short(p.budget.spent_tokens)} of ${p.budget.max_tokens ? short(p.budget.max_tokens) : "—"} tokens${p.budget.exhausted ? " · exhausted: nothing new will launch" : ""}` : "none set"]]));
+      ["Budget", p.budget ? `${short(p.budget.spent_tokens)} of ${p.budget.max_tokens ? short(p.budget.max_tokens) : "—"} tokens${p.budget.cost_complete === false ? ` · cost excludes ${(p.budget.unpriced || []).join(", ")}` : ""}${p.budget.exhausted ? " · exhausted: nothing new will launch" : ""}` : "none set"]]));
     content.append(el("pre", "action-pre", Object.entries(p.mutating_permissions || {}).map(([repo, perms]) => `${repo}: ${perms.length ? perms.join(", ") : "no mutating permissions"}`).join("\n")));
   } else if (action === "set_permission") {
     content.append(factList([["Repository", p.repository], ["Permission", p.permission?.replaceAll("_", " ")], ["New value", p.value ? "allowed" : "denied"], ["File", p.creates_file ? "created from the template" : "edited in place"]]));
