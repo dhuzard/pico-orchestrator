@@ -1,0 +1,89 @@
+{
+  "runs": {
+    "lib-slugify": {
+      "facts": [
+        {
+          "category": "phase",
+          "key": [
+            "lib-slugify"
+          ],
+          "value": {
+            "blocker_code": null,
+            "escalations": 0,
+            "in_wave": false,
+            "route": "CLAUDE_CODEX",
+            "status": "abandoned"
+          }
+        },
+        {
+          "category": "worker",
+          "key": [
+            "lib-slugify",
+            "claude_worker",
+            "0"
+          ],
+          "value": {
+            "backend": "claude-code",
+            "backend_model": "claude-sonnet-5-5",
+            "blocker_code": null,
+            "model": "claude-sonnet-5-5",
+            "status": "abandoned"
+          }
+        },
+        {
+          "category": "finish",
+          "key": [
+            "reconciled",
+            "phase",
+            "lib-slugify",
+            "None",
+            "None"
+          ],
+          "value": {
+            "from_status": "in_progress",
+            "to": "abandoned"
+          }
+        },
+        {
+          "category": "finish",
+          "key": [
+            "reconciled",
+            "worker",
+            "lib-slugify",
+            "claude_worker",
+            "0"
+          ],
+          "value": {
+            "from_status": "in_progress",
+            "to": "abandoned"
+          }
+        },
+        {
+          "category": "finish",
+          "key": [
+            "run"
+          ],
+          "value": {
+            "blocker_code": "EXECUTION_TIME_LIMIT",
+            "final_status": "BLOCKED",
+            "outcome": "blocked"
+          }
+        }
+      ],
+      "lead_calls": 0,
+      "lead_limit": null,
+      "open_items": [],
+      "spend_tokens": 0
+    }
+  },
+  "scenario": "time-limit",
+  "workspace": {
+    "lib-slugify": {
+      "execution_status": "cancelled",
+      "launches": 1,
+      "run_blocker_code": "EXECUTION_TIME_LIMIT",
+      "run_status": "BLOCKED",
+      "state": "cancelled"
+    }
+  }
+}

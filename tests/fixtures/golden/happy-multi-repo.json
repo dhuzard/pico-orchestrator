@@ -1,0 +1,275 @@
+{
+  "runs": {
+    "app-post-url": {
+      "facts": [
+        {
+          "category": "phase",
+          "key": [
+            "app-post-url"
+          ],
+          "value": {
+            "blocker_code": null,
+            "escalations": 0,
+            "in_wave": true,
+            "route": "CLAUDE_CODEX",
+            "status": "completed"
+          }
+        },
+        {
+          "category": "worker",
+          "key": [
+            "app-post-url",
+            "claude_worker",
+            "0"
+          ],
+          "value": {
+            "backend": "claude-code",
+            "backend_model": "claude-sonnet-5-5",
+            "blocker_code": null,
+            "model": "claude-sonnet-5-5",
+            "status": "completed"
+          }
+        },
+        {
+          "category": "worker",
+          "key": [
+            "app-post-url",
+            "codex_reviewer",
+            "0"
+          ],
+          "value": {
+            "backend": "codex",
+            "backend_model": "gpt-6.1-sol",
+            "blocker_code": null,
+            "model": "gpt-6.1-sol",
+            "status": "completed"
+          }
+        },
+        {
+          "category": "wave",
+          "key": [
+            "app-post-url",
+            "0"
+          ],
+          "value": {
+            "task_ids": [
+              "app-post-url"
+            ]
+          }
+        },
+        {
+          "category": "integrate",
+          "key": [
+            "app-post-url",
+            "0",
+            "begin"
+          ],
+          "value": {}
+        },
+        {
+          "category": "integrate",
+          "key": [
+            "app-post-url",
+            "0",
+            "end"
+          ],
+          "value": {}
+        },
+        {
+          "category": "bind",
+          "key": [
+            "app-post-url",
+            "claude_worker"
+          ],
+          "value": {}
+        },
+        {
+          "category": "finish",
+          "key": [
+            "run"
+          ],
+          "value": {
+            "blocker_code": null,
+            "final_status": "COMPLETED",
+            "outcome": "completed"
+          }
+        }
+      ],
+      "lead_calls": 0,
+      "lead_limit": null,
+      "open_items": [],
+      "spend_tokens": 900
+    },
+    "lib-slugify": {
+      "facts": [
+        {
+          "category": "phase",
+          "key": [
+            "lib-slugify"
+          ],
+          "value": {
+            "blocker_code": null,
+            "escalations": 0,
+            "in_wave": true,
+            "route": "CLAUDE_CODEX",
+            "status": "completed"
+          }
+        },
+        {
+          "category": "worker",
+          "key": [
+            "lib-slugify",
+            "claude_worker",
+            "0"
+          ],
+          "value": {
+            "backend": "claude-code",
+            "backend_model": "claude-sonnet-5-5",
+            "blocker_code": null,
+            "model": "claude-sonnet-5-5",
+            "status": "completed"
+          }
+        },
+        {
+          "category": "worker",
+          "key": [
+            "lib-slugify",
+            "codex_reviewer",
+            "0"
+          ],
+          "value": {
+            "backend": "codex",
+            "backend_model": "gpt-6.1-sol",
+            "blocker_code": null,
+            "model": "gpt-6.1-sol",
+            "status": "completed"
+          }
+        },
+        {
+          "category": "wave",
+          "key": [
+            "lib-slugify",
+            "0"
+          ],
+          "value": {
+            "task_ids": [
+              "lib-slugify"
+            ]
+          }
+        },
+        {
+          "category": "integrate",
+          "key": [
+            "lib-slugify",
+            "0",
+            "begin"
+          ],
+          "value": {}
+        },
+        {
+          "category": "integrate",
+          "key": [
+            "lib-slugify",
+            "0",
+            "end"
+          ],
+          "value": {}
+        },
+        {
+          "category": "bind",
+          "key": [
+            "lib-slugify",
+            "claude_worker"
+          ],
+          "value": {}
+        },
+        {
+          "category": "finish",
+          "key": [
+            "run"
+          ],
+          "value": {
+            "blocker_code": null,
+            "final_status": "COMPLETED",
+            "outcome": "completed"
+          }
+        }
+      ],
+      "lead_calls": 0,
+      "lead_limit": null,
+      "open_items": [],
+      "spend_tokens": 1200
+    },
+    "lib-stopwords": {
+      "facts": [
+        {
+          "category": "phase",
+          "key": [
+            "lib-stopwords"
+          ],
+          "value": {
+            "blocker_code": "APPROVED_INPUTS_UNAVAILABLE",
+            "escalations": 0,
+            "in_wave": false,
+            "route": "CLAUDE_CODEX",
+            "status": "blocked"
+          }
+        },
+        {
+          "category": "worker",
+          "key": [
+            "lib-stopwords",
+            "claude_worker",
+            "0"
+          ],
+          "value": {
+            "backend": "claude-code",
+            "backend_model": "claude-sonnet-5-5",
+            "blocker_code": "APPROVED_INPUTS_UNAVAILABLE",
+            "model": "claude-sonnet-5-5",
+            "status": "blocked"
+          }
+        },
+        {
+          "category": "finish",
+          "key": [
+            "run"
+          ],
+          "value": {
+            "blocker_code": "APPROVED_INPUTS_UNAVAILABLE",
+            "final_status": "PARTIAL",
+            "outcome": "partial"
+          }
+        }
+      ],
+      "lead_calls": 0,
+      "lead_limit": null,
+      "open_items": [],
+      "spend_tokens": 0
+    }
+  },
+  "scenario": "happy-multi-repo",
+  "workspace": {
+    "app-post-url": {
+      "execution_status": "exited",
+      "launches": 1,
+      "run_blocker_code": null,
+      "run_status": "COMPLETED",
+      "state": "ready_for_downstream"
+    },
+    "lib-slugify": {
+      "execution_status": "exited",
+      "launches": 1,
+      "run_blocker_code": null,
+      "run_status": "COMPLETED",
+      "state": "ready_for_downstream"
+    },
+    "lib-stopwords": {
+      "execution_status": "exited",
+      "launches": 1,
+      "run_blocker_code": "APPROVED_INPUTS_UNAVAILABLE",
+      "run_status": "PARTIAL",
+      "state": "partial"
+    }
+  }
+}

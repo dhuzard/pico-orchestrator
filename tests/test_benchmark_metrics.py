@@ -315,6 +315,19 @@ class ProvenanceDiff(unittest.TestCase):
             phase["workers"].reverse()
         self.assertEqual(bm.provenance_diff(before, after), [])
 
+    def test_diff_facts_compares_multiplicities(self):
+        fact = {"category": "bind", "key": ["t1", "s"], "value": {}}
+        other = {"category": "bind", "key": ["t1", "s"], "value": {"x": 1}}
+        self.assertEqual(bm.diff_facts([fact], [fact]), [])
+        self.assertEqual(bm.diff_facts([fact, fact], [fact, fact]), [])
+        # A duplicated same-key fact is caught from the side that has fewer copies, and a lost copy likewise.
+        for before, after in (([fact, fact], [fact]), ([fact, fact], [fact, other])):
+            [entry] = bm.diff_facts(before, after)
+            self.assertEqual((entry["reason"], entry["expected"], entry["found"]), ("count", 2, 1))
+        self.assertEqual(bm.diff_facts([fact], [fact, fact]), [], "extra facts in AFTER are still not reported")
+        self.assertEqual([m["reason"] for m in bm.diff_facts([fact], [other])], ["differs"])
+        self.assertEqual([m["reason"] for m in bm.diff_facts([fact], [])], ["absent"])
+
     def test_detects_missing_worker(self):
         before, after = make_record("run-a"), make_record("run-b")
         after["parent_orchestration"]["phases"][1]["workers"] = []

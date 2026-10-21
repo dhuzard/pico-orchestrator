@@ -117,6 +117,22 @@ All notable changes to PICO are recorded here. The format follows
 
 ### Added
 
+- The synthetic pilot as the main regression benchmark (issue #49), in two separate parts.
+  `tests/test_synthetic_pilot.py` is a deterministic integration suite that runs in CI on every
+  pull request, with no model, network or tokens: the synthetic workspace goes through the real
+  scheduler, launcher, run lease, recorder, contract gates (a fake GitHub and bare repositories) and
+  `benchmark_metrics`, with a scripted fake lead (`tests/scenario_lead.py`) in place of the model.
+  Eight scenarios cover a concurrent wave over two repositories with publish, green CI and promotion,
+  the dependency gate, PARTIAL reconciliation with `PREREQUISITE_UNCHANGED`, in-flight budget holding
+  and the direct-launch gate, a SIGKILLed child resumed under the lease (and a drifted checkout
+  refused), `EXECUTION_TIME_LIMIT`, the lead-call limit's resumable stop and `REPEATED_INEFFECTIVE_ACTION`.
+  Each compares its provenance with a golden record in `tests/fixtures/golden/`
+  (`PICO_UPDATE_GOLDEN=1` regenerates it deliberately and is refused when `CI` is set). The
+  real-agent benchmark stays separate and explicit: `benchmarks/synthetic-workspace/run-real.sh REV
+  LABEL` refuses to run unless `PICO_REAL_BENCHMARK=1`, runs setup, launch, validate and metrics on a
+  pinned revision and writes a JSON report; CI never sets that variable. CI runs the suite as its own
+  step. Not covered by the deterministic suite: what a model actually records, the TypeScript
+  extension's enforcement, real GitHub, and the merging of integrated waves.
 - Detection of repeated ineffective actions (issue #48). A failed worker step is recorded as
   a structured failure signature in `parent_orchestration.failure_signatures`: (task, step,
   route epoch, route, failure code, checkout HEAD, a digest of the declared inputs). The code

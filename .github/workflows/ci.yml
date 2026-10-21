@@ -34,7 +34,13 @@ jobs:
       - run: npm run check
       # Policy/schema/prompt/README consistency gate documented in AGENTS.md.
       - run: python tools/validate_routing.py
-      - run: python -m pytest -q
+      # Deterministic synthetic pilot (issue #49): the real scheduler, launcher, lease, recorder and gates
+      # with scripted fake backends and a fake GitHub. No model, no network, no tokens. Its own step so a
+      # regression in orchestration shows up under its own name; the full run below skips these two files
+      # instead of running them twice. The real-agent benchmark (benchmarks/synthetic-workspace/run_real.py)
+      # is started by hand, needs PICO_REAL_BENCHMARK=1, and is never run or enabled here.
+      - run: python -m pytest -q tests/test_synthetic_pilot.py tests/test_real_benchmark_entry.py
+      - run: python -m pytest -q --ignore=tests/test_synthetic_pilot.py --ignore=tests/test_real_benchmark_entry.py
 
   lint:
     runs-on: ubuntu-latest
