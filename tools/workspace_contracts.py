@@ -18,7 +18,7 @@ across repositories once every dependency is validated, each repository at its
 dependency's validated commit (or its pin).
 
 Each PR body references the task's issue with `Refs #N`, or `Closes #N` when the
-task sets `closes_issue: true` (or omits it and the base branch's committed .pi/autonomy.yaml
+task sets `closes_issue: true` (or omits it and .pi/autonomy.yaml at the remote base commit
 sets `issue_reference: closes`); `closes_issue: false` always writes `Refs #N`.
 
 Publication goes through github_integration.publish unchanged: .pi/autonomy.yaml
@@ -187,8 +187,10 @@ def closes_issue(task: dict, repo: dict) -> bool:
     """Whether the task's PR closes its issue on merge.
 
     An explicit `closes_issue` on the task wins; without one, the task follows
-    its repository's `issue_reference` policy (default `refs`) as committed on
-    the base branch, the same value the publication gate trusts.
+    its repository's `issue_reference` policy (default `refs`) at the base
+    commit the verified remote reports, the same value the publication gate
+    trusts. When that commit has not been fetched the body falls back to the
+    safe `Refs #N`, which the gate always accepts.
     """
     if isinstance(task.get("closes_issue"), bool):
         return task["closes_issue"]
@@ -196,8 +198,11 @@ def closes_issue(task: dict, repo: dict) -> bool:
     if checkout is None:
         return False
     try:
-        reference, _ = github_integration.committed_issue_reference(checkout, repo.get("base_branch", "main"))
+        reference, _, _ = github_integration.verified_issue_reference(checkout, repo["repository"],
+                                                                      repo.get("base_branch", "main"))
     except github_integration.IntegrationError as exc:
+        if exc.code == "PUBLICATION_BASE_NOT_FETCHED":
+            return False
         raise WorkspaceRunError(exc.code, exc.detail) from exc
     return reference == "closes"
 

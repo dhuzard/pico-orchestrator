@@ -297,35 +297,48 @@ class ContractLifecycleTest(unittest.TestCase):
         self.work("alpha", "pico/a1", "claims.json")
         self.assertEqual(wc.validate(manifest=manifest, task_id="a1", head="pico/a1")["status"], "VALIDATED")
         self.allow_publication("alpha")
-        body, preview = body_after_dry_run(manifest)
-        self.assertTrue(body.startswith("Refs #7\n"), body)
-        self.assertEqual(preview["plan"]["issue_reference"], "refs")
-
-        # The per-task opt-in writes Closes and authorizes it at the gate, though the repository says refs.
-        body, preview = body_after_dry_run(self.manifest(a1={"closes_issue": True}))
-        self.assertTrue(body.startswith("Closes #7\n"), body)
-        self.assertEqual(preview["plan"]["issue_reference"], "closes")
-        applied = self.publish(self.manifest(a1={"closes_issue": True}), "a1")
-        self.assertEqual(applied["status"], "COMPLETED", applied)
-        self.assertTrue(self.fake.created[0]["body"].startswith("Closes #7\n"))
-
-        # The task's own issue is the only one the opt-in may close.
-        stray = wc.publish(manifest=self.manifest(a1={"closes_issue": True, "title": "Claim adapter, fixes #8"}),
-                           task_id="a1", adapter=self.fake)
-        self.assertEqual((stray["status"], stray["blocker_code"]), ("BLOCKED", "PUBLICATION_BODY_INVALID"))
-
-        # Without a task setting, the repository's issue_reference decides, as committed on the base
-        # branch: an uncommitted edit changes nothing. closes_issue: false keeps Refs.
         path = self.repos["alpha"][0]
         policy = path / ".pi/autonomy.yaml"
-        policy.write_text(policy.read_text().replace("issue_reference: refs", "issue_reference: closes"))
-        self.assertTrue(body_after_dry_run(self.manifest())[0].startswith("Refs #7\n"))
+        git("-C", str(path), "push", "-q", "origin", "main")  # the remote base the gate verifies
+
+        with self.subTest("default writes Refs"):
+            body, preview = body_after_dry_run(manifest)
+            self.assertTrue(body.startswith("Refs #7\n"), body)
+            self.assertEqual(preview["plan"]["issue_reference"], "refs")
+
+        with self.subTest("closes_issue: true writes Closes, though the repository says refs"):
+            body, preview = body_after_dry_run(self.manifest(a1={"closes_issue": True}))
+            self.assertTrue(body.startswith("Closes #7\n"), body)
+            self.assertEqual(preview["plan"]["issue_reference"], "closes")
+
+        with self.subTest("the opt-in may close only the task's own issue"):
+            stray = wc.publish(manifest=self.manifest(a1={"closes_issue": True, "title": "Claim adapter, fixes #8"}),
+                               task_id="a1", adapter=self.fake)
+            self.assertEqual((stray["status"], stray["blocker_code"]), ("BLOCKED", "PUBLICATION_BODY_INVALID"))
+
+        with self.subTest("an uncommitted repository policy changes nothing"):
+            policy.write_text(policy.read_text().replace("issue_reference: refs", "issue_reference: closes"))
+            self.assertTrue(body_after_dry_run(self.manifest())[0].startswith("Refs #7\n"))
+
         git("-C", str(path), "add", ".pi/autonomy.yaml")
         git("-C", str(path), *COMMIT, "close issues on merge")
-        body, preview = body_after_dry_run(self.manifest())
-        self.assertTrue(body.startswith("Closes #7\n"), body)
-        self.assertEqual(preview["plan"]["closes_issues"], [7])
-        self.assertTrue(body_after_dry_run(self.manifest(a1={"closes_issue": False}))[0].startswith("Refs #7\n"))
+        with self.subTest("a policy committed locally but not on the remote base changes nothing"):
+            self.assertTrue(body_after_dry_run(self.manifest())[0].startswith("Refs #7\n"))
+
+        git("-C", str(path), "push", "-q", "origin", "main")
+        with self.subTest("the remote base's committed policy decides when the task is silent"):
+            body, preview = body_after_dry_run(self.manifest())
+            self.assertTrue(body.startswith("Closes #7\n"), body)
+            self.assertEqual(preview["plan"]["closes_issues"], [7])
+            self.assertEqual(preview["plan"]["base_commit"], git("-C", str(path), "rev-parse", "main"))
+
+        with self.subTest("closes_issue: false keeps Refs"):
+            self.assertTrue(body_after_dry_run(self.manifest(a1={"closes_issue": False}))[0].startswith("Refs #7\n"))
+
+        with self.subTest("an applied opt-in publishes Closes"):
+            applied = self.publish(self.manifest(a1={"closes_issue": True}), "a1")
+            self.assertEqual(applied["status"], "COMPLETED", applied)
+            self.assertTrue(self.fake.created[0]["body"].startswith("Closes #7\n"))
 
     def test_downstream_publication_requires_upstream_pr(self):
         # The manifest may declare a1 ready by hand; b1's PR must still link a real upstream PR.

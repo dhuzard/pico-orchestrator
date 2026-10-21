@@ -170,103 +170,6 @@ class IntegrationTest(unittest.TestCase):
         self.assertEqual(stale["mutations_applied"], 0)
         must_not_create.assert_not_called()
 
-    def test_publication_gate_accepts_closes_only_when_authorized(self):
-        self.remote("https://github.com/Examplecorp/examplelab.git")
-        template = (ROOT / "templates/autonomy.yaml").read_text().replace(
-            "push_branch: false", "push_branch: true").replace("create_pr: false", "create_pr: true")
-        self.assertIn("issue_reference: refs", template)
-        closes_policy = template.replace("issue_reference: refs", "issue_reference: closes")
-        wt = str(self.worktree)
-        (self.worktree / ".pi").mkdir()
-        policy = self.worktree / ".pi/autonomy.yaml"
-        body = Path(self.tmp.name) / "pr-body.md"
-        state = {"remote": "origin", "commit": "a" * 40, "remote_commit": None, "existing_pr": None}
-
-        def git(*args):
-            subprocess.run(["git", "-C", wt, "-c", "user.name=t", "-c", "user.email=t@example.com", *args],
-                           check=True, capture_output=True)
-
-        def commit(text, message):
-            policy.write_text(text)
-            git("add", ".pi/autonomy.yaml")
-            git("commit", "-q", "-m", message)
-
-        def dry_run(text, **kwargs):
-            body.write_text(text, encoding="utf-8")
-            with patch.object(gi, "_publication_state", return_value=state), \
-                 patch.object(gi, "_branch", side_effect=lambda _worktree, name, **_kwargs: name):
-                return gi.publish(worktree=self.worktree, base="main", head="pico/batch-1", title="Reviewed batch",
-                                  body_file=body, adapter=self.fake, provenance_root=self.records, **kwargs)
-
-        def refused(text, code="PUBLICATION_BODY_INVALID", **kwargs):
-            result = dry_run(text, **kwargs)
-            self.assertEqual((result["status"], result["blocker_code"]), ("BLOCKED", code), text)
-
-        git("symbolic-ref", "HEAD", "refs/heads/main")
-        commit(template, "refs policy")
-        # Default policy (refs): Refs passes, any closing keyword is refused, wherever and however written.
-        refs = dry_run("Summary\n\nRefs #401\n")
-        self.assertEqual((refs["status"], refs["plan"]["issue_reference"]), ("DRY_RUN", "refs"))
-        self.assertRegex(refs["plan"]["issue_policy_blob"], r"^[0-9a-f]{40,64}$")
-        for text in ("Summary\n\nCloses #401\n", "Refs #401\nAlso fixes: Examplecorp/examplelab#464\n",
-                     "Resolved #401\n", "Refs #401\nCloses https://github.com/o/r/issues/2\n",
-                     "Refs #401\nFixes:#2\n", "Refs #401\nfixes #2\n", "Refs #401\n`Fixes #2`\n"):
-            refused(text)
-        self.assertEqual(dry_run("Refs #401\nDisclosed #464, prefix#3, see #5\n")["status"], "DRY_RUN")
-
-        # A caller opt-in authorizes closing exactly its own issue, in this repository.
-        opted = dry_run("Summary\n\nCloses #401\n", closes_issue=401)
-        self.assertEqual((opted["status"], opted["plan"]["issue_reference"], opted["plan"]["closes_issues"]),
-                         ("DRY_RUN", "closes", [401]))
-        refused("Summary only\n", closes_issue=401)
-        refused("Closes #402\n", closes_issue=401)
-        refused("Closes #401\nFixes #402\n", closes_issue=401)
-        refused("Closes #401\nFixes other/repo#401\n", closes_issue=401)
-
-        # An uncommitted edit cannot grant closing: the gate reads the base branch's committed policy.
-        policy.write_text(closes_policy)
-        refused("Closes #401\n")
-        git("checkout", "-q", "--", ".pi/autonomy.yaml")
-        # Nor can a policy committed on the pico/ branch itself.
-        git("checkout", "-q", "-b", "pico/batch-1")
-        commit(closes_policy, "worker grants itself closing")
-        refused("Closes #401\n")
-        git("checkout", "-q", "main")
-        git("merge", "-q", "--ff-only", "pico/batch-1")
-
-        # Committed issue_reference: closes on the base branch authorizes each declared Closes #N.
-        closes = dry_run("Summary\n\nCloses #401\n")
-        self.assertEqual((closes["status"], closes["plan"]["issue_reference"]), ("DRY_RUN", "closes"))
-        self.assertNotEqual(closes["plan"]["issue_policy_blob"], refs["plan"]["issue_policy_blob"])
-        self.assertNotEqual(closes["plan_hash"], refs["plan_hash"])
-        batch = dry_run("Closes #401\nCloses #402\n")
-        self.assertEqual((batch["status"], batch["plan"]["closes_issues"]), ("DRY_RUN", [401, 402]))
-        self.assertEqual(dry_run("Summary\n\nRefs #401\n")["plan"]["issue_reference"], "refs")
-        refused("Closes #401\nFixes other/repo#99\nResolves #500\n")
-        refused("Closes #401\nResolves #500\n")
-        refused("Closes #401\nFixes other/repo#401\n")
-        refused("Closes #401\nCloses https://github.com/o/r/issues/401\n")
-        self.assertEqual(dry_run("Closes #401\nFixes https://github.com/Examplecorp/examplelab/issues/401\n")["status"],
-                         "DRY_RUN")
-
-        # A modified or symlinked working copy of the policy is refused before the committed policy is trusted.
-        policy.write_text(closes_policy + "\n# local edit\n")
-        refused("Closes #401\n", "AUTONOMY_POLICY_PATH_UNSAFE")
-        self.assertEqual(dry_run("Refs #401\n")["status"], "DRY_RUN")
-        git("checkout", "-q", "--", ".pi/autonomy.yaml")
-        outside = Path(self.tmp.name) / "outside"
-        outside.mkdir()
-        (outside / "autonomy.yaml").write_text(closes_policy)
-        shutil.rmtree(self.worktree / ".pi")
-        (self.worktree / ".pi").symlink_to(outside, target_is_directory=True)
-        refused("Closes #401\n", "AUTONOMY_POLICY_PATH_UNSAFE")
-        (self.worktree / ".pi").unlink()
-        git("checkout", "-q", "--", ".pi")
-
-        # An invalid committed value fails closed.
-        commit(template.replace("issue_reference: refs", "issue_reference: fixes"), "invalid")
-        refused("Summary\n\nRefs #401\n", "AUTONOMY_POLICY_INVALID")
-
     def test_https_ssh_and_explicit_resolution(self):
         self.remote("https://github.com/Examplecorp/examplelab.git")
         self.assertEqual(gi.resolve_target(self.worktree), "Examplecorp/examplelab")
@@ -554,6 +457,200 @@ class IntegrationTest(unittest.TestCase):
                      "label": token, "rationale": "group"}])
         result = self.run_batch(apply=True)
         self.assertNotIn(token, json.dumps(provenance.get_run(self.records, result["run_id"])))
+
+
+class NoPrs:
+    def list_prs(self, *, base, head, repo):
+        return []
+
+
+class IssueClosingGateTest(unittest.TestCase):
+    """The publication gate's issue-closing rules; each bypass is its own test or subTest."""
+
+    REPO = "Examplecorp/examplelab"
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.base = Path(self._tmp.name)
+        self.worktree = self.base / "external"
+        self.bare = self.base / "remote.git"
+        self.records = self.base / "orchestrator"
+        (self.records / "schemas").mkdir(parents=True)
+        shutil.copy(ROOT / "schemas/run-record.schema.json", self.records / "schemas/run-record.schema.json")
+        real_run = subprocess.run
+
+        def redirect(argv, *args, **kwargs):
+            # The GitHub remote is served by a local bare repository.
+            if isinstance(argv, list) and argv[:1] == ["git"] and len(argv) > 3 and argv[3] in {"ls-remote", "push"}:
+                argv = [str(self.bare) if a == "origin" else a for a in argv]
+            return real_run(argv, *args, **kwargs)
+        patcher = patch.object(gi.subprocess, "run", side_effect=redirect)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.template = (ROOT / "templates/autonomy.yaml").read_text().replace(
+            "push_branch: false", "push_branch: true").replace("create_pr: false", "create_pr: true")
+        self.closes_policy = self.template.replace("issue_reference: refs", "issue_reference: closes")
+        self.git("init", "-q", "--bare", str(self.bare), cwd=False)
+        self.git("init", "-q", "-b", "main", str(self.worktree), cwd=False)
+        self.git("remote", "add", "origin", f"https://github.com/{self.REPO}.git")
+        (self.worktree / ".pi").mkdir()
+        self.policy = self.worktree / ".pi/autonomy.yaml"
+        self.commit(self.template, "refs policy")
+        self.git("push", "-q", "origin", "main")
+        self.git("branch", "pico/batch-1")
+        self.body = self.base / "pr-body.md"
+
+    def git(self, *args, cwd=True):
+        prefix = ["git", "-c", "user.name=t", "-c", "user.email=t@example.com"]
+        if cwd:
+            prefix += ["-C", str(self.worktree)]
+        if args[:1] == ("push",):
+            args = tuple(str(self.bare) if a == "origin" else a for a in args)
+        return subprocess.run(prefix + list(args), check=True, capture_output=True, text=True).stdout.strip()
+
+    def commit(self, text, message):
+        self.policy.write_text(text)
+        self.git("add", ".pi/autonomy.yaml")
+        self.git("commit", "-q", "-m", message)
+
+    def publish_closes_policy(self):
+        """Commit issue_reference: closes on main and push it, as a maintainer would."""
+        self.commit(self.closes_policy, "close issues on merge")
+        self.git("push", "-q", "origin", "main")
+
+    def dry_run(self, text, **kwargs):
+        self.body.write_text(text, encoding="utf-8")
+        return gi.publish(worktree=self.worktree, base="main", head="pico/batch-1", title="Reviewed batch",
+                          body_file=self.body, adapter=NoPrs(), provenance_root=self.records, **kwargs)
+
+    def assertRefused(self, text, code="PUBLICATION_BODY_INVALID", **kwargs):
+        result = self.dry_run(text, **kwargs)
+        self.assertEqual((result["status"], result["blocker_code"]), ("BLOCKED", code), text)
+
+    def test_default_policy_accepts_refs_and_records_the_remote_base(self):
+        refs = self.dry_run("Summary\n\nRefs #401\n")
+        self.assertEqual((refs["status"], refs["plan"]["issue_reference"]), ("DRY_RUN", "refs"))
+        self.assertEqual(refs["plan"]["base_commit"], self.git("rev-parse", "main"))
+        self.assertIsNone(refs["plan"]["issue_policy_blob"])  # nothing to close, so the policy is not consulted
+
+    def test_default_policy_refuses_every_closing_form(self):
+        for text in ("Summary\n\nCloses #401\n", "Refs #401\nAlso fixes: Examplecorp/examplelab#464\n",
+                     "Resolved #401\n", "Refs #401\nCloses https://github.com/o/r/issues/2\n",
+                     "Refs #401\nFixes:#2\n", "Refs #401\nfixes #2\n", "Refs #401\n`Fixes #2`\n",
+                     "Refs #401\nCLOSE #2\n"):
+            with self.subTest(text=text):
+                self.assertRefused(text)
+
+    def test_non_closing_text_is_not_a_false_positive(self):
+        self.assertEqual(self.dry_run("Refs #401\nDisclosed #464, prefix#3, see #5\n")["status"], "DRY_RUN")
+
+    def test_caller_opt_in_closes_only_its_own_issue(self):
+        opted = self.dry_run("Summary\n\nCloses #401\n", closes_issue=401)
+        self.assertEqual((opted["status"], opted["plan"]["issue_reference"], opted["plan"]["closes_issues"]),
+                         ("DRY_RUN", "closes", [401]))
+        for text in ("Summary only\n", "Closes #402\n", "Closes #401\nFixes #402\n",
+                     "Closes #401\nFixes other/repo#401\n", "Closes #401\nCloses https://github.com/o/r/issues/401\n"):
+            with self.subTest(text=text):
+                self.assertRefused(text, closes_issue=401)
+
+    def test_committed_closes_policy_accepts_declared_closes_lines(self):
+        refs = self.dry_run("Refs #401\n")
+        self.publish_closes_policy()
+        closes = self.dry_run("Summary\n\nCloses #401\n")
+        self.assertEqual((closes["status"], closes["plan"]["issue_reference"]), ("DRY_RUN", "closes"))
+        self.assertEqual(closes["plan"]["base_commit"], self.git("rev-parse", "main"))
+        self.assertEqual(closes["plan"]["issue_policy_blob"], self.git("rev-parse", "main:.pi/autonomy.yaml"))
+        self.assertNotEqual(closes["plan_hash"], refs["plan_hash"])
+        batch = self.dry_run("Closes #401\nCloses #402\n")
+        self.assertEqual((batch["status"], batch["plan"]["closes_issues"]), ("DRY_RUN", [401, 402]))
+        same = self.dry_run("Closes #401\nFixes https://github.com/Examplecorp/examplelab/issues/401\n")
+        self.assertEqual(same["status"], "DRY_RUN")
+        self.assertEqual(self.dry_run("Summary\n\nRefs #401\n")["plan"]["issue_reference"], "refs")
+
+    def test_committed_closes_policy_refuses_undeclared_and_cross_repository_targets(self):
+        self.publish_closes_policy()
+        for text in ("Closes #401\nFixes other/repo#99\nResolves #500\n", "Closes #401\nResolves #500\n",
+                     "Closes #401\nFixes other/repo#401\n", "Closes #401\nCloses https://github.com/o/r/issues/401\n"):
+            with self.subTest(text=text):
+                self.assertRefused(text)
+
+    def test_uncommitted_edit_cannot_grant_closing(self):
+        self.policy.write_text(self.closes_policy)
+        self.assertRefused("Closes #401\n")
+
+    def test_policy_committed_on_the_pico_branch_cannot_grant_closing(self):
+        self.git("checkout", "-q", "pico/batch-1")
+        self.commit(self.closes_policy, "worker grants itself closing")
+        self.assertRefused("Closes #401\n")
+
+    def test_forged_local_base_ref_cannot_grant_closing(self):
+        # From its pico/ worktree, a worker builds a commit with issue_reference: closes and points local
+        # refs at it; its checkout stays clean.
+        self.git("checkout", "-q", "pico/batch-1")
+        self.policy.write_text(self.closes_policy)
+        blob = self.git("hash-object", "-w", ".pi/autonomy.yaml")
+        self.git("checkout", "-q", "--", ".pi/autonomy.yaml")
+        pi_tree = subprocess.run(["git", "-C", str(self.worktree), "mktree"], input=f"100644 blob {blob}\tautonomy.yaml\n",
+                                 check=True, capture_output=True, text=True).stdout.strip()
+        root = subprocess.run(["git", "-C", str(self.worktree), "mktree"], input=f"040000 tree {pi_tree}\t.pi\n",
+                              check=True, capture_output=True, text=True).stdout.strip()
+        forged = self.git("commit-tree", root, "-p", "main", "-m", "forged")
+        for ref in ("refs/heads/main", "refs/remotes/origin/main"):
+            with self.subTest(ref=ref):
+                self.git("update-ref", ref, forged)
+                self.assertEqual(self.git("status", "--porcelain", "--", ".pi/autonomy.yaml"), "")
+                self.assertRefused("Closes #1\nCloses #77\n")
+
+    def test_git_replace_cannot_substitute_the_remote_policy(self):
+        self.policy.write_text(self.closes_policy)
+        self.git("add", ".pi/autonomy.yaml")
+        forged_tree = self.git("write-tree")
+        self.git("reset", "-q", "--", ".pi/autonomy.yaml")
+        self.git("checkout", "-q", "--", ".pi/autonomy.yaml")
+        real_tree = self.git("rev-parse", "main^{tree}")
+        self.git("replace", real_tree, forged_tree)
+        self.assertRefused("Closes #401\n")
+
+    def test_modified_policy_checkout_is_unsafe(self):
+        self.publish_closes_policy()
+        self.policy.write_text(self.closes_policy + "\n# local edit\n")
+        self.assertRefused("Closes #401\n", "AUTONOMY_POLICY_PATH_UNSAFE")
+        self.assertEqual(self.dry_run("Refs #401\n")["status"], "DRY_RUN")
+
+    def test_symlinked_pi_is_unsafe(self):
+        self.publish_closes_policy()
+        outside = self.base / "outside"
+        outside.mkdir()
+        (outside / "autonomy.yaml").write_text(self.closes_policy)
+        shutil.rmtree(self.worktree / ".pi")
+        (self.worktree / ".pi").symlink_to(outside, target_is_directory=True)
+        self.assertRefused("Closes #401\n", "AUTONOMY_POLICY_PATH_UNSAFE")
+
+    def test_unfetched_remote_base_fails_closed(self):
+        clone = self.base / "maintainer"
+        self.git("clone", "-q", "-b", "main", str(self.bare), str(clone), cwd=False)
+        (clone / ".pi/autonomy.yaml").write_text(self.closes_policy)
+        subprocess.run(["git", "-C", str(clone), "-c", "user.name=t", "-c", "user.email=t@example.com",
+                        "commit", "-q", "-am", "close issues on merge"], check=True)
+        subprocess.run(["git", "-C", str(clone), "push", "-q", "origin", "main"], check=True)
+        self.assertRefused("Closes #401\n", "PUBLICATION_BASE_NOT_FETCHED")
+        self.assertEqual(self.dry_run("Refs #401\n")["status"], "DRY_RUN")
+        self.git("fetch", "-q", str(self.bare), "main")
+        self.assertEqual(self.dry_run("Closes #401\n")["status"], "DRY_RUN")
+
+    def test_remote_without_the_base_branch_defaults_to_refs(self):
+        self.commit(self.closes_policy, "close issues locally")
+        self.git("push", "-q", "origin", ":main")
+        self.assertRefused("Closes #401\n")
+        result = self.dry_run("Refs #401\n")
+        self.assertEqual((result["status"], result["plan"]["base_commit"]), ("DRY_RUN", None))
+
+    def test_invalid_committed_value_fails_closed(self):
+        self.commit(self.template.replace("issue_reference: refs", "issue_reference: fixes"), "invalid")
+        self.git("push", "-q", "origin", "main")
+        self.policy.write_text(self.template)  # the working copy alone stays valid
+        self.assertRefused("Closes #401\n", "AUTONOMY_POLICY_INVALID")
 
 
 if __name__ == "__main__":
