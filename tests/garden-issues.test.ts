@@ -53,8 +53,9 @@ test("issue titles and labels are rendered as text, never as markup", () => {
   assert.equal(nodes.some((node) => ["IMG", "SCRIPT"].includes(node.tagName)), false);
   assert.ok(nodes.some((node) => node.className === "issue-title" && node.textContent === HOSTILE));
   assert.ok(nodes.some((node) => node.className === "issue-label" && node.textContent === HOSTILE));
-  // A non-GitHub URL is not turned into a link.
-  assert.equal(nodes.some((node) => node.href.startsWith("javascript:")), false);
+  // Only https://github.com/ URLs become links; anything else stays text.
+  assert.equal(nodes.some((node) => node.tagName === "A" && !node.href.startsWith("https://github.com/")), false);
+  assert.equal(nodes.filter((node) => node.tagName === "A").length, 1);
   const row = nodes.find((node) => node.className === "issue-row");
   assert.deepEqual(row?.dataset, { repository: "acme/app", issue: "7" });
   assert.ok(nodes.some((node) => node.tagName === "A" && node.href === "https://github.com/acme/app/pull/40"));
