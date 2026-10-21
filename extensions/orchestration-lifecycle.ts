@@ -37,6 +37,10 @@ const HARMLESS_REFUSALS = new Set(["PARENT_WORKER_RECODE_REPEATED", "PARENT_WORK
 const RESTATEMENT_REFUSALS = new Set(["PARENT_EVENT_CONFLICT", "PARENT_WORKER_TRANSITION_INVALID"]);
 const WORKER_TOOLS = new Set(["AskClaude", "ClaudeWorker", "spawn_subagent", "message_subagent"]);
 const CLAUDE_TOOLS = new Set(["AskClaude", "ClaudeWorker"]);
+function withoutAutomaticMarks(event: Json): Json {
+  const { only_if_open: _a, auto_recorded: _b, ...rest } = event;
+  return rest;
+}
 const MARKER = "PI_ORCHESTRATION_RUN_V1";
 const SESSION_ENTRY = "pi-orchestration-parent-v1";
 const MAX_OUTPUT = 256 * 1024;
@@ -1329,7 +1333,8 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
         : ["finish", runId, params.status, ...ownerArgs(),
            ...(params.blocker_code ? ["--blocker-code", params.blocker_code] : [])];
       const result = await command(PARENT, args,
-        params.action === "event" ? params.event as Json : undefined);
+        // `only_if_open` and `auto_recorded` mark the extension's own records: a lead payload never carries them.
+        params.action === "event" ? withoutAutomaticMarks(params.event as Json) : undefined);
       const observedRunId = runId;
       const unresolvedRoute = parentBlocked &&
         (parentFailure?.error_code === "PARENT_EVENT_CONFLICT" || parentFailure?.error_code === "PARENT_ESCALATION_INVALID"

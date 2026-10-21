@@ -2170,3 +2170,12 @@ test("work after an integration with its wave write refused still refuses COMPLE
     assert.deepEqual(refused.errors.map((error) => error[1]), ["PARENT_WAVE_NOT_INTEGRATED"]);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+test("a lead event never carries the extension's automatic marks to the recorder", async () => {
+  const h = harness({ ok: true, status: "READY" });
+  await h.handlers.get("before_agent_start")!({ prompt: "PI_ORCHESTRATION_RUN_V1" }, { cwd: "/tmp/target", ui: { notify() {} } });
+  await h.tools.get("orchestration_record").execute("w", { action: "event", event: {
+    kind: "worker", phase: "A", step_id: "codex_reviewer", status: "completed", only_if_open: true, auto_recorded: true } });
+  const forwarded = h.parentCalls("event").map((call) => call.input!).filter((input) => input.kind === "worker");
+  assert.deepEqual(forwarded, [{ kind: "worker", phase: "A", step_id: "codex_reviewer", status: "completed" }]);
+});
