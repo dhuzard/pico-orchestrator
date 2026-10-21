@@ -1033,6 +1033,14 @@ it and ask how to resolve it rather than choosing a side yourself.
 Publish integrated work per the target's `.pi/autonomy.yaml`. Pushing and
 opening PRs require `permissions.push_branch` and `permissions.create_pr`;
 without them, stop at the validated local batch branch and report it.
+Read the policy's `issue_reference` from `python3
+"$ORCH_ROOT/tools/autonomy_policy.py" limits --worktree <target>`: `refs`
+(the default) means PR bodies reference each issue with `Refs #N`, which never
+closes it; `closes` means `Closes #N`, so GitHub closes the issue when a human
+merges the PR. Even under `closes`, write `Refs #N` for an issue the PR only
+partly addresses. The publication gate refuses any closing keyword
+(`Closes`/`Fixes`/`Resolves #N`) unless the policy says `closes`
+(`PUBLICATION_BODY_INVALID`); never work around it.
 After integration, use the trusted adapter's publication mode: write the
 reviewed PR body to a local file, then call `python3
 "$ORCH_ROOT/tools/github_integration.py" --worktree <target> --publish
@@ -1048,7 +1056,8 @@ fails, report the partial result and review a fresh dry run before retrying.
 
 - `pr_granularity: batch` (the default): after `integrate_end`, push the
   wave's `pico/batch-<n>` branch once and open one PR for it whose body
-  references every included issue with `Refs #N`. `pr_granularity: task`
+  references every included issue (`Refs #N`, or `Closes #N` under
+  `issue_reference: closes`). `pr_granularity: task`
   opens one PR per task branch instead.
 - CI never blocks the next wave. After pushing, record the batch as
   `waiting_ci` (in the mission state when a mission drives the run) and
@@ -1069,9 +1078,10 @@ and the item is in `review` or `completed`, the lead orchestrator — not nested
 workers — links the adapter-created draft PR with `tools/backlog.py
 github-pr-link <id> <pr>` (link the other items of the same batch to that PR).
 For local-backlog work with a separately pushed head, `github-pr-create <id>
---base <base> --head <head> --draft` remains available. Generated PR
-bodies must use `Refs #N`, never a closing keyword; issue closure remains
-controlled only by backlog completion and `github-push`.
+--base <base> --head <head> --draft` remains available. Backlog-generated
+PR bodies always use `Refs #N`, never a closing keyword, whatever
+`issue_reference` says: a backlog item's issue closes only through backlog
+completion and `github-push`.
 
 Use a professional collaboration structure by default. For issues, state the
 problem/value, bounded scope, constraints/invariants, testable acceptance
@@ -1080,7 +1090,9 @@ those sections are applicable. For PRs, use the repository template when
 present and include: summary/issue linkage; important changes to files,
 contracts, schemas, APIs, or behavior; exact validation evidence; risk and
 rollback; review focus; deliberate non-scope/follow-up; and review findings
-fixed before opening. Use `Refs #N` unless auto-close is explicitly desired.
+fixed before opening. Reference issues as the policy's `issue_reference` says
+(`Refs #N` by default, `Closes #N` under `closes`), and use `Refs #N` for an
+issue the PR only partly addresses.
 
 GitHub comments are not mini-transcripts. Post them only when they communicate a
 decision-relevant status, blocker, review finding, requested action, or

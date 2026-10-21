@@ -16,6 +16,13 @@ All notable changes to PICO are recorded here. The format follows
 - A newcomer path at the top of the README: what PICO and Pi are, a diagram,
   prerequisites, a documentation index, and links to the contributing,
   security and conduct files.
+- `issue_reference: refs | closes` in `.pi/autonomy.yaml` (default `refs`)
+  and an optional `closes_issue` on workspace tasks, so a published PR can
+  say `Closes #N` and close its issue on merge. The publication gate accepts
+  `Closes #N` only when the policy or the task opts in, and now refuses any
+  unauthorized closing keyword anywhere in the body. PICO's own
+  `.pi/autonomy.yaml` sets `closes`, and the pull request template uses
+  `Closes #`.
 
 ### Security
 
