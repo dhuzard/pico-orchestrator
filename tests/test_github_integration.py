@@ -170,6 +170,46 @@ class IntegrationTest(unittest.TestCase):
         self.assertEqual(stale["mutations_applied"], 0)
         must_not_create.assert_not_called()
 
+    def test_publication_gate_accepts_closes_only_when_authorized(self):
+        self.remote("https://github.com/Examplecorp/examplelab.git")
+        template = (ROOT / "templates/autonomy.yaml").read_text().replace(
+            "push_branch: false", "push_branch: true").replace("create_pr: false", "create_pr: true")
+        self.assertIn("issue_reference: refs", template)
+        (self.worktree / ".pi").mkdir()
+        policy = self.worktree / ".pi/autonomy.yaml"
+        body = Path(self.tmp.name) / "pr-body.md"
+        state = {"remote": "origin", "commit": "a" * 40, "remote_commit": None, "existing_pr": None}
+
+        def dry_run(text, **kwargs):
+            body.write_text(text)
+            with patch.object(gi, "_publication_state", return_value=state), \
+                 patch.object(gi, "_branch", side_effect=lambda _worktree, name, **_kwargs: name):
+                return gi.publish(worktree=self.worktree, base="main", head="pico/batch-1", title="Reviewed batch",
+                                  body_file=body, adapter=self.fake, provenance_root=self.records, **kwargs)
+
+        # Default policy (refs): Refs passes, any closing keyword is refused, wherever it appears.
+        policy.write_text(template)
+        refs = dry_run("Summary\n\nRefs #401\n")
+        self.assertEqual((refs["status"], refs["plan"]["issue_reference"]), ("DRY_RUN", "refs"))
+        for text in ("Summary\n\nCloses #401\n", "Summary\n\nRefs #401\nAlso fixes: Examplecorp/examplelab#464\n",
+                     "Resolved #401\n"):
+            refused = dry_run(text)
+            self.assertEqual((refused["status"], refused["blocker_code"]), ("BLOCKED", "PUBLICATION_BODY_INVALID"), text)
+        self.assertEqual(dry_run("Refs #401\nDisclosed #464, prefixed fix#3\n")["status"], "DRY_RUN")
+        # An explicit caller opt-in authorizes Closes without changing the repository policy.
+        opted = dry_run("Summary\n\nCloses #401\n", allow_closes=True)
+        self.assertEqual((opted["status"], opted["plan"]["issue_reference"]), ("DRY_RUN", "closes"))
+        self.assertEqual(dry_run("Summary only\n", allow_closes=True)["blocker_code"], "PUBLICATION_BODY_INVALID")
+        # issue_reference: closes authorizes both forms; the plan hash covers the reference mode and body.
+        policy.write_text(template.replace("issue_reference: refs", "issue_reference: closes"))
+        closes = dry_run("Summary\n\nCloses #401\n")
+        self.assertEqual((closes["status"], closes["plan"]["issue_reference"]), ("DRY_RUN", "closes"))
+        self.assertEqual(dry_run("Summary\n\nRefs #401\n")["status"], "DRY_RUN")
+        self.assertNotEqual(closes["plan_hash"], refs["plan_hash"])
+        # An invalid value fails closed.
+        policy.write_text(template.replace("issue_reference: refs", "issue_reference: fixes"))
+        self.assertEqual(dry_run("Summary\n\nRefs #401\n")["blocker_code"], "AUTONOMY_POLICY_INVALID")
+
     def test_https_ssh_and_explicit_resolution(self):
         self.remote("https://github.com/Examplecorp/examplelab.git")
         self.assertEqual(gi.resolve_target(self.worktree), "Examplecorp/examplelab")

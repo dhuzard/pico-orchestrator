@@ -445,6 +445,41 @@ def _publication_authority(worktree: Path, grant: dict | None = None) -> dict:
     return {"source": "one_shot_grant", "granted_by": grant["granted_by"], "granted": missing}
 
 
+# GitHub closes an issue when a PR body uses one of these keywords before an
+# issue reference (`Closes #3`, `fixes: owner/repo#3`), anywhere in the body.
+_CLOSING_REFERENCE = re.compile(
+    r"(?i)\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b:?[ \t]+(?:[\w.-]+/[\w.-]+)?#[0-9]+")
+
+
+def _issue_reference(worktree: Path) -> str:
+    """The repository's `issue_reference` policy: `refs` (default) or `closes`."""
+    import autonomy_policy
+    try:
+        return autonomy_policy.limits(worktree)["issue_reference"]
+    except autonomy_policy.AutonomyPolicyError as exc:
+        raise IntegrationError("AUTONOMY_POLICY_INVALID", str(exc)[:300]) from exc
+
+
+def _check_issue_reference(body: str, *, closes_allowed: bool) -> str:
+    """Require a `Refs #N` (or, when allowed, `Closes #N`) line; refuse unauthorized closing keywords.
+
+    Returns the reference mode the body uses: `closes` when it carries a
+    closing keyword, otherwise `refs`.
+    """
+    closing = _CLOSING_REFERENCE.search(body) is not None
+    if closing and not closes_allowed:
+        raise IntegrationError("PUBLICATION_BODY_INVALID",
+                               "PR body uses a closing keyword (Closes/Fixes/Resolves #N) but neither the "
+                               "repository's issue_reference policy (closes) nor the caller allows closing "
+                               "issues; reference the issue with Refs #N")
+    line = r"(?m)^(?:Refs|Closes) #[1-9][0-9]*\b" if closes_allowed else r"(?m)^Refs #[1-9][0-9]*\b"
+    if not re.search(line, body):
+        raise IntegrationError("PUBLICATION_BODY_INVALID",
+                               "PR body must reference an issue with Refs #N or Closes #N" if closes_allowed
+                               else "PR body must reference an issue with Refs #N")
+    return "closes" if closing else "refs"
+
+
 def _branch(worktree: Path, name: str, *, head: bool) -> str:
     if not isinstance(name, str) or not name or name.startswith("-") or "\n" in name:
         raise IntegrationError("PUBLICATION_REF_INVALID", "invalid branch name")
@@ -497,8 +532,15 @@ def _publication_state(worktree: Path, repo: str, base: str, head: str, adapter=
 def publish(*, worktree: Path, base: str, head: str, title: str, body_file: Path,
             explicit_repo: str | None = None, apply: bool = False,
             expected_plan_hash: str | None = None, adapter=gh,
-            provenance_root: Path = ORCHESTRATOR_ROOT, grant: dict | None = None) -> dict:
-    """Dry-run and publish one reviewed pico branch through a fixed, non-force path."""
+            provenance_root: Path = ORCHESTRATOR_ROOT, grant: dict | None = None,
+            allow_closes: bool = False) -> dict:
+    """Dry-run and publish one reviewed pico branch through a fixed, non-force path.
+
+    The body must reference its issue with `Refs #N`. `Closes #N` (or any other
+    closing keyword) is accepted only when the repository's `.pi/autonomy.yaml`
+    sets `issue_reference: closes` or an in-process caller passes
+    `allow_closes=True` (a workspace task with `closes_issue: true`).
+    """
     meta = {"target_repository": None, "target_worktree": str(worktree.resolve()), "phase": "publication",
             "blocker_code": None, "reason": None, "mutations_planned": 0,
             "mutations_applied": 0, "qa_status": "not_run", "audit": []}
@@ -518,12 +560,12 @@ def publish(*, worktree: Path, base: str, head: str, title: str, body_file: Path
             raise IntegrationError("PUBLICATION_REF_INVALID", "head and base must differ")
         title = _text(title, "title", maximum=256)
         body = _text(body_file.read_text(encoding="utf-8"), "body")
-        if not re.search(r"(?m)^Refs #[1-9][0-9]*\b", body):
-            raise IntegrationError("PUBLICATION_BODY_INVALID", "PR body must reference an issue with Refs #N")
+        policy_reference = _issue_reference(worktree)
+        reference = _check_issue_reference(body, closes_allowed=allow_closes is True or policy_reference == "closes")
         state = _publication_state(worktree, repo, base, head, adapter)
         plan = {"repository": repo, "base": base, "head": head, **state,
                 "title": title, "body_sha256": hashlib.sha256(body.encode()).hexdigest(), "draft": True,
-                "authorization": authorization["source"]}
+                "authorization": authorization["source"], "issue_reference": reference}
         digest = hashlib.sha256(json.dumps(plan, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         meta["mutations_planned"] = int(state["remote_commit"] != state["commit"]) + int(state["existing_pr"] is None)
         if not apply:
@@ -574,7 +616,8 @@ def main() -> int:
     parser.add_argument("--base", help="publication base branch")
     parser.add_argument("--head", help="local pico/ branch to publish")
     parser.add_argument("--title", help="draft PR title")
-    parser.add_argument("--body-file", type=Path, help="draft PR body file, including Refs #N")
+    parser.add_argument("--body-file", type=Path, help="draft PR body file, including Refs #N (Closes #N when "
+                        ".pi/autonomy.yaml sets issue_reference: closes)")
     parser.add_argument("--issue", type=int, help="inspect one issue with --read")
     parser.add_argument("--apply", action="store_true", help="parent authorizes this batch")
     parser.add_argument("--plan-hash", help="SHA-256 plan_hash returned by the reviewed dry-run")
