@@ -190,7 +190,11 @@
           "issue": {
             "type": "integer",
             "minimum": 1,
-            "description": "Issue in this task's repository that its draft PR references (Refs #N)."
+            "description": "Issue in this task's repository that its draft PR references: Refs #N, or Closes #N when the PR should close the issue on merge (see closes_issue)."
+          },
+          "closes_issue": {
+            "type": "boolean",
+            "description": "true: the draft PR body says Closes #<issue>, so GitHub closes the issue when the PR merges. false: it says Refs #<issue>, which never closes it (use this when the task only partly addresses the issue). Omitted: follow the task repository's .pi/autonomy.yaml issue_reference (refs unless that file says closes)."
           },
           "provides": {
             "type": "array",

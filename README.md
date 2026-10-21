@@ -819,7 +819,9 @@ which re-bases the parent-checkout snapshot. Codex and Claude workers of a wave
 mutate in parallel, each in its own worktree. With
 `pr_granularity: batch` (default) each integrated batch gets one push and one
 PR; CI never blocks the next wave, and `limits.open_prs` (default 2) caps open
-batch PRs by stacking new batches on the newest batch branch.
+batch PRs by stacking new batches on the newest batch branch. By default PR bodies say
+`Refs #N`, which leaves the issue open; set `issue_reference: closes` in
+`.pi/autonomy.yaml` to write `Closes #N` so the issue closes when the PR merges.
 
 **Effort routing.** Policy v7 assigns capacity and reasoning effort in five
 tiers, `light < economy < standard < high < max`. Task ambiguity is scored 0–10

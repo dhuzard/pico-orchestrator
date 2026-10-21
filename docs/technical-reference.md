@@ -497,13 +497,73 @@ called through it is blocked with `CLAUDE_WORKER_REQUIRED`.
 
 Publishing follows `.pi/autonomy.yaml`: with `pr_granularity: batch` (default)
 an integrated wave is merged into a local `pico/batch-<n>` branch and gets one
-push and one PR (`Refs #N` for each issue) when `push_branch`/`create_pr` allow
-it; `task` opens one PR per task. After a push the orchestrator records
-`waiting_ci` and continues with the next wave, stacked on the batch branch or
-started from the base when independent. A CI failure becomes a `ci_fix` task in
-a later wave; only merge waits for CI. At `limits.open_prs` (default 2) open
-batch PRs, new waves stack on the newest batch branch instead of opening
-another PR.
+push and one PR (`Refs #N` for each issue, or `Closes #N` under
+`issue_reference: closes`) when `push_branch`/`create_pr` allow it; `task`
+opens one PR per task. After a push the orchestrator records `waiting_ci` and
+continues with the next wave, stacked on the batch branch or started from the
+base when independent. A CI failure becomes a `ci_fix` task in a later wave;
+only merge waits for CI. At `limits.open_prs` (default 2) open batch PRs, new
+waves stack on the newest batch branch instead of opening another PR.
+
+`issue_reference` (`refs` by default, or `closes`) decides whether a published
+PR closes its issue on merge. The publication gate in
+`tools/github_integration.py --publish` requires a line starting `Refs #N`,
+or `Closes #N` when closing is authorized, and finds every issue the body
+would close: a keyword (`close[sd]`, `fix(es|ed)`, `resolve[sd]`, any case)
+followed by an optional colon, optional Unicode whitespace and `#N`,
+`owner/repo#N` or `https://github.com/owner/repo/issues/N`. Each closed issue
+must be authorized, or the gate refuses with `PUBLICATION_BODY_INVALID`:
+
+- an in-process caller can name one issue (`closes_issue=N`, which
+  `workspace_contracts.publish` passes for a task with `closes_issue: true`;
+  there is no command-line flag), and then only that issue may close;
+- otherwise, when the policy says `closes`, each issue must have its own
+  `Closes #N` line, so a batch PR can close every issue it resolves.
+
+Closed issues must be in the PR's own repository. `issue_reference` is read
+from `.pi/autonomy.yaml` at the base branch's current commit **as the GitHub
+API reports it**, through the authenticated `gh` adapter
+(`github_sync.branch_head`: `gh api -X GET repos/<repo>/git/ref/heads/<base>`;
+`github_sync.policy_file_at`: `gh api -X GET
+repos/<repo>/contents/.pi/autonomy.yaml?ref=<sha>`, both fixed argv with
+shape validation, pinned to `--hostname github.com` and run without
+`GH_HOST`), and validated against the schema. Local git is never asked
+about the base branch: every worktree shares the repository's refs and git
+config, so a forged `refs/heads/<base>` or `refs/remotes/...`, a `git
+replace`, or a `core.sshCommand`, `remote.<name>.uploadpack` or
+`include.path` that serves a fake remote cannot authorize closing, and
+neither can an uncommitted edit or a policy committed on the `pico/` branch.
+A base branch or policy that GitHub does not have means `refs`. GitHub
+reports a symlink at `.pi/autonomy.yaml` as `type: symlink` (or, for a
+symlink to a file in the repository, as that file under another `path`);
+both are refused with `AUTONOMY_POLICY_PATH_UNSAFE`, as is a symlinked or
+locally modified policy in the checkout. Base branch names are limited to
+`[A-Za-z0-9._-]` segments separated by `/` (`PUBLICATION_REF_INVALID`). The
+policy is consulted only when the body would close an issue the caller did
+not name. The dry-run plan records `base_commit`, `issue_reference`,
+`closes_issues`, the policy blob SHA (`issue_policy_blob`, when consulted)
+and the body hash, so the reviewed `plan_hash` binds all of them. Because
+`base_commit` is in the plan, any merge to the base branch between the dry
+run and the apply makes the apply fail with `GITHUB_STATE_CONFLICT`, even
+for a PR that only says `Refs #N`; review a fresh dry run and apply again. A
+workspace task without `closes_issue` reads the same GitHub base commit to
+choose its body, and `workspace_contracts publish` returns that choice as
+`issue_reference_decision` (`closes`, `source: task | repository`,
+`base_commit`, `policy_blob`).
+
+The trust boundary stops at the push. The branch push itself still runs
+through local git (`git push` with the checkout's remote and config), so a
+worker that can write the shared `.git/config` can still redirect or alter
+the push; the gate cannot protect against that. Isolating workers from the
+parent repository's git config is tracked with worker isolation (S1) and #39.
+The gate also trusts the lead's own environment and `gh` setup (`GH_CONFIG_DIR`,
+the `gh` found on `PATH`, and its tokens) in the same way it trusts the user's
+home directory.
+The match ignores Markdown structure: GitHub
+does not act on keywords in code spans or HTML comments, but the gate refuses
+them there too rather than reimplement GitHub's parser. Backlog-generated PR
+bodies stay `Refs #N` in every mode, because a backlog item's issue closes
+through `github-push`.
 
 Specifier and reviewer steps remain read-only. Independent review receives the
 integrated diff/repository state and validation evidence in a fresh context;
@@ -1027,7 +1087,8 @@ python3 tools/backlog.py github-push ORCH-001  # close-guard permits closing now
 
 Important safety limits are intentional: these tools do not deploy, merge PRs,
 push branches, or allow workers to mutate GitHub. PR bodies generated by the
-tool use `Refs #N`, not `Closes #N`; issue closure remains possible only via
+tool use `Refs #N`, not `Closes #N`, even when `.pi/autonomy.yaml` sets
+`issue_reference: closes`; a backlog item's issue closes only via
 `github-push` after the local backlog item is `completed`.
 
 Four concerns, kept architecturally separate and never blended:
@@ -1681,7 +1742,10 @@ Released tasks cannot be revalidated (`WORKSPACE_TASK_ALREADY_RELEASED`).
 **`publish`.** Requires `validated`, an `issue`, and the head branch still at
 the validated commit (`WORKSPACE_HEAD_CHANGED`). Every upstream implementation
 task must already have a PR, unless it is `merged`
-(`WORKSPACE_UPSTREAM_UNPUBLISHED`). The body (`Refs #<issue>`, validated
+(`WORKSPACE_UPSTREAM_UNPUBLISHED`). The body (`Refs #<issue>`, or
+`Closes #<issue>` when the task sets `closes_issue: true` or omits it in a
+repository whose `.pi/autonomy.yaml` on GitHub's base branch sets
+`issue_reference: closes`; validated
 commit, check results, contracts, `Depends on: owner/repo#N` lines, no
 objective or transcript, secret-scanned) goes to
 `github_integration.publish` unchanged: autonomy `push_branch` and
@@ -2065,7 +2129,8 @@ choke point (`_run`):
 - `github_pr_create_task(id, base, head)` — creates a PR only for a backlog
   item in `review` or `completed` with a mapped GitHub issue, using an
   explicit already-pushed head branch and a generated body containing
-  `Refs #N` (not closing keywords). It never pushes, checks out, merges, or
+  `Refs #N` (not closing keywords, whatever `issue_reference` says). It never
+  pushes, checks out, merges, or
   marks a PR ready.
 - `github_pr_link_task(id, pr)` — records an existing PR mapping and PR sync
   baseline under the same `review`/`completed` plus mapped-issue guard,

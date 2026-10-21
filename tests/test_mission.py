@@ -228,6 +228,16 @@ class MissionStoreTest(unittest.TestCase):
         data = yaml.safe_load((REPO_ROOT / "templates" / "autonomy.yaml").read_text(encoding="utf-8"))
         jsonschema.Draft202012Validator.check_schema(schema)
         jsonschema.Draft202012Validator(schema).validate(data)
+        self.assertEqual(data["issue_reference"], "refs")
+
+    def test_own_autonomy_policy_closes_issues_and_grants_nothing(self):
+        schema = json.loads((REPO_ROOT / "schemas" / "autonomy.schema.json").read_text(encoding="utf-8"))
+        data = yaml.safe_load((REPO_ROOT / ".pi" / "autonomy.yaml").read_text(encoding="utf-8"))
+        jsonschema.Draft202012Validator(schema).validate(data)
+        self.assertEqual(data["issue_reference"], "closes")
+        permissions = data["permissions"]
+        self.assertFalse(any(v is True for k, v in permissions.items() if k != "merge"))
+        self.assertFalse(permissions["merge"]["enabled"])
 
 
 if __name__ == "__main__":

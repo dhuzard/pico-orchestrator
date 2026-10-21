@@ -445,6 +445,117 @@ def _publication_authority(worktree: Path, grant: dict | None = None) -> dict:
     return {"source": "one_shot_grant", "granted_by": grant["granted_by"], "granted": missing}
 
 
+# GitHub closes an issue when a PR body uses one of these keywords before an
+# issue reference (`Closes #3`, `fixes: owner/repo#3`, `Fixes:#3`,
+# `resolves https://github.com/owner/repo/issues/3`), anywhere in the body.
+# `\s` is Unicode-aware, so a non-breaking space counts as a separator. The
+# match is deliberately not code- or comment-aware: GitHub ignores keywords in
+# code spans and HTML comments, but stripping them here would have to mirror
+# GitHub's Markdown parser exactly, and any mismatch would let a keyword
+# through. The gate therefore refuses such keywords there too.
+_CLOSING_REFERENCE = re.compile(
+    r"(?i)\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b:?\s*"
+    r"(?:(?:(?P<repo>[\w.-]+/[\w.-]+))?#(?P<number>[0-9]+)"
+    r"|https?://(?:www\.)?github\.com/(?P<url_repo>[\w.-]+/[\w.-]+)/issues/(?P<url_number>[0-9]+))")
+_POLICY_FILE = ".pi/autonomy.yaml"
+
+
+def _closing_targets(body: str, repository: str) -> set[tuple[str, int]]:
+    """Every issue a body would close on merge, as (casefolded owner/repo, number)."""
+    targets = set()
+    for match in _CLOSING_REFERENCE.finditer(body):
+        repo = match["repo"] or match["url_repo"] or repository
+        targets.add((repo.casefold(), int(match["number"] or match["url_number"])))
+    return targets
+
+
+def _git_top(worktree: Path) -> Path:
+    import autonomy_policy
+    return autonomy_policy.policy_path(worktree).parent.parent
+
+
+def remote_issue_reference(repo: str, base_commit: str | None, adapter=gh) -> tuple[str, str | None]:
+    """`issue_reference` in `.pi/autonomy.yaml` at `base_commit` on GitHub, and that policy blob's SHA.
+
+    Both the base commit (`_remote_base_commit`) and the policy are read
+    through the authenticated GitHub API adapter, never through local git:
+    every worktree shares the repository's refs and git config (`refs/heads`,
+    `refs/remotes`, `core.sshCommand`, `remote.<name>.uploadpack`,
+    `include.path`, `git replace`), so anything local git reports about the
+    base branch can be forged by a worker. Without a base branch on GitHub or
+    a policy at that commit the answer is the safe default `refs` with no blob.
+    """
+    import autonomy_policy
+    if base_commit is None:
+        return "refs", None
+    entry = adapter.policy_file_at(base_commit, repo=repo)
+    if entry is None:
+        return "refs", None
+    if entry.get("type") == "symlink" or entry.get("path") != _POLICY_FILE:
+        raise IntegrationError("AUTONOMY_POLICY_PATH_UNSAFE", "the committed .pi/autonomy.yaml is a symlink")
+    if entry.get("type") != "file" or not isinstance(entry.get("text"), str):
+        raise IntegrationError("AUTONOMY_POLICY_INVALID", "the committed publication policy is not a readable file")
+    try:
+        data = yaml.safe_load(entry["text"])
+    except yaml.YAMLError as exc:
+        raise IntegrationError("AUTONOMY_POLICY_INVALID", "the committed publication policy is unreadable") from exc
+    issues = autonomy_policy.validate(data)
+    if issues:
+        raise IntegrationError("AUTONOMY_POLICY_INVALID", f"committed policy: {issues[0]}"[:300])
+    return data.get("issue_reference", autonomy_policy.DEFAULTS["issue_reference"]), entry["sha"]
+
+
+def _require_clean_policy_checkout(worktree: Path) -> None:
+    """Refuse a symlinked or locally modified `.pi/autonomy.yaml` before trusting the committed policy."""
+    top = _git_top(worktree)
+    unsafe = "AUTONOMY_POLICY_PATH_UNSAFE"
+    if (top / ".pi").is_symlink() or (top / _POLICY_FILE).is_symlink():
+        raise IntegrationError(unsafe, ".pi or .pi/autonomy.yaml is a symlink")
+    proc = subprocess.run(["git", "-C", str(top), "status", "--porcelain", "--", _POLICY_FILE], shell=False,
+                          capture_output=True, text=True, timeout=10)
+    if proc.returncode or proc.stdout.strip():
+        raise IntegrationError(unsafe, ".pi/autonomy.yaml has uncommitted changes; commit it on the base "
+                                       "branch before publishing a PR that closes issues")
+
+
+def _check_issue_reference(body: str, *, repository: str, policy_closes, closes_issue: int | None) -> dict:
+    """Require a `Refs #N` (or, when closing is authorized, `Closes #N`) line and check every closing target.
+
+    `closes_issue` is a caller's explicit opt-in for exactly that issue (a
+    workspace task with `closes_issue: true`). Otherwise `policy_closes` (a
+    callable, so the policy is consulted only when the body would close
+    something) says whether the committed policy is `closes`; then each issue
+    the body closes must be declared on its own `Closes #N` line, in this
+    repository. Any other closing target is refused.
+    """
+    targets = _closing_targets(body, repository)
+    declared = {int(n) for n in re.findall(r"(?m)^Closes #([1-9][0-9]*)\b", body)}
+    allowed: set[int] = set()
+    if targets:
+        if closes_issue is not None:
+            allowed = {closes_issue}
+        elif policy_closes():
+            allowed = declared
+        if not allowed:
+            raise IntegrationError("PUBLICATION_BODY_INVALID",
+                                   "PR body uses a closing keyword (Closes/Fixes/Resolves #N) but neither the "
+                                   "repository's committed issue_reference policy (closes) nor the caller allows "
+                                   "closing issues; reference the issue with Refs #N")
+        stray = sorted(f"{repo}#{number}" for repo, number in targets
+                       if repo != repository.casefold() or number not in allowed)
+        if stray:
+            raise IntegrationError("PUBLICATION_BODY_INVALID",
+                                   f"PR body would close {', '.join(stray)[:120]}, which this publication may not "
+                                   "close; each closed issue needs its own Closes #N line in this repository")
+    line = r"(?m)^(?:Refs|Closes) #[1-9][0-9]*\b" if targets else r"(?m)^Refs #[1-9][0-9]*\b"
+    if not re.search(line, body):
+        raise IntegrationError("PUBLICATION_BODY_INVALID",
+                               "PR body must reference an issue with Refs #N or Closes #N" if targets
+                               else "PR body must reference an issue with Refs #N")
+    return {"issue_reference": "closes" if targets else "refs",
+            "closes_issues": sorted(number for _, number in targets)}
+
+
 def _branch(worktree: Path, name: str, *, head: bool) -> str:
     if not isinstance(name, str) or not name or name.startswith("-") or "\n" in name:
         raise IntegrationError("PUBLICATION_REF_INVALID", "invalid branch name")
@@ -457,7 +568,8 @@ def _branch(worktree: Path, name: str, *, head: bool) -> str:
     return name
 
 
-def _publication_state(worktree: Path, repo: str, base: str, head: str, adapter=gh) -> dict:
+def _publication_remote(worktree: Path, repo: str) -> str:
+    """The remote whose fetch and push URLs both resolve to the target repository."""
     remotes = _git(worktree, "remote").splitlines()
     candidates = []
     for remote in remotes:
@@ -470,35 +582,73 @@ def _publication_state(worktree: Path, repo: str, base: str, head: str, adapter=
             continue
     if not candidates:
         raise IntegrationError("PUBLICATION_REMOTE_MISMATCH", "no matching GitHub push remote")
-    remote = "origin" if "origin" in candidates else sorted(candidates)[0]
-    commit = _git(worktree, "rev-parse", "--verify", f"refs/heads/{head}^{{commit}}")
-    if not re.fullmatch(r"[0-9a-f]{40,64}", commit):
-        raise IntegrationError("PUBLICATION_REF_INVALID", "head is not a local commit")
-    proc = subprocess.run(["git", "-C", str(worktree), "ls-remote", "--heads", remote, f"refs/heads/{head}"],
+    return "origin" if "origin" in candidates else sorted(candidates)[0]
+
+
+def _remote_head_commit(worktree: Path, remote: str, branch: str) -> str | None:
+    """The commit the pico/ head branch points to on `remote`, or None when it is not pushed yet."""
+    proc = subprocess.run(["git", "-C", str(worktree), "ls-remote", "--heads", remote, f"refs/heads/{branch}"],
                           capture_output=True, text=True, timeout=30)
     if proc.returncode:
         raise IntegrationError("PUBLICATION_REMOTE_UNAVAILABLE", "could not inspect the remote branch")
-    remote_commit = None
-    if proc.stdout.strip():
-        parts = proc.stdout.strip().split("\t")
-        if len(parts) != 2 or parts[1] != f"refs/heads/{head}" or not re.fullmatch(r"[0-9a-f]{40,64}", parts[0]):
-            raise IntegrationError("PUBLICATION_REMOTE_UNAVAILABLE", "unexpected remote branch response")
-        remote_commit = parts[0]
+    if not proc.stdout.strip():
+        return None
+    parts = proc.stdout.strip().split("\t")
+    if len(parts) != 2 or parts[1] != f"refs/heads/{branch}" or not re.fullmatch(r"[0-9a-f]{40,64}", parts[0]):
+        raise IntegrationError("PUBLICATION_REMOTE_UNAVAILABLE", "unexpected remote branch response")
+    return parts[0]
+
+
+def _remote_base_commit(repo: str, base: str, adapter=gh) -> str | None:
+    """The base branch's commit as the GitHub API reports it, or None when GitHub has no such branch."""
+    try:
+        gh.validate_branch(base)
+    except ValueError as exc:
+        raise IntegrationError("PUBLICATION_REF_INVALID",
+                               "base branch must be [A-Za-z0-9._-] segments separated by '/'") from exc
+    return adapter.branch_head(base, repo=repo)
+
+
+def verified_issue_reference(repo: str, base: str, adapter=gh) -> tuple[str, str | None, str | None]:
+    """`issue_reference` at the base commit GitHub reports: (value, policy blob, base commit)."""
+    base_commit = _remote_base_commit(repo, base, adapter)
+    return (*remote_issue_reference(repo, base_commit, adapter), base_commit)
+
+
+def _publication_state(worktree: Path, repo: str, base: str, head: str, adapter=gh) -> dict:
+    remote = _publication_remote(worktree, repo)
+    commit = _git(worktree, "rev-parse", "--verify", f"refs/heads/{head}^{{commit}}")
+    if not re.fullmatch(r"[0-9a-f]{40,64}", commit):
+        raise IntegrationError("PUBLICATION_REF_INVALID", "head is not a local commit")
+    remote_commit = _remote_head_commit(worktree, remote, head)
+    base_commit = _remote_base_commit(repo, base, adapter)
     prs = adapter.list_prs(base=base, head=head, repo=repo)
     open_prs = [pr for pr in prs if pr["state"].lower() == "open"]
     if len(open_prs) > 1:
         raise IntegrationError("PUBLICATION_PR_CONFLICT", "multiple open PRs match this branch")
     if not open_prs and prs:
         raise IntegrationError("PUBLICATION_PR_CONFLICT", "this branch already has a closed or merged PR")
-    return {"remote": remote, "commit": commit, "remote_commit": remote_commit,
+    return {"remote": remote, "commit": commit, "remote_commit": remote_commit, "base_commit": base_commit,
             "existing_pr": open_prs[0]["number"] if open_prs else None}
 
 
 def publish(*, worktree: Path, base: str, head: str, title: str, body_file: Path,
             explicit_repo: str | None = None, apply: bool = False,
             expected_plan_hash: str | None = None, adapter=gh,
-            provenance_root: Path = ORCHESTRATOR_ROOT, grant: dict | None = None) -> dict:
-    """Dry-run and publish one reviewed pico branch through a fixed, non-force path."""
+            provenance_root: Path = ORCHESTRATOR_ROOT, grant: dict | None = None,
+            closes_issue: int | None = None) -> dict:
+    """Dry-run and publish one reviewed pico branch through a fixed, non-force path.
+
+    The body must reference its issue with `Refs #N`. A closing keyword is
+    accepted only for an issue of this repository that either an in-process
+    caller names in `closes_issue` (a workspace task with `closes_issue:
+    true`), or that has its own `Closes #N` line while `.pi/autonomy.yaml` at
+    the base commit GitHub reports sets `issue_reference: closes` and the
+    checkout's copy is neither a symlink nor modified. Base commit and policy
+    are read through the GitHub API adapter, not local git. The plan records
+    both, so the plan hash binds them; a merge to the base between the dry
+    run and the apply therefore gives GITHUB_STATE_CONFLICT.
+    """
     meta = {"target_repository": None, "target_worktree": str(worktree.resolve()), "phase": "publication",
             "blocker_code": None, "reason": None, "mutations_planned": 0,
             "mutations_applied": 0, "qa_status": "not_run", "audit": []}
@@ -518,12 +668,24 @@ def publish(*, worktree: Path, base: str, head: str, title: str, body_file: Path
             raise IntegrationError("PUBLICATION_REF_INVALID", "head and base must differ")
         title = _text(title, "title", maximum=256)
         body = _text(body_file.read_text(encoding="utf-8"), "body")
-        if not re.search(r"(?m)^Refs #[1-9][0-9]*\b", body):
-            raise IntegrationError("PUBLICATION_BODY_INVALID", "PR body must reference an issue with Refs #N")
+        if closes_issue is not None and (type(closes_issue) is not int or closes_issue < 1):
+            raise IntegrationError("PUBLICATION_BODY_INVALID", "closes_issue must be an issue number")
         state = _publication_state(worktree, repo, base, head, adapter)
+        policy_blob = None
+
+        def policy_closes() -> bool:
+            # Read only when the body would close an issue the caller did not name.
+            nonlocal policy_blob
+            policy_reference, policy_blob = remote_issue_reference(repo, state["base_commit"], adapter)
+            if policy_reference != "closes":
+                return False
+            _require_clean_policy_checkout(worktree)
+            return True
+        reference = _check_issue_reference(body, repository=repo, policy_closes=policy_closes,
+                                           closes_issue=closes_issue)
         plan = {"repository": repo, "base": base, "head": head, **state,
                 "title": title, "body_sha256": hashlib.sha256(body.encode()).hexdigest(), "draft": True,
-                "authorization": authorization["source"]}
+                "authorization": authorization["source"], **reference, "issue_policy_blob": policy_blob}
         digest = hashlib.sha256(json.dumps(plan, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         meta["mutations_planned"] = int(state["remote_commit"] != state["commit"]) + int(state["existing_pr"] is None)
         if not apply:
@@ -574,7 +736,8 @@ def main() -> int:
     parser.add_argument("--base", help="publication base branch")
     parser.add_argument("--head", help="local pico/ branch to publish")
     parser.add_argument("--title", help="draft PR title")
-    parser.add_argument("--body-file", type=Path, help="draft PR body file, including Refs #N")
+    parser.add_argument("--body-file", type=Path, help="draft PR body file, including Refs #N (Closes #N when "
+                        ".pi/autonomy.yaml sets issue_reference: closes)")
     parser.add_argument("--issue", type=int, help="inspect one issue with --read")
     parser.add_argument("--apply", action="store_true", help="parent authorizes this batch")
     parser.add_argument("--plan-hash", help="SHA-256 plan_hash returned by the reviewed dry-run")

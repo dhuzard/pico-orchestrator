@@ -45,8 +45,11 @@ work in this repository.
      `python3 tools/backlog.py github-pr-create <ITEM> --base <base> --head <branch>`
      or `python3 tools/backlog.py github-pr-link <ITEM> <pr-number>`.
    - Otherwise create the PR with the repository's normal GitHub workflow.
-   - PR bodies should reference issues with `Refs #N`, not `Closes #N`, unless
-     the repository explicitly wants GitHub auto-close behavior.
+   - PR bodies reference issues as `.pi/autonomy.yaml` `issue_reference` says:
+     `refs` (the default) writes `Refs #N`, which never closes the issue;
+     `closes` writes `Closes #N`, so GitHub closes the issue when the PR
+     merges. Keep `Refs #N` for a PR that only partly addresses its issue. The
+     publication gate refuses closing keywords unless the policy says `closes`.
 
 4. Communicate through GitHub professionally.
    - Use the repository issue/PR templates when present.
@@ -63,6 +66,9 @@ work in this repository.
 6. Close issues only after acceptance.
    - In backlog-managed repos, mark the item `completed` and run
      `python3 tools/backlog.py github-push <ITEM>`; the close guard lives there.
+     Backlog-generated PR bodies always say `Refs #N` for that reason.
+   - With `issue_reference: closes`, merging the PR closes the issue; the
+     merge itself stays a human decision.
    - Do not close issues merely because a PR was opened.
 """
 

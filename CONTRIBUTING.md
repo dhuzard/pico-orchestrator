@@ -79,6 +79,9 @@ Routing is a policy decision, and it must stay deterministic and reviewable.
   in every section, especially **Validation** and **Risk and rollback**.
 - Keep each pull request to one bounded change. Put unrelated fixes in
   separate pull requests.
+- Write `Closes #N` for the issue the pull request resolves, so it closes on
+  merge. Write `Refs #N` instead when the pull request only partly addresses
+  the issue.
 - Add or update tests for any change in behavior.
 - Add an entry under `## [Unreleased]` in [`CHANGELOG.md`](CHANGELOG.md)
   when users or contributors will notice the change.

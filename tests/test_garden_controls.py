@@ -210,6 +210,7 @@ class GardenControlsTest(unittest.TestCase):
         self.assertEqual(repos["beta"]["source"], ".pi/autonomy.yaml")
         self.assertTrue(repos["beta"]["permissions"]["create_pr"] and repos["beta"]["permissions"]["push_branch"])
         self.assertFalse(repos["beta"]["merge_enabled"])
+        self.assertEqual((repos["alpha"]["issue_reference"], repos["beta"]["issue_reference"]), ("refs", "refs"))
         self.assertIn("claude", data["models"]["models"])
         self.assertNotIn("Interoperable claims", json.dumps(data))  # the workspace goal is never served
 

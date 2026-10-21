@@ -13,6 +13,12 @@
       "default": "batch",
       "description": "batch: tasks of a wave are validated in their own worktrees, integrated locally into one pico/batch-<n> branch, and published with one push and one PR referencing every included issue. task: one PR per task. Pushing and opening PRs still require permissions.push_branch and permissions.create_pr."
     },
+    "issue_reference": {
+      "type": "string",
+      "enum": ["refs", "closes"],
+      "default": "refs",
+      "description": "How a published PR body references its issue. refs (default): `Refs #N`, which never closes the issue, so a PR that only partly addresses it cannot close it by accident. closes: `Closes #N`, so GitHub closes the issue when the PR merges. The publication gate rejects closing keywords unless this is closes or the caller opts in explicitly (a workspace task's closes_issue)."
+    },
     "permissions": {
       "type": "object",
       "required": [
