@@ -110,7 +110,7 @@ def _owned(run_id: str, owner_id: str | None, repo_root: Path):
     lease, then run: takeover and resume take them in the same order.
     """
     try:
-        with run_lease.guard(run_id, owner_id, recorded_owner=_recorded_owner(repo_root, run_id),
+        with run_lease.guard(run_id, owner_id, recorded_owner=lambda: _recorded_owner(repo_root, run_id),
                              repo_root=repo_root) as held:
             with _run_lock(repo_root, run_id):
                 yield held
@@ -252,16 +252,18 @@ def _verify_checkpoint_unlocked(run_id: str, worktree: Path, owner_id: str, repo
     expected = parent.get("checkpoint")
     live = capture_checkout(worktree)
     if not isinstance(expected, dict):
-        check = {"at": _now(), "owner_id": owner_id, "status": "unverified",
-                 "reason_code": "RESUME_CHECKPOINT_MISSING", "mismatches": []}
+        check = {"at": _now(), "owner_id": owner_id, "previous_owner_id": parent.get("owner_id"),
+                 "status": "unverified", "reason_code": "RESUME_CHECKPOINT_MISSING", "mismatches": []}
     else:
         mismatches = [{"field": field, "expected": expected.get(field), "actual": live[field]}
                       for field in CHECKPOINT_FIELDS if expected.get(field) != live[field]]
-        check = {"at": _now(), "owner_id": owner_id, "status": "drift" if mismatches else "verified",
+        check = {"at": _now(), "owner_id": owner_id, "previous_owner_id": parent.get("owner_id"),
+                 "status": "drift" if mismatches else "verified",
                  "reason_code": "RESUME_CHECKPOINT_DRIFT" if mismatches else None, "mismatches": mismatches}
     parent.setdefault("resume_checks", []).append(check)
     parent["resume_checks"] = parent["resume_checks"][-MAX_RESUME_CHECKS:]
     if check["status"] == "verified":
+        # A verified resume makes the caller the owner; `previous_owner_id` keeps who owned it before.
         parent["owner_id"] = owner_id
     provenance.update_parent_orchestration(repo_root, run_id, parent)
     return {"check": check, "checkpoint": expected, "live": live}

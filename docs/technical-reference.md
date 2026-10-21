@@ -1143,10 +1143,17 @@ invocation); `--pid` defaults to the calling process.
   is dead or reused on this machine (`OWNER_PROCESS_DEAD`), or the file is
   unreadable or implausible (`LEASE_UNREADABLE`: bad JSON, an expiry beyond
   the heartbeat plus the 24-hour maximum TTL, or a heartbeat more than 120
-  seconds in the future). A pid on another machine cannot be probed, so only
-  the expiry counts there. Without `/proc` (non-Linux) the pid start time and
-  machine key are unavailable: the hostname identifies the host, and a live
-  pid counts as the holder.
+  seconds in the future). The holder's pid is probed on this machine for every
+  lease that parses, implausible timestamps included, so a clock that moved
+  backwards after sleep never makes a running holder look abandoned. A pid on
+  another machine cannot be probed, so only the expiry counts there. Without
+  `/proc` (macOS and other non-Linux hosts) the pid start time and machine key
+  are unavailable: the hostname identifies the host, and a live pid counts as
+  the holder. Hosts without a machine key that share one state directory over
+  a network filesystem, under the same hostname, would therefore trust each
+  other's pid probes; give each host its own state directory. On Windows no
+  signal is ever sent (`os.kill(pid, 0)` would send CTRL_C_EVENT): a pid
+  always counts as alive and only the expiry decides.
 - Only `takeover` recovers a stale lease. It refuses a live lease
   (`RUN_LEASE_HELD`) or a missing one (`RUN_LEASE_NOT_HELD`). If the heartbeat
   expired but the holder process is still running on this machine, it is
@@ -1174,6 +1181,19 @@ owner took the run over therefore can no longer settle, finish or write to
 that run, nor free the new owner's lease. Runs created in-process without an
 owner, and records from before leases, have no recorded owner and accept any
 writer while no lease exists; `ParentRun` gives its in-process run an owner.
+Such runs (`owner_id` absent or null: records from before leases, or created
+through the Python API without an owner) have no single-owner protection, so
+the queue dispatcher (#34) must refuse to operate on them. A verified resume
+by another owner changes `owner_id` and records the previous owner as
+`previous_owner_id` on that `resume_checks` entry.
+
+**Threat model.** The owner id and the hand-off rule protect a run against
+stale, sleeping, duplicated or buggy processes of the same user, not against a
+hostile local user. The owner id is not a secret: it is in the lease file, in
+the run record and in Garden. In the Python API `caller_pid` is supplied by
+the caller, and anyone who can write the state directory can edit the lease.
+Isolation between local users relies on file permissions on the state
+directory.
 
 **Wiring.** `parent_orchestration.py start --owner <id> --pid <pid>` records the
 owner and takes the lease of the new run. `parent_orchestration.py resume

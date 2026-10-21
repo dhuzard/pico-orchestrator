@@ -479,6 +479,7 @@
             "properties": {
               "at": {"type": "string", "format": "date-time"},
               "owner_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$"},
+              "previous_owner_id": {"type": ["string", "null"], "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$", "description": "Recorded owner when the check ran. A verified check by another owner changed ownership from this value to owner_id."},
               "status": {"enum": ["verified", "drift", "unverified"]},
               "reason_code": {"enum": ["RESUME_CHECKPOINT_DRIFT", "RESUME_CHECKPOINT_MISSING", null]},
               "mismatches": {

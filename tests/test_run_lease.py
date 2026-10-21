@@ -338,6 +338,24 @@ class TakeoverTest(StateTestCase):
         self.assertEqual((entry["forced"], entry["force_reason"]), (True, "HOLDER_HUNG"))
         self.assertEqual(self.parent(run_id)["lease_takeovers"][-1], entry)
 
+    def test_implausible_timestamps_never_unprotect_a_running_holder(self):
+        # A clock that moved backwards after sleep (WSL2) leaves a heartbeat in the future.
+        run_id = self.start_run(owner="sleeper")
+        now = time.time()
+        self.rewrite_lease(run_id, heartbeat_at=run_lease._iso(now + 600), expires_at=run_lease._iso(now + 900))
+        view = run_lease.status(run_id, repo_root=self.records)
+        self.assertEqual((view["state"], view["stale_reason"], view["holder_alive"]),
+                         ("stale", "LEASE_UNREADABLE", True))
+        with self.assertRaises(run_lease.LeaseError) as alive:
+            run_lease.takeover(run_id, "recovery", reason="OPERATOR_RECOVERY", repo_root=self.records)
+        self.assertEqual(alive.exception.code, "RUN_LEASE_HOLDER_ALIVE")
+        self.assertNotIn("lease_takeovers", self.parent(run_id))
+        # A dead holder with the same implausible timestamps is recoverable without force.
+        self.rewrite_lease(run_id, pid=dead_pid(), pid_start=None)
+        self.assertFalse(run_lease.status(run_id, repo_root=self.records)["holder_alive"])
+        taken = run_lease.takeover(run_id, "recovery", reason="OPERATOR_RECOVERY", repo_root=self.records)
+        self.assertEqual((taken["takeover"]["stale_reason"], taken["takeover"]["forced"]), ("LEASE_UNREADABLE", False))
+
     def test_takeover_without_provenance_is_refused_and_leaves_the_lease(self):
         run_lease.acquire("run-missing", "crashed-owner", pid=dead_pid(), repo_root=self.records)
         with self.assertRaises(run_lease.LeaseError) as refused:
@@ -411,6 +429,26 @@ class OwnedWriteTest(StateTestCase):
         self.expire(run_id)
         po.finish(run_id, "PARTIAL", owner_id="owner-a", repo_root=self.records)
         self.assertEqual(run_lease.status(run_id, repo_root=self.records)["state"], "free")
+
+    def test_recorded_owner_is_read_only_under_the_lease_lock(self):
+        import fcntl
+        run_id = self.start_run(owner="owner-a")
+        run_lease.release(run_id, "owner-a", repo_root=self.records)
+        lock = run_lease.lease_path(run_id, self.records).with_suffix(".lock")
+        observed = []
+
+        def recorded_owner():
+            with open(lock, "a+b") as handle:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                    observed.append("unlocked")
+                except BlockingIOError:
+                    observed.append("locked")
+            return "owner-a"
+        with run_lease.guard(run_id, "owner-a", recorded_owner=recorded_owner, repo_root=self.records):
+            pass
+        self.assertEqual(observed, ["locked"])
 
     def test_cli_requires_an_owner_for_every_write(self):
         for command in (["start", "--worktree", str(self.target)], ["event", "run-x"], ["finish", "run-x", "PARTIAL"],
@@ -497,6 +535,15 @@ class ResumeCheckpointTest(StateTestCase):
         self.assertEqual(parent["owner_id"], "owner-b")
         self.assertEqual([(check["status"], check["owner_id"]) for check in parent["resume_checks"]],
                          [("verified", "owner-b")])
+
+    def test_ownership_change_by_resume_records_the_previous_owner(self):
+        run_id = self.crashed_run()  # owned by "crashed", lease free
+        self.resume(run_id, owner="owner-b")
+        parent = self.parent(run_id)
+        self.assertEqual(parent["owner_id"], "owner-b")
+        check = parent["resume_checks"][-1]
+        self.assertEqual((check["status"], check["previous_owner_id"], check["owner_id"]),
+                         ("verified", "crashed", "owner-b"))
 
     def test_live_lease_blocks_resume_before_any_record_change(self):
         run_id = self.start_run(owner="owner-a")

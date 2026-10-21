@@ -65,7 +65,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import atomic_io  # noqa: E402
@@ -171,9 +171,15 @@ def parent_pid(pid: int) -> int | None:
 
 
 def pid_alive(pid: Any) -> bool:
-    """Signal-0 probe. Never reaps: a lease may name a child of the caller."""
+    """Signal-0 probe. Never reaps: a lease may name a child of the caller.
+
+    On Windows `os.kill(pid, 0)` would send CTRL_C_EVENT, so no signal is ever
+    sent there and a pid counts as alive (only the expiry decides).
+    """
     if type(pid) is not int or pid <= 0:
         return False
+    if os.name == "nt":  # pragma: no cover - non-POSIX
+        return True
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -303,18 +309,21 @@ def assess(lease: dict | None | object, *, now: float | None = None) -> tuple[st
     """(state, stale_reason, holder_alive): state is "free", "live" or "stale".
 
     holder_alive is True or False when the holder is on this machine, None when
-    it cannot be probed (another machine, or an unreadable lease).
+    it cannot be probed (another machine, or a file that does not parse).
+    The pid is probed before the timestamps are judged: implausible timestamps
+    (a clock that moved backwards after sleep) make the lease stale, but a
+    holder that is still running stays protected by holder_alive.
     """
     if lease is None:
         return "free", None, None
     if lease is _UNREADABLE or not isinstance(lease, dict):
         return "stale", LEASE_UNREADABLE, None
+    alive = process_matches(lease.get("pid"), lease.get("pid_start")) if _same_machine(lease) else None
     current = time.time() if now is None else now
     beat, expires = _epoch(lease.get("heartbeat_at")), _epoch(lease.get("expires_at"))
     if (beat is None or expires is None or expires < beat or expires > beat + MAX_TTL_SECONDS
             or beat > current + CLOCK_SKEW_SECONDS):
-        return "stale", LEASE_UNREADABLE, None
-    alive = process_matches(lease.get("pid"), lease.get("pid_start")) if _same_machine(lease) else None
+        return "stale", LEASE_UNREADABLE, alive
     if alive is False:
         return "stale", OWNER_PROCESS_DEAD, False
     if current >= expires:
@@ -429,16 +438,20 @@ def acquire(run_id: str, owner_id: str, *, pid: int | None = None, ttl_seconds: 
 
 
 @contextlib.contextmanager
-def guard(run_id: str, owner_id: str | None, *, recorded_owner: str | None, repo_root: Path = ROOT):
+def guard(run_id: str, owner_id: str | None, *, recorded_owner: Callable[[], str | None] | str | None,
+          repo_root: Path = ROOT):
     """Hold the lease lock around a write to the run and refuse a caller that does not own the run.
 
     Allowed: the caller holds the lease (live, or stale but not taken over),
     or the lease is free and the caller is the run's recorded owner. A run
     with no recorded owner and no lease (created before leases, or in-process
-    without one) accepts any caller.
+    without one) accepts any caller. `recorded_owner` may be a callable, read
+    only once the lease lock is held.
     """
     owner = None if owner_id is None else _owner(owner_id)
     with _locked(run_id, repo_root) as path:
+        if callable(recorded_owner):
+            recorded_owner = recorded_owner()
         lease = _read(path)
         if isinstance(lease, dict) or lease is _UNREADABLE:
             if not isinstance(lease, dict) or owner is None or lease["owner_id"] != owner:
