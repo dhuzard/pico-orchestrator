@@ -96,7 +96,8 @@ if os.environ.get("FAKE_PI_MESS"):
     subprocess.run(["git", "worktree", "add", "-q", "-b", "pico/task-1", os.path.join(sdir, "..", "wt-task-1")], capture_output=True)
     if os.environ["FAKE_PI_MESS"] == "dirty":
         open(os.path.join(sdir, "..", "wt-task-1", "scratch.txt"), "w").write("uncommitted\n")
-usage = os.environ.get("FAKE_PI_USAGE")  # "<input>,<output>[,<cost>]": report worker usage like a real child
+here = os.path.basename(os.getcwd())
+usage = os.environ.get("FAKE_PI_USAGE_" + here, os.environ.get("FAKE_PI_USAGE"))  # "<input>,<output>[,<cost>]": report worker usage like a real child
 if usage:
     numbers = usage.split(",")
     event = {"kind": "usage", "backend": "claude-code", "input_tokens": int(numbers[0]), "output_tokens": int(numbers[1]),
@@ -106,7 +107,7 @@ if usage:
     subprocess.run([sys.executable, parent, "event", run_id, "--owner", owner], input=json.dumps(event),
                    capture_output=True, text=True)
 if behavior == "slow":
-    time.sleep(float(os.environ.get("FAKE_PI_SLEEP", "0.4")))
+    time.sleep(float(os.environ.get("FAKE_PI_SLEEP_" + here, os.environ.get("FAKE_PI_SLEEP", "0.4"))))
     behavior = "finish"
 if behavior == "finish":
     pcmd("finish", run_id, "PARTIAL", "--owner", owner)

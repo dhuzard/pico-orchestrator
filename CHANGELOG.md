@@ -31,6 +31,14 @@ All notable changes to PICO are recorded here. The format follows
   integration. A resume whose checkout moved is refused with
   `RESUME_CHECKPOINT_DRIFT` instead of being re-based, and the run stays
   `IN_PROGRESS` for an operator (audit A10, mitigated).
+- Usage accounting: Claude cache writes are recorded as `cache_write_tokens`
+  and counted in budgeted spend (cache reads are not); the lead's Pi-reported
+  cost is forwarded as optional `estimated_cost_usd`; usage blocks carry
+  `cost_complete` and `unpriced`, shown by the scheduler and the Garden; the
+  scheduler counts the spend of children that are still running, and holds
+  new launches when that spend cannot be resolved. Per-participant
+  `cost_complete` is false for calls with no cost or a zero cost despite
+  tokens. Records written before this change stay valid and readable.
 - `CONTRIBUTING.md` with the development checks, the rules for routing and
   policy changes, pull request expectations and the licensing stance.
 - `CODE_OF_CONDUCT.md` (Contributor Covenant 2.1).
@@ -39,6 +47,18 @@ All notable changes to PICO are recorded here. The format follows
 - A newcomer path at the top of the README: what PICO and Pi are, a diagram,
   prerequisites, a documentation index, and links to the contributing,
   security and conduct files.
+
+### Compatibility
+
+- Run records written by this version can contain `lead_usage.estimated_cost_usd`,
+  `lead_usage.cache_write_tokens`, `lead_usage.cost_complete`,
+  `worker_usage.*.cache_write_tokens` and `worker_usage.*.cost_complete`.
+  Older PICO versions validate these closed objects with
+  `additionalProperties: false` and will reject such records. The record
+  version is not bumped.
+- Run records can also contain `parent_orchestration.owner_id`, `checkpoint`,
+  `resume_checks` and `lease_takeovers`, which older PICO versions reject for the
+  same reason.
 
 ### Security
 

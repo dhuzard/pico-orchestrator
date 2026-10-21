@@ -245,7 +245,7 @@ class CheckpointProvenanceTest(unittest.TestCase):
         self.assertEqual(context["worker_usage"]["claude-code"],
                          {"invocations": 2, "duration_ms": 5000, "input_tokens": None,
                           "output_tokens": None, "cached_tokens": None, "total_tokens": None,
-                          "total_tokens_complete": False})
+                          "total_tokens_complete": False, "cost_complete": False})
         self.assertEqual(context["worker_usage"]["pi-subagent"]["input_tokens"], 900)
         for cost in (0.25, 0.125):
             po.record_event(self.run_id, {"kind": "usage", "backend": "claude-code", "input_tokens": 10,
