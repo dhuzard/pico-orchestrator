@@ -1,6 +1,6 @@
 /** Parent-run trace and backend readiness boundary for /orchestrate. */
 import { spawn } from "node:child_process";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { hostname } from "node:os";
 import { dirname, join } from "node:path";
@@ -343,7 +343,7 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
   let lastPhase = "routing";
   let currentTurn: number | null = null;
   const messageStarts = new Map<number, number>();
-  let activeWave: { id: string; tasks: Map<string, string[]> } | null = null;
+  let activeWave: { id: string; tasks: Map<string, string[]>; implicit?: boolean } | null = null;
   let integrating: string | null = null;
   let batchStart = 0;
   let batchPeak = 0;
@@ -872,11 +872,22 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
         return { block: true, reason: "WORKER_SCOPE_UNVERIFIABLE: could not snapshot the parent checkout" };
       }
       snapshots.set(call.toolCallId, before);
+      // A routed task started while no worker runs and no wave is declared is a single-task wave: record it
+      // here so the lead need not. Concurrent work still needs the lead's declare_wave (gate above).
+      if (taskId && approval && inFlight.size === 0 && (activeWave === null || activeWave.implicit === true) &&
+          !(activeWave && activeWave.tasks.has(taskId))) await recordImplicitWave(taskId);
       if (inFlight.size === 0) batchStart = Date.now();
       inFlight.set(call.toolCallId, { taskId, stepId: step?.id ?? null, tool: call.toolName,
         phase: workerPlans.get(call.toolCallId)?.phase });
+      // The activity entry carries what a lead directive event used to: task, step, route, and a digest of
+      // the worker contract (never its text).
+      const fields = call.input as Record<string, unknown>;
+      const contract = [fields.prompt, fields.task, fields.message]
+        .find((value): value is string => typeof value === "string" && value.length > 0);
       if (runId) await observe({ kind: "activity", status: "started", tool: call.toolName,
-        task_id: taskId, step_id: step?.id ?? null });
+        task_id: taskId, step_id: step?.id ?? null,
+        ...(approval ? { route: approval.route } : {}),
+        ...(contract ? { prompt_digest: createHash("sha256").update(contract).digest("hex") } : {}) });
       batchPeak = Math.max(batchPeak, inFlight.size);
       workerStarts.set(call.toolCallId, Date.now());
       const plan = workerPlans.get(call.toolCallId);
@@ -1073,6 +1084,20 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
              details: { ok, active: runId !== null, run_id: runId, result } };
   }
 
+  /**
+   * Record a single-task wave for a task the lead started without declaring one. Telemetry-grade: a refused
+   * write is diagnosed and leaves no wave, so the previous behaviour (no wave) applies and nothing blocks.
+   */
+  async function recordImplicitWave(taskId: string): Promise<void> {
+    if (!runId || parentBlocked) return;
+    // Unique across processes (a resumed run has no counter), so a repeated task never reuses an integrated wave.
+    const id = `auto-${randomBytes(4).toString("hex")}-${taskId}`.slice(0, 128);
+    const result = await command(PARENT, ["event", runId, ...ownerArgs()],
+      { kind: "wave", wave_id: id, task_ids: [taskId], status: "declared" });
+    if (result.ok === false) { diagnose("telemetry", result); return; }
+    activeWave = { id, tasks: new Map([[taskId, []]]), implicit: true };
+  }
+
   async function declareWave(waveId: string, tasks: { task_id: string; write_scope: string[] }[]) {
     if (integrating) return reply(false, `BLOCKED: INTEGRATION_IN_PROGRESS: wave ${integrating} is still integrating.`);
     if (inFlight.size > 0) return reply(false, "BLOCKED: WAVE_WORKERS_IN_FLIGHT: wait for running workers before declaring the next wave.");
@@ -1114,7 +1139,9 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
       { wave_id: waveId, task_ids: ids, parallel_tasks: limit });
   }
 
-  async function integration(action: "integrate_begin" | "integrate_end", waveId: string) {
+  async function integration(action: "integrate_begin" | "integrate_end", requestedWaveId: string) {
+    // The lead names an implicitly recorded single-task wave as "auto".
+    const waveId = requestedWaveId === "auto" && activeWave?.implicit ? activeWave.id : requestedWaveId;
     if (action === "integrate_begin") {
       if (!activeWave || activeWave.id !== waveId) return reply(false, `BLOCKED: WAVE_UNKNOWN: ${waveId} is not the declared wave.`);
       if (integrating) return reply(true, `Wave ${waveId} is already integrating.`);

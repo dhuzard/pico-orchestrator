@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -17,7 +18,7 @@ function harness(preflight: Record<string, unknown>, failEvent = false, verifyOk
                  options: { scopeOk?: boolean; worktreeOk?: boolean; worktreeBlocker?: string; entries?: any[];
                    parentStatus?: string; sessionId?: string; settleFails?: boolean; completionDetail?: string;
                    completionError?: string; limits?: Record<string, unknown>; executable?: string;
-                   routeConflict?: boolean; reroutePhases?: string[];
+                   routeConflict?: boolean; reroutePhases?: string[]; waveEventResult?: Record<string, unknown>;
                    escalationWorkerConflict?: boolean; resumeResult?: Record<string, unknown>;
                    heartbeatResult?: Record<string, unknown>; eventResult?: Record<string, unknown>;
                    clock?: () => number } = {}) {
@@ -57,6 +58,7 @@ function harness(preflight: Record<string, unknown>, failEvent = false, verifyOk
     if (args[0] === "settle" && options.settleFails) return { ok: false, error_code: "PARENT_STORAGE_UNAVAILABLE" };
     if (args[0] === "event" && failEvent) return { ok: false };
     if (args[0] === "event" && options.eventResult) return options.eventResult;
+    if (args[0] === "event" && options.waveEventResult && input?.kind === "wave") return options.waveEventResult;
     if (args[0] === "event" && options.routeConflict && !escalated && input?.kind === "phase" && input.route === "CLAUDE_CODEX")
       return { ok: false, error_code: "PARENT_EVENT_CONFLICT" };
     if (args[0] === "event" && options.escalationWorkerConflict && input?.kind === "escalation")
@@ -1580,4 +1582,289 @@ test("a successful renewal extends how long the process may act", async () => {
   }
   assert.equal(await h.handlers.get("tool_call")!({ toolName: "spawn_subagent", toolCallId: "w",
     input: { task: "explore" } }, ctx), undefined);
+});
+
+// ---- Lead overhead (issue #43): what the lead must record, before and after ----
+
+const REPLAY = `
+import json, shutil, subprocess, sys, tempfile
+from pathlib import Path
+root = Path(sys.argv[1])
+sys.path.insert(0, str(root / "tools"))
+import parent_orchestration as po
+import provenance
+payload = json.load(sys.stdin)
+with tempfile.TemporaryDirectory() as tmp:
+    records = Path(tmp) / "orchestrator"
+    (records / "schemas").mkdir(parents=True)
+    shutil.copy(root / "schemas/run-record.schema.json", records / "schemas/run-record.schema.json")
+    target = Path(tmp) / "target"
+    subprocess.run(["git", "init", "-q", str(target)], check=True)
+    subprocess.run(["git", "-C", str(target), "remote", "add", "origin", "git@github.com:Examplecorp/examplelab.git"], check=True)
+    run_id = po.start(worktree=target, repo_root=records)["run_id"]
+    errors = []
+    for event in payload["events"]:
+        try:
+            po.record_event(run_id, event, repo_root=records)
+        except po.ParentRunError as exc:
+            errors.append([event.get("kind"), getattr(exc, "error_code", None), str(exc)])
+    final = None
+    if payload.get("finish"):
+        try:
+            final = po.finish(run_id, payload["finish"], repo_root=records)["outcome"]
+        except po.ParentRunError as exc:
+            errors.append(["finish", getattr(exc, "error_code", None), str(exc)])
+    print(json.dumps({"errors": errors, "final": final, "parent": provenance.get_run(records, run_id)["parent_orchestration"]}))
+`;
+
+/** Replay the parent events the harness saw into the real recorder; returns the resulting parent record. */
+function replay(events: unknown[], finish: string | null) {
+  const root = join(import.meta.dirname, "..");
+  const python = existsSync(join(root, ".venv/bin/python")) ? join(root, ".venv/bin/python") : "python3";
+  const done = spawnSync(python, ["-I", "-c", REPLAY, root], { input: JSON.stringify({ events, finish }), encoding: "utf8" });
+  assert.equal(done.status, 0, done.stderr);
+  return JSON.parse(done.stdout) as { errors: unknown[][]; final: string | null; parent: any };
+}
+const eventsOf = (h: ReturnType<typeof harness>) => h.parentCalls("event").map((call) => call.input);
+
+/**
+ * A scripted lead for a two-task run shaped like the CRT pilot: each task has a Codex specifier, a mutating
+ * Claude worker and a Codex reviewer, run one task at a time. `legacy` records what the previous prompt required
+ * (inspection phase, a declared wave per task, a directive and a feedback for every step); `lean` records what
+ * the current prompt requires.
+ */
+async function twoTaskRun(mode: "legacy" | "lean") {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "pico-lead-overhead-")));
+  try {
+    const h = harness({ ok: true, status: "READY" }, false, true, { executable: fakeClaude(dir) });
+    await h.handlers.get("before_agent_start")!({ prompt: "PI_ORCHESTRATION_RUN_V1" }, { cwd: dir, ui: { notify() {} } });
+    const record = h.tools.get("orchestration_record");
+    let leadRecordCalls = 0;
+    const lead = async (params: Record<string, unknown>) => {
+      leadRecordCalls += 1;
+      const result = await record.execute(`r${leadRecordCalls}`, params);
+      assert.equal(result.details.ok, true, JSON.stringify(params) + result.content[0].text);
+      return result;
+    };
+    const interaction = (type: string, task: string, step: string, summary: string) =>
+      lead({ action: "event", event: { kind: "interaction", type, task_id: task, step_id: step, summary } });
+    await lead({ action: "status" });
+    if (mode === "legacy") {
+      await lead({ action: "event", event: { kind: "phase", phase: "inspection", status: "in_progress" } });
+      await lead({ action: "event", event: { kind: "phase", phase: "inspection", status: "completed" } });
+    }
+    for (const task of ["A", "B"]) {
+      await h.handlers.get("tool_result")!(routeFor(task, { workerMutation: "allowed" }));
+      const workspace = join(dir, `wt-${task}`);
+      mkdirSync(workspace);
+      await lead({ action: "bind_workspace", task_id: task, step_id: "claude_worker", path: workspace });
+      if (mode === "legacy") {
+        await lead({ action: "declare_wave", wave_id: `wave-${task}`, tasks: [{ task_id: task, write_scope: [`${task}/**`] }] });
+      }
+      for (const [step, tool] of [["codex_specifier", "spawn_subagent"], ["claude_worker", "ClaudeWorker"], ["codex_reviewer", "spawn_subagent"]]) {
+        if (mode === "legacy") await interaction("directive", task, step, `Run ${step}`);
+        const id = `${task}-${step}`;
+        if (tool === "ClaudeWorker") {
+          const run = await claudeWorkerRun(h, id, { prompt: `[pico-task ${task}:${step}] implement in ${workspace}` });
+          assert.equal(run.guard, undefined);
+        } else {
+          const input = { task: `${step} for ${task}`, label: `${task}:${step}` };
+          assert.equal(await h.handlers.get("tool_call")!({ toolName: tool, toolCallId: id, input }), undefined);
+          await h.handlers.get("tool_result")!({ toolName: tool, toolCallId: id, content: [],
+            details: { subagent_id: `sub-${id}`, elapsedMs: 5 } });
+        }
+        if (mode === "legacy") await interaction("feedback", task, step, `${step} returned`);
+      }
+      if (task === "A") await interaction("decision", "A", "codex_reviewer", "Review passed; start the next task");
+      await lead({ action: "event", event: { kind: "worker", phase: task, step_id: "codex_reviewer",
+        status: "completed", model: CODEX_HIGH } });
+      await lead({ action: "event", event: { kind: "phase", phase: task, status: "completed", route: "CODEX_CLAUDE_CODEX" } });
+      const wave = mode === "legacy" ? `wave-${task}` : "auto";
+      await lead({ action: "integrate_begin", wave_id: wave });
+      await lead({ action: "integrate_end", wave_id: wave });
+    }
+    await lead({ action: "finish", status: "COMPLETED" });
+    return { h, leadRecordCalls, replayed: replay(eventsOf(h), "COMPLETED") };
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+}
+
+/** The audit facts of a parent record, with wave ids (a lead's choice or generated) masked. */
+function facts(parent: any) {
+  return {
+    activity: parent.activity.map((entry: any) => `${entry.status} ${entry.tool} ${entry.task_id}:${entry.step_id}`).sort(),
+    routedStarts: parent.activity.filter((entry: any) => entry.status === "started")
+      .map((entry: any) => `${entry.task_id}:${entry.step_id}:${entry.route}`).sort(),
+    waves: parent.waves.map((wave: any) => `${wave.task_ids.join(",")}:${wave.status}`),
+    phases: parent.phases.filter((phase: any) => phase.id !== "inspection").map((phase: any) =>
+      `${phase.id}:${phase.status}:${phase.route}:${phase.wave_id ? "waved" : "no-wave"}:` +
+      phase.workers.map((worker: any) => `${worker.step_id}=${worker.status}`).join(",")),
+    checkpoint: parent.checkpoint.reason,
+    final: parent.final_status,
+  };
+}
+
+test("a two-task run needs fewer lead record calls and loses no recorded fact", async () => {
+  const before = await twoTaskRun("legacy");
+  const after = await twoTaskRun("lean");
+  // Exact counts: legacy = status 1 + inspection 2 + per task (bind 1, wave 1, directive+feedback 6, reviewer 1,
+  // phase 1, integrate 2) x 2 + decision 1 + finish 1; lean drops inspection, waves and directive/feedback.
+  assert.equal(before.leadRecordCalls, 29);
+  assert.equal(after.leadRecordCalls, 13);
+  for (const run of [before, after]) {
+    assert.deepEqual(run.replayed.errors, []);
+    assert.equal(run.replayed.final, "completed");
+  }
+  assert.deepEqual(facts(after.replayed.parent), facts(before.replayed.parent));
+  const parent = after.replayed.parent;
+  // Worker calls: task, step and route, plus a contract digest, for all six calls.
+  const started = parent.activity.filter((entry: any) => entry.status === "started");
+  assert.equal(started.length, 6);
+  for (const entry of started) {
+    assert.equal(entry.route, "CODEX_CLAUDE_CODEX");
+    assert.match(entry.prompt_digest, /^[0-9a-f]{64}$/);
+  }
+  // Every legacy directive (a start) and feedback (a finish) has its activity entry in the lean record.
+  for (const item of before.replayed.parent.interactions.filter((entry: any) => entry.type !== "decision")) {
+    const status = item.type === "directive" ? "started" : "finished";
+    assert.ok(parent.activity.some((entry: any) => entry.status === status && entry.task_id === item.task_id
+      && entry.step_id === item.step_id), `${item.type} ${item.task_id}:${item.step_id}`);
+  }
+  assert.deepEqual(parent.interactions.map((entry: any) => entry.type), ["decision"]);
+  assert.equal(parent.waves.length, 2);
+  assert.ok(parent.waves.every((wave: any) => wave.id.startsWith("auto-") && wave.status === "integrated"));
+});
+
+test("the prompts no longer ask for directive, feedback, or optional phase events", () => {
+  for (const file of ["orchestrate.md", "orchestrate-core.md"]) {
+    const text = readFileSync(join(import.meta.dirname, "..", "prompts", file), "utf8");
+    assert.doesNotMatch(text, /record a brief `interaction` directive/);
+    assert.doesNotMatch(text, /"phase":"inspection","status":"in_progress"/);
+    assert.match(text, /Do not record `interaction` directive or feedback events/);
+  }
+});
+
+test("gates still hold with implicit waves: concurrency, bind, bracket, and parent checkout", async () => {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "pico-implicit-gates-")));
+  try {
+    const h = harness({ ok: true, status: "READY" }, false, true, { executable: fakeClaude(dir) });
+    await h.handlers.get("before_agent_start")!({ prompt: "PI_ORCHESTRATION_RUN_V1" }, { cwd: dir, ui: { notify() {} } });
+    const record = h.tools.get("orchestration_record");
+    await h.handlers.get("tool_result")!(routeFor("A", { workerMutation: "allowed" }));
+    await h.handlers.get("tool_result")!(routeFor("B", { workerMutation: "allowed" }));
+    const waves = () => h.calls.filter((call) => call.input?.kind === "wave");
+    const spawn = (id: string, label: string) => ({ toolName: "spawn_subagent", toolCallId: id, input: { task: "t", label } });
+    const done = (id: string) => h.handlers.get("tool_result")!({ toolName: "spawn_subagent", toolCallId: id, content: [],
+      details: { subagent_id: `sub-${id}` } });
+    // No integration of an unknown wave, and a mutating step is unbound until the lead binds it.
+    assert.match((await record.execute("i", { action: "integrate_begin", wave_id: "auto" })).content[0].text, /WAVE_UNKNOWN/);
+    const unbound = await h.handlers.get("tool_call")!({ toolName: "ClaudeWorker", toolCallId: "u",
+      input: { prompt: "[pico-task A:claude_worker] go" } });
+    assert.match(unbound.reason, /WORKER_WORKSPACE_UNBOUND/);
+    assert.equal(waves().length, 0, "a blocked call records no wave");
+    // One task alone: an implicit wave. A second task alongside it still needs declare_wave.
+    assert.equal(await h.handlers.get("tool_call")!(spawn("a1", "A:codex_specifier")), undefined);
+    assert.equal(waves().length, 1);
+    assert.deepEqual([waves()[0].input!.task_ids, waves()[0].input!.status], [["A"], "declared"]);
+    assert.match((await h.handlers.get("tool_call")!(spawn("b1", "B:codex_specifier"))).reason, /WAVE_UNDECLARED/);
+    assert.match((await record.execute("w", { action: "declare_wave", wave_id: "w", tasks: [
+      { task_id: "A", write_scope: ["a/**"] }, { task_id: "B", write_scope: ["b/**"] }] })).content[0].text, /WAVE_WORKERS_IN_FLIGHT/);
+    // Another step of the same task adds no wave; the bracket is still required and still a barrier.
+    await done("a1");
+    assert.equal(await h.handlers.get("tool_call")!(spawn("a2", "A:codex_reviewer")), undefined);
+    assert.equal(waves().length, 1);
+    assert.match((await record.execute("i", { action: "integrate_begin", wave_id: "auto" })).content[0].text, /INTEGRATION_WORKERS_IN_FLIGHT/);
+    await done("a2");
+    assert.equal((await record.execute("i", { action: "integrate_begin", wave_id: "auto" })).details.ok, true);
+    assert.match((await h.handlers.get("tool_call")!(spawn("a3", "A:codex_reviewer"))).reason, /INTEGRATION_IN_PROGRESS/);
+    assert.equal((await record.execute("i", { action: "integrate_end", wave_id: "auto" })).details.ok, true);
+    // A worker that writes the parent checkout still latches the violation inside an implicit wave.
+    assert.equal(await h.handlers.get("tool_call")!(spawn("b2", "B:codex_specifier")), undefined);
+    assert.equal(waves().length, 4, "declared, integrating, integrated for A, then B's own wave");
+    h.checkout.digest = "dirty";
+    h.checkout.status = ["M file"];
+    const violated = await done("b2");
+    assert.match(violated.content.at(-1).text, /WORKER_SCOPE_VIOLATION/);
+    assert.match((await h.handlers.get("tool_call")!(spawn("b3", "B:codex_reviewer"))).reason, /WORKER_SCOPE_VIOLATION/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("a refused implicit wave is diagnosed, records nothing, and never blocks the run", async () => {
+  const h = harness({ ok: true, status: "READY" }, false, true,
+    { waveEventResult: { ok: false, error_code: "PARENT_WAVE_TRANSITION_INVALID" } });
+  await h.handlers.get("before_agent_start")!({ prompt: "PI_ORCHESTRATION_RUN_V1" }, { cwd: "/tmp/target", ui: { notify() {} } });
+  await h.handlers.get("tool_result")!(routeFor("A"));
+  const quiet = process.stderr.write;
+  process.stderr.write = (() => true) as typeof process.stderr.write;
+  try {
+    for (const id of ["a1", "a2"]) {
+      assert.equal(await h.handlers.get("tool_call")!({ toolName: "spawn_subagent", toolCallId: id,
+        input: { task: "t", label: "A:codex_specifier" } }), undefined);
+      await h.handlers.get("tool_result")!({ toolName: "spawn_subagent", toolCallId: id, content: [], details: { subagent_id: id } });
+    }
+  } finally { process.stderr.write = quiet; }
+  // Without a recorded wave nothing changes from before: the lead can still declare one and status is ready.
+  assert.equal((await h.tools.get("orchestration_record").execute("s", { action: "status" })).details.ok, true);
+  assert.equal((await h.tools.get("orchestration_record").execute("i", { action: "integrate_begin", wave_id: "auto" })).details.ok, false);
+});
+
+test("worker failure and integration conflict with auto-recorded events leave the run finishable", async () => {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "pico-implicit-failure-")));
+  try {
+    const h = harness({ ok: true, status: "READY" }, false, true, { executable: fakeClaude(dir) });
+    await h.handlers.get("before_agent_start")!({ prompt: "PI_ORCHESTRATION_RUN_V1" }, { cwd: dir, ui: { notify() {} } });
+    const record = h.tools.get("orchestration_record");
+    await h.handlers.get("tool_result")!(routeFor("A", { workerMutation: "allowed" }));
+    const workspace = join(dir, "wt");
+    mkdirSync(workspace);
+    await record.execute("b", { action: "bind_workspace", task_id: "A", step_id: "claude_worker", path: workspace });
+    const failed = await claudeWorkerRun(h, "f", { prompt: "[pico-task A:claude_worker] FAIL" });
+    assert.equal(failed.result!.isError, true);
+    // No parentBlocked: the lead keeps recording, and a retry of the same step is allowed.
+    assert.equal((await record.execute("s", { action: "status" })).details.ok, true);
+    const retry = await claudeWorkerRun(h, "r", { prompt: "[pico-task A:claude_worker] go again" });
+    assert.equal(retry.result!.isError, false);
+    // Integration conflict: begin, a merge that cannot be resolved, so the lead never calls integrate_end.
+    assert.equal((await record.execute("i", { action: "integrate_begin", wave_id: "auto" })).details.ok, true);
+    assert.match((await h.handlers.get("tool_call")!({ toolName: "ClaudeWorker", toolCallId: "x",
+      input: { prompt: "[pico-task A:claude_worker] more" } })).reason, /INTEGRATION_IN_PROGRESS/);
+    await record.execute("p", { action: "event", event: { kind: "phase", phase: "A", status: "partial" } });
+    assert.equal((await record.execute("f", { action: "finish", status: "PARTIAL" })).details.ok, true);
+    const replayed = replay(eventsOf(h), "PARTIAL");
+    // The only refusal is the recorder declining the retry's automatic "completed" over the earlier terminal
+    // "failed": telemetry-grade, so it never blocks the run (the lead can record its own judgment).
+    assert.deepEqual(replayed.errors.map((error) => error[1]), ["PARENT_WORKER_TRANSITION_INVALID"]);
+    assert.equal(replayed.final, "partial");
+    const parent = replayed.parent;
+    assert.deepEqual(parent.activity.filter((entry: any) => entry.status === "failed").map((entry: any) => entry.step_id), ["claude_worker"]);
+    assert.deepEqual(parent.waves.map((wave: any) => wave.status), ["integrating"]);
+    const open = parent.phases.flatMap((phase: any) => [phase, ...phase.workers]).filter((item: any) => ["not_started", "in_progress"].includes(item.status));
+    assert.deepEqual(open, []);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("resume after an interruption starts a fresh implicit wave without conflicting with the old one", async () => {
+  const entries: any[] = [];
+  const context = { cwd: process.cwd(), ui: { notify() {} },
+    sessionManager: { getSessionId: () => "session-a", getBranch: () => entries } };
+  const first = harness({ ok: true, status: "READY" }, false, true, { entries });
+  await first.handlers.get("session_start")!({ reason: "startup" }, context);
+  await first.handlers.get("before_agent_start")!({ prompt: "PI_ORCHESTRATION_RUN_V1" }, context);
+  await first.handlers.get("tool_result")!(routeFor("A"));
+  assert.equal(await first.handlers.get("tool_call")!({ toolName: "spawn_subagent", toolCallId: "a1",
+    input: { task: "t", label: "A:codex_specifier" } }), undefined);
+  // The process dies with the worker in flight; the session is resumed in a new process.
+  await first.handlers.get("session_shutdown")!({ reason: "reload" });
+  const resumed = harness({ ok: true, status: "READY" }, false, true, { entries });
+  await resumed.handlers.get("session_start")!({ reason: "startup" }, context);
+  assert.equal((await resumed.tools.get("orchestration_record").execute("s", { action: "status" })).details.ok, true);
+  await resumed.handlers.get("tool_result")!(routeFor("A"));
+  assert.equal(await resumed.handlers.get("tool_call")!({ toolName: "spawn_subagent", toolCallId: "a2",
+    input: { task: "t", label: "A:codex_specifier" } }), undefined);
+  const wave = resumed.calls.find((call) => call.input?.kind === "wave");
+  assert.deepEqual(wave?.input?.task_ids, ["A"]);
+  assert.equal((await resumed.tools.get("orchestration_record").execute("s", { action: "status" })).details.ok, true);
+  // Both processes' events replay cleanly into the real recorder; the second wave has its own id.
+  const replayed = replay([...eventsOf(first), ...eventsOf(resumed)], null);
+  assert.deepEqual(replayed.errors, []);
+  assert.equal(replayed.parent.waves.length, 2);
 });

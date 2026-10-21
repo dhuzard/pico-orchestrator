@@ -425,6 +425,22 @@ class LifecycleTest(unittest.TestCase):
             parent.event({"kind": "activity", "status": "started", "tool": "spawn_subagent",
                           "task_id": "ghp_" + "x" * 30})
 
+    def test_activity_may_carry_route_and_contract_digest_but_never_other_fields(self):
+        parent = po.ParentRun(worktree=self.target, repo_root=self.records)
+        digest = "a" * 64
+        parent.event({"kind": "activity", "status": "started", "tool": "ClaudeWorker", "task_id": "task-1",
+                      "step_id": "claude_worker", "route": "CODEX_CLAUDE_CODEX", "prompt_digest": digest})
+        parent.event({"kind": "activity", "status": "finished", "tool": "ClaudeWorker", "task_id": "task-1",
+                      "step_id": "claude_worker"})
+        record = provenance.get_run(self.records, parent.run_id)
+        started, finished = record["parent_orchestration"]["activity"]
+        self.assertEqual((started["route"], started["prompt_digest"]), ("CODEX_CLAUDE_CODEX", digest))
+        self.assertNotIn("route", finished)  # older and non-start entries are unchanged
+        for bad in ({"route": "NOT_A_ROUTE"}, {"prompt_digest": "short"}, {"prompt_digest": "A" * 64},
+                    {"prompt": "the contract text"}):
+            with self.assertRaises(po.ParentRunError):
+                parent.event({"kind": "activity", "status": "started", "tool": "ClaudeWorker", **bad})
+
     def test_numbered_interactions_link_directives_feedback_and_decisions(self):
         parent = po.ParentRun(worktree=self.target, repo_root=self.records)
         first = parent.event({"kind": "interaction", "type": "directive",

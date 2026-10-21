@@ -662,6 +662,15 @@
                   "string",
                   "null"
                 ]
+              },
+              "route": {
+                "type": "string",
+                "description": "Routed route of the task, recorded by the lifecycle extension at worker start."
+              },
+              "prompt_digest": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$",
+                "description": "SHA-256 of the worker contract; the contract itself is never recorded."
               }
             }
           }

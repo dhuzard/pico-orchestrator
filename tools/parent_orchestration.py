@@ -534,7 +534,7 @@ def _record_event_unlocked(run_id: str, event: dict, *, repo_root: Path = ROOT) 
         "wave": {"kind", "wave_id", "task_ids", "status"},
         "concurrency": {"kind", "peak_workers", "active_ms"},
         "spawn": {"kind"},
-        "activity": {"kind", "status", "tool", "task_id", "step_id", "subagent_id"},
+        "activity": {"kind", "status", "tool", "task_id", "step_id", "subagent_id", "route", "prompt_digest"},
         "interaction": {"kind", "type", "summary", "task_id", "step_id", "subagent_id", "reply_to"},
         "lead_usage": {"kind", "model", "phase", "task_type", "turn_index", "duration_ms", "input_tokens", "output_tokens", "cached_tokens", "cache_write_tokens", "total_tokens", "estimated_cost_usd"},
         "checkpoint": {"kind", "phase", "reason"},
@@ -715,6 +715,17 @@ def _record_event_unlocked(run_id: str, event: dict, *, repo_root: Path = ROOT) 
         entry = {"at": datetime.now(timezone.utc).isoformat(), "status": event["status"], "tool": event["tool"]}
         for field in ("task_id", "step_id", "subagent_id"):
             entry[field] = _safe(event.get(field), ID_RE, field)
+        # Optional, set by the lifecycle extension at worker start: the routed route and a SHA-256 digest of
+        # the worker contract (the contract text itself is never recorded).
+        if event.get("route") is not None:
+            if event["route"] not in ROUTES:
+                raise ParentRunError("invalid activity route")
+            entry["route"] = event["route"]
+        if event.get("prompt_digest") is not None:
+            digest = event["prompt_digest"]
+            if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+                raise ParentRunError("invalid activity prompt digest")
+            entry["prompt_digest"] = digest
         parent.setdefault("activity", []).append(entry)
         parent["activity"] = parent["activity"][-500:]
     elif kind == "interaction":

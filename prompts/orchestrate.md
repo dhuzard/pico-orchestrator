@@ -19,9 +19,12 @@ worker dispatch. If the parent is blocked because multiple GitHub
 remotes need disambiguation, stop and ask the launcher to be rerun with the
 parent-authorized `--repo owner/repository` option; do not choose a remote by
 name or let a worker choose the target.
-For a phase event use `{"action":"event","event":{"kind":"phase",
-"phase":"inspection","status":"in_progress"}}` before inspection, then
-record `status: "completed"` when it finishes. The phase statuses are exactly
+Record a phase event only for a routed task's own phase (its route and its
+outcome): do not record optional phases such as `inspection`, which carry no
+route or outcome. A phase event looks like
+`{"action":"event","event":{"kind":"phase","phase":"<task id>","status":"completed"}}`.
+The lifecycle extension already records each routed phase as `in_progress` with
+its route when `route_task` succeeds. The phase statuses are exactly
 `not_started`, `in_progress`, `completed`, `blocked`, `failed`, and `partial`;
 `started` is invalid. A phase event requires `kind`, `phase`, and `status`;
 `route`, `policy_version`, and `blocker_code` are optional until known.
@@ -130,10 +133,11 @@ Your job is to:
 9. integrate the wave between waves and validate the integrated result;
 10. continue with the next dependency-ready wave until no authorized work remains.
 
-For each delegated step, record a brief `interaction` directive before launch
-and a feedback summary after its result using `orchestration_record` events.
-Record a parent decision when feedback changes the next action. Use the
-returned interaction sequence as `reply_to` when linking steps. These are
+Do not record `interaction` directive or feedback events: the lifecycle
+extension records every worker call itself (task, step, route, and a digest of
+the worker contract). Record an `interaction` `decision` only when worker
+results change the next action, since it is your judgment. Use the returned
+interaction sequence as `reply_to` when linking a decision. These are
 single-line, non-secret summaries of observable work, never prompts, outputs,
 transcripts, or hidden reasoning. See the event contract below.
 
@@ -402,13 +406,17 @@ the parent orchestrator.
 
 ### Conversation trace
 
-Use `orchestration_record` with `action: "event"` and an event shaped like
-`{"kind":"interaction","type":"directive","task_id":"<task>","step_id":"<step>","summary":"Inspect the save path and report the race."}`.
-After the worker returns, record `type: "feedback"` with a factual summary;
-when the parent chooses a next action, record `type: "decision"`. Each returned
-parent record contains the numbered `interactions` array. Link a feedback to
-its directive and a decision to its triggering feedback with `reply_to` set to
-the observed earlier `sequence`. Include `subagent_id` when known. Keep the
+The lifecycle extension records every worker call itself as an `activity`
+entry: tool, task, step, routed route, and a SHA-256 digest of the worker
+contract (never its text). Do not record `directive` or `feedback`
+interactions; they only repeat that entry and the worker's result.
+
+Record a `decision` when worker results change your next action, since it is
+your judgment and not mechanical: `{"kind":"interaction","type":"decision",
+"task_id":"<task>","step_id":"<step>","summary":"Re-plan the save path after the review found a race."}`.
+Each returned parent record contains the numbered `interactions` array. Link a
+decision to an earlier interaction with `reply_to` set to its observed
+`sequence`. Include `subagent_id` when known. Keep the
 summary under 180 characters and never copy prompts, raw worker output, paths with
 secrets, or hidden reasoning. These events explain observed coordination; do
 not invent a conversation for historical or unobserved work.
@@ -704,7 +712,10 @@ edit implementation or integration worktrees.
    `WORKER_WORKSPACE_PROTECTED_PATH`), then bind it with
    `orchestration_record`
    `{"action":"bind_workspace","task_id":"<task id>","step_id":"<step id>","path":"<worktree>"}`.
-4. Declare the wave:
+4. Declare the wave when more than one task will run concurrently. A task
+   started alone (no other worker running and no wave declared) is recorded by
+   the lifecycle extension as an implicit single-task wave; do not declare one.
+   Name it `"auto"` in `integrate_begin` and `integrate_end`. Declare the wave:
    `{"action":"declare_wave","wave_id":"wave-<n>","tasks":[{"task_id":"<id>","write_scope":["src/a/**"]}, ...]}`.
    It is rejected with `WAVE_SCOPE_OVERLAP` (overlapping scopes; a glob's
    literal directory prefix counts as its scope), `WAVE_LIMIT_EXCEEDED`,

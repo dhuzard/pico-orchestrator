@@ -6,6 +6,18 @@ All notable changes to PICO are recorded here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- The lead records less (issue #43). The prompts no longer ask for `directive` or
+  `feedback` interaction events or for optional phases such as `inspection`; `decision`,
+  status, bind, worker/phase outcomes, the integrate bracket and finish stay.
+  The extension's `activity` entry at worker start now also carries the task's
+  `route` and a SHA-256 `prompt_digest` of the worker contract (never its text), so
+  nothing a directive carried is lost. A routed task started with no worker running
+  and no wave declared is recorded as an implicit single-task wave (named `"auto"` in
+  `integrate_begin`/`integrate_end`); concurrent tasks still need `declare_wave`
+  (`WAVE_UNDECLARED`). A refused implicit-wave write is diagnosed and never blocks.
+
 ### Fixed
 
 - A run that ends PARTIAL, BLOCKED, FAILED or settled no longer leaves phases or

@@ -399,6 +399,10 @@ The parent runs independent tasks in waves. Each task declares a write scope
 | `integrate_begin {wave_id}` | Starts integration; worker launches are refused until it ends. | `WAVE_UNKNOWN`, `INTEGRATION_WORKERS_IN_FLIGHT` |
 | `integrate_end {wave_id}` | Re-bases the parent-checkout snapshot after the parent's merges and closes the wave. | `INTEGRATION_NOT_STARTED`, `WORKER_SCOPE_UNVERIFIABLE` |
 
+A routed task started while no worker runs and no wave is declared is recorded by the lifecycle extension as an
+implicit single-task wave (`auto-<hex>-<task>`); `integrate_begin` and `integrate_end` accept `"auto"` for it.
+The extension never infers the integrate bracket: `integrated` would assert a merge it did not observe.
+
 Scope overlap is conservative: an entry's scope is its literal directory
 prefix up to the first glob segment, and two entries overlap when one prefix
 contains the other (`src/a/**` and `src/b/**` are disjoint; `src/*.ts`

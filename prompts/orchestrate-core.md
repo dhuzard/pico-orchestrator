@@ -19,9 +19,12 @@ worker dispatch. If the parent is blocked because multiple GitHub
 remotes need disambiguation, stop and ask the launcher to be rerun with the
 parent-authorized `--repo owner/repository` option; do not choose a remote by
 name or let a worker choose the target.
-For a phase event use `{"action":"event","event":{"kind":"phase",
-"phase":"inspection","status":"in_progress"}}` before inspection, then
-record `status: "completed"` when it finishes. The phase statuses are exactly
+Record a phase event only for a routed task's own phase (its route and its
+outcome): do not record optional phases such as `inspection`, which carry no
+route or outcome. A phase event looks like
+`{"action":"event","event":{"kind":"phase","phase":"<task id>","status":"completed"}}`.
+The lifecycle extension already records each routed phase as `in_progress` with
+its route when `route_task` succeeds. The phase statuses are exactly
 `not_started`, `in_progress`, `completed`, `blocked`, `failed`, and `partial`;
 `started` is invalid. A phase event requires `kind`, `phase`, and `status`;
 `route`, `policy_version`, and `blocker_code` are optional until known.
@@ -134,10 +137,11 @@ Your job is to:
    remove the clean worktrees and keep their branches;
 10. continue with the next dependency-ready wave until no authorized work remains.
 
-For each delegated step, record a brief `interaction` directive before launch
-and a feedback summary after its result using `orchestration_record` events.
-Record a parent decision when feedback changes the next action. Use the
-returned interaction sequence as `reply_to` when linking steps. These are
+Do not record `interaction` directive or feedback events: the lifecycle
+extension records every worker call itself (task, step, route, and a digest of
+the worker contract). Record an `interaction` `decision` only when worker
+results change the next action, since it is your judgment. Use the returned
+interaction sequence as `reply_to` when linking a decision. These are
 single-line, non-secret summaries of observable work, never prompts, outputs,
 transcripts, or hidden reasoning. See the full reference for the event fields.
 
