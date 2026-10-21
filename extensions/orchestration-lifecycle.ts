@@ -582,7 +582,8 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
 
   pi.on("before_agent_start", async (trigger, ctx) => {
     compactionFailed = false;
-    if (!trigger.prompt.includes(MARKER)) return;
+    // Pi >= 1.3 only carries `prompt` on runs started by a user prompt.
+    if (!("prompt" in trigger) || !trigger.prompt.includes(MARKER)) return;
     if (parentBlocked && !runId) {
       const code = String(parentFailure?.error_code ?? "PARENT_PROVENANCE_UNAVAILABLE");
       return { message: { customType: "orchestration-blocker", display: true,
