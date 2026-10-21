@@ -474,63 +474,35 @@ def _git_top(worktree: Path) -> Path:
     return autonomy_policy.policy_path(worktree).parent.parent
 
 
-def committed_issue_reference(worktree: Path, base_commit: str | None) -> tuple[str, str | None]:
-    """`issue_reference` as committed at the remote base commit, and the policy blob it came from.
+def remote_issue_reference(repo: str, base_commit: str | None, adapter=gh) -> tuple[str, str | None]:
+    """`issue_reference` in `.pi/autonomy.yaml` at `base_commit` on GitHub, and that policy blob's SHA.
 
-    `base_commit` is the base branch's commit as the verified GitHub remote
-    reports it (`_remote_branch_commit`), never a local ref: every worktree
-    can rewrite `refs/heads/<base>` or `refs/remotes/...`. The working tree is
-    never read either, so an uncommitted edit, a symlinked `.pi`, a policy
-    committed on a pico/ branch or a forged local base ref cannot authorize
-    closing issues. Without a remote base branch or a committed policy the
-    answer is the safe default `refs` with no blob. A remote base commit that
-    is not in the local object store fails closed with
-    `PUBLICATION_BASE_NOT_FETCHED`.
+    Both the base commit (`_remote_base_commit`) and the policy are read
+    through the authenticated GitHub API adapter, never through local git:
+    every worktree shares the repository's refs and git config (`refs/heads`,
+    `refs/remotes`, `core.sshCommand`, `remote.<name>.uploadpack`,
+    `include.path`, `git replace`), so anything local git reports about the
+    base branch can be forged by a worker. Without a base branch on GitHub or
+    a policy at that commit the answer is the safe default `refs` with no blob.
     """
     import autonomy_policy
-    top = _git_top(worktree)
-
-    def git(*args: str) -> subprocess.CompletedProcess:
-        # --no-replace-objects: a local `git replace` must not substitute the remote commit's tree.
-        return subprocess.run(["git", "--no-replace-objects", "-C", str(top), *args], shell=False,
-                              capture_output=True, text=True, timeout=10)
-
     if base_commit is None:
         return "refs", None
-    if not re.fullmatch(r"[0-9a-f]{40,64}", base_commit) or \
-            git("cat-file", "-e", f"{base_commit}^{{commit}}").returncode:
-        raise IntegrationError("PUBLICATION_BASE_NOT_FETCHED",
-                               "the remote base branch's commit is not in this checkout; fetch the base branch "
-                               "(git fetch <remote> <base>) and retry")
-    ref = base_commit
-    unsafe = IntegrationError("AUTONOMY_POLICY_PATH_UNSAFE", "the committed .pi/autonomy.yaml is a symlink")
-    entries = {}
-    for path in (".pi", _POLICY_FILE):
-        proc = git("ls-tree", "--full-tree", "-z", ref, "--", path)
-        if proc.returncode:
-            raise IntegrationError("AUTONOMY_POLICY_INVALID", "the committed publication policy is unreadable")
-        for entry in filter(None, proc.stdout.split("\0")):
-            meta, _, name = entry.partition("\t")
-            entries[name] = meta.split()
-    if entries.get(".pi", [""])[0] == "120000":
-        raise unsafe
-    policy = entries.get(_POLICY_FILE)
-    if policy is None:
+    entry = adapter.policy_file_at(base_commit, repo=repo)
+    if entry is None:
         return "refs", None
-    mode, kind, blob = policy
-    if kind != "blob" or mode == "120000":
-        raise unsafe
-    proc = git("cat-file", "blob", blob)
+    if entry.get("type") == "symlink" or entry.get("path") != _POLICY_FILE:
+        raise IntegrationError("AUTONOMY_POLICY_PATH_UNSAFE", "the committed .pi/autonomy.yaml is a symlink")
+    if entry.get("type") != "file" or not isinstance(entry.get("text"), str):
+        raise IntegrationError("AUTONOMY_POLICY_INVALID", "the committed publication policy is not a readable file")
     try:
-        if proc.returncode:
-            raise ValueError
-        data = yaml.safe_load(proc.stdout)
-        issues = autonomy_policy.validate(data)
-    except (ValueError, yaml.YAMLError) as exc:
+        data = yaml.safe_load(entry["text"])
+    except yaml.YAMLError as exc:
         raise IntegrationError("AUTONOMY_POLICY_INVALID", "the committed publication policy is unreadable") from exc
+    issues = autonomy_policy.validate(data)
     if issues:
         raise IntegrationError("AUTONOMY_POLICY_INVALID", f"committed policy: {issues[0]}"[:300])
-    return data.get("issue_reference", autonomy_policy.DEFAULTS["issue_reference"]), blob
+    return data.get("issue_reference", autonomy_policy.DEFAULTS["issue_reference"]), entry["sha"]
 
 
 def _require_clean_policy_checkout(worktree: Path) -> None:
@@ -613,8 +585,8 @@ def _publication_remote(worktree: Path, repo: str) -> str:
     return "origin" if "origin" in candidates else sorted(candidates)[0]
 
 
-def _remote_branch_commit(worktree: Path, remote: str, branch: str) -> str | None:
-    """The commit `branch` points to on `remote` right now, or None when the remote has no such branch."""
+def _remote_head_commit(worktree: Path, remote: str, branch: str) -> str | None:
+    """The commit the pico/ head branch points to on `remote`, or None when it is not pushed yet."""
     proc = subprocess.run(["git", "-C", str(worktree), "ls-remote", "--heads", remote, f"refs/heads/{branch}"],
                           capture_output=True, text=True, timeout=30)
     if proc.returncode:
@@ -627,10 +599,20 @@ def _remote_branch_commit(worktree: Path, remote: str, branch: str) -> str | Non
     return parts[0]
 
 
-def verified_issue_reference(worktree: Path, repo: str, base: str) -> tuple[str, str | None, str | None]:
-    """`issue_reference` at the base commit the verified remote reports: (value, policy blob, base commit)."""
-    base_commit = _remote_branch_commit(worktree, _publication_remote(worktree, repo), base)
-    return (*committed_issue_reference(worktree, base_commit), base_commit)
+def _remote_base_commit(repo: str, base: str, adapter=gh) -> str | None:
+    """The base branch's commit as the GitHub API reports it, or None when GitHub has no such branch."""
+    try:
+        gh.validate_branch(base)
+    except ValueError as exc:
+        raise IntegrationError("PUBLICATION_REF_INVALID",
+                               "base branch must be [A-Za-z0-9._-] segments separated by '/'") from exc
+    return adapter.branch_head(base, repo=repo)
+
+
+def verified_issue_reference(repo: str, base: str, adapter=gh) -> tuple[str, str | None, str | None]:
+    """`issue_reference` at the base commit GitHub reports: (value, policy blob, base commit)."""
+    base_commit = _remote_base_commit(repo, base, adapter)
+    return (*remote_issue_reference(repo, base_commit, adapter), base_commit)
 
 
 def _publication_state(worktree: Path, repo: str, base: str, head: str, adapter=gh) -> dict:
@@ -638,8 +620,8 @@ def _publication_state(worktree: Path, repo: str, base: str, head: str, adapter=
     commit = _git(worktree, "rev-parse", "--verify", f"refs/heads/{head}^{{commit}}")
     if not re.fullmatch(r"[0-9a-f]{40,64}", commit):
         raise IntegrationError("PUBLICATION_REF_INVALID", "head is not a local commit")
-    remote_commit = _remote_branch_commit(worktree, remote, head)
-    base_commit = _remote_branch_commit(worktree, remote, base)
+    remote_commit = _remote_head_commit(worktree, remote, head)
+    base_commit = _remote_base_commit(repo, base, adapter)
     prs = adapter.list_prs(base=base, head=head, repo=repo)
     open_prs = [pr for pr in prs if pr["state"].lower() == "open"]
     if len(open_prs) > 1:
@@ -661,9 +643,11 @@ def publish(*, worktree: Path, base: str, head: str, title: str, body_file: Path
     accepted only for an issue of this repository that either an in-process
     caller names in `closes_issue` (a workspace task with `closes_issue:
     true`), or that has its own `Closes #N` line while `.pi/autonomy.yaml` at
-    the base commit the remote reports sets `issue_reference: closes` and the
-    checkout's copy is neither a symlink nor modified. The plan records that
-    base commit and policy blob, so the plan hash binds them.
+    the base commit GitHub reports sets `issue_reference: closes` and the
+    checkout's copy is neither a symlink nor modified. Base commit and policy
+    are read through the GitHub API adapter, not local git. The plan records
+    both, so the plan hash binds them; a merge to the base between the dry
+    run and the apply therefore gives GITHUB_STATE_CONFLICT.
     """
     meta = {"target_repository": None, "target_worktree": str(worktree.resolve()), "phase": "publication",
             "blocker_code": None, "reason": None, "mutations_planned": 0,
@@ -692,7 +676,7 @@ def publish(*, worktree: Path, base: str, head: str, title: str, body_file: Path
         def policy_closes() -> bool:
             # Read only when the body would close an issue the caller did not name.
             nonlocal policy_blob
-            policy_reference, policy_blob = committed_issue_reference(worktree, state["base_commit"])
+            policy_reference, policy_blob = remote_issue_reference(repo, state["base_commit"], adapter)
             if policy_reference != "closes":
                 return False
             _require_clean_policy_checkout(worktree)

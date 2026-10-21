@@ -495,6 +495,78 @@ def make_repo_root(tmp_root: Path) -> Path:
     return repo
 
 
+class PublicationGateReadsTest(unittest.TestCase):
+    """The two fixed read-only `gh api -X GET` shapes the publication gate uses."""
+
+    SHA = "a" * 40
+
+    def call(self, fn, *args, stdout="", returncode=0, stderr="", **kwargs):
+        with patch.object(gh.shutil, "which", return_value="/usr/bin/gh"), \
+             patch.object(gh.subprocess, "run", return_value=fake_proc(returncode, stdout, stderr)) as mock_run:
+            result = fn(*args, **kwargs)
+        self.assertEqual(mock_run.call_args.kwargs.get("shell"), False)
+        return result, mock_run.call_args.args[0]
+
+    def test_branch_head_uses_the_fixed_argv_and_validates_the_shape(self):
+        ref = {"ref": "refs/heads/release/1.x", "object": {"type": "commit", "sha": self.SHA}}
+        sha, argv = self.call(gh.branch_head, "release/1.x", repo="acme/repo", stdout=json.dumps(ref))
+        self.assertEqual(sha, self.SHA)
+        self.assertEqual(argv, ["gh", "api", "-X", "GET", "repos/acme/repo/git/ref/heads/release/1.x"])
+        self.assertIsNone(self.call(gh.branch_head, "main", repo="acme/repo", returncode=1,
+                                    stderr="gh: Not Found (HTTP 404)")[0])
+        for bad in ({"ref": "refs/heads/other", "object": {"type": "commit", "sha": self.SHA}},
+                    {"ref": "refs/heads/main", "object": {"type": "tag", "sha": self.SHA}},
+                    {"ref": "refs/heads/main", "object": {"type": "commit", "sha": "xyz"}},
+                    [{"ref": "refs/heads/main"}]):
+            with self.subTest(bad=bad), self.assertRaises(gh.GhOutputError):
+                self.call(gh.branch_head, "main", repo="acme/repo", stdout=json.dumps(bad))
+        with self.assertRaises(gh.GhCommandError):
+            self.call(gh.branch_head, "main", repo="acme/repo", returncode=1, stderr="HTTP 500")
+        for branch in ("../x", "a..b", "a b", "a?b", "-x", "a#b", "", "a/", "/a"):
+            with self.subTest(branch=branch), self.assertRaises(ValueError):
+                gh.branch_head(branch, repo="acme/repo")
+
+    def test_policy_file_at_decodes_and_reports_type_and_path(self):
+        import base64
+        content = {"type": "file", "path": ".pi/autonomy.yaml", "sha": "b" * 40, "encoding": "base64",
+                   "content": base64.b64encode(b"issue_reference: closes\n").decode()}
+        entry, argv = self.call(gh.policy_file_at, self.SHA, repo="acme/repo", stdout=json.dumps(content))
+        self.assertEqual(argv, ["gh", "api", "-X", "GET", f"repos/acme/repo/contents/.pi/autonomy.yaml?ref={self.SHA}"])
+        self.assertEqual(entry, {"type": "file", "path": ".pi/autonomy.yaml", "sha": "b" * 40,
+                                 "text": "issue_reference: closes\n"})
+        symlink = {"type": "symlink", "path": ".pi/autonomy.yaml", "sha": "c" * 40, "target": "/etc/x"}
+        self.assertEqual(self.call(gh.policy_file_at, self.SHA, repo="acme/repo", stdout=json.dumps(symlink))[0]["type"],
+                         "symlink")
+        self.assertEqual(self.call(gh.policy_file_at, self.SHA, repo="acme/repo", stdout="[]")[0]["type"], "dir")
+        self.assertIsNone(self.call(gh.policy_file_at, self.SHA, repo="acme/repo", returncode=1,
+                                    stderr="gh: Not Found (HTTP 404)")[0])
+        with self.assertRaises(gh.GhOutputError):
+            self.call(gh.policy_file_at, self.SHA, repo="acme/repo", stdout=json.dumps({"type": "weird"}))
+        with self.assertRaises(ValueError):
+            gh.policy_file_at("main", repo="acme/repo")
+
+    def test_allowlist_accepts_only_the_two_get_shapes(self):
+        gh._validate_allowlisted(["gh", "api", "-X", "GET", "repos/acme/repo/git/ref/heads/main"])
+        gh._validate_allowlisted(["gh", "api", "-X", "GET", f"repos/acme/repo/contents/.pi/autonomy.yaml?ref={self.SHA}"])
+        for argv in (
+                ["gh", "api", "-X", "GET", "repos/acme/repo/git/refs/heads/main"],
+                ["gh", "api", "-X", "GET", "repos/acme/repo/git/ref/heads/a..b"],
+                ["gh", "api", "-X", "GET", "repos/acme/repo/git/ref/heads/main?x=1"],
+                ["gh", "api", "-X", "GET", "repos/acme/repo/contents/.pi/autonomy.yaml"],
+                ["gh", "api", "-X", "GET", "repos/acme/repo/contents/.pi/autonomy.yaml?ref=main"],
+                ["gh", "api", "-X", "GET", "repos/acme/repo/contents/secrets.env?ref=" + self.SHA],
+                ["gh", "api", "-X", "GET", "repos/acme/repo/git/ref/heads/main", "-f", "x=y"],
+                ["gh", "api", "-X", "GET", "user"],
+                ["gh", "api", "-X", "GET", "repos/../repo/git/ref/heads/main"],
+                ["gh", "api", "-X", "POST", "repos/acme/repo/git/ref/heads/main"]):
+            with self.subTest(argv=argv):
+                with patch.object(gh.shutil, "which", return_value="/usr/bin/gh"), \
+                     patch.object(gh.subprocess, "run") as mock_run:
+                    with self.assertRaises(gh.GithubSyncError):
+                        gh._run(argv)
+                    mock_run.assert_not_called()
+
+
 class BacklogGithubCompositionTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
