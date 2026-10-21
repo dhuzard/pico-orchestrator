@@ -4,3 +4,4 @@ __pycache__/
 provenance/checkpoints/
 provenance/runs/*.lock
 provenance/leases/
+.venv/

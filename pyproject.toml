@@ -9,3 +9,8 @@ select = ["E9", "F", "B"]
 # E501: long lines are tolerated. E402: tools/tests/benchmarks insert the repo
 # root into sys.path before importing sibling modules.
 ignore = ["E501", "E402"]
+
+[tool.pytest.ini_options]
+# The synthetic benchmark's task tests fail by design until a worker does the
+# task; they run inside the generated throwaway repositories, not here.
+addopts = "--ignore=benchmarks/synthetic-workspace/files"
