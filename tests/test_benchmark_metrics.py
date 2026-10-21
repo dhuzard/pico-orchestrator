@@ -118,6 +118,82 @@ class TokenSeparation(unittest.TestCase):
         self.assertEqual(calls["event_kinds"], {"interaction": 1, "phase": 1})
 
 
+class SessionBindsAndAttribution(unittest.TestCase):
+    """CRT-like session excerpt: two runs in one session file, binds with and without task_id."""
+
+    @staticmethod
+    def call(call_id, **args):
+        return {"type": "message", "message": {"role": "assistant", "content": [
+            {"type": "toolCall", "id": call_id, "name": "orchestration_record", "arguments": args}]}}
+
+    def session(self, state: Path):
+        sessions = state / "executions" / "k" / "sessions"
+        sessions.mkdir(parents=True)
+        lines = [self.call("pre", action="status"),  # before any run: belongs to none
+                 {"type": "custom", "customType": bm.SESSION_ENTRY, "data": {"run_id": "run-old"}},
+                 self.call("o1", action="bind_workspace", task_id="t9", step_id="impl"),
+                 self.call("o2", action="status"),
+                 {"type": "custom", "customType": bm.SESSION_ENTRY, "data": {"run_id": "run-1"}},
+                 self.call("b1", action="bind_workspace", task_id="t1", step_id="impl"),
+                 self.call("b2", action="bind_workspace", task_id="t2", step_id="impl"),
+                 self.call("b3", action="bind_workspace", task_id="t2", step_id="impl"),  # rebind: one fact
+                 self.call("w", action="declare_wave", wave_id="w1", tasks=[{"task_id": "t1", "write_scope": ["a"]}]),
+                 self.call("f", action="finish", status="COMPLETED")]
+        (sessions / "20260101_s.jsonl").write_text("\n".join(json.dumps(x) for x in lines), encoding="utf-8")
+
+    def test_only_calls_after_the_runs_start_and_both_binds_are_found(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp)
+            self.session(state)
+            report = bm.run_report(make_record("run-1"), state=state)
+            old = bm.run_report(make_record("run-old"), state=state)
+        self.assertEqual(report["calls"]["orchestration_record"]["by_action"],
+                         {"bind_workspace": 3, "declare_wave": 1, "finish": 1})
+        self.assertEqual(old["calls"]["orchestration_record"]["by_action"], {"bind_workspace": 1, "status": 1})
+        binds = [(f["key"], f["evidence"]) for f in report["provenance_facts"] if f["category"] == "bind"]
+        self.assertEqual(binds, [(["t1", "impl"], "session"), (["t2", "impl"], "session")])
+
+    def test_bind_evidence_is_not_compared_and_a_missing_bind_is_reported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp)
+            self.session(state)
+            before = bm.run_report(make_record("run-1"), state=state)["provenance_facts"]
+        after = make_record("run-2")
+        after["parent_orchestration"]["activity"] = [
+            {"tool": "ClaudeWorker", "status": "started", "task_id": "t1", "step_id": "impl"},
+            {"tool": "ClaudeWorker", "status": "started", "task_id": "t2", "step_id": "impl"}]
+        same = bm.diff_facts(before, bm.provenance_facts(after))
+        self.assertEqual([m for m in same if m["category"] == "bind"], [])  # different evidence, same binds
+        after["parent_orchestration"]["activity"].pop()
+        missing = [m for m in bm.diff_facts(before, bm.provenance_facts(after)) if m["category"] == "bind"]
+        self.assertEqual([m["key"] for m in missing], [["t2", "impl"]])
+
+    def test_bind_without_task_id_resolves_to_the_sole_phase(self):
+        calls = [{"action": "bind_workspace", "step_id": "impl"}]
+        self.assertEqual(bm.session_binds(calls, ["only"]), [("only", "impl")])
+        self.assertEqual(bm.session_binds(calls, ["a", "b"]), [("?", "impl")])
+        self.assertIsNone(bm.session_binds(None, ["a"]))
+
+
+class Durations(unittest.TestCase):
+    def test_sum_and_wall_clock_span_differ_for_overlapping_runs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp)
+            write_state(state, {
+                "run-a": make_record("run-a", started="2026-01-01T00:00:00Z", ended="2026-01-01T00:10:00Z"),
+                "run-b": make_record("run-b", started="2026-01-01T00:05:00Z", ended="2026-01-01T00:20:00Z")},
+                {"ta": passed("run-a"), "tb": passed("run-b")})
+            totals = bm.workspace_report(state, "ws")["totals"]
+        self.assertEqual(totals["run_seconds_sum"], 600 + 900)
+        self.assertEqual(totals["wall_clock_span_seconds"], 1200)
+        self.assertNotIn("wall_clock_seconds", totals)
+
+    def test_span_is_unknown_when_a_run_has_not_ended(self):
+        running = make_record("run-a")
+        del running["ended_at"]
+        self.assertIsNone(bm._span([bm.run_report(running)]))
+
+
 class Headline(unittest.TestCase):
     def test_headline_is_tokens_per_verified_task_and_na_when_none(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -352,6 +428,62 @@ class SyntheticWorkspace(unittest.TestCase):
         self.assertEqual({t["id"]: t.get("issue") for t in yaml.safe_load(on.read_text())["tasks"]}["lib-slugify"], 7)
         with self.assertRaises(self.setup.SetupError):
             self.setup.create(self.base / "bad", issues={"nope": 1})
+
+
+class SetupGuards(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self._tmp.name)
+        self.setup = load_setup()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_refuses_any_target_inside_a_work_tree_or_its_control_directory(self):
+        outer = self.base / "outer"
+        outer.mkdir()
+        subprocess.run(["git", "init", "-q", str(outer)], check=True)
+        for target in (outer / "bench", outer / "deep" / "er" / "bench", outer / ".git" / "bench"):
+            with self.assertRaises(self.setup.SetupError, msg=str(target)):
+                self.setup.create(target)
+            self.assertFalse(target.exists())
+
+    def test_refuses_this_checkouts_common_dir(self):
+        common = subprocess.run(["git", "-C", str(REPO_ROOT), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                                capture_output=True, text=True, check=True).stdout.strip()
+        with self.assertRaises(self.setup.SetupError):
+            self.setup.create(Path(common) / "bench")
+
+    def test_publication_for_another_owner_needs_confirmation(self):
+        with self.assertRaises(self.setup.SetupError):
+            self.setup.create(self.base / "a", owner="someone", publication=True)
+        self.assertFalse((self.base / "a").exists())
+        self.setup.create(self.base / "b", owner="someone", publication=True, confirm_owned=True)
+        self.setup.create(self.base / "c", publication=True)  # default sandbox owner needs no flag
+        script = str(BENCH / "setup.py")
+        refused = subprocess.run([sys.executable, script, str(self.base / "d"), "--owner", "someone", "--publication"],
+                                 capture_output=True, text=True, check=False)
+        self.assertEqual(refused.returncode, 1)
+        accepted = subprocess.run([sys.executable, script, str(self.base / "e"), "--owner", "someone", "--publication",
+                                   "--i-own-these-repos"], capture_output=True, text=True, check=False)
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+
+    def test_pins_ignore_the_users_git_configuration(self):
+        baseline = self.setup.create(self.base / "plain")["pinned_commits"]
+        hostile = self.base / "gitconfig"
+        hostile.write_text("[user]\n\tname = Someone Else\n[commit]\n\tgpgsign = true\n[core]\n\tautocrlf = true\n"
+                           f"\thooksPath = {self.base}/nohooks\n[init]\n\tdefaultBranch = trunk\n", encoding="utf-8")
+        old = {k: os.environ.get(k) for k in ("GIT_CONFIG_GLOBAL", "HOME")}
+        os.environ.update({"GIT_CONFIG_GLOBAL": str(hostile), "HOME": str(self.base)})
+        try:
+            hostile_pins = self.setup.create(self.base / "hostile")["pinned_commits"]
+        finally:
+            for key, value in old.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+        self.assertEqual(hostile_pins, baseline)
 
 
 class SyntheticWorkspaceFakePi(unittest.TestCase):

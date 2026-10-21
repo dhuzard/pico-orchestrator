@@ -2,7 +2,7 @@
 """Create the synthetic benchmark workspace: two throwaway repositories and a workspace manifest.
 
     python3 benchmarks/synthetic-workspace/setup.py TARGET_DIR [--owner OWNER] [--workspace-id ID]
-                                                    [--publication] [--issue TASK=N ...]
+                                                    [--publication [--i-own-these-repos]] [--issue TASK=N ...]
 
 TARGET_DIR must not exist yet (or be empty) and must not lie inside the PICO
 repository. It receives `synth-lib/`, `synth-app/` and `workspace.yaml`.
@@ -54,8 +54,9 @@ class SetupError(Exception):
 
 
 def git(repo: Path, *args: str) -> str:
-    env = {**os.environ, **COMMIT_ENV}
-    done = subprocess.run(["git", "-C", str(repo), *args], env=env, capture_output=True, text=True, check=False)
+    # Independent of the user's Git configuration: no global/system config, no signing, no hooks.
+    env = {**os.environ, **COMMIT_ENV, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1"}
+    done = subprocess.run(["git", "-C", str(repo), "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", *args], env=env, capture_output=True, text=True, check=False)
     if done.returncode:
         raise SetupError(f"git {' '.join(args)} failed in {repo}: {done.stderr.strip()}")
     return done.stdout.strip()
@@ -125,11 +126,31 @@ def build_manifest(workspace_id: str, owner: str, pins: dict[str, str], issues: 
             "tasks": tasks}
 
 
+def inside_git(target: Path) -> bool:
+    """Whether target lies inside any Git work tree or Git directory (checked from its nearest existing parent)."""
+    probe = target
+    while not probe.exists() and probe != probe.parent:
+        probe = probe.parent
+    if not probe.is_dir():
+        probe = probe.parent
+    done = subprocess.run(["git", "-C", str(probe), "rev-parse", "--git-dir"], capture_output=True, text=True, check=False)
+    return done.returncode == 0
+
+
 def create(target: Path, *, owner: str = DEFAULT_OWNER, workspace_id: str = DEFAULT_WORKSPACE_ID,
-           publication: bool = False, issues: dict[str, int] | None = None) -> dict:
+           publication: bool = False, issues: dict[str, int] | None = None, confirm_owned: bool = False) -> dict:
     target = target.expanduser().resolve()
     if target == ROOT or ROOT in target.parents:
         raise SetupError("target must be outside the PICO repository")
+    common = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                            capture_output=True, text=True, check=False)
+    if common.returncode == 0 and (Path(common.stdout.strip()) == target or Path(common.stdout.strip()) in target.parents):
+        raise SetupError("target must not be inside this checkout's Git directory")
+    if inside_git(target):
+        raise SetupError("target must not be inside any Git repository or work tree")
+    if publication and owner != DEFAULT_OWNER and not confirm_owned:
+        raise SetupError(f"--publication with owner {owner!r} commits push and PR permissions for that owner's "
+                         "repositories: pass --i-own-these-repos to confirm they are your sandbox repositories")
     if target.exists() and (not target.is_dir() or any(target.iterdir())):
         raise SetupError("target exists and is not an empty directory")
     issues = issues or {}
@@ -152,6 +173,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--workspace-id", default=DEFAULT_WORKSPACE_ID)
     parser.add_argument("--publication", action="store_true",
                         help="commit .pi/autonomy.yaml allowing push and draft PRs (sandbox repositories only)")
+    parser.add_argument("--i-own-these-repos", dest="confirm_owned", action="store_true",
+                        help="required with --publication and an owner other than the default: confirms the named "
+                             "repositories are your own sandbox repositories")
     parser.add_argument("--issue", action="append", default=[], metavar="TASK=N",
                         help="issue number in the task's repository that its draft PR references")
     args = parser.parse_args(argv)
@@ -163,7 +187,7 @@ def main(argv: list[str] | None = None) -> int:
                 raise SetupError(f"--issue expects TASK=N, got {item!r}")
             issues[task] = int(number)
         result = create(args.target, owner=args.owner, workspace_id=args.workspace_id,
-                        publication=args.publication, issues=issues)
+                        publication=args.publication, issues=issues, confirm_owned=args.confirm_owned)
     except SetupError as exc:
         print(f"setup failed: {exc}", file=sys.stderr)
         return 1

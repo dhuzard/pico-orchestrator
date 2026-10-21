@@ -121,19 +121,25 @@ def _sum_known(values: list) -> int | float | None:
 
 # --- session JSONL ---------------------------------------------------------
 
-def _tool_calls(node: Any, found: dict):
-    """Collect orchestration_record tool calls from one decoded session entry, keyed to dedupe repeats."""
+def _tool_calls(node: Any, found: dict, run_id: str | None = None, run_filter: str | None = None):
+    """Collect orchestration_record tool calls from one decoded session entry, keyed to dedupe repeats.
+
+    Calls are attributed to `run_id`, the run whose lifecycle entry most recently preceded them; with
+    `run_filter` set, calls of other runs are ignored.
+    """
     if isinstance(node, dict):
         if node.get("name") == "orchestration_record" and node.get("type") in {"toolCall", "tool_use", "tool_call"}:
+            if run_filter is not None and run_id != run_filter:
+                return
             args = next((node[k] for k in ("arguments", "input", "args", "params") if isinstance(node.get(k), dict)), {})
             key = node.get("id") or f"anon-{len(found)}"
             found.setdefault(key, args)
             return
         for value in node.values():
-            _tool_calls(value, found)
+            _tool_calls(value, found, run_id, run_filter)
     elif isinstance(node, list):
         for value in node:
-            _tool_calls(value, found)
+            _tool_calls(value, found, run_id, run_filter)
 
 
 def session_files(state: Path, run_id: str, extra_dirs: list[Path]) -> list[Path]:
@@ -155,8 +161,12 @@ def session_files(state: Path, run_id: str, extra_dirs: list[Path]) -> list[Path
     return matches
 
 
-def orchestration_record_calls(files: list[Path]) -> dict | None:
-    """`orchestration_record` calls by action (events also by kind) from the lead's session; None without a session."""
+def session_calls(files: list[Path], run_id: str) -> list[dict] | None:
+    """Arguments of the `orchestration_record` calls the lead made for `run_id`; None without a session.
+
+    A session may host several runs: only calls after that run's lifecycle entry (and before another
+    run's entry) are counted. Calls before any lifecycle entry belong to no run and are ignored.
+    """
     if not files:
         return None
     found: dict = {}
@@ -165,14 +175,26 @@ def orchestration_record_calls(files: list[Path]) -> dict | None:
             lines = file.read_text(encoding="utf-8").splitlines()
         except OSError:
             continue
+        current = None
         for line in lines:
             try:
-                _tool_calls(json.loads(line), found)
+                entry = json.loads(line)
             except ValueError:
                 continue
+            if isinstance(entry, dict) and entry.get("type") == "custom" and entry.get("customType") == SESSION_ENTRY:
+                current = (entry.get("data") or {}).get("run_id", current)
+                continue
+            _tool_calls(entry, found, current, run_id)
+    return list(found.values())
+
+
+def orchestration_record_calls(calls: list[dict] | None) -> dict | None:
+    """Calls by action (events also by kind); None when there is no session."""
+    if calls is None:
+        return None
     by_action: dict[str, int] = {}
     event_kinds: dict[str, int] = {}
-    for args in found.values():
+    for args in calls:
         action = args.get("action") if isinstance(args.get("action"), str) else "unknown"
         by_action[action] = by_action.get(action, 0) + 1
         if action == "event" and isinstance(args.get("event"), dict):
@@ -182,20 +204,35 @@ def orchestration_record_calls(files: list[Path]) -> dict | None:
             "event_kinds": dict(sorted(event_kinds.items()))}
 
 
+def session_binds(calls: list[dict] | None, phase_ids: list[str]) -> list[tuple[str, str]] | None:
+    """(task, step) of each `bind_workspace` call; a missing task_id means the sole routed task."""
+    if calls is None:
+        return None
+    out = set()
+    for args in calls:
+        if args.get("action") == "bind_workspace" and isinstance(args.get("step_id"), str):
+            task = args.get("task_id")
+            out.add((str(task) if task else (phase_ids[0] if len(phase_ids) == 1 else "?"), args["step_id"]))
+    return sorted(out)
+
+
 # --- provenance facts ------------------------------------------------------
 
 def _fact(category: str, key: list, value: dict) -> dict:
     return {"category": category, "key": [str(k) for k in key], "value": value}
 
 
-def provenance_facts(record: dict, interaction_types: tuple[str, ...] = ()) -> list[dict]:
+def provenance_facts(record: dict, interaction_types: tuple[str, ...] = (),
+                     session_bind_keys: list[tuple[str, str]] | None = None) -> list[dict]:
     """Phase, worker, wave, bind, integrate and finish facts of a run record, each with a semantic key.
 
     Keys are identities (phase id, phase/step/epoch, wave id), never positions, so order does not matter.
     A wave contributes one `wave` fact (its tasks) and, per status reached, `integrate` begin/end facts.
-    Bind: the record has no standalone bind event. A bind is evidenced by a `bind_workspace`
-    entry in an optional `binds` list, by the latest checkpoint reason `worker_approval`, or by a
-    ClaudeWorker `started` activity for the (task, step); each is keyed by (task, step) where known.
+    Bind: the run record has no standalone bind event. With a lead session, binds are the
+    `bind_workspace` calls in it (`session_bind_keys`, from `session_binds`); without one they are
+    an optional record `binds` list plus ClaudeWorker `started` activity. Every bind is keyed by
+    (task, step) only; `evidence` is metadata outside the compared value, so a bind seen through
+    different evidence on the two sides is not reported missing.
     Interactions are excluded unless their type is listed in `interaction_types`.
     """
     parent = record.get("parent_orchestration") if isinstance(record.get("parent_orchestration"), dict) else {}
@@ -219,18 +256,18 @@ def provenance_facts(record: dict, interaction_types: tuple[str, ...] = ()) -> l
             facts.append(_fact("integrate", [wave.get("id"), "begin"], {}))
         if reached >= 2:
             facts.append(_fact("integrate", [wave.get("id"), "end"], {}))
-    binds: dict[tuple, dict] = {}
-    for item in parent.get("binds") or []:
-        if isinstance(item, dict):
-            binds[("bind", str(item.get("task_id")), str(item.get("step_id")))] = {"evidence": "bind_workspace"}
-    checkpoint = parent.get("checkpoint")
-    if isinstance(checkpoint, dict) and checkpoint.get("reason") == "worker_approval":
-        binds[("bind", "checkpoint", str(checkpoint.get("phase")))] = {"evidence": "worker_approval"}
-    for entry in parent.get("activity") or []:
-        if isinstance(entry, dict) and entry.get("tool") == "ClaudeWorker" and entry.get("status") == "started":
-            binds[("bind", str(entry.get("task_id")), str(entry.get("step_id")))] = {"evidence": "worker_started"}
-    for (_, task, step), value in binds.items():
-        facts.append(_fact("bind", [task, step], value))
+    binds: dict[tuple[str, str], str] = {}
+    if session_bind_keys is not None:
+        binds = {key: "session" for key in session_bind_keys}
+    else:
+        for item in parent.get("binds") or []:
+            if isinstance(item, dict):
+                binds[(str(item.get("task_id")), str(item.get("step_id")))] = "record_binds"
+        for entry in parent.get("activity") or []:
+            if isinstance(entry, dict) and entry.get("tool") == "ClaudeWorker" and entry.get("status") == "started":
+                binds[(str(entry.get("task_id")), str(entry.get("step_id")))] = "worker_started"
+    for (task, step), evidence in sorted(binds.items()):
+        facts.append({**_fact("bind", [task, step], {}), "evidence": evidence})
     for item in parent.get("reconciled") or []:
         facts.append(_fact("finish", ["reconciled", item.get("kind"), item.get("phase_id"), item.get("step_id"),
                                       item.get("route_epoch")], {"from_status": item.get("from_status"), "to": item.get("to")}))
@@ -266,6 +303,20 @@ def provenance_diff(before: dict, after: dict, interaction_types: tuple[str, ...
 
 # --- per-run and aggregate reports -----------------------------------------
 
+def _instant(value: Any) -> datetime | None:
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _span(runs: list[dict]) -> float | None:
+    """Earliest start to latest end across finished runs: the elapsed wall clock of the whole benchmark."""
+    starts = [t for t in (_instant(r.get("started_at")) for r in runs) if t]
+    ends = [t for t in (_instant(r.get("ended_at")) for r in runs) if t]
+    return round((max(ends) - min(starts)).total_seconds(), 3) if starts and ends and len(ends) == len(runs) else None
+
+
 def _duration(record: dict) -> float | None:
     try:
         start = datetime.fromisoformat(str(record["started_at"]).replace("Z", "+00:00"))
@@ -285,6 +336,8 @@ def run_report(record: dict, *, state: Path | None = None, session_dirs: list[Pa
     cost, unpriced = usage.cost_coverage(context)
     lead_calls = context.get("lead_calls")
     files = session_files(state, record.get("run_id", ""), session_dirs or []) if state is not None else []
+    calls = session_calls(files, record.get("run_id", ""))
+    phase_ids = [str(ph.get("id")) for ph in parent.get("phases") or [] if isinstance(ph, dict)]
     observed = (entry or {}).get("observed") if isinstance((entry or {}).get("observed"), dict) else {}
     checks = observed.get("checks") if isinstance(observed.get("checks"), list) else None
     validation = observed.get("validation") if isinstance(observed.get("validation"), dict) else {}
@@ -299,15 +352,16 @@ def run_report(record: dict, *, state: Path | None = None, session_dirs: list[Pa
         "tokens": used,
         "spend_tokens": sum(s for s, _ in spent), "spend_complete": all(c for _, c in spent),
         "calls": {"lead": len(lead_calls) if isinstance(lead_calls, list) else None,
-                  "orchestration_record": orchestration_record_calls(files),
+                  "orchestration_record": orchestration_record_calls(calls),
                   "workers": {b: v["invocations"] for b, v in used["workers"].items()}},
         "wall_clock_seconds": _duration(record),
+        "started_at": record.get("started_at"), "ended_at": record.get("ended_at"),
         "cost": {"estimated_usd": cost, "cost_complete": not unpriced, "unpriced": unpriced},
         "outcome": {"final_status": status, "blocker_code": parent.get("blocker_code"),
                     "checks_passed": checks_passed,
                     "checks": [{"id": c.get("id"), "status": c.get("status")} for c in checks or [] if isinstance(c, dict)],
                     "verified": status == "COMPLETED" and checks_passed is True},
-        "provenance_facts": provenance_facts(record),
+        "provenance_facts": provenance_facts(record, session_bind_keys=session_binds(calls, phase_ids)),
     }
 
 
@@ -342,7 +396,8 @@ def aggregate(label: str, runs: list[dict], *, workspace_id: str | None = None, 
             "spend_complete": bool(runs) and all(r["spend_complete"] for r in runs),
             "calls": {"lead": _sum_known([r["calls"]["lead"] for r in runs]), "orchestration_record": orch_total,
                       "workers": worker_calls},
-            "wall_clock_seconds": round(sum(d for d in durations if d is not None), 3) if any(d is not None for d in durations) else None,
+            "run_seconds_sum": round(sum(d for d in durations if d is not None), 3) if any(d is not None for d in durations) else None,
+            "wall_clock_span_seconds": _span(runs),
             "cost": {"estimated_usd": round(sum(c for c in costs if c is not None), 6) if any(c is not None for c in costs) else None,
                      "cost_complete": not unpriced, "unpriced": unpriced},
             "tasks": {"runs": len(runs), "completed": sum(r["outcome"]["final_status"] == "COMPLETED" for r in runs),
@@ -416,7 +471,8 @@ def compare(before: dict, after: dict) -> dict:
         "lead_calls": _delta(bt["calls"]["lead"], at["calls"]["lead"]),
         "orchestration_record_calls": _delta((bt["calls"]["orchestration_record"] or {}).get("total"),
                                              (at["calls"]["orchestration_record"] or {}).get("total")),
-        "wall_clock_seconds": _delta(bt["wall_clock_seconds"], at["wall_clock_seconds"]),
+        "run_seconds_sum": _delta(bt["run_seconds_sum"], at["run_seconds_sum"]),
+        "wall_clock_span_seconds": _delta(bt["wall_clock_span_seconds"], at["wall_clock_span_seconds"]),
         "estimated_cost_usd": _delta(bt["cost"]["estimated_usd"], at["cost"]["estimated_usd"]),
         "lead_tokens": {n: _delta(bt["tokens"]["lead"].get(n), at["tokens"]["lead"].get(n)) for n in TOKEN_NAMES.values()},
         "worker_tokens": {b: {n: _delta(bt["tokens"]["workers"].get(b, {}).get(n), at["tokens"]["workers"].get(b, {}).get(n))
@@ -454,7 +510,8 @@ def render_report(report: dict) -> str:
     lines.append(f"Calls: lead={_cell(totals['calls']['lead'])} orchestration_record={_cell(orch and orch['total'])}"
                  + (" " + json.dumps(orch["by_action"]) if orch else "") + f" workers={json.dumps(totals['calls']['workers'])}")
     cost = totals["cost"]
-    lines.append(f"Duration: {_cell(totals['wall_clock_seconds'])} s (sum of runs)")
+    lines.append(f"Duration: run_seconds_sum={_cell(totals['run_seconds_sum'])} s, "
+                 f"wall_clock_span_seconds={_cell(totals['wall_clock_span_seconds'])} s (first start to last end)")
     lines.append(f"Cost: {_cell(cost['estimated_usd'])} USD, cost_complete={cost['cost_complete']}, unpriced={cost['unpriced'] or 'none'}")
     tasks = totals["tasks"]
     lines.append(f"Tasks: {tasks['completed']}/{tasks['runs']} completed, {tasks['verified']} verified")
@@ -468,7 +525,7 @@ def render_compare(result: dict) -> str:
     d = result["deltas"]
     lines = [render_report(result["before"]), "", render_report(result["after"]), "", "Deltas (after - before)"]
     for name in ("headline_tokens_per_verified_task", "verified_tasks", "spend_tokens", "lead_calls",
-                 "orchestration_record_calls", "wall_clock_seconds", "estimated_cost_usd"):
+                 "orchestration_record_calls", "run_seconds_sum", "wall_clock_span_seconds", "estimated_cost_usd"):
         item = d[name]
         pct = "" if item["percent"] is None else f" ({item['percent']:+.1f}%)"
         change = NA if item["delta"] is None else f"{item['delta']:+,}"
