@@ -18,7 +18,7 @@ across repositories once every dependency is validated, each repository at its
 dependency's validated commit (or its pin).
 
 Each PR body references the task's issue with `Refs #N`, or `Closes #N` when the
-task sets `closes_issue: true` (or omits it and the repository's .pi/autonomy.yaml
+task sets `closes_issue: true` (or omits it and the base branch's committed .pi/autonomy.yaml
 sets `issue_reference: closes`); `closes_issue: false` always writes `Refs #N`.
 
 Publication goes through github_integration.publish unchanged: .pi/autonomy.yaml
@@ -42,7 +42,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import autonomy_policy  # noqa: E402
 import github_integration  # noqa: E402
 import github_sync as gh  # noqa: E402
 import headless_run  # noqa: E402
@@ -188,7 +187,8 @@ def closes_issue(task: dict, repo: dict) -> bool:
     """Whether the task's PR closes its issue on merge.
 
     An explicit `closes_issue` on the task wins; without one, the task follows
-    its repository's `issue_reference` policy (default `refs`).
+    its repository's `issue_reference` policy (default `refs`) as committed on
+    the base branch, the same value the publication gate trusts.
     """
     if isinstance(task.get("closes_issue"), bool):
         return task["closes_issue"]
@@ -196,9 +196,10 @@ def closes_issue(task: dict, repo: dict) -> bool:
     if checkout is None:
         return False
     try:
-        return autonomy_policy.limits(checkout)["issue_reference"] == "closes"
-    except autonomy_policy.AutonomyPolicyError as exc:
-        raise WorkspaceRunError("AUTONOMY_POLICY_INVALID", str(exc)[:300]) from exc
+        reference, _ = github_integration.committed_issue_reference(checkout, repo.get("base_branch", "main"))
+    except github_integration.IntegrationError as exc:
+        raise WorkspaceRunError(exc.code, exc.detail) from exc
+    return reference == "closes"
 
 
 def pr_body(plan: dict, task: dict, repo: dict, observed: dict) -> str:
@@ -257,7 +258,7 @@ def publish(*, manifest: Path, task_id: str, apply: bool = False, plan_hash: str
                                         title=task["title"], body_file=body_file, explicit_repo=repo["repository"],
                                         apply=apply, expected_plan_hash=plan_hash, adapter=adapter,
                                         provenance_root=headless_run.ROOT, grant=grant,
-                                        allow_closes=task.get("closes_issue") is True)
+                                        closes_issue=task["issue"] if task.get("closes_issue") is True else None)
     if result["status"] == "COMPLETED" and result.get("pr"):
         def mutate(obs: dict) -> None:
             obs["pr"] = {"number": result["pr"], "repository": repo["repository"],

@@ -309,10 +309,22 @@ class ContractLifecycleTest(unittest.TestCase):
         self.assertEqual(applied["status"], "COMPLETED", applied)
         self.assertTrue(self.fake.created[0]["body"].startswith("Closes #7\n"))
 
-        # Without a task setting, the repository's issue_reference decides; closes_issue: false keeps Refs.
-        policy = self.repos["alpha"][0] / ".pi/autonomy.yaml"
+        # The task's own issue is the only one the opt-in may close.
+        stray = wc.publish(manifest=self.manifest(a1={"closes_issue": True, "title": "Claim adapter, fixes #8"}),
+                           task_id="a1", adapter=self.fake)
+        self.assertEqual((stray["status"], stray["blocker_code"]), ("BLOCKED", "PUBLICATION_BODY_INVALID"))
+
+        # Without a task setting, the repository's issue_reference decides, as committed on the base
+        # branch: an uncommitted edit changes nothing. closes_issue: false keeps Refs.
+        path = self.repos["alpha"][0]
+        policy = path / ".pi/autonomy.yaml"
         policy.write_text(policy.read_text().replace("issue_reference: refs", "issue_reference: closes"))
-        self.assertTrue(body_after_dry_run(self.manifest())[0].startswith("Closes #7\n"))
+        self.assertTrue(body_after_dry_run(self.manifest())[0].startswith("Refs #7\n"))
+        git("-C", str(path), "add", ".pi/autonomy.yaml")
+        git("-C", str(path), *COMMIT, "close issues on merge")
+        body, preview = body_after_dry_run(self.manifest())
+        self.assertTrue(body.startswith("Closes #7\n"), body)
+        self.assertEqual(preview["plan"]["closes_issues"], [7])
         self.assertTrue(body_after_dry_run(self.manifest(a1={"closes_issue": False}))[0].startswith("Refs #7\n"))
 
     def test_downstream_publication_requires_upstream_pr(self):
