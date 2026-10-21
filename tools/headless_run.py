@@ -299,7 +299,7 @@ def run_status(run_id: str | None) -> dict | None:
         if isinstance(limit, dict):
             calls = context.get("lead_calls")
             summary["lead_call_limit"] = {"max_lead_calls": limit.get("max_lead_calls"), "source": limit.get("source"),
-                                          "calls": len(calls) if isinstance(calls, list) else None,
+                                          "calls": max(len(calls) if isinstance(calls, list) else 0, limit.get("calls_seen") or 0),
                                           "warn_at": limit.get("warn_at"), "warned": limit.get("warned_at_call") is not None,
                                           "reached": limit.get("calls_at_limit") is not None,
                                           "stopped": bool(limit.get("stopped"))}
@@ -534,11 +534,11 @@ def _launch_locked(path: Path, *, worktree: Path, identity: str, common: Path, e
         exhausted = run.get("lead_call_limit") or {}
         if (resume and run.get("status") == "IN_PROGRESS" and type(exhausted.get("calls")) is int
                 and type(exhausted.get("max_lead_calls")) is int and exhausted["calls"] >= exhausted["max_lead_calls"]
-                and max_lead_calls is not None and max_lead_calls <= exhausted["calls"]):
+                and (max_lead_calls is None or max_lead_calls <= exhausted["calls"])):
             # The run stopped (or is parked) at its lead-call limit: only an explicit higher limit continues it.
             raise HeadlessError("LEAD_CALL_LIMIT_EXHAUSTED",
                                 f"the run has made {exhausted['calls']} lead calls against a limit of {exhausted['max_lead_calls']}; "
-                                f"resume with a limit above {exhausted['calls']} (--max-lead-calls, or a higher task/manifest "
+                                f"resume with a limit above {exhausted['calls']} (a resume without a limit is refused too; --max-lead-calls, or a higher task/manifest "
                                 "max_lead_calls) or finish the run")
         if resume and run.get("status") not in {None, "IN_PROGRESS"}:
             record["status"] = "exited"

@@ -1830,7 +1830,7 @@ inherited. The launcher resolves the effective values, records them in the execu
 `PI_ORCHESTRATION_LEAD_CALLS_WARN_AT`; an interactive session without the launcher reads the
 policy itself. The lifecycle extension records `context.lead_call_limit` (limit, source,
 `warn_at`, `warned_at_call`, `calls_at_limit`, `stopped`, `stopped_reason`, `calls_at_stop`).
-The count is the run's recorded `lead_calls`, so it carries over a resume.
+The count is the larger of the recorded `lead_calls` and the extension's own count (`calls_seen`, carried by its limit events, so a lost telemetry write cannot undercount); it carries over a resume, and a restored session re-applies the effective limit at `session_start`. Every assistant call counts, including one whose model string fails validation.
 
 Enforcement is deterministic. At `warn_at` the extension sends the lead one steering message
 (converge, integrate, record outcomes) and records `lead_call_warning`; nothing is blocked. When
@@ -1839,18 +1839,18 @@ is blocked with a `LEAD_CALL_LIMIT` reason that says so. The lead may finish wit
 of 2 further calls and its chosen outcome is recorded as given (a non-COMPLETED finish is
 reconciled as usual, abandoning open work). If the lead has not finished by then, the extension
 stops the run without finishing it: it records any worker still in flight as `blocked`
-(`LEAD_CALL_LIMIT`), aborts worker handles, records `lead_call_limit_reached` (the recorder
+(`LEAD_CALL_LIMIT`), aborts worker handles and waits (bounded, 5 s) for them to settle, records `lead_call_limit_reached` (the recorder
 writes a fresh resume checkpoint with reason `lead_call_limit` and `stopped_reason:
 LEAD_CALL_LIMIT`, under the owner-checked write), releases the run lease through the owner
 path, and aborts the agent. The run stays `IN_PROGRESS`, the session marker stays active and
-later tool calls are refused. The headless execution ends `interrupted` with
+later tool calls are refused. If a wave is `integrating` at the stop, the pre-integration checkpoint is kept and `mid_integration: true` recorded, so a resume reports drift (#40) and needs reconciliation. The headless execution ends `interrupted` with
 `stop_reason: LEAD_CALL_LIMIT`. If the checkpoint cannot be written the run is not left
 resumable; it stays closed and the normal settle ends it.
 
 **Resume after a lead-call stop.** Only an explicit operator action continues it: `pico exec
 start --resume --max-lead-calls N` (or `--resume-interrupted` with a higher task/manifest
-limit, or a higher policy limit). The new limit must exceed the calls already made; the same
-or a lower effective limit is refused before anything launches with `LEAD_CALL_LIMIT_EXHAUSTED`.
+limit, or a higher policy limit). The new limit must exceed the calls already made; the same,
+a lower, or no effective limit is refused before anything launches with `LEAD_CALL_LIMIT_EXHAUSTED`.
 The usual resume rules apply (lease claim, checkpoint verification; drift refuses), the new
 limit and source are recorded and the call count does not reset. Because the run is not terminal,
 a repeat `start` without `--resume` reports `resume_required`. If the wall-clock limit also

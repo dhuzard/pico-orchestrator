@@ -415,18 +415,36 @@ LEAD_LIMIT_STATES = ("set", "reached")
 LEAD_LIMIT_STOP_REASON = "LEAD_CALL_LIMIT"
 
 
+def lead_call_count(context: dict, event: dict | None = None) -> int:
+    """The run's lead call count: the larger of the recorded `lead_calls` and the extension's own authoritative
+    count (`calls_seen`, from its limit events), so a lost telemetry write cannot undercount."""
+    limit = context.get("lead_call_limit") or {}
+    seen = [len(context.get("lead_calls") or []), limit.get("calls_seen") or 0]
+    if event is not None and event.get("calls") is not None:
+        seen.append(_count(event["calls"], "lead call count"))
+    return max(seen)
+
+
+def _integrating(parent: dict) -> bool:
+    phases = parent.get("phases") or []
+    return any(wave.get("status") == "integrating" and _wave_is_current(phases, wave)
+               for wave in parent.get("waves") or [])
+
+
 def _lead_limit_event(parent: dict, event: dict) -> None:
     """Record the lead-call limit and what the lifecycle extension did about it.
 
     `lead_limit` `set` records the effective limit, its source and the warning threshold; `reached` records the
     call that used the last allowed call (tools are then limited to status and finish). `lead_call_warning`
     records the one convergence warning. `lead_call_limit_reached` is the stop: the run stays IN_PROGRESS with
-    `stopped_reason: LEAD_CALL_LIMIT` and a fresh resume checkpoint. Written only by the lifecycle extension,
-    never by the lead's own event payload.
+    `stopped_reason: LEAD_CALL_LIMIT` and a fresh resume checkpoint, except mid-integration, where the
+    pre-integration checkpoint is kept so a resume reports drift. Events may carry the extension's own `calls`
+    count. Written only by the lifecycle extension, never by the lead's own event payload.
     """
     context = parent.setdefault("context", empty_context())
     kind = event["kind"]
-    calls = len(context.setdefault("lead_calls", []))
+    context.setdefault("lead_calls", [])
+    calls = lead_call_count(context, event)
     if kind == "lead_limit":
         state = event["state"]
         if state not in LEAD_LIMIT_STATES:
@@ -443,17 +461,20 @@ def _lead_limit_event(parent: dict, event: dict) -> None:
                 "max_lead_calls": maximum, "source": event["source"], "warn_at": warn_at,
                 "warned_at_call": previous.get("warned_at_call") if warn_at is not None and previous.get("warn_at") == warn_at else None,
                 "calls_at_limit": previous.get("calls_at_limit") if calls >= maximum else None,
-                "stopped": False, "stopped_reason": None, "calls_at_stop": previous.get("calls_at_stop")}
+                "calls_seen": calls, "stopped": False, "stopped_reason": None, "mid_integration": False,
+                "calls_at_stop": previous.get("calls_at_stop")}
             return
         limit = context.get("lead_call_limit")
-        if limit is None or set(event) - {"kind", "state"}:
+        if limit is None or set(event) - {"kind", "state", "calls"}:
             raise ParentRunError("no lead call limit is set for this run")
+        limit["calls_seen"] = calls
         if limit["calls_at_limit"] is None:
             limit["calls_at_limit"] = calls
         return
     limit = context.get("lead_call_limit")
-    if limit is None or set(event) != {"kind"}:
+    if limit is None or set(event) - {"kind", "calls"}:
         raise ParentRunError("no lead call limit is set for this run")
+    limit["calls_seen"] = calls
     if kind == "lead_call_warning":
         if limit["warned_at_call"] is None:
             limit["warned_at_call"] = calls
@@ -462,7 +483,12 @@ def _lead_limit_event(parent: dict, event: dict) -> None:
     limit.update({"stopped": True, "stopped_reason": LEAD_LIMIT_STOP_REASON, "calls_at_stop": calls})
     if limit["calls_at_limit"] is None:
         limit["calls_at_limit"] = min(calls, limit["max_lead_calls"])
-    _checkpoint(parent, reason="lead_call_limit", phase=None)
+    if _integrating(parent):
+        # A wave is mid-integration: the checkpoint stays at the pre-integration state, so the resume sees the
+        # partial merge as drift and needs reconciliation (#40's crash-mid-integration rule).
+        limit["mid_integration"] = True
+    else:
+        _checkpoint(parent, reason="lead_call_limit", phase=None)
 
 
 def _count(value: Any, field: str) -> int:
@@ -667,9 +693,9 @@ def _record_event_unlocked(run_id: str, event: dict, *, repo_root: Path = ROOT) 
         "interaction": {"kind", "type", "summary", "task_id", "step_id", "subagent_id", "reply_to"},
         "lead_usage": {"kind", "model", "phase", "task_type", "turn_index", "duration_ms", "input_tokens", "output_tokens", "cached_tokens", "cache_write_tokens", "total_tokens", "estimated_cost_usd"},
         "checkpoint": {"kind", "phase", "reason", "workspace_bound"},
-        "lead_limit": {"kind", "state", "max_lead_calls", "source", "warn_at"},
-        "lead_call_warning": {"kind"},
-        "lead_call_limit_reached": {"kind"},
+        "lead_limit": {"kind", "state", "max_lead_calls", "source", "warn_at", "calls"},
+        "lead_call_warning": {"kind", "calls"},
+        "lead_call_limit_reached": {"kind", "calls"},
     }
     required = {
         "phase": {"kind", "phase", "status"},

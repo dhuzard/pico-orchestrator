@@ -907,7 +907,9 @@
                 "warn_at": { "type": ["integer", "null"], "minimum": 1 },
                 "warned_at_call": { "type": ["integer", "null"], "minimum": 0 },
                 "calls_at_limit": { "type": ["integer", "null"], "minimum": 0 },
+                "calls_seen": { "type": "integer", "minimum": 0, "description": "The lifecycle extension's own lead call count from its limit events; the run's count is the larger of this and the recorded lead_calls." },
                 "stopped": { "type": "boolean" },
+                "mid_integration": { "type": "boolean", "description": "The stop came while a wave was integrating: the pre-integration checkpoint was kept, so a resume reports drift and needs reconciliation." },
                 "stopped_reason": { "enum": ["LEAD_CALL_LIMIT", null] },
                 "calls_at_stop": { "type": ["integer", "null"], "minimum": 0 }
               }

@@ -155,6 +155,39 @@ class RecorderTest(StateTestCase):
         self.assertEqual(refused.exception.error_code, "RESUME_CHECKPOINT_DRIFT")
         self.assertEqual(self.parent(self.run_id)["final_status"], "IN_PROGRESS")
 
+    def test_a_stop_during_integration_keeps_the_pre_integration_checkpoint_so_a_resume_is_drift(self):
+        self.limit(2, "task", 1)
+        self.event({"kind": "phase", "phase": "t1", "status": "in_progress"})
+        self.event({"kind": "wave", "wave_id": "w1", "task_ids": ["t1"], "status": "declared"})
+        self.event({"kind": "wave", "wave_id": "w1", "task_ids": ["t1"], "status": "integrating"})
+        pre = self.parent(self.run_id)["checkpoint"]
+        self.commit("partial merge")  # the integration advanced HEAD before the stop
+        self.calls(4)
+        self.event({"kind": "lead_call_limit_reached"})
+        parent = self.parent(self.run_id)
+        self.assertEqual(parent["checkpoint"], pre, "the stop must not move the checkpoint mid-integration")
+        limit = parent["context"]["lead_call_limit"]
+        self.assertEqual((limit["stopped"], limit["mid_integration"]), (True, True))
+        run_lease.release(self.run_id, self.owner, repo_root=self.records)
+        with self.assertRaises(po.ParentRunError) as refused:
+            po.resume(self.run_id, worktree=self.target, owner_id="owner-b", pid=os.getpid(),
+                      explicit_repo="Examplecorp/examplelab", repo_root=self.records)
+        self.assertEqual(refused.exception.error_code, "RESUME_CHECKPOINT_DRIFT")
+        self.assertEqual(self.parent(self.run_id)["final_status"], "IN_PROGRESS")
+
+    def test_the_extensions_own_count_wins_over_lost_telemetry_and_survives_a_resume(self):
+        self.limit(5, "cli", 4)
+        self.calls(3)  # three lead_usage rows were recorded; the extension counted seven calls
+        self.event({"kind": "lead_call_limit_reached", "calls": 7})
+        limit = self.parent(self.run_id)["context"]["lead_call_limit"]
+        self.assertEqual((limit["calls_seen"], limit["calls_at_stop"]), (7, 7))
+        self.assertEqual(po.lead_call_count(self.parent(self.run_id)["context"]), 7)
+        run_lease.release(self.run_id, self.owner, repo_root=self.records)
+        po.resume(self.run_id, worktree=self.target, owner_id="owner-b", pid=os.getpid(),
+                  explicit_repo="Examplecorp/examplelab", repo_root=self.records)
+        again = self.limit_as("owner-b", 20, "cli")
+        self.assertEqual(again["calls_seen"], 7)
+
     def test_a_lead_finish_after_the_warning_is_reconciled_as_usual(self):
         self.limit(5, "cli", 4)
         self.event({"kind": "phase", "phase": "t1", "status": "in_progress"})
@@ -302,6 +335,20 @@ class LeadLimitExecutionTest(HeadlessFixture):
         self.assertEqual(self.status()["launches"], 1)
         self.assertEqual(self.status()["run"]["status"], "IN_PROGRESS")
         self.assertEqual(self.status()["run_id"], first["run_id"])
+
+    def test_resume_without_any_limit_is_refused_for_a_stopped_run(self):
+        self.stopped()
+        with self.assertRaises(hr.HeadlessError) as refused:
+            self.start(behavior="leadlimit", resume=True)
+        self.assertEqual(refused.exception.code, "LEAD_CALL_LIMIT_EXHAUSTED")
+        self.assertEqual(self.status()["launches"], 1)
+
+    def test_a_run_that_was_never_limited_resumes_unlimited(self):
+        crashed = self.start(behavior="crash")
+        self.assertEqual(crashed["status"], "interrupted")
+        resumed = self.start(behavior="finish", resume=True, takeover=True)
+        self.assertEqual(resumed["run"]["status"], "PARTIAL")
+        self.assertNotIn("max_lead_calls", resumed)
 
     def test_resume_with_a_raised_limit_continues_the_same_run_and_keeps_the_count(self):
         first = self.stopped()
