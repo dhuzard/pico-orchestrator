@@ -3,7 +3,7 @@
 A small, reproducible workspace for measuring PICO orchestration, not model quality. It serves two issues:
 
 - **#43**: the same task run on two PICO revisions with real backends (before and after), reporting tokens, calls, duration, cost, outcome and provenance completeness.
-- **#49**: the same workspace later runs in CI with fake backends as a regression test for orchestration invariants.
+- **#49**: the same workspace is the main regression benchmark, in two separate parts: deterministic integration tests with fake backends that run in CI on every pull request, and real-agent benchmarks that are only ever started by hand (see "Two parts, kept apart" below).
 
 Nothing here contains scientific content, and nothing is estimated: every metric comes from a recorded run, and an unobserved value is reported as unknown (`null` in JSON, `n/a` in tables).
 
@@ -86,11 +86,51 @@ Provenance completeness (#43): `benchmark_metrics.provenance_diff(before_record,
 
 The #43 failure and recovery modes (resume after an interruption, a worker failure, an integration conflict) are not produced by this happy-path workspace; inject them as separate runs on the same workspace (kill a child and `pico workspace launch --resume`, then record what the extension wrote) and measure them with the same tool.
 
-## Turning it into the #49 CI test
+## Two parts, kept apart (#49)
 
-1. `setup.py` already makes everything deterministic: fixed commits and pins, no network, fixed task ids.
-2. Replace the backends with scripted ones. `tests/test_headless_run.py` has the fake `pi` (`FAKE_PI`, with `FAKE_PI_BEHAVIOR` and `FAKE_PI_USAGE`) and `tests/test_workspace_contracts.py` has a fake GitHub adapter that makes `validate`, `publish`, `ci` and `promote` work offline. A scenario script applies `reference/<repo>/...` for the tasks that should complete and writes nothing for `lib-stopwords`, so it ends PARTIAL.
-3. Assert invariants against the state directory with `benchmark_metrics`: headline and verified counts, `provenance_diff` empty against a stored reference record, no phase or worker left `in_progress` after the PARTIAL run (#42), budget holding with in-flight spend (shrink `budget.max_tokens` in a copy of the manifest, #44/#45), `EXECUTION_TIME_LIMIT` (lower `max_duration_seconds` with a `slow` fake, #46), lead-call and repeated-action limits (#47, #48), and the run lease on resume (#40).
-4. Where the fake and a real run disagree, the real run wins: record its metrics (`--output`) as the reference and add a fake scenario that reproduces it.
+Stochastic model behavior and cache variance must not hide a change in scheduler correctness, and a CI run must not spend tokens. So the workspace serves two separate benchmarks:
 
-`tests/test_benchmark_metrics.py` already covers the metrics tool on fixture records, `setup.py` (planner validates it, checks fail before and pass with the reference solution), and the plumbing of launching `lib-slugify` with the fake `pi` and measuring it.
+| | Deterministic suite | Real-agent benchmark |
+| --- | --- | --- |
+| Where | `tests/test_synthetic_pilot.py` (harness: `tests/scenario_support.py`, `tests/scenario_lead.py`) | `run-real.sh REV LABEL` (`run_real.py`) |
+| Runs | In CI on every pull request, and locally with `python -m pytest -q tests/test_synthetic_pilot.py` | Only when someone starts it with `PICO_REAL_BENCHMARK=1`. CI never sets that variable and never calls the script |
+| Backends | A scripted fake `pi` and a fake GitHub. No model, no network, no tokens | The real `pi`, models and `pico` launcher |
+| Proves | Orchestration is correct and safe: gates, budget, lease, limits, reconciliation, provenance | Task completion, model choice, prompt and context usage, run time and the cost the backends report |
+| Result | Pass or fail, plus provenance compared with a committed golden record | A JSON report (`report.json`) with the metrics of `tools/benchmark_metrics.py` |
+
+When the two disagree, the real run wins: add a scenario to the deterministic suite that reproduces what the real run showed.
+
+### The deterministic suite
+
+The real scheduler, launcher, run lease, recorder (`tools/parent_orchestration.py`, called through its CLI with the lease owner, as the extension does), contract gates (`validate`, `publish`, `ci`, `promote` against a fake GitHub backed by bare repositories on disk) and `benchmark_metrics` all run. Only the model is replaced: the fake `pi` of `tests/test_headless_run.py` takes the lease and starts or restores the run, then a scripted lead (`tests/scenario_lead.py`) replays a list of ops from a scenario file. Ops are data: record an event, apply the `reference/` solution on a `pico/<task>` branch, finish with a status, wait at a barrier, make N lead calls, hang, crash. A recorder call that is refused, or a task without a script, makes the child write `fake-scenario-error` to its log and the test fails: a scenario cannot pass by accident.
+
+| Scenario (test) | What it asserts |
+| --- | --- |
+| `happy-multi-repo` | Wave 1 completes `lib-slugify`; it is validated, published as a draft PR, CI observed green and promoted. Only then do `app-post-url` (synth-app) and `lib-stopwords` (synth-lib) run, and they overlap in time (a barrier makes the test fail if they do not). The qualification task passes at the validated commits. Metrics: 2 verified tasks, headline 1050 tokens per verified task. |
+| `dependency-gate` | `app-post-url` is refused with `WORKSPACE_TASK_BLOCKED` while `lib-slugify` has not run, is only implemented, only validated, only published, and while CI is pending, absent, or green on another commit (`WORKSPACE_CI_NOT_GREEN`). After promotion it is dispatchable. |
+| `partial-and-reconcile` | `lib-stopwords` ends PARTIAL with `APPROVED_INPUTS_UNAVAILABLE` and nothing stays open: the running reviewer, the declared wave and a not-started phase are reconciled to `abandoned` (#42), and the blocked step keeps its blocker. Three restarts are refused with `PREREQUISITE_UNCHANGED` and counted once (#48). |
+| `budget` | With `max_tokens: 2000`, a child that reported 1500 tokens and is still running makes the budget exhausted (2700, including in-flight spend). A direct launch is refused with `WORKSPACE_BUDGET_EXHAUSTED`, the scheduler holds the next task (`held_by_budget`), cost is a lower bound with the unpriced worker listed, and `--ignore-budget` is recorded. |
+| `interrupt-resume` | A child killed with SIGKILL leaves a stale lease; nothing restarts it implicitly; resume without takeover is refused (`RUN_LEASE_STALE`); the scheduler's resume takes the lease over, the child verifies the checkpoint and finishes the same run. A second test moves the checkout (a branch switch at the same HEAD): the checkpoint is refused (`RESUME_CHECKPOINT_DRIFT`) and the run stays open. |
+| `time-limit` | A hanging child is stopped at `max_duration_seconds` (900) on an injected clock: run BLOCKED with `EXECUTION_TIME_LIMIT`, nothing left open, the process group gone; relaunch and resume are no-ops (#46). |
+| `lead-call-limit` | The warning at call 3 and the resumable stop at call 4 (run stays `IN_PROGRESS`, lease released, fresh checkpoint). A resume with the same limit is refused by the launcher and by the scheduler; a raised limit continues the same run and keeps the count (6 calls) (#47). |
+| `retry-gate` | The same failure signature at the same HEAD and inputs exhausts the budget (1): `REPEATED_INEFFECTIVE_ACTION`, the step is blocked, the run ends PARTIAL, nothing open (#48). |
+
+Each scenario also compares the provenance it left behind with `tests/fixtures/golden/<scenario>.json`: phase, worker, wave, bind, integrate and finish facts extracted by `benchmark_metrics.provenance_facts` (identities and statuses, never timestamps or ids), compared in both directions with `diff_facts`, plus the task states, lead-call counts and tokens. A deliberate change of recorded provenance updates them in one step:
+
+```bash
+PICO_UPDATE_GOLDEN=1 python -m pytest -q tests/test_synthetic_pilot.py   # rewrites tests/fixtures/golden/*.json; review the diff
+```
+
+The variable is refused when `CI` is set, and CI never sets it.
+
+What the deterministic suite does not show, and does not pretend to: whether a model records these events correctly (the scripts say what a competent lead and extension record), the TypeScript extension's own enforcement (covered by `tests/orchestration-lifecycle.test.ts`), real GitHub or CI behavior (the fake GitHub returns what the test sets), and that integrated waves are merged (the scripted lead records the wave events and leaves the work on `pico/<task>`; it does not merge). It takes about 40 seconds.
+
+### The real-agent benchmark
+
+```bash
+PICO_REAL_BENCHMARK=1 benchmarks/synthetic-workspace/run-real.sh <40-hex PICO commit> <label> [--output-dir DIR] [--owner OWNER]
+```
+
+Without `PICO_REAL_BENCHMARK=1` (exactly that value) the script exits 2 and creates nothing. With it, it runs four steps on a pinned revision (`PI_CODING_ORCHESTRATOR_REF`) and one fresh workspace and state directory per label (default `~/pico-bench/LABEL`): setup, `pico workspace schedule`, `pico workspace validate` for every COMPLETED task, and `benchmark_metrics`. It writes `DIR/report.json`: the launch result, the validation results and the metrics report (tokens by participant, calls, models, duration, reported cost with the unpriced participants, outcome, and the headline tokens per verified task). It reports a missing `pico` or `pi` (exit 3) instead of faking one, and never pushes, opens a PR or merges. Without GitHub a default run covers the first wave; for all four tasks use sandbox repositories as described above, publish and promote by hand, then run the script again with `--continue`. To compare two revisions, give the `--compare` of `tools/benchmark_metrics.py` the two reports.
+
+`tests/test_real_benchmark_entry.py` checks the boundary itself (the refusals, that CI never mentions the variable or the script) and the plumbing, with a fake `pi` and a `pico` stand-in. It sets the variable only in the environment of the child process under test.

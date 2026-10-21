@@ -2562,6 +2562,48 @@ work branch). The policy must validate and have an uncommitted change
 (`POLICY_UNCHANGED`). The preview shows the diff and is bound to `HEAD` and the
 diff. Nothing is pushed.
 
+### Synthetic pilot: deterministic regression suite and real-agent benchmark
+
+The synthetic workspace of `benchmarks/synthetic-workspace/` (two repositories, four tasks, a
+provides/requires contract, a budget and time limits) is the main regression benchmark for
+orchestration. It has two parts that never mix, so that model variance and cache effects cannot hide a
+change in scheduler correctness, and CI never spends tokens.
+
+**Deterministic suite (CI, every pull request).** `tests/test_synthetic_pilot.py` runs the workspace
+through the real `workspace_scheduler`, `workspace_run` launcher, run lease, recorder
+(`tools/parent_orchestration.py` through its CLI, with the lease owner), `workspace_contracts`
+(`validate`, `publish`, `ci`, `promote` against a fake GitHub and bare repositories on disk) and
+`benchmark_metrics`. Only the model is replaced: the suite's fake `pi` takes the lease and starts or
+restores the run, and a scripted lead (`tests/scenario_lead.py`, scenario files are JSON lists of ops)
+records events, applies the `reference/` solution on a `pico/<task>` branch, finishes, hangs, crashes or
+makes N lead calls. A refused recorder call or an unscripted task fails the test. The scenarios are
+`happy-multi-repo` (concurrent wave over two repositories, publish, CI green, promote, qualification),
+`dependency-gate`, `partial-and-reconcile` (#42, #48 `PREREQUISITE_UNCHANGED`), `budget` (in-flight
+spend, hold, direct-launch gate, `--ignore-budget`), `interrupt-resume` (SIGKILL, stale lease,
+takeover, checkpoint verification, and checkpoint drift refused), `time-limit` (#46, injected clock),
+`lead-call-limit` (#47, warning, resumable stop, same limit refused, raised limit continues) and
+`retry-gate` (#48 `REPEATED_INEFFECTIVE_ACTION`). Each compares the provenance it left behind with a
+golden record, `tests/fixtures/golden/<scenario>.json`: the facts of `benchmark_metrics.provenance_facts`
+(no timestamps or ids) compared both ways with `diff_facts`, task states, lead calls and tokens.
+Regenerate them deliberately with `PICO_UPDATE_GOLDEN=1 python -m pytest -q tests/test_synthetic_pilot.py`
+(refused when `CI` is set; review the diff). The suite takes about 40 seconds, uses temporary
+directories and bounded polling rather than fixed sleeps, sets a local Git identity in every repository it
+commits to, and waits for whole process groups to exit after a kill. It does not prove that a model
+records these events, the TypeScript extension's enforcement (`tests/orchestration-lifecycle.test.ts`),
+real GitHub behavior, or that integrated waves are merged. CI runs it as its own step; the full run skips
+those files so nothing runs twice.
+
+**Real-agent benchmark (started by hand, never in CI).**
+`benchmarks/synthetic-workspace/run-real.sh <40-hex revision> <label>` (`run_real.py`) is the single
+entry point. It exits 2 and creates nothing unless `PICO_REAL_BENCHMARK=1` is set. It runs setup,
+`pico workspace schedule` with `PI_CODING_ORCHESTRATOR_REF` pinned, `pico workspace validate` for each
+COMPLETED task, and `tools/benchmark_metrics.py`, and writes `report.json` (completion, models, tokens,
+calls, duration and the reported cost with unpriced participants; unobserved values are null). A missing
+`pico` or `pi` exits 3. It never pushes, opens a PR or merges; without GitHub it covers the first wave,
+and `--continue` repeats launch, validate and metrics after the operator published and promoted tasks in
+sandbox repositories. When a real run and the deterministic suite disagree, the real run wins and a
+scenario is added.
+
 ### GitHub synchronization: a safe `gh`-CLI boundary
 
 `tools/github_sync.py` is the ONLY module in this repository that invokes
