@@ -1015,7 +1015,7 @@ from GitHub Issues (the human-facing collaboration surface) and from
 Never hand-edit `backlog/backlog.yaml` or `provenance/runs/*.json`; use
 `tools/backlog.py` (`list`, `get`, `add`, `update`, `next`, `report`, `trace`,
 `validate`, `github-status`, `github-sync`, `github-push`, `github-pull`,
-`github-pr-sync`, `github-pr-create`, `github-pr-link`) for every read and
+`github-pr-sync`, `github-pr-link`) for every read and
 every mutation, so state transitions, dependency checks, and GitHub lifecycle
 operations stay deterministic rather than narrated.
 
@@ -1069,7 +1069,7 @@ your final report per "Final report" above.
 
 For the orchestrator's own local backlog, GitHub Issues and PRs are synchronized through `tools/backlog.py`'s
 `github-status`/`github-sync`/`github-push`/`github-pull` and
-`github-pr-sync`/`github-pr-create`/`github-pr-link` commands, which are
+`github-pr-sync`/`github-pr-link` commands, which are
 themselves callers of the `gh` CLI through the trusted `github_sync.py` boundary. Do not call
 `gh` directly, and do not close, edit, reopen, merge, checkout, mark ready,
 or push through GitHub yourself: an issue may only be closed once its backlog
@@ -1127,11 +1127,13 @@ For a backlog item, once the integrated batch is validated, committed, pushed,
 and the item is in `review` or `completed`, the lead orchestrator — not nested
 workers — links the adapter-created draft PR with `tools/backlog.py
 github-pr-link <id> <pr>` (link the other items of the same batch to that PR).
-For local-backlog work with a separately pushed head, `github-pr-create <id>
---base <base> --head <head> --draft` remains available. Backlog-generated
-PR bodies always use `Refs #N`, never a closing keyword, whatever
-`issue_reference` says: a backlog item's issue closes only through backlog
-completion and `github-push`.
+PRs are opened only through the gated publication path
+(`python3 tools/github_integration.py --publish`, or `pico workspace publish`):
+it needs `push_branch` and `create_pr` on the default branch's
+`.pi/autonomy.yaml` on GitHub, a dry run and a reviewed plan hash. There is no
+`backlog github-pr-create`; link the resulting PR with `github-pr-link`. Write
+a backlog item's PR body with `Refs #N`, never a closing keyword: its issue
+closes only through backlog completion and `github-push`.
 
 Use a professional collaboration structure by default. For issues, state the
 problem/value, bounded scope, constraints/invariants, testable acceptance

@@ -34,7 +34,8 @@ class InitProjectTest(unittest.TestCase):
         workflow = self.tmp / ".pi" / "orchestrator-pr-workflow.md"
         self.assertTrue(workflow.exists())
         text = workflow.read_text(encoding="utf-8")
-        self.assertIn("github-pr-create", text)
+        self.assertIn("github-pr-link", text)
+        self.assertNotIn("github-pr-create", text)
         self.assertIn("Refs #N", text)
         self.assertIn("issue_reference", text)
         self.assertIn("trace --latest", text)

@@ -323,8 +323,11 @@ class Controls:
                       "error": "publication was refused by its preconditions or the autonomy policy"}
             if preview["blocker_code"] == "PUBLICATION_NOT_AUTHORIZED":
                 result["grantable"] = True
-                result["error"] = ("this repository's .pi/autonomy.yaml does not allow push_branch and create_pr; "
-                                   "you can allow them for this one PR")
+                result["error"] = ("this repository's .pi/autonomy.yaml on the default branch on GitHub does not allow "
+                                   "push_branch and create_pr; you can allow them for this one PR")
+            elif preview["blocker_code"] == "AUTONOMY_POLICY_PATH_UNSAFE":
+                result["error"] = ("the checkout's .pi/autonomy.yaml is a symlink; "
+                                   "restore it before publishing")
             return result
         expected = self._confirm("publish", task["id"], preview["plan_hash"], grant_once)
         if confirm is None:
@@ -471,7 +474,10 @@ class Controls:
                     "preview": {"repository": repo["repository"], "permission": name, "value": value,
                                 "creates_file": not before, "diff": diff or "(no change)",
                                 "note": "Writes the repository's .pi/autonomy.yaml. The change stays uncommitted "
-                                        "until you commit it."}}
+                                        "until you commit it. Publishing (push branch, create PR) ignores this file: "
+                                        "it reads the policy committed on the default branch on GitHub, so "
+                                        "this change has no effect on publication until it is committed "
+                                        "and pushed to the default branch."}}
         self._check_confirm(confirm, expected)
         _safe_policy_location(path)
         path.parent.mkdir(exist_ok=True)

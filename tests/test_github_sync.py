@@ -11,6 +11,8 @@ Run with: python3 -m unittest discover -s tests -p 'test_*.py'
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import shutil
 import subprocess
@@ -533,6 +535,35 @@ class PublicationGateReadsTest(unittest.TestCase):
             with self.subTest(branch=branch), self.assertRaises(ValueError):
                 gh.branch_head(branch, repo="acme/repo")
 
+    def test_default_branch_uses_the_fixed_argv_and_validates_the_shape(self):
+        info = {"full_name": "Acme/Repo", "default_branch": "release/1.x"}
+        name, argv = self.call(gh.default_branch, repo="acme/repo", stdout=json.dumps(info))
+        self.assertEqual(name, "release/1.x")
+        self.assertEqual(argv, ["gh", "api", "-X", "GET", "repos/acme/repo", "--hostname", "github.com"])
+        for bad in ({"full_name": "acme/other", "default_branch": "main"},  # a rename or transfer redirect
+                    {"full_name": "acme/repo", "default_branch": "../x"},
+                    {"full_name": "acme/repo", "default_branch": 3},
+                    {"default_branch": "main"}, ["acme/repo"]):
+            with self.subTest(bad=bad), self.assertRaises(gh.GhOutputError):
+                self.call(gh.default_branch, repo="acme/repo", stdout=json.dumps(bad))
+        with self.assertRaises(gh.GhOutputError):
+            self.call(gh.default_branch, repo="acme/repo", returncode=1, stderr="gh: Not Found (HTTP 404)")
+        with self.assertRaises(gh.GhCommandError):
+            self.call(gh.default_branch, repo="acme/repo", returncode=1, stderr="HTTP 500")
+
+    def test_get_allowlist_accepts_only_the_repository_branch_and_policy_endpoints(self):
+        base = [gh.GH_BINARY, "api", "-X", "GET"]
+        pin = ["--hostname", "github.com"]
+        for endpoint in ("repos/acme/repo", "repos/acme/repo/git/ref/heads/main",
+                         f"repos/acme/repo/contents/.pi/autonomy.yaml?ref={'a' * 40}"):
+            gh._validate_allowlisted(base + [endpoint] + pin)
+        for endpoint in ("repos/acme/repo/pulls", "repos/acme/repo/contents/README.md?ref=" + "a" * 40,
+                         "user", "repos/acme/repo/", "repos/acme"):
+            with self.subTest(endpoint=endpoint), self.assertRaises(gh.GithubSyncError):
+                gh._validate_allowlisted(base + [endpoint] + pin)
+        with self.assertRaises(gh.GithubSyncError):
+            gh._validate_allowlisted(base + ["repos/acme/repo", "--hostname", "evil.example"])
+
     def test_policy_file_at_decodes_and_reports_type_and_path(self):
         import base64
         content = {"type": "file", "path": ".pi/autonomy.yaml", "sha": "b" * 40, "encoding": "base64",
@@ -1054,33 +1085,17 @@ class BacklogGithubCompositionTest(unittest.TestCase):
         for target in ("planned", "ready", "in_progress", "review"):
             store.backlog_update("ORCH-001", status=target, repo_root=self.repo_root)
 
-    def test_github_pr_create_requires_review_or_completed_and_mapped_issue(self):
-        store.backlog_add(title="Implement feature", description="d", version="v1", id="ORCH-001", repo_root=self.repo_root)
-        with self.assertRaises(backlog_cli.PrLifecycleError):
-            backlog_cli.github_pr_create_task("ORCH-001", base="main", head="feature", repo_root=self.repo_root)
-        for target in ("planned", "ready", "in_progress", "review"):
-            store.backlog_update("ORCH-001", status=target, repo_root=self.repo_root)
-        with self.assertRaises(backlog_cli.PrLifecycleError):
-            backlog_cli.github_pr_create_task("ORCH-001", base="main", head="feature", repo_root=self.repo_root)
-
-    def test_github_pr_create_uses_refs_body_and_records_snapshot(self):
+    def test_backlog_cli_cannot_create_a_pr(self):
+        # `github-pr-create` called gh pr create for any base and head with no permission check, dry run
+        # or plan hash. PRs are opened only by github_integration.publish (default-branch policy gate).
         self._add_review_item(github_issue=5)
-        with patch.object(backlog_cli.gh, "create_pr", return_value={"number": 8, "url": "https://github.com/acme/repo/pull/8"}) as mock_create:
-            result = backlog_cli.github_pr_create_task("ORCH-001", base="main", head="feature", repo_root=self.repo_root)
-        self.assertEqual(result["action"], "created")
-        self.assertEqual(result["pr"], 8)
-        args, kwargs = mock_create.call_args
-        body = args[1]
-        self.assertIn("Refs #5", body)
-        self.assertNotIn("Closes #5", body)
-        self.assertNotIn("Fixes #5", body)
-        self.assertEqual(kwargs["base"], "main")
-        self.assertEqual(kwargs["head"], "feature")
-        item = store.backlog_get("ORCH-001", self.repo_root)
-        self.assertEqual(item["github_pr"], 8)
-        self.assertEqual(item["github_pr_sync"]["pr"], 8)
-        self.assertEqual(item["github_pr_sync"]["issue"], 5)
-        self.assertEqual(item["github_pr_sync"]["remote_body"], body)
+        self.assertFalse(hasattr(backlog_cli, "github_pr_create_task"))
+        with patch.object(backlog_cli.gh, "create_pr") as mock_create, \
+                contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as ctx:
+            backlog_cli.main(["github-pr-create", "ORCH-001", "--base", "main", "--head", "feature"])
+        self.assertNotEqual(ctx.exception.code, 0)
+        mock_create.assert_not_called()
+        self.assertNotIn("github-pr-create", backlog_cli.build_parser().format_help())
 
     def test_github_pr_link_records_existing_remote_without_editing_pr(self):
         self._add_review_item(github_issue=5)

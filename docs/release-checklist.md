@@ -39,9 +39,9 @@ operator actions.
    not run; do not label a partial run as passed.
 6. **Branch and PR.** After reviewing the integrated diff and successful
    acceptance evidence, create/push the branch through an authorized human or
-   CI workflow, then create/link a PR. `github-pr-create` requires an already
-   pushed head branch and uses a non-closing `Refs #N` body (backlog bodies
-   stay `Refs` even under `issue_reference: closes`). The orchestrator
+   CI workflow, then create the PR through `github_integration --publish`
+   (default-branch policy, dry run, plan hash) and link it with
+   `github-pr-link`. Backlog PR bodies use a non-closing `Refs #N`. The orchestrator
    does not push or merge.
 7. **Close the GitHub issue deliberately.** Complete the local backlog item
    only once its acceptance criteria are met and required review/validation are

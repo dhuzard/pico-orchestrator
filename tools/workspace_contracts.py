@@ -18,11 +18,11 @@ across repositories once every dependency is validated, each repository at its
 dependency's validated commit (or its pin).
 
 Each PR body references the task's issue with `Refs #N`, or `Closes #N` when the
-task sets `closes_issue: true` (or omits it and .pi/autonomy.yaml at the base commit GitHub reports
+task sets `closes_issue: true` (or omits it and .pi/autonomy.yaml on the default branch GitHub reports
 sets `issue_reference: closes`); `closes_issue: false` always writes `Refs #N`.
 
 Publication goes through github_integration.publish unchanged: .pi/autonomy.yaml
-must grant push_branch and create_pr, the head must be a pico/ branch, the plan
+on the default branch on GitHub must grant push_branch and create_pr, the head must be a pico/ branch, the plan
 is a dry run until --apply with the reviewed --plan-hash, pushes are non-force,
 and the PR is a draft. Each repository gets its own PR, which links its
 upstream PRs; nothing here merges, marks ready, or pushes to a base branch.
@@ -187,21 +187,21 @@ def issue_reference_decision(task: dict, repo: dict, adapter=gh) -> dict:
     """Whether the task's PR closes its issue on merge, and what decided it.
 
     An explicit `closes_issue` on the task wins (`source: task`); without one,
-    the task follows its repository's `issue_reference` (default `refs`) at the
-    base commit GitHub reports (`source: repository`), the same value the
+    the task follows its repository's `issue_reference` (default `refs`) on the
+    default branch GitHub reports (`source: repository`), the same value the
     publication gate trusts.
     """
     if isinstance(task.get("closes_issue"), bool):
-        return {"closes": task["closes_issue"], "source": "task", "base_commit": None, "policy_blob": None}
+        return {"closes": task["closes_issue"], "source": "task", "policy_branch": None, "policy_commit": None,
+                "policy_blob": None}
     try:
-        reference, blob, base_commit = github_integration.verified_issue_reference(
-            repo["repository"], repo.get("base_branch", "main"), adapter)
+        reference, blob, commit, branch = github_integration.verified_issue_reference(repo["repository"], adapter)
     except github_integration.IntegrationError as exc:
         raise WorkspaceRunError(exc.code, exc.detail) from exc
     except (gh.GithubSyncError, ValueError) as exc:
-        raise WorkspaceRunError("GITHUB_READ_FAILED", "could not read the base branch's issue policy") from exc
-    return {"closes": reference == "closes", "source": "repository", "base_commit": base_commit,
-            "policy_blob": blob}
+        raise WorkspaceRunError("GITHUB_READ_FAILED", "could not read the default branch's issue policy") from exc
+    return {"closes": reference == "closes", "source": "repository", "policy_branch": branch,
+            "policy_commit": commit, "policy_blob": blob}
 
 
 def pr_body(plan: dict, task: dict, repo: dict, observed: dict, decision: dict | None = None) -> str:

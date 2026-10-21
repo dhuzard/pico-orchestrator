@@ -241,8 +241,8 @@
     shell=False; gh api, pr merge, pr checkout, pr ready, and git push remain unsupported.
   - schemas/backlog-item.schema.json and tools/backlog_store.py validate github_pr
     and github_pr_sync snapshots, uniqueness, and issue/PR identity consistency.
-  - tools/backlog.py provides github-pr-sync, github-pr-create, and github-pr-link
-    composition commands; PR create/link require status review or completed and an
+  - tools/backlog.py provides github-pr-sync and github-pr-link
+    composition commands; PR link requires status review or completed and an
     existing mapped GitHub issue.
   - 'Generated PR bodies reference issues with ''Refs #N'' and do not use GitHub closing
     keywords.'
