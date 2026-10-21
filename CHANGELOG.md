@@ -17,7 +17,7 @@ All notable changes to PICO are recorded here. The format follows
   `prompt_excerpt` taken after the task tag and goal line; on return a 600-character
   `result_summary`, its `result_digest` and any reported `commit_sha`. Text is single-line
   with control characters removed; credential shapes (tokens, JWTs, `password=` style
-  assignments, URLs with credentials, cloud and package-registry keys) are masked in the
+  assignments with a 16+ character value, URLs with credentials, cloud and package-registry keys) are masked in the
   whole text before it is cut, and an unbroken run left at the cut is dropped. The full
   text lives in the Pi session transcript. Garden's Conversation view shows these entries.
 - A routed task started with no worker running and no wave declared gets its own implicit
@@ -27,8 +27,10 @@ All notable changes to PICO are recorded here. The format follows
   wave and refuse with `WAVE_AUTO_AMBIGUOUS` (several) or `WAVE_UNKNOWN` (none). A run that
   ends without COMPLETED marks its open waves `abandoned` (`reconciled`, kind `wave`).
   COMPLETED is refused with `PARENT_WAVE_INTEGRATING` while an integration was begun and not
-  ended, and with `PARENT_WAVE_NOT_INTEGRATED` for a never-integrated wave whose task has a
-  bound worktree (`phase.workspace_bound`); read-only waves do not block it.
+  ended, and with `PARENT_WAVE_NOT_INTEGRATED` for any task with a bound worktree that no
+  integrated wave has covered since (`phase.workspace_bound`, checked per task so a missing
+  wave record cannot hide it; `phase.bound_epochs` keeps the route epochs that bound one, so
+  an escalation does not forget the old route's worktree); read-only tasks do not block it.
 - A failed Claude step whose retry succeeded is now `completed`: after the last failure the
   same step must have started again on the same route and returned without error. The
   failure stays in `worker_overrides` (`by` `extension` or `lead`, `reason`

@@ -405,8 +405,10 @@ write-scope, parallel-limit and routing checks. `integrate_begin` and `integrate
 implicit wave; with several open it fails with `WAVE_AUTO_AMBIGUOUS` (listing the ids) and with none with
 `WAVE_UNKNOWN`. At a non-COMPLETED finish every `declared` or `integrating` wave becomes `abandoned` (`reconciled`,
 kind `wave`). COMPLETED is refused with `PARENT_WAVE_INTEGRATING` while a current wave is `integrating`, and with
-`PARENT_WAVE_NOT_INTEGRATED` while a current, never-integrated wave contains a task with a bound worktree
-(`phase.workspace_bound`, set by the bind checkpoint, cleared by an escalation); a read-only wave does not block it.
+`PARENT_WAVE_NOT_INTEGRATED` for any task whose bound worktree no integrated wave has covered since
+(`phase.workspace_bound`, set by the bind checkpoint and cleared when a wave containing the task is `integrated`; checked
+per task, so a missing wave record cannot hide it). `phase.bound_epochs` lists the route epochs that bound a worktree, so
+an escalation does not forget the old route's; a read-only task does not block COMPLETED.
 The extension never infers the integrate bracket: `integrated` would assert a merge it did not observe.
 
 Worker `activity` entries replace the lead's directive and feedback events. At start they carry `route`,
@@ -414,7 +416,7 @@ Worker `activity` entries replace the lead's directive and feedback events. At s
 goal line); on return `result_summary` (first 600 characters of the final text), `result_digest` and `commit_sha` when
 the result reports one. Text is single-line with control characters removed. Secret-like spans (provenance's content
 patterns plus GitHub fine-grained and GitLab tokens, Google API keys, JWTs, `password=`/`token=`/`secret=`
-assignments, URLs with credentials, npm tokens and Stripe live keys) are masked in the whole text, bounded to eight
+assignments with a value of 16 or more characters without spaces, URLs with credentials, npm tokens and Stripe live keys) are masked in the whole text, bounded to eight
 times the recorded size, before the cut; an unbroken run of 16 or more characters left at the cut is dropped. The full
 text lives only in the Pi session transcript. A failed step may become `completed` only when, after its last failure, it
 was started again on the same route and that start returned without error: the failure is kept in `worker_overrides`
