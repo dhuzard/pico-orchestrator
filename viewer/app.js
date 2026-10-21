@@ -137,12 +137,12 @@ function renderActivity(run) {
   }
 }
 // "Abandoned (run ended PARTIAL)": reconciled work the run ended without finishing, never shown as running.
-const abandonedLabel = (run, phaseId, stepId) => {
-  const entry = (run?.reconciled || []).find((item) => item.phase_id === phaseId && (stepId ? item.kind === "worker" && item.step_id === stepId : item.kind === "phase"));
+const abandonedLabel = (run, phaseId, stepId, epoch) => {
+  const entry = (run?.reconciled || []).find((item) => item.phase_id === phaseId && (stepId ? item.kind === "worker" && item.step_id === stepId && (item.route_epoch ?? 0) === (epoch ?? 0) : item.kind === "phase"));
   const ended = String(entry?.reason || "").replace(/^run finished /, "");
   return ended ? `Abandoned (run ended ${ended})` : "Abandoned";
 };
-const statusLabel = (run, phase, worker) => (worker || phase).status === "abandoned" ? abandonedLabel(run, phase.id, worker?.step_id) : cap((worker || phase).status);
+const statusLabel = (run, phase, worker) => (worker || phase).status === "abandoned" ? abandonedLabel(run, phase.id, worker?.step_id, worker?.route_epoch) : cap((worker || phase).status);
 const normalizedStatus = (value) => ({ in_progress: "active", completed: "completed", partial: "blocked", abandoned: "abandoned", blocked: "blocked", failed: "failed", not_started: "waiting" })[String(value || "").toLowerCase()] || "waiting";
 const timeLabel = (value) => value ? new Date(value).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "Time unknown";
 
@@ -168,7 +168,7 @@ function agentNodes(run) {
   for (const phase of phases) {
     for (const worker of phase.workers || []) {
       if (nodes.some((node) => node.kind === "subagent" && node.task === phase.id && node.label === worker.step_id.replaceAll("_", " "))) continue;
-      nodes.push({ key: `worker/${phase.id}/${worker.step_id}`, kind: "worker", label: worker.step_id.replaceAll("_", " "), task: phase.id, stepId: worker.step_id, status: normalizedStatus(worker.status), label_text: worker.status === "abandoned" ? abandonedLabel(run, phase.id, worker.step_id) : undefined, model: worker.model || "Model not recorded", backend: worker.backend || "pi-subagent", identity: worker.step_id });
+      nodes.push({ key: `worker/${phase.id}/${worker.step_id}`, kind: "worker", label: worker.step_id.replaceAll("_", " "), task: phase.id, stepId: worker.step_id, status: normalizedStatus(worker.status), label_text: worker.status === "abandoned" ? abandonedLabel(run, phase.id, worker.step_id, worker.route_epoch) : undefined, model: worker.model || "Model not recorded", backend: worker.backend || "pi-subagent", identity: worker.step_id });
     }
   }
   return nodes;

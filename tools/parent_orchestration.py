@@ -636,36 +636,52 @@ def _record_event_unlocked(run_id: str, event: dict, *, repo_root: Path = ROOT) 
                       "required_backend_version": None}
             phase["workers"].append(worker)
         prior = worker["status"]
-        if event.get("only_if_open") is True:
-            # The lifecycle's automatic record of a worker's raw result: never overrides a status already recorded.
-            if prior not in {"not_started", "in_progress"}:
-                return parent
-        elif "only_if_open" in event:
+        # Validate every field before anything can return or change, including the automatic no-op.
+        if "only_if_open" in event and event["only_if_open"] is not True:
             raise ParentRunError("invalid worker event")
-        if prior in {"completed", "blocked", "failed"} and event["status"] != prior:
-            # The lead's judgment wins over the automatic record: a completed worker may be
-            # marked failed or blocked, with its reason (blocker_code). Nothing else reopens.
-            if not (prior == "completed" and event["status"] in {"failed", "blocked"}
-                    and event.get("blocker_code") is not None):
+        if "reasoning_effort" in event and event["reasoning_effort"] not in REASONING_EFFORTS:
+            raise ParentRunError("invalid reasoning effort")
+        values = {key: _safe(event[key], pattern, key) for key, pattern in (
+            ("model", MODEL_RE), ("backend", MODEL_RE), ("backend_model", MODEL_RE), ("blocker_code", CODE_RE),
+            ("installed_backend_version", VERSION_RE), ("required_backend_version", VERSION_RE)) if key in event}
+        if event.get("only_if_open") is True and prior not in {"not_started", "in_progress"}:
+            # The lifecycle's automatic record of a worker's raw result: never overrides a recorded status.
+            return parent
+        terminal = {"completed", "blocked", "failed"}
+        override = None
+        if prior in terminal:
+            # The lead's judgment wins over an earlier record, but never silently: each override is
+            # appended to `worker_overrides` with what it replaced. Allowed: completed -> failed/blocked
+            # and failed -> blocked (each with a blocker code), and a failed/blocked worker restated with
+            # a different blocker code. Nothing else reopens or changes a terminal worker.
+            reclassified = event["status"] != prior
+            recoded = (not reclassified and prior in {"failed", "blocked"} and "blocker_code" in values
+                       and values["blocker_code"] != worker.get("blocker_code"))
+            if reclassified and not ((prior, event["status"]) in {("completed", "failed"), ("completed", "blocked"),
+                                                                  ("failed", "blocked")}
+                                     and values.get("blocker_code") is not None):
                 raise ParentRunError("worker is already terminal", error_code="PARENT_WORKER_TRANSITION_INVALID")
+            if reclassified or recoded:
+                override = {"phase_id": phase["id"], "step_id": step_id, "route_epoch": epoch,
+                            "from_status": prior, "from_blocker_code": worker.get("blocker_code")}
+                details = {key: worker[key] for key in ("installed_backend_version", "required_backend_version")
+                           if worker.get(key) is not None}
+                if details:
+                    override["from_details"] = details
+                override.update(to_status=event["status"], blocker_code=values["blocker_code"],
+                                phase_status=phase["status"], by="lead", at=_now())
         worker["status"] = event["status"]
         if "reasoning_effort" in event:
-            if event["reasoning_effort"] not in REASONING_EFFORTS:
-                raise ParentRunError("invalid reasoning effort")
             if worker.get("reasoning_effort") is not None and worker["reasoning_effort"] != event["reasoning_effort"]:
                 raise ParentRunError("worker field conflicts with prior event", error_code="PARENT_EVENT_CONFLICT")
             worker["reasoning_effort"] = event["reasoning_effort"]
-        for key, pattern in (("model", MODEL_RE), ("backend", MODEL_RE), ("backend_model", MODEL_RE), ("blocker_code", CODE_RE),
-                             ("installed_backend_version", VERSION_RE),
-                             ("required_backend_version", VERSION_RE)):
-            if key in event:
-                value = _safe(event[key], pattern, key)
-                # A terminal worker restated by the lead may take the lead's own blocker code
-                # in place of the automatically recorded one.
-                restated = key == "blocker_code" and prior in {"failed", "blocked"} and event["status"] == prior
-                if worker.get(key) is not None and value != worker[key] and not restated:
-                    raise ParentRunError("worker field conflicts with prior event", error_code="PARENT_EVENT_CONFLICT")
-                worker[key] = value
+        for key, value in values.items():
+            replaced = key == "blocker_code" and override is not None
+            if worker.get(key) is not None and value != worker[key] and not replaced:
+                raise ParentRunError("worker field conflicts with prior event", error_code="PARENT_EVENT_CONFLICT")
+            worker[key] = value
+        if override is not None:
+            parent.setdefault("worker_overrides", []).append(override)
     elif kind == "child":
         phase = _phase(parent, event["phase"])
         child_id = _safe(event.get("run_id"), ID_RE, "child run id")

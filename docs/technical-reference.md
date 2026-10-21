@@ -1332,7 +1332,16 @@ event carries `only_if_open`, so it never overrides a status the lead already
 recorded. The lead's judgment wins: it may move a `completed` worker to
 `failed` or `blocked` by recording that status with a `blocker_code`, and may
 restate a `failed` or `blocked` worker with its own `blocker_code`, which
-replaces the automatic one. Other changes of a terminal worker stay refused.
+replaces the automatic one; `failed` may likewise be reclassified `blocked`
+with a `blocker_code`. Other changes of a terminal worker stay refused. No
+override rewrites history: each is appended to
+`parent_orchestration.worker_overrides` as `phase_id`, `step_id`,
+`route_epoch`, `from_status`, `from_blocker_code`, `from_details?` (backend
+versions), `to_status`, `blocker_code`, `phase_status`, `by: "lead"` and `at`,
+while the worker holds the current values. An override inside a phase that is
+already terminal is allowed (a phase cannot be reopened, and the lead's
+judgment must be able to win) and is flagged by `phase_status` being that
+terminal value. Older PICO versions reject `worker_overrides`.
 Coverage: `tests/test_reconcile_open.py`, `tests/orchestration-lifecycle.test.ts`.
 
 **Ownership.** Run records belong to the orchestrator installation whose

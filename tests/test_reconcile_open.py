@@ -224,6 +224,68 @@ class WorkerJudgmentTest(_Base):
         self.auto("failed", blocker_code="WORKER_FAILED")
         self.assertEqual(provenance.run_path(self.records, self.run_id).read_bytes(), before)
 
+    def overrides(self):
+        return provenance.get_run(self.records, self.run_id)["parent_orchestration"].get("worker_overrides", [])
+
+    def test_probe_completed_then_rejected_keeps_the_completed_record(self):
+        self.auto("completed")
+        self.lead("failed", blocker_code="REVIEW_REJECTED")
+        [entry] = self.overrides()
+        self.assertEqual((entry["from_status"], entry["from_blocker_code"], entry["to_status"], entry["blocker_code"],
+                          entry["by"], entry["route_epoch"], entry["phase_status"]),
+                         ("completed", None, "failed", "REVIEW_REJECTED", "lead", 0, "in_progress"))
+        self.assertEqual(provenance.validate_run_record(
+            provenance.get_run(self.records, self.run_id), self.schema), [])
+
+    def test_probe_restated_preflight_block_keeps_the_original_code_and_versions(self):
+        self.lead("blocked", blocker_code="MODEL_BACKEND_UNAVAILABLE", installed_backend_version="2.1.251",
+                  required_backend_version=">=2.1.280")
+        self.assertEqual(self.overrides(), [])
+        self.lead("blocked", blocker_code="MODEL_BACKEND_UNAVAILABLE")  # same code: nothing to record
+        self.assertEqual(self.overrides(), [])
+        self.lead("blocked", blocker_code="LEAD_RECLASSIFIED")
+        [entry] = self.overrides()
+        self.assertEqual((entry["from_status"], entry["from_blocker_code"], entry["to_status"], entry["blocker_code"]),
+                         ("blocked", "MODEL_BACKEND_UNAVAILABLE", "blocked", "LEAD_RECLASSIFIED"))
+        self.assertEqual(entry["from_details"], {"installed_backend_version": "2.1.251",
+                                                 "required_backend_version": ">=2.1.280"})
+        self.assertEqual(self.worker()["blocker_code"], "LEAD_RECLASSIFIED")
+
+    def test_failed_may_be_reclassified_blocked_with_a_code_and_is_recorded(self):
+        self.auto("failed", blocker_code="WORKER_FAILED")
+        with self.assertRaises(po.ParentRunError):
+            self.lead("blocked")
+        self.lead("blocked", blocker_code="MODEL_BACKEND_UNAVAILABLE")
+        [entry] = self.overrides()
+        self.assertEqual((entry["from_status"], entry["from_blocker_code"], entry["to_status"]),
+                         ("failed", "WORKER_FAILED", "blocked"))
+        with self.assertRaises(po.ParentRunError):
+            self.lead("failed", blocker_code="X")  # blocked -> failed is not an override
+
+    def test_chained_overrides_are_all_kept_in_order(self):
+        self.auto("completed")
+        self.lead("failed", blocker_code="REVIEW_REJECTED")
+        self.lead("blocked", blocker_code="MODEL_BACKEND_UNAVAILABLE")
+        self.assertEqual([(e["from_status"], e["to_status"]) for e in self.overrides()],
+                         [("completed", "failed"), ("failed", "blocked")])
+
+    def test_override_in_a_terminal_phase_is_allowed_and_flagged(self):
+        self.auto("completed")
+        self.event({"kind": "phase", "phase": "p", "status": "completed"})
+        self.lead("failed", blocker_code="REVIEW_REJECTED")
+        self.assertEqual(self.overrides()[0]["phase_status"], "completed")
+
+    def test_invalid_fields_are_refused_even_for_the_automatic_no_op(self):
+        self.lead("failed", blocker_code="REVIEW_REJECTED")
+        before = provenance.run_path(self.records, self.run_id).read_bytes()
+        for extra in ({"model": "bad model!"}, {"reasoning_effort": "extreme"}, {"blocker_code": "lower"}):
+            with self.assertRaises(po.ParentRunError):
+                self.auto("completed", **extra)
+        with self.assertRaises(po.ParentRunError):
+            self.event({"kind": "worker", "phase": "p", "step_id": "claude_worker", "status": "completed",
+                        "only_if_open": "yes"})
+        self.assertEqual(provenance.run_path(self.records, self.run_id).read_bytes(), before)
+
     def test_unrelated_blocker_conflicts_still_refused(self):
         self.lead("in_progress", blocker_code="A_CODE")
         with self.assertRaises(po.ParentRunError) as raised:
