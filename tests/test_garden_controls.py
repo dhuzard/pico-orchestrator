@@ -316,7 +316,7 @@ class GardenControlsTest(unittest.TestCase):
             self.act(action="set_permission", repository="alpha", permission=permission, value=True,
                      confirm=preview["confirm"])
         _, refused = self.act(action="publish", task="a1")  # the toggled copy is uncommitted
-        self.assertEqual((refused["stage"], refused["error_code"]), ("refused", "AUTONOMY_POLICY_PATH_UNSAFE"))
+        self.assertEqual((refused["stage"], refused["error_code"]), ("refused", "PUBLICATION_NOT_AUTHORIZED"))
         _, committed = self.act(action="commit_policy", repository="alpha")
         _, done = self.act(action="commit_policy", repository="alpha", confirm=committed["confirm"])
         self.assertTrue(done["ok"], done)

@@ -422,8 +422,8 @@ def _publication_authority(policy: dict | None, grant: dict | None = None) -> di
     symlink its own copy. A grant is passed in process only (never from the
     command line) by a caller that has shown the exact reviewed plan and
     obtained an explicit confirmation for it, such as the Garden. It covers
-    only the permissions the base policy withholds for this single
-    publication; an unreadable or invalid base policy is never overridden.
+    only the permissions the authorizing policy withholds for this single
+    publication; an unreadable or invalid authorizing policy is never overridden.
     """
     permissions = (policy or {}).get("permissions") or {}
     evaluated = {name: permissions.get(name) is True for name in ONE_SHOT_PERMISSIONS}
@@ -432,15 +432,15 @@ def _publication_authority(policy: dict | None, grant: dict | None = None) -> di
         return {"source": "policy", "granted_by": None, "granted": [], "permissions": evaluated}
     if not (isinstance(grant, dict) and grant.get("one_shot") is True
             and isinstance(grant.get("granted_by"), str) and re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", grant["granted_by"])):
-        detail = ".pi/autonomy.yaml on the base branch on GitHub is required for publication" if policy is None \
-            else "push_branch and create_pr must be granted by .pi/autonomy.yaml on the base branch on GitHub"
+        detail = ".pi/autonomy.yaml on the default branch on GitHub is required for publication" if policy is None \
+            else "push_branch and create_pr must be granted by .pi/autonomy.yaml on the default branch on GitHub"
         raise IntegrationError("PUBLICATION_NOT_AUTHORIZED", detail)
     return {"source": "one_shot_grant", "granted_by": grant["granted_by"], "granted": missing,
             "permissions": evaluated}
 
 
 def _policy_drift(worktree: Path, policy: dict | None) -> list[str]:
-    """Permissions the checkout's own `.pi/autonomy.yaml` sets differently from the base policy.
+    """Permissions the checkout's own `.pi/autonomy.yaml` sets differently from the authorizing (default-branch) policy.
 
     Informational only (see docs): it never grants anything and is not part of
     the plan. Unreadable, symlinked or absent copies report nothing.
@@ -520,6 +520,20 @@ def _remote_policy(repo: str, base_commit: str | None, adapter=gh) -> tuple[dict
     return data, entry["sha"]
 
 
+def authority_policy(repo: str, adapter=gh) -> dict:
+    """The policy that authorizes GitHub writes: the repository's DEFAULT branch, as GitHub reports it.
+
+    The caller's `--base` only chooses where a PR points; it is never
+    authority, because a worker's `pico/` branch can reach GitHub (one grant)
+    and carry any policy. Returns {branch, commit, policy, blob}; `commit` and
+    `policy`/`blob` are None when GitHub has no such branch or policy.
+    """
+    branch = adapter.default_branch(repo=repo)
+    commit = _remote_base_commit(repo, branch, adapter)
+    policy, blob = _remote_policy(repo, commit, adapter)
+    return {"branch": branch, "commit": commit, "policy": policy, "blob": blob}
+
+
 def _issue_reference(policy: dict | None) -> str:
     import autonomy_policy
     return (policy or {}).get("issue_reference", autonomy_policy.DEFAULTS["issue_reference"])
@@ -535,17 +549,16 @@ def remote_issue_reference(repo: str, base_commit: str | None, adapter=gh) -> tu
     return _issue_reference(policy), blob
 
 
-def _require_clean_policy_checkout(worktree: Path) -> None:
-    """Refuse a symlinked or uncommitted-edited `.pi/autonomy.yaml`: a tampered checkout is never published from."""
+def _refuse_symlinked_policy(worktree: Path) -> None:
+    """Refuse a symlinked `.pi` or `.pi/autonomy.yaml` in the checkout (cheap defence in depth).
+
+    Authority never comes from the checkout, so a dirty, untracked or deleted
+    copy is not a threat and is not refused; only a symlink, which could make
+    other local readers follow a path outside the repository, is.
+    """
     top = _git_top(worktree)
-    unsafe = "AUTONOMY_POLICY_PATH_UNSAFE"
     if (top / ".pi").is_symlink() or (top / _POLICY_FILE).is_symlink():
-        raise IntegrationError(unsafe, ".pi or .pi/autonomy.yaml is a symlink")
-    proc = subprocess.run(["git", "-C", str(top), "status", "--porcelain", "--", _POLICY_FILE], shell=False,
-                          capture_output=True, text=True, timeout=10)
-    if proc.returncode or proc.stdout.strip():
-        raise IntegrationError(unsafe, ".pi/autonomy.yaml has uncommitted changes; commit it on the base "
-                                       "branch before publishing")
+        raise IntegrationError("AUTONOMY_POLICY_PATH_UNSAFE", ".pi or .pi/autonomy.yaml is a symlink")
 
 
 def _check_issue_reference(body: str, *, repository: str, policy_closes, closes_issue: int | None) -> dict:
@@ -639,10 +652,10 @@ def _remote_base_commit(repo: str, base: str, adapter=gh) -> str | None:
     return adapter.branch_head(base, repo=repo)
 
 
-def verified_issue_reference(repo: str, base: str, adapter=gh) -> tuple[str, str | None, str | None]:
-    """`issue_reference` at the base commit GitHub reports: (value, policy blob, base commit)."""
-    base_commit = _remote_base_commit(repo, base, adapter)
-    return (*remote_issue_reference(repo, base_commit, adapter), base_commit)
+def verified_issue_reference(repo: str, adapter=gh) -> tuple[str, str | None, str | None, str]:
+    """`issue_reference` on the default branch as GitHub reports it: (value, blob, commit, branch)."""
+    authority = authority_policy(repo, adapter)
+    return (_issue_reference(authority["policy"]), authority["blob"], authority["commit"], authority["branch"])
 
 
 def _publication_state(worktree: Path, repo: str, base: str, head: str, adapter=gh,
@@ -673,12 +686,14 @@ def publish(*, worktree: Path, base: str, head: str, title: str, body_file: Path
     accepted only for an issue of this repository that either an in-process
     caller names in `closes_issue` (a workspace task with `closes_issue:
     true`), or that has its own `Closes #N` line while `.pi/autonomy.yaml` at
-    the base commit GitHub reports sets `issue_reference: closes`. The same
-    single policy read supplies `push_branch`/`create_pr`. A symlinked or
-    uncommitted-edited checkout copy is refused. Base commit and policy
-    are read through the GitHub API adapter, not local git. The plan records
-    the base commit, policy blob and evaluated permissions, so the plan hash binds them; a merge to the base between the dry
-    run and the apply therefore gives GITHUB_STATE_CONFLICT.
+    the repository's DEFAULT branch (named by the API, never by `base`) sets
+    `issue_reference: closes`. The same single policy read supplies
+    `push_branch`/`create_pr`. `base` only chooses where the PR points. A
+    symlinked checkout policy is refused; a dirty one is ignored. Everything
+    is read through the GitHub API adapter, not local git. The plan records
+    the policy branch, commit and blob, the evaluated permissions and the base
+    commit, so the plan hash binds them; a merge to either branch between the
+    dry run and the apply therefore gives GITHUB_STATE_CONFLICT.
     """
     meta = {"target_repository": None, "target_worktree": str(worktree.resolve()), "phase": "publication",
             "blocker_code": None, "reason": None, "mutations_planned": 0,
@@ -692,13 +707,15 @@ def publish(*, worktree: Path, base: str, head: str, title: str, body_file: Path
     try:
         repo = resolve_target(worktree, explicit_repo)
         meta["target_repository"] = repo
-        # One API read of the base commit and one of the policy blob: they authorize push/PR and decide
-        # issue_reference. The checkout's own copy is never trusted, so a symlinked or uncommitted-edited
-        # one is refused, and nothing else is inspected before authorization.
-        _require_clean_policy_checkout(worktree)
+        # The authorizing policy is the one on the repository's DEFAULT branch (API reads, never the
+        # caller's base, never the checkout); it authorizes push/PR and decides issue_reference. `base`
+        # only chooses where the PR points. A symlinked checkout policy is refused, and nothing else
+        # is inspected before authorization.
+        _refuse_symlinked_policy(worktree)
         base = _branch(worktree, base, head=False)
-        base_commit = _remote_base_commit(repo, base, adapter)
-        policy, policy_blob = _remote_policy(repo, base_commit, adapter)
+        authority = authority_policy(repo, adapter)
+        policy, policy_blob = authority["policy"], authority["blob"]
+        base_commit = authority["commit"] if base == authority["branch"] else _remote_base_commit(repo, base, adapter)
         authorization = _publication_authority(policy, grant)
         meta["authorization"] = {k: v for k, v in authorization.items() if k != "permissions"}
         drift = _policy_drift(worktree, policy)
@@ -717,7 +734,8 @@ def publish(*, worktree: Path, base: str, head: str, title: str, body_file: Path
                                            closes_issue=closes_issue)
         plan = {"repository": repo, "base": base, "head": head, **state,
                 "title": title, "body_sha256": hashlib.sha256(body.encode()).hexdigest(), "draft": True,
-                "authorization": authorization["source"], **reference, "policy_blob": policy_blob,
+                "authorization": authorization["source"], **reference, "policy_branch": authority["branch"],
+                "policy_commit": authority["commit"], "policy_blob": policy_blob,
                 "publication_permissions": authorization["permissions"]}
         digest = hashlib.sha256(json.dumps(plan, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         meta["mutations_planned"] = int(state["remote_commit"] != state["commit"]) + int(state["existing_pr"] is None)

@@ -577,38 +577,10 @@ def github_pr_sync_task(id: str, repo_root: Path = REPO_ROOT) -> dict:
     }
 
 
-def github_pr_create_task(id: str, *, base: str, head: str, draft: bool = False,
-                          repo_root: Path = REPO_ROOT) -> dict:
-    """Create a PR for a backlog item in review/completed state. Requires an
-    existing mapped GitHub issue and emits a PR body with `Refs #N` only.
-    Never pushes, checks out, merges, or marks a PR ready."""
-    item = store.backlog_get(id, repo_root)
-    issue_number = _require_pr_lifecycle_preconditions(item)
-    if item.get("github_pr") is not None:
-        raise PrLifecycleError(f"{id}: already linked to GitHub PR #{item['github_pr']}")
-    repo = _repo_name(repo_root)
-    body = _format_pr_body(item)
-    created = gh.create_pr(item["title"], body, base=base, head=head, repo=repo, draft=draft)
-    pr_number = created["number"]
-    remote = {
-        "number": pr_number,
-        "title": item["title"],
-        "state": "open",
-        "body": body,
-        "url": created["url"],
-        "headRefName": head,
-        "baseRefName": base,
-        "isDraft": draft,
-    }
-    snapshot = _pr_snapshot(repo, item, pr_number, remote)
-    store.backlog_update(id, github_pr=pr_number, github_pr_sync=snapshot, repo_root=repo_root)
-    return {"id": id, "action": "created", "issue": issue_number, "pr": pr_number, "url": created["url"]}
-
-
 def github_pr_link_task(id: str, pr_number: int, repo_root: Path = REPO_ROOT) -> dict:
     """Link an existing PR to a review/completed backlog item locally and
     record a baseline snapshot. This does not edit the PR body or any remote
-    metadata; use github_pr_create_task for generated `Refs #N` PR bodies."""
+    metadata. PRs are opened only through the gated `github_integration --publish` path."""
     item = store.backlog_get(id, repo_root)
     issue_number = _require_pr_lifecycle_preconditions(item)
     existing = item.get("github_pr")
@@ -897,16 +869,6 @@ def _cmd_github_pr_sync(args: argparse.Namespace) -> int:
         return 1
 
 
-def _cmd_github_pr_create(args: argparse.Namespace) -> int:
-    try:
-        _print_json(github_pr_create_task(args.id, base=args.base, head=args.head,
-                                          draft=args.draft, repo_root=REPO_ROOT))
-        return 0
-    except (store.BacklogError, gh.GithubSyncError, PrLifecycleError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 1
-
-
 def _cmd_github_pr_link(args: argparse.Namespace) -> int:
     try:
         _print_json(github_pr_link_task(args.id, args.pr, REPO_ROOT))
@@ -1010,13 +972,6 @@ def build_parser() -> argparse.ArgumentParser:
     p_gh_pr_sync = sub.add_parser("github-pr-sync", help="Read-only local/remote comparison for one linked PR.")
     p_gh_pr_sync.add_argument("id")
     p_gh_pr_sync.set_defaults(func=_cmd_github_pr_sync)
-
-    p_gh_pr_create = sub.add_parser("github-pr-create", help="Create a PR for a review/completed backlog item.")
-    p_gh_pr_create.add_argument("id")
-    p_gh_pr_create.add_argument("--base", required=True, help="Target/base branch for gh pr create.")
-    p_gh_pr_create.add_argument("--head", required=True, help="Already-pushed head branch for gh pr create.")
-    p_gh_pr_create.add_argument("--draft", action="store_true", help="Open the PR as a draft.")
-    p_gh_pr_create.set_defaults(func=_cmd_github_pr_create)
 
     p_gh_pr_link = sub.add_parser("github-pr-link", help="Link an existing PR to a review/completed backlog item.")
     p_gh_pr_link.add_argument("id")

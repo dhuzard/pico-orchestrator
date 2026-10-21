@@ -41,9 +41,9 @@ work in this repository.
      new batches stack on the newest batch branch instead of opening a PR.
 
 3. Create or link the PR.
-   - If this repo vendors the backlog tools and has a mapped backlog item:
-     `python3 tools/backlog.py github-pr-create <ITEM> --base <base> --head <branch>`
-     or `python3 tools/backlog.py github-pr-link <ITEM> <pr-number>`.
+   - Open the PR through the gated path (`python3 tools/github_integration.py
+     --publish`, a dry run first), then, with a mapped backlog item, link it:
+     `python3 tools/backlog.py github-pr-link <ITEM> <pr-number>`.
    - Otherwise create the PR with the repository's normal GitHub workflow.
    - PR bodies reference issues as `.pi/autonomy.yaml` `issue_reference` says:
      `refs` (the default) writes `Refs #N`, which never closes the issue;

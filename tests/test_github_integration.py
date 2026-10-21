@@ -469,11 +469,16 @@ class FakeGithubApi:
     def __init__(self):
         self.heads = {}
         self.policies = {}
+        self.default = {}  # repo -> default branch name (main when unset)
         self.reads = []
         self._commits = 0
 
     def list_prs(self, *, base, head, repo):
         return []
+
+    def default_branch(self, *, repo):
+        self.reads.append(("default_branch", repo))
+        return self.default.get(repo.casefold(), "main")
 
     def branch_head(self, branch, *, repo):
         self.reads.append(("branch", repo, branch))
@@ -618,7 +623,7 @@ class IssueClosingGateTest(unittest.TestCase):
 
     def test_uncommitted_edit_cannot_grant_closing(self):
         self.policy.write_text(self.closes_policy)
-        self.assertRefused("Closes #401\n", "AUTONOMY_POLICY_PATH_UNSAFE")
+        self.assertRefused("Closes #401\n")
 
     def test_local_commit_not_on_github_cannot_grant_closing(self):
         for branch in ("pico/batch-1", "main"):
@@ -677,11 +682,13 @@ class IssueClosingGateTest(unittest.TestCase):
         self.assertRefused("Closes #1\nFixes #77\n")
         self.assertFalse(marker.exists())
 
-    def test_modified_policy_checkout_is_unsafe(self):
+    def test_dirty_policy_checkout_is_ignored_not_refused(self):
+        # Authority is remote, so a Garden toggle or init_project's uncommitted policy is harmless.
         self.merge_closes_policy()
-        self.policy.write_text(self.closes_policy + "\n# local edit\n")
-        self.assertRefused("Closes #401\n", "AUTONOMY_POLICY_PATH_UNSAFE")
-        self.assertRefused("Refs #401\n", "AUTONOMY_POLICY_PATH_UNSAFE")  # no publication from a tampered checkout
+        self.policy.write_text(self.closes_policy.replace("create_pr: true", "create_pr: false"))
+        result = self.dry_run("Closes #401\n")
+        self.assertEqual((result["status"], result["policy_drift"]), ("DRY_RUN", ["create_pr"]))
+        self.assertTrue(result["plan"]["publication_permissions"]["create_pr"])
 
     def test_symlinked_pi_is_unsafe(self):
         self.merge_closes_policy()
@@ -753,17 +760,16 @@ class IssueClosingGateTest(unittest.TestCase):
         self.assertEqual(plan["policy_blob"], self.api.policies[(self.REPO.casefold(), head)]["sha"])
         self.assertEqual(self.api.reads.count(("policy", self.REPO, head)), 1)  # one read serves every decision
         self.assertEqual(self.api.reads.count(("branch", self.REPO, "main")), 1)
+        self.assertEqual((plan["policy_branch"], plan["policy_commit"]), ("main", head))
 
     def test_uncommitted_working_tree_edit_cannot_grant_publication(self):
         self.withhold_on_github()
         self.commit(self.withheld, "withheld, as on GitHub")
         self.policy.write_text(self.template)  # a worker edits its tracked copy
-        self.assertRefused("Refs #401\n", "AUTONOMY_POLICY_PATH_UNSAFE")
+        self.assertRefused("Refs #401\n", self.NOT_AUTHORIZED)
         self.policy.write_text(self.withheld)
         self.assertRefused("Refs #401\n", self.NOT_AUTHORIZED)
-        self.git("rm", "-q", "-f", ".pi/autonomy.yaml")  # a deletion is a modification too
-        self.assertRefused("Refs #401\n", "AUTONOMY_POLICY_PATH_UNSAFE")
-        self.git("commit", "-q", "-m", "drop the policy")  # once committed, no copy at all changes nothing
+        self.git("rm", "-q", "-f", ".pi/autonomy.yaml")  # a deleted copy changes nothing either
         self.assertRefused("Refs #401\n", self.NOT_AUTHORIZED)
 
     def test_untracked_working_tree_policy_cannot_grant_publication(self):
@@ -772,7 +778,7 @@ class IssueClosingGateTest(unittest.TestCase):
         self.git("commit", "-q", "-m", "drop the policy")
         (self.worktree / ".pi").mkdir(exist_ok=True)
         self.policy.write_text(self.template)
-        self.assertRefused("Refs #401\n", "AUTONOMY_POLICY_PATH_UNSAFE")
+        self.assertRefused("Refs #401\n", self.NOT_AUTHORIZED)
 
     def test_policy_committed_locally_but_not_on_the_remote_base_cannot_grant_publication(self):
         self.withhold_on_github()
@@ -816,6 +822,46 @@ class IssueClosingGateTest(unittest.TestCase):
                 self.api.merge(self.REPO, entry=entry)
                 self.assertRefused("Refs #401\n", code)
                 self.assertRefused("Refs #401\n", code, grant=self.GRANT)
+
+    def test_caller_base_cannot_supply_authority(self):
+        # The reviewer's probe: main withholds, but a branch on GitHub (reachable through one grant) grants.
+        self.withhold_on_github()
+        main_commit = self.api.heads[(self.REPO.casefold(), "main")]
+        self.api.merge(self.REPO, self.template + "# evil\n", branch="pico/evil-base")
+        self.git("branch", "pico/evil-base")
+        for text in ("Refs #401\n", "Closes #401\n"):
+            with self.subTest(text=text):
+                self.assertRefused(text, self.NOT_AUTHORIZED, base="pico/evil-base")
+        # Granting through the grant is the only way, and the plan shows where authority came from.
+        granted = self.dry_run("Refs #401\n", base="pico/evil-base", grant=self.GRANT)
+        self.assertEqual((granted["plan"]["authorization"], granted["plan"]["policy_branch"],
+                          granted["plan"]["policy_commit"], granted["plan"]["base"]),
+                         ("one_shot_grant", "main", main_commit, "pico/evil-base"))
+        self.assertEqual(granted["plan"]["base_commit"], self.api.heads[(self.REPO.casefold(), "pico/evil-base")])
+        self.assertIn(("default_branch", self.REPO), self.api.reads)
+
+    def test_default_branch_policy_authorizes_a_different_pr_base(self):
+        self.api.merge(self.REPO, self.template + "# other\n", branch="release")  # release has no say
+        self.git("branch", "release")
+        result = self.dry_run("Refs #401\n", base="release")
+        self.assertEqual((result["status"], result["plan"]["authorization"]), ("DRY_RUN", "policy"))
+        main_commit = self.api.heads[(self.REPO.casefold(), "main")]
+        self.assertEqual((result["plan"]["policy_branch"], result["plan"]["policy_commit"], result["plan"]["base"]),
+                         ("main", main_commit, "release"))
+        self.assertEqual(result["plan"]["policy_blob"], self.api.policies[(self.REPO.casefold(), main_commit)]["sha"])
+
+    def test_renamed_default_branch_is_followed(self):
+        self.api.default[self.REPO.casefold()] = "trunk"
+        self.assertRefused("Refs #401\n", self.NOT_AUTHORIZED)  # no trunk on GitHub yet
+        trunk = self.api.merge(self.REPO, self.template, branch="trunk")
+        result = self.dry_run("Refs #401\n", base="trunk")
+        self.assertEqual((result["plan"]["policy_branch"], result["plan"]["policy_commit"]), ("trunk", trunk))
+
+    def test_default_branch_moving_after_the_dry_run_conflicts(self):
+        preview = self.dry_run("Refs #401\n", base="main")
+        self.api.merge(self.REPO, self.template + "# moved\n", branch="main")
+        stale = self.dry_run("Refs #401\n", base="main", apply=True, expected_plan_hash=preview["plan_hash"])
+        self.assertEqual(stale["blocker_code"], "GITHUB_STATE_CONFLICT")
 
     def test_base_policy_changing_between_dry_run_and_apply_conflicts(self):
         preview = self.dry_run("Refs #401\n")

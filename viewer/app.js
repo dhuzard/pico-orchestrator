@@ -628,8 +628,8 @@ function renderControls() {
   if (!panels) return;
   $("ws-controls-state").textContent = controlState.enabled ? "actions on" : panels.enabled ? "actions need the launch URL" : "read-only";
   $("ws-perm-note").textContent = controlState.enabled
-    ? "Select a permission to change it. You review the exact diff of .pi/autonomy.yaml first; merge, deploy and mark-ready stay file-only. Publishing (push branch, create PR) reads the policy committed on the base branch on GitHub, so a change here has no effect on it until it is committed and pushed there."
-    : "Read from each checkout's autonomy policy. Change them in the file. Publishing reads the policy on the base branch on GitHub, not this checkout.";
+    ? "Select a permission to change it. You review the exact diff of .pi/autonomy.yaml first; merge, deploy and mark-ready stay file-only. Publishing (push branch, create PR) reads the policy committed on the default branch on GitHub, so a change here has no effect on it until it is committed and pushed to the default branch."
+    : "Read from each checkout's autonomy policy. Change them in the file. Publishing reads the policy on the default branch on GitHub, not this checkout.";
   $("ws-model-note").textContent = controlState.enabled
     ? "Select a model to change it for that tier. The next run uses the new value."
     : "Change them with pico models set. The next run uses the new value.";

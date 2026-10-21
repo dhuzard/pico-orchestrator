@@ -8,27 +8,34 @@ All notable changes to PICO are recorded here. The format follows
 
 ### Security
 
-- Publication permissions come from the remote base policy (issue #39).
+- Publication permissions come from the default branch's policy on GitHub (issue #39).
   `github_integration.publish` took `push_branch` and `create_pr` from the checkout's own
   `.pi/autonomy.yaml`, which a worker can edit, commit on its `pico/` branch (it reaches the
-  integrated branch on integration) or symlink. It now uses the single API-read policy at the
-  verified GitHub base commit that already decides `issue_reference`; the working tree is never
-  an authority.
+  integrated branch on integration) or symlink. It now uses the single API-read policy on the
+  repository's default branch (`repos/<repo>` `default_branch`, a new allowlisted, host-pinned
+  read) that also decides `issue_reference`. The caller's `--base` only chooses where the PR
+  points and is never authority, so a `pico/` branch on GitHub cannot authorize itself. The
+  working tree is never an authority.
+- Removed `backlog github-pr-create`: it ran `gh pr create` for any base and head with no
+  permission check, dry run or plan hash. Open PRs with `github_integration --publish` (or
+  `pico workspace publish`) and link them with `github-pr-link`.
+- Documented, not changed: `create_github_issues`, `comment_on_issue` and `comment_on_pr` are
+  not enforced by `github_integration.execute` or `backlog github-push` (#58); the Garden
+  one-shot grant trusts whoever holds the session token (#59).
 
 ### Changed
 
 - Behavior change: a local-only permission edit no longer authorizes publication. Uncommitted,
   locally committed or `pico/`-branch changes to `.pi/autonomy.yaml` are ignored for
-  `push_branch`/`create_pr`; the policy must be committed and pushed to the base branch on
-  GitHub. A missing base policy is `PUBLICATION_NOT_AUTHORIZED` (the Garden one-shot grant is
-  unchanged). A symlinked or uncommitted-edited `.pi/autonomy.yaml` in the checkout is refused
-  with `AUTONOMY_POLICY_PATH_UNSAFE` for every publication, not only closing ones. The plan
-  records `policy_blob` (always; replaces `issue_policy_blob`), `publication_permissions` and
-  `base_commit`, all bound by the plan hash. `publish` also returns `policy_drift` (informational
-  list of permissions where a committed checkout copy differs from the base). The Garden
-  permission panel and `set_permission` preview say a toggle does not affect publication until
-  committed and pushed to the base.
-
+  `push_branch`/`create_pr`; the policy must be on the default branch on GitHub. A missing
+  policy is `PUBLICATION_NOT_AUTHORIZED` (the Garden one-shot grant is unchanged). A symlinked
+  `.pi` or policy in the checkout is refused with `AUTONOMY_POLICY_PATH_UNSAFE`; a dirty copy is
+  ignored. The plan records `policy_branch`, `policy_commit`, `policy_blob` (always; replaces
+  `issue_policy_blob`), `publication_permissions` and `base_commit`, all bound by the plan hash.
+  `issue_reference_decision` reports `policy_branch`/`policy_commit` instead of `base_commit`.
+  `publish` also returns `policy_drift` (informational list of permissions where the checkout
+  copy differs). The Garden permission panel and `set_permission` preview say a toggle does not
+  affect publication until committed and pushed to the default branch.
 - The lead records less (issue #43). The prompts no longer ask for `directive` or
   `feedback` interaction events or for optional phases such as `inspection`; `decision`,
   status, bind, worker/phase outcomes, the integrate bracket and finish stay. Worker

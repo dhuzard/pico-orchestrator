@@ -42,6 +42,9 @@ class FakeGithub:
         self.heads = {}  # (repo, branch) -> commit, as the GitHub API reports it
         self.policies = {}  # (repo, commit) -> contents entry for .pi/autonomy.yaml
 
+    def default_branch(self, *, repo):
+        return "main"
+
     def branch_head(self, branch, *, repo):
         return self.heads.get((repo, branch))
 
@@ -329,7 +332,8 @@ class ContractLifecycleTest(unittest.TestCase):
             self.assertTrue(body.startswith("Refs #7\n"), body)
             self.assertEqual(preview["plan"]["issue_reference"], "refs")
             self.assertEqual(preview["issue_reference_decision"],
-                             {"closes": False, "source": "repository", "base_commit": github_main,
+                             {"closes": False, "source": "repository", "policy_branch": "main",
+                              "policy_commit": github_main,
                               "policy_blob": self.fake.policies[("acme/alpha", github_main)]["sha"]})
 
         with self.subTest("closes_issue: true writes Closes, though the repository says refs"):
@@ -343,10 +347,9 @@ class ContractLifecycleTest(unittest.TestCase):
                                task_id="a1", adapter=self.fake)
             self.assertEqual((stray["status"], stray["blocker_code"]), ("BLOCKED", "PUBLICATION_BODY_INVALID"))
 
-        with self.subTest("an uncommitted repository policy is refused"):
+        with self.subTest("an uncommitted repository policy changes nothing"):
             policy.write_text(closes_policy)
-            blocked = wc.publish(manifest=self.manifest(), task_id="a1", adapter=self.fake)
-            self.assertEqual((blocked["status"], blocked["blocker_code"]), ("BLOCKED", "AUTONOMY_POLICY_PATH_UNSAFE"))
+            self.assertTrue(dry_run(self.manifest())[0].startswith("Refs #7\n"))
 
         git("-C", str(path), "add", ".pi/autonomy.yaml")
         git("-C", str(path), *COMMIT, "close issues on merge")
@@ -383,7 +386,7 @@ class ContractLifecycleTest(unittest.TestCase):
         with self.subTest("uncommitted edit"):
             policy.write_text(granting)
             blocked = wc.publish(manifest=manifest, task_id="a1", adapter=self.fake)
-            self.assertEqual(blocked["blocker_code"], "AUTONOMY_POLICY_PATH_UNSAFE")
+            self.assertEqual(blocked["blocker_code"], "PUBLICATION_NOT_AUTHORIZED")
         with self.subTest("committed locally, not on GitHub"):
             git("-C", str(path), "add", ".pi/autonomy.yaml")
             git("-C", str(path), *COMMIT, "grant publication")
