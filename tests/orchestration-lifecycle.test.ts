@@ -22,13 +22,14 @@ function harness(preflight: Record<string, unknown>, failEvent = false, verifyOk
                    workerRestatementResult?: Record<string, unknown>;
                    escalationWorkerConflict?: boolean; resumeResult?: Record<string, unknown>;
                    heartbeatResult?: Record<string, unknown>; eventResult?: Record<string, unknown>;
-                   clock?: () => number } = {}) {
+                   clock?: () => number; failKind?: string } = {}) {
   const handlers = new Map<string, Handler>();
   const tools = new Map<string, any>();
   const calls: { script: string; args: string[]; input?: Record<string, unknown> }[] = [];
   // Parent checkout state as seen by the fake snapshot operation.
   const checkout = { digest: "clean", status: [] as string[] };
   let escalated = false;
+  const messages: { message: any; options?: any }[] = [];
   const command = async (script: string, args: string[], input?: Record<string, unknown>) => {
     calls.push({ script, args, input });
     if (script.endsWith("run_lease.py")) return options.heartbeatResult ?? { ok: true, state: "live" };
@@ -57,6 +58,9 @@ function harness(preflight: Record<string, unknown>, failEvent = false, verifyOk
     if (args[0] === "status" || args[0] === "resume") return { run_id: args[1], status: options.parentStatus ?? "IN_PROGRESS",
       reroute_phases: options.reroutePhases ?? [] };
     if (args[0] === "settle" && options.settleFails) return { ok: false, error_code: "PARENT_STORAGE_UNAVAILABLE" };
+    if (args[0] === "event" && options.failKind && input?.kind === options.failKind) {
+      return { ok: false, error_code: "PARENT_STORAGE_UNAVAILABLE" };
+    }
     if (args[0] === "event" && failEvent) return { ok: false };
     if (args[0] === "event" && options.eventResult) return options.eventResult;
     if (args[0] === "event" && options.waveEventResult && input?.kind === "wave") return options.waveEventResult;
@@ -79,6 +83,7 @@ function harness(preflight: Record<string, unknown>, failEvent = false, verifyOk
   const pi = {
     on(name: string, handler: Handler) { handlers.set(name, (event, context) => handler(event, context ?? defaultContext)); },
     registerTool(tool: any) { tools.set(tool.name, tool); },
+    sendMessage(message: any, sendOptions?: any) { messages.push({ message, options: sendOptions }); },
     appendEntry(customType: string, data: unknown) { entries.push({ type: "custom", customType, data }); },
     getActiveTools() { return ["route_task", "spawn_subagent", "ClaudeWorker", "orchestration_record"]; },
   } as unknown as ExtensionAPI;
@@ -87,7 +92,7 @@ function harness(preflight: Record<string, unknown>, failEvent = false, verifyOk
     calls.filter((call) => call.script.endsWith("parent_orchestration.py") && call.args[0] === operation);
   const leaseCalls = (operation: string) =>
     calls.filter((call) => call.script.endsWith("run_lease.py") && call.args[0] === operation);
-  return { handlers, tools, calls, parentCalls, leaseCalls, checkout, entries };
+  return { handlers, tools, calls, parentCalls, leaseCalls, checkout, entries, messages };
 }
 
 const CODEX_HIGH = "openai-codex/gpt-6.1-sol";
@@ -2178,4 +2183,261 @@ test("a lead event never carries the extension's automatic marks to the recorder
     kind: "worker", phase: "A", step_id: "codex_reviewer", status: "completed", only_if_open: true, auto_recorded: true } });
   const forwarded = h.parentCalls("event").map((call) => call.input!).filter((input) => input.kind === "worker");
   assert.deepEqual(forwarded, [{ kind: "worker", phase: "A", step_id: "codex_reviewer", status: "completed" }]);
+});
+
+// --- lead-call limit (LEAD_CALL_LIMIT) ---
+async function withLeadLimit(env: Record<string, string | undefined>, options: Parameters<typeof harness>[3],
+                             body: (h: ReturnType<typeof harness>, aborts: number[]) => Promise<void>) {
+  const names = ["PI_ORCHESTRATION_MAX_LEAD_CALLS", "PI_ORCHESTRATION_MAX_LEAD_CALLS_SOURCE", "PI_ORCHESTRATION_LEAD_CALLS_WARN_AT"];
+  const saved = names.map((name) => process.env[name]);
+  for (const name of names) delete process.env[name];
+  for (const [name, value] of Object.entries(env)) if (value !== undefined) process.env[name] = value;
+  try {
+    const h = harness({ ok: true, status: "READY" }, false, true, options);
+    const aborts: number[] = [];
+    await h.handlers.get("before_agent_start")!({ prompt: "PI_ORCHESTRATION_RUN_V1" },
+      { cwd: "/tmp/target", ui: { notify() {} }, abort: () => { aborts.push(1); } });
+    await body(h, aborts);
+  } finally {
+    names.forEach((name, index) => { if (saved[index] === undefined) delete process.env[name]; else process.env[name] = saved[index]; });
+  }
+}
+let leadClock = 0;
+const leadCall = (h: ReturnType<typeof harness>, content: unknown[] = []) => h.handlers.get("message_end")!({ message: {
+  role: "assistant", provider: "openai-codex", model: "gpt-6.1-sol", timestamp: ++leadClock, content,
+  usage: { input: 10, output: 2, totalTokens: 12 } } });
+const finishCall = [{ type: "toolCall", name: "orchestration_record", arguments: { action: "finish", status: "COMPLETED" } }];
+const limitEvents = (h: ReturnType<typeof harness>) => h.parentCalls("event").map((call) => call.input!).filter((input) =>
+  ["lead_limit", "lead_call_warning", "lead_call_limit_reached"].includes(String(input.kind)));
+const bash = { toolName: "bash", input: { command: "ls" } };
+
+test("no lead-call limit: nothing is recorded and tools stay available however many calls are made", async () => {
+  await withLeadLimit({}, {}, async (h) => {
+    for (let i = 0; i < 40; i++) await leadCall(h);
+    assert.equal(await h.handlers.get("tool_call")!(bash), undefined);
+    assert.deepEqual(limitEvents(h), []);
+    assert.equal(h.messages.length, 0);
+    assert.equal(h.parentCalls("finish").length, 0);
+  });
+});
+
+test("the warning fires once at 80% by default (rounded down) and blocks nothing", async () => {
+  await withLeadLimit({ PI_ORCHESTRATION_MAX_LEAD_CALLS: "5", PI_ORCHESTRATION_MAX_LEAD_CALLS_SOURCE: "task" }, {}, async (h) => {
+    assert.deepEqual(limitEvents(h), [{ kind: "lead_limit", state: "set", max_lead_calls: 5, source: "task", warn_at: 4 }]);
+    for (let i = 0; i < 3; i++) await leadCall(h);
+    assert.equal(h.messages.length, 0);
+    await leadCall(h);
+    assert.equal(h.messages.length, 1);
+    assert.equal(h.messages[0].message.customType, "lead-call-warning");
+    assert.match(h.messages[0].message.content, /4 of 5 lead calls.*Converge/s);
+    assert.equal(await h.handlers.get("tool_call")!(bash), undefined, "the warning blocks nothing");
+    await leadCall(h);
+    assert.equal(h.messages.length, 1, "warned once");
+    assert.equal(limitEvents(h).filter((event) => event.kind === "lead_call_warning").length, 1);
+  });
+});
+
+test("the warning threshold is configurable, must be below the limit, and a limit of 1 has no default warning", async () => {
+  await withLeadLimit({ PI_ORCHESTRATION_MAX_LEAD_CALLS: "10", PI_ORCHESTRATION_LEAD_CALLS_WARN_AT: "3" }, {}, async (h) => {
+    assert.equal(limitEvents(h)[0].warn_at, 3);
+    await leadCall(h); await leadCall(h);
+    assert.equal(h.messages.length, 0);
+    await leadCall(h);
+    assert.equal(h.messages.length, 1);
+  });
+  await withLeadLimit({ PI_ORCHESTRATION_MAX_LEAD_CALLS: "1" }, {}, async (h) => {
+    assert.equal("warn_at" in limitEvents(h)[0], false);
+  });
+  await withLeadLimit({ PI_ORCHESTRATION_MAX_LEAD_CALLS: "4", PI_ORCHESTRATION_LEAD_CALLS_WARN_AT: "4" }, {}, async (h) => {
+    assert.deepEqual(limitEvents(h), []);
+    assert.equal((await h.handlers.get("tool_call")!(bash)).block, true);
+  });
+  await withLeadLimit({ PI_ORCHESTRATION_MAX_LEAD_CALLS: "10" }, { limits: { ok: true, max_lead_calls: 10, lead_calls_warn_at: 6 } }, async (h) => {
+    assert.equal(limitEvents(h)[0].warn_at, 6);
+  });
+});
+
+test("reaching the limit blocks tools except status and finish; the lead's finish within the grace is honoured once", async () => {
+  await withLeadLimit({ PI_ORCHESTRATION_MAX_LEAD_CALLS: "3" }, {}, async (h, aborts) => {
+    await leadCall(h); await leadCall(h);
+    assert.equal(await h.handlers.get("tool_call")!(bash), undefined);
+    await leadCall(h);
+    const blocked = await h.handlers.get("tool_call")!(bash);
+    assert.equal(blocked.block, true);
+    assert.match(blocked.reason, /^LEAD_CALL_LIMIT: 3 of 3 lead calls are used/);
+    assert.match(blocked.reason, /2 more model call\(s\)/);
+    assert.equal((await h.handlers.get("tool_call")!({ toolName: "route_task", input: {} })).block, true);
+    assert.equal((await h.handlers.get("tool_call")!({ toolName: "orchestration_record", input: { action: "event" } })).block, true);
+    assert.equal(await h.handlers.get("tool_call")!({ toolName: "orchestration_record", input: { action: "status" } }), undefined);
+    const status = await h.tools.get("orchestration_record").execute("s", { action: "status" });
+    assert.match(status.content[0].text, /Lead calls: 3 of 3 \(limit reached: finish now\)/);
+    await leadCall(h);
+    await leadCall(h, finishCall);   // the last grace slot carries the finish
+    assert.equal(await h.handlers.get("tool_call")!({ toolName: "orchestration_record", input: { action: "finish" } }), undefined);
+    const done = await h.tools.get("orchestration_record").execute("f", { action: "finish", status: "PARTIAL", blocker_code: "OUT_OF_CALLS" });
+    assert.equal(done.details.ok, true);
+    await leadCall(h);               // the run is finished: nothing more is counted or enforced
+    const finishes = h.parentCalls("finish");
+    assert.equal(finishes.length, 1);
+    assert.equal(finishes[0].args[2], "PARTIAL");
+    assert.equal(finishes[0].args.at(-1), "OUT_OF_CALLS");
+    assert.deepEqual(aborts, []);
+    assert.equal(h.parentCalls("event").some((call) => call.input?.kind === "lead_call_limit_reached"), false);
+    assert.equal(h.leaseCalls("release").length, 0);
+  });
+});
+
+test("grace exhausted: the run is stopped IN_PROGRESS with a checkpoint event, the lease released by its owner, the agent aborted", async () => {
+  await withLeadLimit({ PI_ORCHESTRATION_MAX_LEAD_CALLS: "2", PI_ORCHESTRATION_MAX_LEAD_CALLS_SOURCE: "manifest" }, {}, async (h, aborts) => {
+    await leadCall(h); await leadCall(h); await leadCall(h);
+    assert.equal(h.parentCalls("event").some((call) => call.input?.kind === "lead_call_limit_reached"), false);
+    await leadCall(h);               // calls == limit + grace and no finish in it
+    assert.equal(h.parentCalls("finish").length, 0, "the run is never finished by the limit");
+    assert.equal(h.parentCalls("settle").length, 0);
+    const kinds = limitEvents(h).map((event) => event.kind === "lead_limit" ? `lead_limit:${event.state}` : event.kind);
+    assert.deepEqual(kinds, ["lead_limit:set", "lead_call_warning", "lead_limit:reached", "lead_call_limit_reached"]);
+    const releases = h.leaseCalls("release");
+    assert.equal(releases.length, 1);
+    assert.deepEqual(releases[0].args.slice(0, 2), ["release", "parent-test"]);
+    assert.ok(releases[0].args.includes("--owner"), "released through the owner path");
+    // The stop is recorded (and the checkpoint written) before the lease is released.
+    const order = h.calls.map((call) => call.input?.kind === "lead_call_limit_reached" ? "stop" : call.args[0]);
+    assert.ok(order.indexOf("stop") < order.indexOf("release"));
+    assert.deepEqual(aborts, [1]);
+    const write = await h.handlers.get("tool_call")!({ toolName: "orchestration_record", input: { action: "finish" } });
+    assert.equal(write.block, true);
+    assert.equal(write.terminate, true);
+    assert.equal((await h.handlers.get("tool_call")!(bash)).block, true);
+    const status = await h.tools.get("orchestration_record").execute("st", { action: "status" });
+    assert.match(status.content[0].text, /left in progress/);
+    assert.equal(status.details.active, false);
+    // The aborted agent and the shutdown that follows must not settle (finish) the run.
+    await h.handlers.get("agent_before_settle")!({ outcome: "aborted", continue: false });
+    await h.handlers.get("session_shutdown")!({ reason: "quit" });
+    await leadCall(h);
+    assert.equal(h.parentCalls("finish").length, 0);
+    assert.equal(h.parentCalls("settle").length, 0);
+    assert.equal(h.leaseCalls("release").length, 1);
+    assert.equal(h.entries.some((entry: any) => entry.data?.active === false), false, "the session marker stays active for the resume");
+  });
+});
+
+test("workers still in flight at the stop are recorded blocked and the stop leaves no worker aborted silently", async () => {
+  await withLeadLimit({ PI_ORCHESTRATION_MAX_LEAD_CALLS: "1" }, {}, async (h, aborts) => {
+    await h.handlers.get("tool_result")!(routed);
+    await h.handlers.get("tool_call")!({ toolName: "spawn_subagent", toolCallId: "s1", input: { task: "x" } },
+      { cwd: "/tmp/target", ui: { notify() {} }, abort: () => { aborts.push(1); } });
+    await leadCall(h); await leadCall(h); await leadCall(h);
+    const stopped = h.calls.findIndex((call) => call.input?.kind === "lead_call_limit_reached");
+    assert.ok(stopped >= 0);
+    const blocked = h.calls.slice(0, stopped).filter((call) => call.input?.kind === "worker" && call.input.blocker_code === "LEAD_CALL_LIMIT");
+    assert.ok(blocked.length >= 1, "the in-flight worker is recorded before the stop");
+    assert.equal(blocked[0].input?.status, "blocked");
+    assert.deepEqual(aborts, [1]);
+  });
+});
+
+test("a finish that fails in the last grace call is still followed by the stop on the next call", async () => {
+  await withLeadLimit({ PI_ORCHESTRATION_MAX_LEAD_CALLS: "1" }, { completionError: "PARENT_COMPLETION_INCOMPLETE" }, async (h, aborts) => {
+    await leadCall(h); await leadCall(h);
+    await leadCall(h, finishCall);
+    assert.equal(h.parentCalls("event").some((call) => call.input?.kind === "lead_call_limit_reached"), false);
+    const refused = await h.tools.get("orchestration_record").execute("f", { action: "finish", status: "COMPLETED" });
+    assert.equal(refused.details.ok, false);
+    await leadCall(h);
+    assert.equal(h.parentCalls("event").filter((call) => call.input?.kind === "lead_call_limit_reached").length, 1);
+    assert.deepEqual(aborts, [1]);
+  });
+});
+
+test("a resumed run keeps counting from the recorded calls and warns at once when already past the threshold", async () => {
+  const earlier = Array.from({ length: 7 }, (_, index) => ({ sequence: index + 1 }));
+  await withLeadLimit({ PI_ORCHESTRATION_MAX_LEAD_CALLS: "9", PI_ORCHESTRATION_MAX_LEAD_CALLS_SOURCE: "cli" },
+    { eventResult: { ok: true, context: { lead_calls: earlier } } }, async (h) => {
+      assert.equal(h.messages.length, 1, "7 recorded calls are past the default threshold of 7 (80% of 9)");
+      assert.equal(await h.handlers.get("tool_call")!(bash), undefined);
+      await leadCall(h);
+      assert.equal(await h.handlers.get("tool_call")!(bash), undefined);
+      await leadCall(h);
+      assert.equal((await h.handlers.get("tool_call")!(bash)).block, true, "7 + 2 new calls reach the limit of 9");
+    });
+});
+
+test("the repository policy supplies the limit; an explicit one wins and an invalid one blocks the run", async () => {
+  await withLeadLimit({}, { limits: { ok: true, parallel_tasks: 3, open_prs: 2, max_lead_calls: 4 } }, async (h) => {
+    assert.deepEqual(limitEvents(h), [{ kind: "lead_limit", state: "set", max_lead_calls: 4, source: "policy", warn_at: 3 }]);
+  });
+  await withLeadLimit({ PI_ORCHESTRATION_MAX_LEAD_CALLS: "9" }, { limits: { ok: true, max_lead_calls: 4 } }, async (h) => {
+    assert.deepEqual(limitEvents(h), [{ kind: "lead_limit", state: "set", max_lead_calls: 9, source: "env", warn_at: 7 }]);
+  });
+  for (const bad of ["0", "-1", "2.5", "abc"]) {
+    await withLeadLimit({ PI_ORCHESTRATION_MAX_LEAD_CALLS: bad }, {}, async (h) => {
+      assert.deepEqual(limitEvents(h), []);
+      assert.equal((await h.handlers.get("tool_call")!(bash)).block, true);
+    });
+  }
+});
+
+test("the lead cannot forge a lead-call limit event", () => {
+  const h = harness({ ok: true, status: "READY" });
+  const params = h.tools.get("orchestration_record").parameters;
+  for (const kind of ["lead_limit", "lead_call_warning", "lead_call_limit_reached"]) {
+    assert.equal(Value.Check(params, { action: "event", event: { kind, state: "set" } }), false);
+  }
+});
+
+test("a restored (resumed) session is bound by the limit and counts from the larger of telemetry and its own count", async () => {
+  const names = ["PI_ORCHESTRATION_MAX_LEAD_CALLS", "PI_ORCHESTRATION_MAX_LEAD_CALLS_SOURCE", "PI_ORCHESTRATION_LEAD_CALLS_WARN_AT"];
+  const saved = names.map((name) => process.env[name]);
+  for (const name of names) delete process.env[name];
+  process.env.PI_ORCHESTRATION_MAX_LEAD_CALLS = "5";
+  process.env.PI_ORCHESTRATION_MAX_LEAD_CALLS_SOURCE = "cli";
+  try {
+    const cwd = process.cwd();
+    const entries: any[] = [{ type: "custom", customType: "pi-orchestration-parent-v1",
+      data: { run_id: "parent-test", session_id: "session-a", target_cwd: cwd, active: true } }];
+    // 2 telemetry rows were lost: the extension's own count says 3, the recorded rows say 1.
+    const aborts: number[] = [];
+    const h = harness({ ok: true, status: "READY" }, false, true, { entries,
+      eventResult: { ok: true, context: { lead_calls: [{}], lead_call_limit: { calls_seen: 3 } } } });
+    await h.handlers.get("session_start")!({ reason: "startup" }, { cwd, abort: () => { aborts.push(1); },
+      ui: { notify() {} }, sessionManager: { getSessionId: () => "session-a", getBranch: () => entries } });
+    assert.equal(h.parentCalls("resume").length, 1);
+    assert.deepEqual(limitEvents(h)[0], { kind: "lead_limit", state: "set", max_lead_calls: 5, source: "cli", warn_at: 4 });
+    assert.equal(await h.handlers.get("tool_call")!(bash, { cwd, abort: () => { aborts.push(1); }, ui: { notify() {} } }), undefined);
+    await leadCall(h);                       // 4: warning
+    assert.equal(h.messages.length, 1);
+    await leadCall(h);                       // 5: limit reached
+    const blocked = await h.handlers.get("tool_call")!(bash, { cwd, abort: () => { aborts.push(1); }, ui: { notify() {} } });
+    assert.equal(blocked.block, true);
+    assert.match(blocked.reason, /^LEAD_CALL_LIMIT: 5 of 5/);
+    await leadCall(h); await leadCall(h);    // grace used up
+    const stop = h.parentCalls("event").map((call) => call.input!).find((input) => input.kind === "lead_call_limit_reached");
+    assert.deepEqual(stop, { kind: "lead_call_limit_reached", calls: 7 });
+    assert.deepEqual(aborts, [1]);
+    assert.equal(h.parentCalls("finish").length, 0);
+  } finally {
+    names.forEach((name, index) => { if (saved[index] === undefined) delete process.env[name]; else process.env[name] = saved[index]; });
+  }
+});
+
+test("a call whose model string fails validation is still counted against the limit", async () => {
+  await withLeadLimit({ PI_ORCHESTRATION_MAX_LEAD_CALLS: "1" }, {}, async (h) => {
+    await h.handlers.get("message_end")!({ message: { role: "assistant", provider: "bad provider!", model: "x", timestamp: ++leadClock, content: [] } });
+    assert.equal(h.parentCalls("event").some((call) => call.input?.kind === "lead_usage"), false);
+    assert.equal((await h.handlers.get("tool_call")!(bash)).block, true);
+    assert.deepEqual(limitEvents(h).at(-1), { kind: "lead_limit", state: "reached", calls: 1 });
+  });
+});
+
+test("when the stop checkpoint cannot be written the lease is kept, the agent is aborted and settle ends the run BLOCKED", async () => {
+  await withLeadLimit({ PI_ORCHESTRATION_MAX_LEAD_CALLS: "1" }, { failKind: "lead_call_limit_reached" }, async (h, aborts) => {
+    await leadCall(h); await leadCall(h); await leadCall(h);
+    assert.equal(h.leaseCalls("release").length, 0, "the lease is not released without a checkpoint");
+    assert.deepEqual(aborts, [1]);
+    assert.equal((await h.handlers.get("tool_call")!(bash)).block, true);
+    await h.handlers.get("agent_before_settle")!({ outcome: "aborted", continue: false });
+    assert.equal(h.parentCalls("settle").length, 1, "the normal settle path ends the run");
+    assert.equal(h.parentCalls("finish").length, 0);
+  });
 });

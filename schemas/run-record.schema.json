@@ -530,7 +530,7 @@
             "branch": {"type": ["string", "null"], "maxLength": 255, "pattern": "^[^\\u0000-\\u001f\\u007f]+$"},
             "head": {"type": ["string", "null"], "pattern": "^[0-9a-f]{40,64}$"},
             "phase": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$"},
-            "reason": {"enum": ["run_start", "phase_boundary", "worker_approval", "integration_started", "wave_integrated", "mutation_recorded"]},
+            "reason": {"enum": ["run_start", "phase_boundary", "worker_approval", "integration_started", "wave_integrated", "mutation_recorded", "lead_call_limit"]},
             "recorded_at": {"type": "string", "format": "date-time"},
             "sequence": {"type": "integer", "minimum": 1}
           }
@@ -894,6 +894,25 @@
                   "type": "integer",
                   "minimum": 0
                 }
+              }
+            },
+            "lead_call_limit": {
+              "type": "object",
+              "additionalProperties": false,
+              "description": "Present only when the run had a lead-call limit: the effective limit, where it came from, the warning threshold and the call it fired at, the lead call count when the limit was reached, and whether the lifecycle extension stopped the run at the limit. A stop leaves the run IN_PROGRESS (stopped_reason LEAD_CALL_LIMIT) with a fresh resume checkpoint; it is resumable only with a raised limit.",
+              "required": ["max_lead_calls", "source", "warn_at", "warned_at_call", "calls_at_limit", "stopped", "stopped_reason", "calls_at_stop"],
+              "properties": {
+                "max_lead_calls": { "type": "integer", "minimum": 1 },
+                "source": { "type": "string", "enum": ["cli", "task", "manifest", "policy", "env"] },
+                "warn_at": { "type": ["integer", "null"], "minimum": 1 },
+                "warned_at_call": { "type": ["integer", "null"], "minimum": 0 },
+                "calls_at_limit": { "type": ["integer", "null"], "minimum": 0 },
+                "calls_seen": { "type": "integer", "minimum": 0, "description": "The lifecycle extension's own lead call count from its limit events; the run's count is the larger of this and the recorded lead_calls." },
+                "stopped": { "type": "boolean" },
+                "mid_integration": { "type": "boolean", "description": "The stop came while a wave was integrating: the pre-integration checkpoint was kept, so a resume reports drift and needs reconciliation." },
+                "refused_sets": { "type": "array", "maxItems": 10, "description": "Later limit settings that differed from the limit the launcher pinned and were refused (a forged raise).", "items": { "type": "object", "additionalProperties": false, "required": ["max_lead_calls", "source"], "properties": { "max_lead_calls": { "type": "integer" }, "source": { "type": "string" } } } },
+                "stopped_reason": { "enum": ["LEAD_CALL_LIMIT", null] },
+                "calls_at_stop": { "type": ["integer", "null"], "minimum": 0 }
               }
             },
             "lead_calls": {

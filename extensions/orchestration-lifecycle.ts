@@ -61,6 +61,15 @@ export const REASONING_EFFORTS: readonly string[] = ["low", "medium", "high"];
 const EFFORT = Type.Union(REASONING_EFFORTS.map((effort) => Type.Literal(effort)));
 /** Default `limits.parallel_tasks` when the target has no .pi/autonomy.yaml. */
 const DEFAULT_PARALLEL_TASKS = 3;
+/** Lead-call limit: set by the launcher (or the operator) in the environment, else by .pi/autonomy.yaml. */
+const LEAD_LIMIT_ENV = "PI_ORCHESTRATION_MAX_LEAD_CALLS";
+const LEAD_LIMIT_SOURCE_ENV = "PI_ORCHESTRATION_MAX_LEAD_CALLS_SOURCE";
+const LEAD_WARN_ENV = "PI_ORCHESTRATION_LEAD_CALLS_WARN_AT";
+const LEAD_LIMIT_SOURCES = new Set(["cli", "task", "manifest", "policy"]);
+/** Lead calls allowed after the limit is reached, so the lead can record an explicit outcome. */
+export const LEAD_CALL_GRACE = 2;
+/** Longest wait for aborted workers to settle before the stop checkpoint and lease release. */
+const LEAD_STOP_SETTLE_MS = 5000;
 const TAG_ID = "[A-Za-z0-9][A-Za-z0-9_.-]{0,127}";
 const LABEL_TAG = new RegExp(`^(${TAG_ID}):(${TAG_ID})$`);
 const EXCERPT_CHARS = 300;
@@ -392,6 +401,10 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
   let budget: BudgetState | null = null;
   let recordedPeak = 0;
   let compactionFailed = false;
+  // Lead-call limit of the active run; null when none is configured (then nothing below applies).
+  let leadLimit: { max: number; source: string; calls: number; warnAt: number | null; warned: boolean; reached: boolean } | null = null;
+  // Set once the extension itself stopped the run at the limit (left IN_PROGRESS for a resume): every later tool call is refused.
+  let limitStopped: string | null = null;
   let sessionId: string | null = null;
   let leaseTimer: ReturnType<typeof setInterval> | null = null;
   const leaseIdentity = leaseProcessState();
@@ -516,6 +529,8 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
     }
     budget = initialBudgetState();
     startHeartbeat(result);
+    // A resumed run is bound by the effective limit too, counting from the calls already made.
+    await configureLeadLimit();
   }
 
   function diagnose(operation: string, result: Json): void {
@@ -550,9 +565,129 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
     approvals.clear(); pendingRoutes.clear(); workspaces.clear(); snapshots.clear();
     subagentTasks.clear(); inFlight.clear(); claudeCalls.clear(); workerPlans.clear();
     scopeViolation = null; activeWave = null; integrating = null; implicitOpen.clear(); routeEpochs.clear(); implicitEpoch.clear(); autoWorkers.clear(); lastPhase = "routing";
-    currentTurn = null; messageStarts.clear();
+    currentTurn = null; messageStarts.clear(); leadLimit = null;
     batchStart = 0; batchPeak = 0;
     pendingReroutes.clear();
+  }
+  /**
+   * Resolve this run's lead-call limit and warning threshold (explicit env from the launcher, else the repository
+   * policy) and record them. An invalid value blocks the run closed: a limit that cannot be honored is never
+   * silently dropped.
+   */
+  async function configureLeadLimit(): Promise<void> {
+    leadLimit = null;
+    if (!runId) return;
+    const invalid = (code: string) => {
+      parentBlocked = true; blockAllWorktrees();
+      parentFailure = { ok: false, error_code: code, error_category: "InvalidLeadCallLimit" };
+      diagnose("lead_limit", parentFailure);
+    };
+    let max: number | null = null;
+    let source = "policy";
+    let warnAt: number | null = null;
+    const raw = process.env[LEAD_LIMIT_ENV];
+    const rawWarn = process.env[LEAD_WARN_ENV];
+    const positive = /^[1-9][0-9]{0,8}$/;
+    if (raw !== undefined && raw !== "") {
+      if (!positive.test(raw)) return invalid("MAX_LEAD_CALLS_INVALID");
+      max = Number(raw);
+      const named = process.env[LEAD_LIMIT_SOURCE_ENV];
+      source = named !== undefined && LEAD_LIMIT_SOURCES.has(named) ? named : "env";
+      if (rawWarn !== undefined && rawWarn !== "") {
+        if (!positive.test(rawWarn)) return invalid("LEAD_CALLS_WARN_AT_INVALID");
+        warnAt = Number(rawWarn);
+      }
+    }
+    if (max === null || warnAt === null) {
+      const limits = await command(AUTONOMY, ["limits", "--worktree", targetCwd ?? "."]);
+      if (limits.ok !== false) {
+        if (max === null) max = count(limits.max_lead_calls) || null;
+        // The repository's threshold applies only below the effective limit; otherwise the 80% default does.
+        const inherited = count(limits.lead_calls_warn_at);
+        if (warnAt === null && max !== null && inherited !== null && inherited >= 1 && inherited < max) warnAt = inherited;
+      }
+    }
+    if (max === null) return;
+    if (warnAt !== null && warnAt >= max) return invalid("LEAD_CALLS_WARN_AT_INVALID");
+    // Default: 80% of the limit, rounded down; no warning when that is below the first call.
+    if (warnAt === null) { const derived = Math.floor(max * 0.8); warnAt = derived >= 1 && derived < max ? derived : null; }
+    const result = await command(PARENT, ["event", runId, ...ownerArgs()],
+      { kind: "lead_limit", state: "set", max_lead_calls: max, source, ...(warnAt === null ? {} : { warn_at: warnAt }) });
+    if (result.ok === false) {
+      if (LEASE_LOST.has(String(result.error_code))) detach(result);
+      else { diagnose("lead_limit", result); parentFailure = result; parentBlocked = true; blockAllWorktrees(); }
+      return;
+    }
+    // A resumed run keeps counting from the calls already recorded; the count never resets.
+    // The count is the larger of the recorded telemetry and the extension's own earlier count.
+    const recorded = result.context as Json | undefined;
+    const telemetry = Array.isArray(recorded?.lead_calls) ? (recorded!.lead_calls as unknown[]).length : 0;
+    const own = count((recorded?.lead_call_limit as Json | undefined)?.calls_seen) ?? 0;
+    leadLimit = { max, source, calls: Math.max(telemetry, own), warnAt, warned: false, reached: false };
+    await crossThresholds();
+  }
+  /** Warn once at the warning threshold; at the limit, restrict tools to status and finish. */
+  async function crossThresholds(): Promise<void> {
+    const used = leadLimit;
+    if (!used) return;
+    if (used.warnAt !== null && used.calls >= used.warnAt && !used.warned) {
+      used.warned = true;
+      await observe({ kind: "lead_call_warning", calls: used.calls });
+      pi.sendMessage?.({ customType: "lead-call-warning", display: true,
+        content: `LEAD_CALL_WARNING: ${used.calls} of ${used.max} lead calls are used. Converge now: wrap up the current work, integrate finished tasks and record outcomes. ` +
+          `At ${used.max} calls only orchestration_record status or finish stays available.` }, { deliverAs: "steer" });
+    }
+    if (used.calls >= used.max && !used.reached) {
+      used.reached = true;
+      await observe({ kind: "lead_limit", state: "reached", calls: used.calls });
+    }
+  }
+  const leadGraceLeft = () => leadLimit ? Math.max(0, leadLimit.max + LEAD_CALL_GRACE - leadLimit.calls) : 0;
+  /** The lead has used its calls; it may still read status and finish. */
+  function leadLimitBlock(): string {
+    const used = leadLimit!;
+    return `LEAD_CALL_LIMIT: ${used.calls} of ${used.max} lead calls are used. Only orchestration_record status or finish is available now. ` +
+      `Call orchestration_record {"action":"finish"} immediately with an explicit outcome (COMPLETED, PARTIAL, BLOCKED or FAILED); ` +
+      `${leadGraceLeft()} more model call(s) are allowed before the run is stopped for an operator to resume with a higher limit.`;
+  }
+  /**
+   * The lead did not finish within the grace. Fail closed but resumable: record the stop (the recorder writes a fresh
+   * resume checkpoint and keeps the run IN_PROGRESS, stopped_reason LEAD_CALL_LIMIT), account for workers still in
+   * flight, release the lease through the owner path, then stop the agent. The run is NOT finished.
+   */
+  async function stopAtLeadLimit(): Promise<void> {
+    const id = runId;
+    if (!id || !leadLimit) return;
+    const used = leadLimit;
+    for (const worker of inFlight.values()) {
+      if (worker.taskId && worker.stepId) await observe({ kind: "worker", phase: worker.phase ?? worker.taskId,
+        step_id: worker.stepId, status: "blocked", blocker_code: "LEAD_CALL_LIMIT", only_if_open: true });
+    }
+    for (const controller of workerAborts.values()) controller.abort();
+    // Let aborted workers settle (bounded) before the checkpoint is taken and the lease is released, so no
+    // worktree changes afterwards without anyone holding the lease.
+    const settleBy = Date.now() + LEAD_STOP_SETTLE_MS;
+    while (workerAborts.size > 0 && Date.now() < settleBy) await new Promise((resolve) => setTimeout(resolve, 25));
+    workerAborts.clear();
+    inFlight.clear();
+    const stopped = await command(PARENT, ["event", id, ...ownerArgs()], { kind: "lead_call_limit_reached", calls: used.calls });
+    if (runId !== id) return;
+    if (stopped.ok === false) {
+      // No fresh checkpoint: the run cannot be left resumable. Stay closed; the normal settle path ends it.
+      if (LEASE_LOST.has(String(stopped.error_code))) { detach(stopped); return; }
+      diagnose("lead_limit_stop", stopped);
+      parentFailure = stopped; parentBlocked = true; blockAllWorktrees();
+      lastCtx?.abort?.();
+      return;
+    }
+    stopHeartbeat();
+    const released = await command(LEASE, ["release", id, ...ownerArgs()]);
+    if (released.ok === false) diagnose("lead_limit_release", released);
+    runId = null;
+    lastRunId = id;
+    blockAllWorktrees();
+    limitStopped = `LEAD_CALL_LIMIT: the run was stopped after ${used.calls} lead calls (limit ${used.max}) and left in progress for an operator to resume with a higher limit; nothing more can be recorded or run`;
+    lastCtx?.abort?.();
   }
   async function scopeCheck(target: string, worker: string): Promise<Json> {
     const scope = await command(SESSION_SCOPE, [], { target_cwd: target, worker_cwd: worker });
@@ -692,6 +827,7 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
       return { message: { customType: "orchestration-blocker", display: true,
         content: `BLOCKED: parent orchestration continuation failed (${code}). Start a new Pi session after resolving the repository mismatch.` } };
     }
+    limitStopped = null;
     await settle();
     if (runId) {
       return { message: { customType: "orchestration-blocker", display: true,
@@ -717,6 +853,7 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
     }
     const started = await command(CONTEXT, ["start", runId!, ...ownerArgs()], { cwd: ctx.cwd });
     if (started.ok === false) diagnose("context_start", started);
+    await configureLeadLimit();
     budget = initialBudgetState();
     startHeartbeat(result);
   });
@@ -857,6 +994,13 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
     lastCtx = ctx;
     // No successful renewal for most of the lease's lifetime: stop before another owner may take it.
     if (leaseLapsed()) selfExpire();
+    if (limitStopped && !(call.toolName === "orchestration_record" && call.input.action === "status")) {
+      return { block: true, terminate: true, reason: limitStopped };
+    }
+    if (runId && leadLimit?.reached && !(call.toolName === "orchestration_record"
+        && (call.input.action === "status" || call.input.action === "finish"))) {
+      return { block: true, reason: leadLimitBlock() };
+    }
     if (!runId && !parentBlocked) return guardOutsideRun(call, ctx.cwd);
     if (parentBlocked && call.toolName !== "orchestration_record") {
       return { block: true, terminate: true,
@@ -1281,6 +1425,10 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
     ]),
     async execute(_id, params) {
       if (!runId) {
+        if (limitStopped) {
+          return { content: [{ type: "text", text: limitStopped }],
+                   details: { ok: false, active: false, run_id: lastRunId, result: { error_code: "LEAD_CALL_LIMIT" } } };
+        }
         if (params.action === "status" && lastRunId && lastTerminal && !parentFailure) {
           return { content: [{ type: "text", text: `Parent orchestration run ${lastRunId} finalized (ok: false, active: false).` }],
                    details: { ok: false, active: false, run_id: lastRunId, result: lastTerminal } };
@@ -1375,7 +1523,8 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
       // The model reads only this text, never `details`, so the status line states ok/active explicitly.
       const message = harmless ? `Worker override refused (${code}); nothing changed and the run is not blocked. Record a different judgment or leave the worker as recorded.`
         : ok ? (params.action === "status"
-          ? `Parent orchestration record ${observedRunId} is ready (ok: true, active: ${runId !== null}).`
+          ? `Parent orchestration record ${observedRunId} is ready (ok: true, active: ${runId !== null}).` +
+            (leadLimit && runId ? ` Lead calls: ${leadLimit.calls} of ${leadLimit.max}${leadLimit.reached ? " (limit reached: finish now)" : ""}.` : "")
         : params.action === "finish" ? completionSummary(result, observedRunId)
         : "Parent orchestration trace updated.")
         : `BLOCKED: parent orchestration ${params.action} failed${code ? ` (${code})` : ""}` +
@@ -1465,18 +1614,28 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
     if (!runId || event.message.role !== "assistant") return;
     const message = event.message;
     const model = `${message.provider}/${message.model}`;
-    if (!/^[A-Za-z0-9_.:/-]{1,128}$/.test(model)) return;
-    const started = messageStarts.get(message.timestamp);
-    messageStarts.delete(message.timestamp);
-    const approval = approvals.size === 1 ? approvals.get(lastPhase) : undefined;
-    const leadCost = (message.usage as { cost?: { total?: unknown } } | undefined)?.cost?.total; // Pi's per-message estimate
-    await observe({ kind: "lead_usage", model, phase: lastPhase,
-      task_type: approval?.taskType ?? null, turn_index: currentTurn,
-      duration_ms: started === undefined ? null : Math.max(0, Date.now() - started),
-      input_tokens: count(message.usage?.input), output_tokens: count(message.usage?.output),
-      cached_tokens: count(message.usage?.cacheRead), total_tokens: count(message.usage?.totalTokens),
-      ...(count(message.usage?.cacheWrite) === null ? {} : { cache_write_tokens: count(message.usage?.cacheWrite) }),
-      ...(typeof leadCost === "number" && Number.isFinite(leadCost) && leadCost >= 0 ? { estimated_cost_usd: leadCost } : {}) });
+    // The limit counts every assistant call, including one whose model string fails validation.
+    if (leadLimit) leadLimit.calls += 1;
+    if (/^[A-Za-z0-9_.:/-]{1,128}$/.test(model)) {
+      const started = messageStarts.get(message.timestamp);
+      messageStarts.delete(message.timestamp);
+      const approval = approvals.size === 1 ? approvals.get(lastPhase) : undefined;
+      const leadCost = (message.usage as { cost?: { total?: unknown } } | undefined)?.cost?.total; // Pi's per-message estimate
+      await observe({ kind: "lead_usage", model, phase: lastPhase,
+        task_type: approval?.taskType ?? null, turn_index: currentTurn,
+        duration_ms: started === undefined ? null : Math.max(0, Date.now() - started),
+        input_tokens: count(message.usage?.input), output_tokens: count(message.usage?.output),
+        cached_tokens: count(message.usage?.cacheRead), total_tokens: count(message.usage?.totalTokens),
+        ...(count(message.usage?.cacheWrite) === null ? {} : { cache_write_tokens: count(message.usage?.cacheWrite) }),
+        ...(typeof leadCost === "number" && Number.isFinite(leadCost) && leadCost >= 0 ? { estimated_cost_usd: leadCost } : {}) });
+    }
+    if (!leadLimit || !runId) return;
+    await crossThresholds();
+    // The call that uses the last grace slot may still carry the finish; any call beyond it ends the run.
+    const finishing = Array.isArray(message.content) && message.content.some((part: any) => part?.type === "toolCall"
+      && part.name === "orchestration_record" && part.arguments?.action === "finish");
+    const last = leadLimit.max + LEAD_CALL_GRACE;
+    if (leadLimit.calls > last || (leadLimit.calls === last && !finishing)) await stopAtLeadLimit();
   });
 
   pi.on("session_compact", async (event) => {

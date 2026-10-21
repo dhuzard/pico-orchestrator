@@ -529,6 +529,10 @@ function workspaceTaskCard(task) {
       : `Time limit ${duration(limit.max_duration_seconds)}`;
     facts.append(el("p", limit.stop_reason ? "ws-chip failed" : "ws-chip", text));
   }
+  const calls = task.lead_call_limit;
+  if (calls?.max_lead_calls) {
+    facts.append(el("p", calls.stopped ? "ws-chip failed" : "ws-chip", `Lead calls ${calls.calls ?? "?"} of ${calls.max_lead_calls}${calls.stopped ? " · stopped by LEAD_CALL_LIMIT" : ""}`));
+  }
   if (task.run_id) {
     const line = el("p", "ws-run");
     const status = task.run?.status ? cap(task.run.status.toLowerCase()) : "record unavailable";

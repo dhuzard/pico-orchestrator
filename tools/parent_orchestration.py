@@ -369,7 +369,8 @@ def resume(run_id: str, *, worktree: Path, owner_id: str, pid: int | None = None
                     held.release()  # finished between the status read and the lease
                     return status(run_id, repo_root=repo_root)
                 verdict = _verify_checkpoint_unlocked(run_id, worktree, owner_id, repo_root)
-            if verdict["check"]["status"] != "verified":
+                mid_integration = _mid_integration(_parent(provenance.get_run(repo_root, run_id)))
+            if verdict["check"]["status"] != "verified" or mid_integration:
                 held.release()
             lease = held.lease
     except run_lease.LeaseError as exc:
@@ -383,6 +384,12 @@ def resume(run_id: str, *, worktree: Path, owner_id: str, pid: int | None = None
         raise ParentRunError(detail, error_code=check["reason_code"],
                              details={"expected": verdict["checkpoint"], "actual": verdict["live"],
                                       "mismatches": check["mismatches"], "run_status": "IN_PROGRESS"})
+    if mid_integration:
+        # HEAD may be unchanged while the tree holds a half-applied merge, so the checkpoint cannot prove it clean.
+        raise ParentRunError(
+            "a wave was mid-integration when the run stopped; the checkout may hold a half-applied merge. "
+            "Cancel the execution (`pico exec cancel`, which abandons the open wave) and start a new run",
+            error_code="RESUME_MID_INTEGRATION", details={"run_status": "IN_PROGRESS"})
     return {**current, "lease": lease, "checkpoint": verdict["checkpoint"]}
 
 
@@ -408,6 +415,106 @@ def empty_context() -> dict:
     return {"starting_commit": None, "baseline_tokens": None, "peak_context_tokens": None,
             "peak_working_tokens": None, "compactions": 0, "structured_compactions": 0,
             "checkpoints": [], "worker_usage": {}, "lead_usage": {}, "lead_calls": [], "spawned_agents": 0}
+
+
+LEAD_LIMIT_SOURCES = ("cli", "task", "manifest", "policy", "env")
+LEAD_LIMIT_STATES = ("set", "reached")
+LEAD_LIMIT_STOP_REASON = "LEAD_CALL_LIMIT"
+
+
+def lead_call_count(context: dict, event: dict | None = None) -> int:
+    """The run's lead call count: the larger of the recorded `lead_calls` and the extension's own authoritative
+    count (`calls_seen`, from its limit events), so a lost telemetry write cannot undercount."""
+    limit = context.get("lead_call_limit") or {}
+    seen = [len(context.get("lead_calls") or []), limit.get("calls_seen") or 0]
+    if event is not None and event.get("calls") is not None:
+        seen.append(_count(event["calls"], "lead call count"))
+    return max(seen)
+
+
+def _mid_integration(parent: dict) -> bool:
+    """The run stopped (or crashed) with a current wave integrating, or a lead-call stop recorded that it did."""
+    limit = (parent.get("context") or {}).get("lead_call_limit") or {}
+    return bool(limit.get("mid_integration")) or _integrating(parent)
+
+
+def _integrating(parent: dict) -> bool:
+    phases = parent.get("phases") or []
+    return any(wave.get("status") == "integrating" and _wave_is_current(phases, wave)
+               for wave in parent.get("waves") or [])
+
+
+def _lead_limit_event(parent: dict, event: dict) -> None:
+    """Record the lead-call limit and what the lifecycle extension did about it.
+
+    `lead_limit` `set` records the effective limit, its source and the warning threshold; `reached` records the
+    call that used the last allowed call (tools are then limited to status and finish). `lead_call_warning`
+    records the one convergence warning. `lead_call_limit_reached` is the stop: the run stays IN_PROGRESS with
+    `stopped_reason: LEAD_CALL_LIMIT` and a fresh resume checkpoint, except mid-integration, where the
+    pre-integration checkpoint is kept so a resume reports drift. Events may carry the extension's own `calls`
+    count. Written only by the lifecycle extension, never by the lead's own event payload.
+    """
+    context = parent.setdefault("context", empty_context())
+    kind = event["kind"]
+    context.setdefault("lead_calls", [])
+    calls = lead_call_count(context, event)
+    if kind == "lead_limit":
+        state = event["state"]
+        if state not in LEAD_LIMIT_STATES:
+            raise ParentRunError("invalid lead limit state")
+        if state == "set":
+            maximum, warn_at = event.get("max_lead_calls"), event.get("warn_at")
+            if type(maximum) is not int or maximum < 1 or event.get("source") not in LEAD_LIMIT_SOURCES:
+                raise ParentRunError("invalid lead call limit", error_code="MAX_LEAD_CALLS_INVALID")
+            if warn_at is not None and (type(warn_at) is not int or not 1 <= warn_at < maximum):
+                raise ParentRunError("invalid lead call warning threshold", error_code="LEAD_CALLS_WARN_AT_INVALID")
+            previous = context.get("lead_call_limit") or {}
+            pinned = os.environ.get("PI_ORCHESTRATION_MAX_LEAD_CALLS")
+            if previous and pinned and (pinned != str(maximum) or os.environ.get(
+                    "PI_ORCHESTRATION_MAX_LEAD_CALLS_SOURCE", event["source"]) != event["source"]):
+                # The launcher pinned the limit in the environment: a later set that differs is probably not the
+                # extension's (a forged raise). Keep the recorded limit and record the refusal. This is best-effort
+                # only: the lead's bash inherits the environment and can override the variable. The authoritative
+                # resume check is the launcher's execution record (headless_run._launch_locked); an interactive run
+                # has no launcher record and therefore no exhausted check on resume.
+                previous.setdefault("refused_sets", []).append({"max_lead_calls": maximum, "source": event["source"]})
+                del previous["refused_sets"][:-10]
+                return
+            # A resume sets the limit again: the call count carries over, and a raised limit clears the stop.
+            context["lead_call_limit"] = {
+                "max_lead_calls": maximum, "source": event["source"], "warn_at": warn_at,
+                "warned_at_call": previous.get("warned_at_call") if warn_at is not None and previous.get("warn_at") == warn_at else None,
+                "calls_at_limit": previous.get("calls_at_limit") if calls >= maximum else None,
+                "calls_seen": calls, "stopped": False, "stopped_reason": None,
+                "mid_integration": bool(previous.get("mid_integration")),
+                **({"refused_sets": previous["refused_sets"]} if previous.get("refused_sets") else {}),
+                "calls_at_stop": previous.get("calls_at_stop")}
+            return
+        limit = context.get("lead_call_limit")
+        if limit is None or set(event) - {"kind", "state", "calls"}:
+            raise ParentRunError("no lead call limit is set for this run")
+        limit["calls_seen"] = calls
+        if limit["calls_at_limit"] is None:
+            limit["calls_at_limit"] = calls
+        return
+    limit = context.get("lead_call_limit")
+    if limit is None or set(event) - {"kind", "calls"}:
+        raise ParentRunError("no lead call limit is set for this run")
+    limit["calls_seen"] = calls
+    if kind == "lead_call_warning":
+        if limit["warned_at_call"] is None:
+            limit["warned_at_call"] = calls
+        return
+    # lead_call_limit_reached: leave the run resumable, never terminal.
+    limit.update({"stopped": True, "stopped_reason": LEAD_LIMIT_STOP_REASON, "calls_at_stop": calls})
+    if limit["calls_at_limit"] is None:
+        limit["calls_at_limit"] = min(calls, limit["max_lead_calls"])
+    if _integrating(parent):
+        # A wave is mid-integration: the checkpoint stays at the pre-integration state, so the resume sees the
+        # partial merge as drift and needs reconciliation (#40's crash-mid-integration rule).
+        limit["mid_integration"] = True
+    else:
+        _checkpoint(parent, reason="lead_call_limit", phase=None)
 
 
 def _count(value: Any, field: str) -> int:
@@ -612,6 +719,9 @@ def _record_event_unlocked(run_id: str, event: dict, *, repo_root: Path = ROOT) 
         "interaction": {"kind", "type", "summary", "task_id", "step_id", "subagent_id", "reply_to"},
         "lead_usage": {"kind", "model", "phase", "task_type", "turn_index", "duration_ms", "input_tokens", "output_tokens", "cached_tokens", "cache_write_tokens", "total_tokens", "estimated_cost_usd"},
         "checkpoint": {"kind", "phase", "reason", "workspace_bound"},
+        "lead_limit": {"kind", "state", "max_lead_calls", "source", "warn_at", "calls"},
+        "lead_call_warning": {"kind", "calls"},
+        "lead_call_limit_reached": {"kind", "calls"},
     }
     required = {
         "phase": {"kind", "phase", "status"},
@@ -628,6 +738,9 @@ def _record_event_unlocked(run_id: str, event: dict, *, repo_root: Path = ROOT) 
         "interaction": {"kind", "type", "summary", "task_id", "step_id"},
         "lead_usage": {"kind", "model"},
         "checkpoint": {"kind", "phase", "reason"},
+        "lead_limit": {"kind", "state"},
+        "lead_call_warning": {"kind"},
+        "lead_call_limit_reached": {"kind"},
     }
     if kind not in allowed or set(event) - allowed[kind]:
         raise ParentRunError("unsupported event or unexpected fields")
@@ -920,6 +1033,8 @@ def _record_event_unlocked(run_id: str, event: dict, *, repo_root: Path = ROOT) 
         for field in ("input_tokens", "output_tokens", "cached_tokens", "total_tokens"):
             call[field] = event.get(field)
         context["lead_calls"].append(call)
+    elif kind in {"lead_limit", "lead_call_warning", "lead_call_limit_reached"}:
+        _lead_limit_event(parent, event)
     elif kind == "wave":
         _wave_event(parent, event)
         if event["status"] == "integrating":

@@ -220,11 +220,17 @@ def _entry(record: dict, task: dict, repo: dict, execution: dict, inputs: dict |
                   "run_status": run.get("status"), "run_blocker_code": run.get("blocker_code"),
                   "trace_path": run.get("trace_path"), "last_seen": _now()})
     # Time limit of the current launch (absent keys clear a previous launch's values).
-    for key in ("max_duration_seconds", "deadline_at", "deadline_epoch", "stop_reason", "time_limit"):
+    for key in ("max_duration_seconds", "deadline_at", "deadline_epoch", "stop_reason", "time_limit",
+                "max_lead_calls", "max_lead_calls_source", "lead_calls_warn_at"):
         if execution.get(key) is not None:
             entry[key] = execution[key]
         else:
             entry.pop(key, None)
+    # Lead calls used against the limit, from the run record (absent without a limit).
+    if isinstance((execution.get("run") or {}).get("lead_call_limit"), dict):
+        entry["lead_call_limit"] = execution["run"]["lead_call_limit"]
+    else:
+        entry.pop("lead_call_limit", None)
     if execution.get("checkout"):
         cleanup = execution["checkout"]
         entry["checkout"] = {"restored": cleanup["restored"], "branch": cleanup["branch_after"],
@@ -394,6 +400,14 @@ def launch(*, manifest: Path, task_id: str, allow_mutation: bool = False, resume
     budget_override: dict | None = None
     # A task's own limit overrides the manifest default; neither set means no limit.
     max_duration = task.get("max_duration_seconds") or plan.get("max_duration_seconds")
+    # Same precedence for the lead-call limit; the repository policy is the extension's fallback.
+    if task.get("max_lead_calls"):
+        max_lead_calls, lead_source = task["max_lead_calls"], "task"
+    elif plan.get("max_lead_calls"):
+        max_lead_calls, lead_source = plan["max_lead_calls"], "manifest"
+    else:
+        max_lead_calls, lead_source = None, "cli"
+    lead_warn_at = task.get("lead_calls_warn_at") or plan.get("lead_calls_warn_at")
 
     def budget_gate() -> None:
         # Runs only when a child would really start or resume, never for a repeat launch that is a no-op.
@@ -445,7 +459,8 @@ def launch(*, manifest: Path, task_id: str, allow_mutation: bool = False, resume
                                        objective=objective, allow_mutation=allow_mutation,
                                        resume=resume, wait=wait, pi_executable=pi_executable,
                                        before_spawn=budget_gate, takeover=takeover_stale_lease,
-                                       max_duration_seconds=max_duration)
+                                       max_duration_seconds=max_duration, max_lead_calls=max_lead_calls,
+                                       max_lead_calls_source=lead_source, lead_calls_warn_at=lead_warn_at)
     except headless_run.HeadlessError as exc:
         raise WorkspaceRunError(exc.code, exc.detail) from exc
     with locked_workspace(plan["workspace_id"]):

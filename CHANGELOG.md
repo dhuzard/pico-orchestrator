@@ -117,6 +117,31 @@ All notable changes to PICO are recorded here. The format follows
 
 ### Added
 
+- Optional maximum lead calls per run (issue #47), with a warning and a resumable stop.
+  `max_lead_calls` is set per workspace task, as a manifest default,
+  `pico exec start --max-lead-calls N`, or as `limits.max_lead_calls` in
+  `.pi/autonomy.yaml` (precedence: CLI/task, then manifest, then repository policy; unset
+  means no limit). `lead_calls_warn_at` (same levels, `--lead-calls-warn-at`) defaults to
+  80% of the limit, rounded down; there the extension tells the lead once to converge and
+  records `lead_call_warning`; nothing is blocked. At the limit only `orchestration_record`
+  `status` and `finish` stay available, and the lead's finish within a grace of 2 more
+  calls is honoured as given. Otherwise the run is not finished: the extension records
+  `lead_call_limit_reached` (fresh resume checkpoint, `stopped_reason: LEAD_CALL_LIMIT`),
+  accounts for in-flight workers, releases the lease through the owner path and aborts the
+  agent. The run stays `IN_PROGRESS`; the headless execution ends `interrupted` with
+  `stop_reason: LEAD_CALL_LIMIT`. Resuming needs an explicit higher limit
+  (`--resume --max-lead-calls N`, or a higher manifest/task limit with
+  `--resume-interrupted`); the same or a lower limit is refused with
+  `LEAD_CALL_LIMIT_EXHAUSTED`. The call count carries over a resume. Garden and the
+  scheduler show lead calls against the limit; the benchmark metrics report carries the
+  limit. Compatibility: `schemas/workspace.schema.json` gains optional `max_lead_calls` and
+  `lead_calls_warn_at` (top level and per task), `schemas/autonomy.schema.json` gains
+  optional `limits.max_lead_calls` and `limits.lead_calls_warn_at`, the run record gains an
+  optional `context.lead_call_limit` and checkpoint reason `lead_call_limit`, and execution
+  records gain optional `max_lead_calls`, `max_lead_calls_source`, `lead_calls_warn_at`.
+  Existing manifests, policies and records are valid and unchanged when nothing is set.
+  Closes #47.
+
 - Optional wall-clock limit per child execution: `pico exec start
   --max-duration SECONDS`, `max_duration_seconds` on a workspace task and a
   manifest-level default. A child that reaches it is stopped through the

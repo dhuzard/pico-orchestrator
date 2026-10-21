@@ -58,7 +58,7 @@ Usage:
   use-latest.sh workspace validate|publish|ci|promote <workspace-manifest> --task <id> [--head pico/<branch>] [--apply --plan-hash <hash>]
   use-latest.sh workspace schedule <workspace-manifest> [--max-parallel N] [--allow-mutation] [--resume-interrupted] [--json] [--no-access-check]
   use-latest.sh workspace launch|status|cancel <workspace-manifest> [--task <id>] [--allow-mutation] [--resume] [--no-wait] [--ignore-budget] [--no-access-check]
-  use-latest.sh exec start|status|cancel --repo owner/repository --execution-id <id> [--target repo] [--objective ...] [--allow-mutation] [--resume] [--no-wait] [--max-duration SECONDS]
+  use-latest.sh exec start|status|cancel --repo owner/repository --execution-id <id> [--target repo] [--objective ...] [--allow-mutation] [--resume] [--no-wait] [--max-duration SECONDS] [--max-lead-calls N] [--lead-calls-warn-at N]
   use-latest.sh preflight|doctor [target-repo] [--json]
   use-latest.sh sync [target-repo] [--copy-extension] [--github-templates] [--overwrite]
   use-latest.sh models show|validate|set|reset [...]

@@ -66,6 +66,8 @@
       "properties": {
         "parallel_tasks": { "type": "integer", "minimum": 1, "description": "Most routed tasks one wave may run concurrently (orchestration_record declare_wave enforces it)." },
         "open_prs": { "type": "integer", "minimum": 1, "default": 2, "description": "Most open batch PRs; when reached, new batches stack on the newest batch branch instead of opening another PR." },
+        "max_lead_calls": { "type": "integer", "minimum": 1, "description": "Optional repository default for the most model calls the lead may make in one run. At the limit the lifecycle extension allows only orchestration_record status or finish, then stops the run IN_PROGRESS (stopped_reason LEAD_CALL_LIMIT) for an explicit, higher-limit resume. An explicit task, manifest or --max-lead-calls limit overrides it. Omitted: no limit." },
+        "lead_calls_warn_at": { "type": "integer", "minimum": 1, "description": "Optional repository default for the lead call at which the lifecycle extension tells the lead, once, to converge. Must be below the effective max_lead_calls. Omitted: 80% of max_lead_calls, rounded down." },
         "nested_agents_per_task": { "type": "integer", "minimum": 0 },
         "repair_attempts": { "type": "integer", "minimum": 0 },
         "replans": { "type": "integer", "minimum": 0 }

@@ -62,6 +62,12 @@ LEASE_OWNER_ENV = "PI_ORCHESTRATION_LEASE_OWNER"
 LEASE_TAKEOVER_REASON = "HEADLESS_RESUME_TAKEOVER"
 TIME_LIMIT_CODE = "EXECUTION_TIME_LIMIT"
 WAIT_POLL_SECONDS = 1.0
+# The lead-call limit travels to the child as env vars the lifecycle extension reads at run start.
+LEAD_LIMIT_ENV = "PI_ORCHESTRATION_MAX_LEAD_CALLS"
+LEAD_LIMIT_SOURCE_ENV = "PI_ORCHESTRATION_MAX_LEAD_CALLS_SOURCE"
+LEAD_WARN_ENV = "PI_ORCHESTRATION_LEAD_CALLS_WARN_AT"
+LEAD_LIMIT_SOURCES = ("cli", "task", "manifest")  # explicit sources; `policy` is resolved below
+LEAD_LIMIT_CODE = "LEAD_CALL_LIMIT"
 # A resumed session must not carry the run marker: the lifecycle answers the
 # marker by settling the restored run and starting a new one. Without it,
 # session_start restores the IN_PROGRESS run and the agent continues it.
@@ -99,6 +105,47 @@ def validate_max_duration(value) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise HeadlessError("MAX_DURATION_INVALID", "max_duration_seconds must be a positive integer")
     return value
+
+
+def validate_max_lead_calls(value, source: str = "cli") -> tuple[int | None, str | None]:
+    """None means no explicit limit; otherwise a positive integer and where it came from."""
+    if value is None:
+        return None, None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise HeadlessError("MAX_LEAD_CALLS_INVALID", "max_lead_calls must be a positive integer")
+    if source not in LEAD_LIMIT_SOURCES:
+        raise HeadlessError("MAX_LEAD_CALLS_INVALID", f"max_lead_calls source must be one of {', '.join(LEAD_LIMIT_SOURCES)}")
+    return value, source
+
+
+def validate_lead_calls_warn_at(value) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise HeadlessError("LEAD_CALLS_WARN_AT_INVALID", "lead_calls_warn_at must be a positive integer")
+    return value
+
+
+def resolve_lead_limit(worktree: Path, explicit: int | None, source: str | None,
+                       warn_at: int | None) -> tuple[int | None, str | None, int | None]:
+    """Effective (limit, source, warning call): an explicit CLI/task/manifest value wins, then `.pi/autonomy.yaml`."""
+    policy: dict = {}
+    if explicit is None or warn_at is None:
+        try:
+            policy = autonomy_policy.limits(worktree)
+        except autonomy_policy.AutonomyPolicyError as exc:
+            raise HeadlessError("AUTONOMY_POLICY_INVALID", str(exc)[:300]) from exc
+    if explicit is None:
+        explicit, source = policy.get("max_lead_calls"), "policy"
+    if explicit is None:
+        return None, None, None
+    if warn_at is None:
+        # The repository's default threshold only applies below the effective limit; otherwise the 80% default does.
+        inherited = policy.get("lead_calls_warn_at")
+        warn_at = inherited if inherited is not None and inherited < explicit else None
+    elif warn_at >= explicit:
+        raise HeadlessError("LEAD_CALLS_WARN_AT_INVALID", f"lead_calls_warn_at ({warn_at}) must be below max_lead_calls ({explicit})")
+    return explicit, source, warn_at
 
 
 def state_root() -> Path:
@@ -245,8 +292,18 @@ def run_status(run_id: str | None) -> dict | None:
     try:
         record = provenance.get_run(ROOT, run_id)
         parent = record.get("parent_orchestration") or {}
-        return {"run_id": run_id, "status": parent.get("final_status"), "blocker_code": parent.get("blocker_code"),
-                "trace_path": str(provenance.run_path(ROOT, run_id)), "lease": run_lease.summary(run_id)}
+        summary = {"run_id": run_id, "status": parent.get("final_status"), "blocker_code": parent.get("blocker_code"),
+                   "trace_path": str(provenance.run_path(ROOT, run_id)), "lease": run_lease.summary(run_id)}
+        context = parent.get("context") or {}
+        limit = context.get("lead_call_limit")
+        if isinstance(limit, dict):
+            calls = context.get("lead_calls")
+            summary["lead_call_limit"] = {"max_lead_calls": limit.get("max_lead_calls"), "source": limit.get("source"),
+                                          "calls": max(len(calls) if isinstance(calls, list) else 0, limit.get("calls_seen") or 0),
+                                          "warn_at": limit.get("warn_at"), "warned": limit.get("warned_at_call") is not None,
+                                          "reached": limit.get("calls_at_limit") is not None,
+                                          "stopped": bool(limit.get("stopped"))}
+        return summary
     except (provenance.ProvenanceError, OSError, KeyError, TypeError):
         return {"run_id": run_id, "status": None, "blocker_code": "PARENT_PROVENANCE_UNAVAILABLE", "trace_path": None}
 
@@ -343,6 +400,10 @@ def refresh(record: dict) -> dict:
     # that is a crash, resumable into the same run, not a finished execution.
     if record["status"] == "exited" and (record["run"] or {}).get("status") == "IN_PROGRESS":
         record["status"] = "interrupted"
+    # The lifecycle stopped the run at its lead-call limit: interrupted and resumable, with the reason named.
+    if (record["status"] == "interrupted" and ((record["run"] or {}).get("lead_call_limit") or {}).get("stopped")
+            and not record.get("stop_reason")):
+        record["stop_reason"] = LEAD_LIMIT_CODE
     return record
 
 
@@ -368,8 +429,11 @@ def claim_run_lease(run_id: str, owner: str, *, takeover: bool) -> dict:
 def start(*, target: Path, explicit_repo: str, execution_id: str, objective: str, allow_mutation: bool = False,
           resume: bool = False, pi_executable: str = "pi", python: str = sys.executable,
           wait: bool = True, before_spawn=None, takeover: bool = False,
-          max_duration_seconds: int | None = None) -> dict:
+          max_duration_seconds: int | None = None, max_lead_calls: int | None = None,
+          max_lead_calls_source: str = "cli", lead_calls_warn_at: int | None = None) -> dict:
     max_duration_seconds = validate_max_duration(max_duration_seconds)
+    max_lead_calls, max_lead_calls_source = validate_max_lead_calls(max_lead_calls, max_lead_calls_source)
+    lead_calls_warn_at = validate_lead_calls_warn_at(lead_calls_warn_at)
     if takeover and not resume:
         raise HeadlessError("TAKEOVER_REQUIRES_RESUME", "--takeover-stale-lease applies only to --resume")
     if not objective.strip() or len(objective) > 20000:
@@ -377,6 +441,8 @@ def start(*, target: Path, explicit_repo: str, execution_id: str, objective: str
     if provenance._contains_secret_like_content(objective):
         raise HeadlessError("OBJECTIVE_INVALID", "objective looks like it contains a secret")
     worktree, identity, common = _target(target, explicit_repo)
+    max_lead_calls, max_lead_calls_source, lead_calls_warn_at = resolve_lead_limit(
+        worktree, max_lead_calls, max_lead_calls_source, lead_calls_warn_at)
     path = execution_path(common, execution_id)
     # Deciding and launching happen under the record lock, so two starts with
     # the same id cannot both see "not running" and both start Pi.
@@ -385,7 +451,8 @@ def start(*, target: Path, explicit_repo: str, execution_id: str, objective: str
                                   execution_id=execution_id, objective=objective, allow_mutation=allow_mutation,
                                   resume=resume, pi_executable=pi_executable, python=python,
                                   before_spawn=before_spawn, takeover=takeover,
-                                  max_duration_seconds=max_duration_seconds)
+                                  max_duration_seconds=max_duration_seconds, max_lead_calls=max_lead_calls,
+                                  max_lead_calls_source=max_lead_calls_source, lead_calls_warn_at=lead_calls_warn_at)
     if isinstance(launched, dict):
         return launched
     record, child, log, before = launched
@@ -438,7 +505,9 @@ def _wait_for_child(child, path: Path, record: dict) -> int:
 
 def _launch_locked(path: Path, *, worktree: Path, identity: str, common: Path, execution_id: str, objective: str,
                    allow_mutation: bool, resume: bool, pi_executable: str, python: str, before_spawn=None,
-                   takeover: bool = False, max_duration_seconds: int | None = None):
+                   takeover: bool = False, max_duration_seconds: int | None = None,
+                   max_lead_calls: int | None = None, max_lead_calls_source: str | None = None,
+                   lead_calls_warn_at: int | None = None):
     """Return the settled record, or (record, child, log, checkout_before) for a new launch. Caller holds the lock."""
     record = load_record(path)
     if record is not None:
@@ -462,6 +531,19 @@ def _launch_locked(path: Path, *, worktree: Path, identity: str, common: Path, e
             save_record(path, record)
             return record
         run = record.get("run") or {}
+        exhausted = dict(run.get("lead_call_limit") or {})
+        # The launcher's own record of the previous launch's limit is authoritative: the run record's limit can be
+        # rewritten by anything holding the run's owner id, this execution record cannot.
+        if type(record.get("max_lead_calls")) is int:
+            exhausted["max_lead_calls"] = record["max_lead_calls"]
+        if (resume and run.get("status") == "IN_PROGRESS" and type(exhausted.get("calls")) is int
+                and type(exhausted.get("max_lead_calls")) is int and exhausted["calls"] >= exhausted["max_lead_calls"]
+                and (max_lead_calls is None or max_lead_calls <= exhausted["calls"])):
+            # The run stopped (or is parked) at its lead-call limit: only an explicit higher limit continues it.
+            raise HeadlessError("LEAD_CALL_LIMIT_EXHAUSTED",
+                                f"the run has made {exhausted['calls']} lead calls against a limit of {exhausted['max_lead_calls']}; "
+                                f"resume with a limit above {exhausted['calls']} (a resume without a limit is refused too; --max-lead-calls, or a higher task/manifest "
+                                "max_lead_calls) or finish the run")
         if resume and run.get("status") not in {None, "IN_PROGRESS"}:
             record["status"] = "exited"
             record["outcome"] = "already_finished"
@@ -489,6 +571,13 @@ def _launch_locked(path: Path, *, worktree: Path, identity: str, common: Path, e
                   "launches": 0, "run_id": None, "run": None, "pid": None, "exit_code": None, "status": "created"}
     identity_env = _backend_identity(worktree, python)
     env = dict(os.environ)
+    # An explicit limit is handed to the child; otherwise the extension falls back to the repository policy.
+    for name in (LEAD_LIMIT_ENV, LEAD_LIMIT_SOURCE_ENV, LEAD_WARN_ENV):
+        env.pop(name, None)
+    if max_lead_calls is not None:
+        env.update({LEAD_LIMIT_ENV: str(max_lead_calls), LEAD_LIMIT_SOURCE_ENV: max_lead_calls_source or "cli"})
+        if lead_calls_warn_at is not None:
+            env[LEAD_WARN_ENV] = str(lead_calls_warn_at)
     env.update({"PI_TARGET_REPOSITORY": identity, "PI_ORCHESTRATOR_CLAUDE_BACKEND_IDENTITY": identity_env,
                 provenance.STATE_ENV: str(state_root()), "PI_ORCHESTRATION_EXECUTION_ID": execution_id})
     run = run_status(record.get("run_id")) or {}
@@ -549,8 +638,13 @@ def _launch_locked(path: Path, *, worktree: Path, identity: str, common: Path, e
         # The limit belongs to this launch: a resume starts a fresh window from now and does not inherit an
         # earlier launch's limit (the caller passes it again).
         launched_at = clock()
-        for stale in ("max_duration_seconds", "deadline_at", "deadline_epoch", "stop_reason", "time_limit"):
+        for stale in ("max_duration_seconds", "deadline_at", "deadline_epoch", "stop_reason", "time_limit",
+                      "max_lead_calls", "max_lead_calls_source", "lead_calls_warn_at"):
             record.pop(stale, None)
+        if max_lead_calls is not None:
+            record.update({"max_lead_calls": max_lead_calls, "max_lead_calls_source": max_lead_calls_source})
+            if lead_calls_warn_at is not None:
+                record["lead_calls_warn_at"] = lead_calls_warn_at
         if max_duration_seconds is not None:
             record.update({"max_duration_seconds": max_duration_seconds, "deadline_epoch": launched_at + max_duration_seconds,
                            "deadline_at": _iso(launched_at + max_duration_seconds)})
@@ -727,6 +821,11 @@ def main(argv: list[str] | None = None) -> int:
             p.add_argument("--no-wait", action="store_true", help="return after launching instead of waiting for exit")
             p.add_argument("--max-duration", type=int, default=None, metavar="SECONDS",
                            help="stop the child after this many wall-clock seconds (EXECUTION_TIME_LIMIT); default: no limit")
+            p.add_argument("--max-lead-calls", type=int, default=None, metavar="N",
+                           help="stop the run (left in progress, resumable only with a higher limit, LEAD_CALL_LIMIT) once the "
+                                "lead has made this many model calls; default: the repository's .pi/autonomy.yaml limits.max_lead_calls, else no limit")
+            p.add_argument("--lead-calls-warn-at", type=int, default=None, metavar="N",
+                           help="tell the lead once to converge at this lead call (default: 80%% of the limit, rounded down)")
             p.add_argument("--pi", default=os.environ.get("PI_EXECUTABLE", "pi"), help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     try:
@@ -734,7 +833,8 @@ def main(argv: list[str] | None = None) -> int:
             record = start(target=args.target, explicit_repo=args.repo, execution_id=args.execution_id,
                            objective=args.objective, allow_mutation=args.allow_mutation, resume=args.resume,
                            pi_executable=args.pi, wait=not args.no_wait, takeover=args.takeover_stale_lease,
-                           max_duration_seconds=args.max_duration)
+                           max_duration_seconds=args.max_duration, max_lead_calls=args.max_lead_calls,
+                           lead_calls_warn_at=args.lead_calls_warn_at)
         elif args.command == "status":
             record = status(target=args.target, explicit_repo=args.repo, execution_id=args.execution_id)
         else:
