@@ -502,16 +502,23 @@ class PublicationGateReadsTest(unittest.TestCase):
 
     def call(self, fn, *args, stdout="", returncode=0, stderr="", **kwargs):
         with patch.object(gh.shutil, "which", return_value="/usr/bin/gh"), \
+             patch.dict(gh.os.environ, {"GH_HOST": "evil.example", "GH_CONFIG_DIR": "/cfg"}), \
              patch.object(gh.subprocess, "run", return_value=fake_proc(returncode, stdout, stderr)) as mock_run:
             result = fn(*args, **kwargs)
         self.assertEqual(mock_run.call_args.kwargs.get("shell"), False)
+        # The host is pinned in argv and GH_HOST cannot override it; the rest of the environment is kept.
+        env = mock_run.call_args.kwargs.get("env")
+        self.assertNotIn("GH_HOST", env)
+        self.assertEqual(env.get("GH_CONFIG_DIR"), "/cfg")
+        self.assertEqual(mock_run.call_args.args[0][-2:], ["--hostname", "github.com"])
         return result, mock_run.call_args.args[0]
 
     def test_branch_head_uses_the_fixed_argv_and_validates_the_shape(self):
         ref = {"ref": "refs/heads/release/1.x", "object": {"type": "commit", "sha": self.SHA}}
         sha, argv = self.call(gh.branch_head, "release/1.x", repo="acme/repo", stdout=json.dumps(ref))
         self.assertEqual(sha, self.SHA)
-        self.assertEqual(argv, ["gh", "api", "-X", "GET", "repos/acme/repo/git/ref/heads/release/1.x"])
+        self.assertEqual(argv, ["gh", "api", "-X", "GET", "repos/acme/repo/git/ref/heads/release/1.x",
+                                "--hostname", "github.com"])
         self.assertIsNone(self.call(gh.branch_head, "main", repo="acme/repo", returncode=1,
                                     stderr="gh: Not Found (HTTP 404)")[0])
         for bad in ({"ref": "refs/heads/other", "object": {"type": "commit", "sha": self.SHA}},
@@ -531,7 +538,8 @@ class PublicationGateReadsTest(unittest.TestCase):
         content = {"type": "file", "path": ".pi/autonomy.yaml", "sha": "b" * 40, "encoding": "base64",
                    "content": base64.b64encode(b"issue_reference: closes\n").decode()}
         entry, argv = self.call(gh.policy_file_at, self.SHA, repo="acme/repo", stdout=json.dumps(content))
-        self.assertEqual(argv, ["gh", "api", "-X", "GET", f"repos/acme/repo/contents/.pi/autonomy.yaml?ref={self.SHA}"])
+        self.assertEqual(argv, ["gh", "api", "-X", "GET", f"repos/acme/repo/contents/.pi/autonomy.yaml?ref={self.SHA}",
+                                "--hostname", "github.com"])
         self.assertEqual(entry, {"type": "file", "path": ".pi/autonomy.yaml", "sha": "b" * 40,
                                  "text": "issue_reference: closes\n"})
         symlink = {"type": "symlink", "path": ".pi/autonomy.yaml", "sha": "c" * 40, "target": "/etc/x"}
@@ -546,10 +554,17 @@ class PublicationGateReadsTest(unittest.TestCase):
             gh.policy_file_at("main", repo="acme/repo")
 
     def test_allowlist_accepts_only_the_two_get_shapes(self):
-        gh._validate_allowlisted(["gh", "api", "-X", "GET", "repos/acme/repo/git/ref/heads/main"])
-        gh._validate_allowlisted(["gh", "api", "-X", "GET", f"repos/acme/repo/contents/.pi/autonomy.yaml?ref={self.SHA}"])
+        host = ["--hostname", "github.com"]
+        gh._validate_allowlisted(["gh", "api", "-X", "GET", "repos/acme/repo/git/ref/heads/main", *host])
+        gh._validate_allowlisted(["gh", "api", "-X", "GET", f"repos/acme/repo/contents/.pi/autonomy.yaml?ref={self.SHA}",
+                                  *host])
         for argv in (
-                ["gh", "api", "-X", "GET", "repos/acme/repo/git/refs/heads/main"],
+                ["gh", "api", "-X", "GET", "repos/acme/repo/git/ref/heads/main"],
+                ["gh", "api", "-X", "GET", "repos/acme/repo/git/ref/heads/main", "--hostname", "evil.example"],
+                ["gh", "api", "-X", "GET", "repos/acme/repo/git/ref/heads/main", "--hostname"],
+                ["gh", "api", "-X", "GET", "repos/acme/repo/git/ref/heads/main", "github.com", "--hostname"],
+                ["gh", "api", "--hostname", "github.com", "-X", "GET", "repos/acme/repo/git/ref/heads/main"],
+                ["gh", "api", "-X", "GET", "repos/acme/repo/git/refs/heads/main", "--hostname", "github.com"],
                 ["gh", "api", "-X", "GET", "repos/acme/repo/git/ref/heads/a..b"],
                 ["gh", "api", "-X", "GET", "repos/acme/repo/git/ref/heads/main?x=1"],
                 ["gh", "api", "-X", "GET", "repos/acme/repo/contents/.pi/autonomy.yaml"],

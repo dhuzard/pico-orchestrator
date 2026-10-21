@@ -526,7 +526,8 @@ API reports it**, through the authenticated `gh` adapter
 (`github_sync.branch_head`: `gh api -X GET repos/<repo>/git/ref/heads/<base>`;
 `github_sync.policy_file_at`: `gh api -X GET
 repos/<repo>/contents/.pi/autonomy.yaml?ref=<sha>`, both fixed argv with
-shape validation), and validated against the schema. Local git is never asked
+shape validation, pinned to `--hostname github.com` and run without
+`GH_HOST`), and validated against the schema. Local git is never asked
 about the base branch: every worktree shares the repository's refs and git
 config, so a forged `refs/heads/<base>` or `refs/remotes/...`, a `git
 replace`, or a `core.sshCommand`, `remote.<name>.uploadpack` or
@@ -555,6 +556,9 @@ through local git (`git push` with the checkout's remote and config), so a
 worker that can write the shared `.git/config` can still redirect or alter
 the push; the gate cannot protect against that. Isolating workers from the
 parent repository's git config is tracked with worker isolation (S1) and #39.
+The gate also trusts the lead's own environment and `gh` setup (`GH_CONFIG_DIR`,
+the `gh` found on `PATH`, and its tokens) in the same way it trusts the user's
+home directory.
 The match ignores Markdown structure: GitHub
 does not act on keywords in code spans or HTML comments, but the gate refuses
 them there too rather than reimplement GitHub's parser. Backlog-generated PR

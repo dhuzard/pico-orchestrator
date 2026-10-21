@@ -29,8 +29,10 @@ Safety properties, all enforced here:
   - Two read-only `gh api -X GET` shapes serve the publication gate, which
     must read the base branch and its issue policy from GitHub rather than
     through local git (whose config every worktree shares):
-      gh api -X GET repos/<owner>/<repo>/git/ref/heads/<branch>
-      gh api -X GET repos/<owner>/<repo>/contents/.pi/autonomy.yaml?ref=<sha>
+      gh api -X GET repos/<owner>/<repo>/git/ref/heads/<branch> --hostname github.com
+      gh api -X GET repos/<owner>/<repo>/contents/.pi/autonomy.yaml?ref=<sha> --hostname github.com
+    Both pin `--hostname github.com` and run without `GH_HOST`, so the
+    environment cannot redirect them to another host.
     The branch is limited to `[A-Za-z0-9._-]` segments that start with a
     letter or digit, separated by `/`
     (no `..`), the ref to a full hex commit SHA, and nothing may follow.
@@ -49,6 +51,7 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -172,15 +175,18 @@ _BRANCH = r"[A-Za-z0-9][A-Za-z0-9._-]*(?:/[A-Za-z0-9][A-Za-z0-9._-]*)*"
 _GET_BRANCH_RE = re.compile(rf"repos/{_OWNER_REPO}/git/ref/heads/({_BRANCH})")
 _GET_POLICY_RE = re.compile(rf"repos/{_OWNER_REPO}/contents/\.pi/autonomy\.yaml\?ref=([0-9a-f]{{40,64}})")
 POLICY_PATH = ".pi/autonomy.yaml"
+GITHUB_HOSTNAME = "github.com"
 
 
 def _validate_get_argv(argv: list[str]) -> None:
-    """Accept only `gh api -X GET <branch ref | policy contents endpoint>`, nothing more."""
+    """Accept only `gh api -X GET <branch ref | policy contents endpoint> --hostname github.com`."""
     def reject(reason: str) -> None:
         raise GithubSyncError(f"internal error: gh api argv rejected ({reason}): {argv!r}")
 
-    if len(argv) != 5 or not all(isinstance(arg, str) for arg in argv):
+    if len(argv) != 7 or not all(isinstance(arg, str) for arg in argv):
         reject("unexpected length")
+    if argv[5:] != ["--hostname", GITHUB_HOSTNAME]:
+        reject("the host must be pinned with --hostname github.com")
     match = _GET_BRANCH_RE.fullmatch(argv[4]) or _GET_POLICY_RE.fullmatch(argv[4])
     if not match:
         reject("endpoint must be a branch ref or the .pi/autonomy.yaml contents at a commit")
@@ -200,7 +206,8 @@ def validate_branch(branch: str) -> str:
 
 def _get_or_none(argv: list[str], context: str) -> Any:
     """Run a fixed GET; None on HTTP 404, parsed JSON otherwise."""
-    proc = _run(argv)
+    env = {name: value for name, value in os.environ.items() if name != "GH_HOST"}
+    proc = _run(argv, env=env)
     if proc.returncode != 0 and "HTTP 404" in (proc.stderr or ""):
         return None
     _require_success(proc, argv)
@@ -210,7 +217,8 @@ def _get_or_none(argv: list[str], context: str) -> Any:
 def branch_head(branch: str, *, repo: str) -> str | None:
     """The commit SHA `branch` points to on GitHub, or None when the branch does not exist."""
     validate_branch(branch)
-    argv = [GH_BINARY, "api", "-X", "GET", f"repos/{validate_repo(repo)}/git/ref/heads/{branch}"]
+    argv = [GH_BINARY, "api", "-X", "GET", f"repos/{validate_repo(repo)}/git/ref/heads/{branch}",
+            "--hostname", GITHUB_HOSTNAME]
     data = _get_or_none(argv, "gh api git/ref")
     if data is None:
         return None
@@ -232,7 +240,8 @@ def policy_file_at(commit: str, *, repo: str) -> dict | None:
     """
     if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40,64}", commit):
         raise ValueError(f"commit must be a hex SHA, got {commit!r}")
-    argv = [GH_BINARY, "api", "-X", "GET", f"repos/{validate_repo(repo)}/contents/{POLICY_PATH}?ref={commit}"]
+    argv = [GH_BINARY, "api", "-X", "GET", f"repos/{validate_repo(repo)}/contents/{POLICY_PATH}?ref={commit}",
+            "--hostname", GITHUB_HOSTNAME]
     data = _get_or_none(argv, "gh api contents")
     if data is None:
         return None
@@ -269,7 +278,8 @@ def _validate_allowlisted(argv: list[str]) -> None:
         )
 
 
-def _run(argv: list[str], *, timeout: int = DEFAULT_TIMEOUT_SECONDS, cwd: str | None = None) -> subprocess.CompletedProcess:
+def _run(argv: list[str], *, timeout: int = DEFAULT_TIMEOUT_SECONDS, cwd: str | None = None,
+         env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
     """The single point every `gh` invocation passes through. Always
     `shell=False`, always argv-only, always allowlist-checked."""
     _validate_allowlisted(argv)
@@ -283,6 +293,7 @@ def _run(argv: list[str], *, timeout: int = DEFAULT_TIMEOUT_SECONDS, cwd: str | 
             text=True,
             timeout=timeout,
             cwd=cwd,
+            env=env,
         )
     except FileNotFoundError as exc:
         raise GhUnavailableError("the 'gh' CLI is not installed or not on PATH") from exc
