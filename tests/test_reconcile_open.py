@@ -209,10 +209,14 @@ class WorkerJudgmentTest(_Base):
 
     def test_downgrade_needs_a_reason_and_nothing_else_reopens(self):
         self.auto("completed")
-        for status, extra in (("failed", {}), ("in_progress", {}), ("not_started", {})):
-            with self.assertRaises(po.ParentRunError) as raised:
-                self.lead(status, **extra)
-            self.assertEqual(raised.exception.error_code, "PARENT_WORKER_TRANSITION_INVALID")
+        with self.assertRaises(po.ParentRunError) as raised:
+            self.lead("failed")
+        self.assertEqual(raised.exception.error_code, "PARENT_WORKER_TRANSITION_INVALID")
+        # A start restated after the automatic terminal status is an accepted no-op, never a reopening.
+        before = provenance.run_path(self.records, self.run_id).read_bytes()
+        self.lead("in_progress")
+        self.lead("not_started")
+        self.assertEqual(provenance.run_path(self.records, self.run_id).read_bytes(), before)
         self.lead("failed", blocker_code="REVIEW_REJECTED")
         with self.assertRaises(po.ParentRunError):
             self.lead("completed")

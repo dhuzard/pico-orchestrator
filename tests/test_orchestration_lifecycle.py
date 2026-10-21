@@ -612,6 +612,28 @@ class LifecycleTest(unittest.TestCase):
         cut = po._bounded_text("a " * 290 + "b" * 40, 600)
         self.assertEqual(cut, ("a " * 290).strip())
 
+    def test_lead_restatements_of_an_automatically_recorded_worker_are_lenient(self):
+        parent = po.ParentRun(worktree=self.target, repo_root=self.records)
+        parent.event({"kind": "phase", "phase": "t", "status": "in_progress", "route": "CODEX"})
+        parent.event({"kind": "worker", "phase": "t", "step_id": "rev", "status": "in_progress", "only_if_open": True,
+                      "model": "openai-codex/gpt-5.2-codex", "reasoning_effort": "high"})
+        parent.event({"kind": "worker", "phase": "t", "step_id": "rev", "status": "completed", "only_if_open": True})
+        for restated in ({"status": "completed", "model": "gpt-5.2-codex"},
+                         {"status": "completed", "model": "openai-codex/gpt-5.2-codex", "reasoning_effort": "low"},
+                         {"status": "in_progress"}, {"status": "not_started"}):
+            parent.event({"kind": "worker", "phase": "t", "step_id": "rev", **restated})
+        worker = provenance.get_run(self.records, parent.run_id)["parent_orchestration"]["phases"][0]["workers"][0]
+        self.assertEqual((worker["status"], worker["model"], worker["reasoning_effort"], worker["auto_recorded"]),
+                         ("completed", "openai-codex/gpt-5.2-codex", "high", True))
+        # A worker only the lead recorded keeps the strict rules.
+        parent.event({"kind": "worker", "phase": "t", "step_id": "own", "status": "completed", "model": "a/b", "reasoning_effort": "high"})
+        for bad in ({"model": "a/c"}, {"reasoning_effort": "low"}):
+            with self.assertRaises(po.ParentRunError) as refused:
+                parent.event({"kind": "worker", "phase": "t", "step_id": "own", "status": "completed", **bad})
+            self.assertEqual(refused.exception.error_code, "PARENT_EVENT_CONFLICT")
+        with self.assertRaises(po.ParentRunError):
+            parent.event({"kind": "worker", "phase": "t", "step_id": "own", "status": "in_progress"})
+
     def test_assignment_masking_needs_a_secret_like_value_so_prose_is_kept(self):
         for prose in ("token: 80 passes", "secret = none left", "the token budget was 5", "password: n/a"):
             self.assertEqual(po._bounded_text(f"ran {prose} today", 600), f"ran {prose} today")

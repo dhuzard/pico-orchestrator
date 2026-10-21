@@ -713,6 +713,14 @@ def _record_event_unlocked(run_id: str, event: dict, *, repo_root: Path = ROOT) 
                       "required_backend_version": None}
             phase["workers"].append(worker)
         prior = worker["status"]
+        automatic = event.get("only_if_open") is True
+        if worker.get("auto_recorded") and not automatic:
+            # The lead restating a worker the extension already recorded (the old habit) is never an error.
+            if prior in {"completed", "blocked", "failed"} and event["status"] in {"not_started", "in_progress"}:
+                return parent  # a start after the automatic terminal status: nothing to change
+            # The routed plan's reasoning effort is authoritative: a different value from the lead is a no-op.
+            event = {key: value for key, value in event.items()
+                     if not (key == "reasoning_effort" and worker.get("reasoning_effort") not in (None, value))}
         # Validate every field before anything can return or change, including the automatic no-op.
         if "only_if_open" in event and event["only_if_open"] is not True:
             raise ParentRunError("invalid worker event")
@@ -785,9 +793,15 @@ def _record_event_unlocked(run_id: str, event: dict, *, repo_root: Path = ROOT) 
             worker["reasoning_effort"] = event["reasoning_effort"]
         for key, value in values.items():
             replaced = key == "blocker_code" and override is not None
-            if worker.get(key) is not None and value != worker[key] and not replaced:
+            # The same model with or without its provider prefix (`gpt-5.2-codex` vs `openai-codex/gpt-5.2-codex`).
+            same_model = (key in {"model", "backend_model"} and worker.get(key) is not None
+                          and str(value).rsplit("/", 1)[-1] == str(worker[key]).rsplit("/", 1)[-1])
+            if worker.get(key) is not None and value != worker[key] and not replaced and not same_model:
                 raise ParentRunError("worker field conflicts with prior event", error_code="PARENT_EVENT_CONFLICT")
-            worker[key] = value
+            if not same_model:
+                worker[key] = value
+        if automatic:
+            worker["auto_recorded"] = True
         if override is not None:
             parent.setdefault("worker_overrides", []).append(override)
     elif kind == "child":

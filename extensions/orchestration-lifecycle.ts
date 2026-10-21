@@ -33,6 +33,8 @@ const LEASE_STATE = Symbol.for("pico.orchestration.lease");
 const OWNER_ENV = "PI_ORCHESTRATION_LEASE_OWNER";
 /** Parent refusals of a worker override that leave the record unchanged; they must never block the run. */
 const HARMLESS_REFUSALS = new Set(["PARENT_WORKER_RECODE_REPEATED", "PARENT_WORKER_OVERRIDE_LIMIT"]);
+/** Also harmless, but only for a worker the extension itself recorded: the lead restating it the old way. */
+const RESTATEMENT_REFUSALS = new Set(["PARENT_EVENT_CONFLICT", "PARENT_WORKER_TRANSITION_INVALID"]);
 const WORKER_TOOLS = new Set(["AskClaude", "ClaudeWorker", "spawn_subagent", "message_subagent"]);
 const CLAUDE_TOOLS = new Set(["AskClaude", "ClaudeWorker"]);
 const MARKER = "PI_ORCHESTRATION_RUN_V1";
@@ -374,6 +376,8 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
   // Route epoch (escalations seen) of each task, and the epoch each implicit wave was recorded in.
   const routeEpochs = new Map<string, number>();
   const implicitEpoch = new Map<string, number>();
+  // Workers (phase, step) whose start or terminal status this extension recorded.
+  const autoWorkers = new Set<string>();
   let integrating: string | null = null;
   let batchStart = 0;
   let batchPeak = 0;
@@ -541,7 +545,7 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
   function resetRunState(): void {
     approvals.clear(); pendingRoutes.clear(); workspaces.clear(); snapshots.clear();
     subagentTasks.clear(); inFlight.clear(); claudeCalls.clear(); workerPlans.clear();
-    scopeViolation = null; activeWave = null; integrating = null; implicitOpen.clear(); routeEpochs.clear(); implicitEpoch.clear(); lastPhase = "routing";
+    scopeViolation = null; activeWave = null; integrating = null; implicitOpen.clear(); routeEpochs.clear(); implicitEpoch.clear(); autoWorkers.clear(); lastPhase = "routing";
     currentTurn = null; messageStarts.clear();
     batchStart = 0; batchPeak = 0;
     pendingReroutes.clear();
@@ -936,11 +940,13 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
       // A routed Codex step: the validated model and reasoning effort are recorded here, so the record names
       // which model ran even when the lead records nothing. The lead's own worker event still wins.
       if (call.toolName === "spawn_subagent" && approval && step?.model) {
-        await observe({ kind: "worker", phase: approval.phase, step_id: step.id, status: "in_progress", model: step.model,
+        autoWorkers.add(workspaceKey(approval.phase, step.id));
+        await observe({ kind: "worker", phase: approval.phase, step_id: step.id, status: "in_progress", only_if_open: true, model: step.model,
           ...(step.effort ? { reasoning_effort: step.effort } : {}) });
       }
       // Observational: the lead may record the worker itself; the tool_result handler records its terminal status.
-      if (plan) await observe({ kind: "worker", phase: plan.phase, step_id: plan.stepId, status: "in_progress",
+      if (plan) autoWorkers.add(workspaceKey(plan.phase, plan.stepId));
+      if (plan) await observe({ kind: "worker", phase: plan.phase, step_id: plan.stepId, status: "in_progress", only_if_open: true,
         model: plan.canonical, backend: "claude-code", backend_model: plan.backendModel, reasoning_effort: plan.effort });
     }
     if (call.toolName === "route_task") {
@@ -1332,7 +1338,10 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
         && !(params.action === "status" && unresolvedRoute);
       // A refused repeat or excess override of an already-terminal worker changes nothing: it is reported to the
       // lead and never blocks the run.
-      const harmless = params.action === "event" && result.ok === false && HARMLESS_REFUSALS.has(String(result.error_code));
+      const restated = params.action === "event" && params.event.kind === "worker"
+        && autoWorkers.has(workspaceKey(params.event.phase, params.event.step_id));
+      const harmless = params.action === "event" && result.ok === false
+        && (HARMLESS_REFUSALS.has(String(result.error_code)) || (restated && RESTATEMENT_REFUSALS.has(String(result.error_code))));
       if (!ok && !harmless) {
         const failure = params.action === "status" && parentBlocked ? parentFailure ?? result : result;
         diagnose(params.action, failure);

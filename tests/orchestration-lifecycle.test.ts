@@ -19,6 +19,7 @@ function harness(preflight: Record<string, unknown>, failEvent = false, verifyOk
                    parentStatus?: string; sessionId?: string; settleFails?: boolean; completionDetail?: string;
                    completionError?: string; limits?: Record<string, unknown>; executable?: string;
                    routeConflict?: boolean; reroutePhases?: string[]; waveEventResult?: Record<string, unknown>;
+                   workerRestatementResult?: Record<string, unknown>;
                    escalationWorkerConflict?: boolean; resumeResult?: Record<string, unknown>;
                    heartbeatResult?: Record<string, unknown>; eventResult?: Record<string, unknown>;
                    clock?: () => number } = {}) {
@@ -59,6 +60,8 @@ function harness(preflight: Record<string, unknown>, failEvent = false, verifyOk
     if (args[0] === "event" && failEvent) return { ok: false };
     if (args[0] === "event" && options.eventResult) return options.eventResult;
     if (args[0] === "event" && options.waveEventResult && input?.kind === "wave") return options.waveEventResult;
+    if (args[0] === "event" && options.workerRestatementResult && input?.kind === "worker" && !input.only_if_open && input.status === "completed")
+      return options.workerRestatementResult;
     if (args[0] === "event" && options.routeConflict && !escalated && input?.kind === "phase" && input.route === "CLAUDE_CODEX")
       return { ok: false, error_code: "PARENT_EVENT_CONFLICT" };
     if (args[0] === "event" && options.escalationWorkerConflict && input?.kind === "escalation")
@@ -723,7 +726,7 @@ test("mutating Claude workers of a wave run concurrently, each in its own bound 
     const launched = h.calls.filter((call) => call.input?.kind === "worker" && call.input.status === "in_progress");
     assert.deepEqual(launched.map((call) => call.input!.phase), ["A", "B"]);
     assert.deepEqual({ ...launched[0].input, phase: undefined }, { kind: "worker", phase: undefined, step_id: "claude_worker",
-      status: "in_progress", model: "anthropic/claude-opus-5-5", backend: "claude-code", backend_model: "claude-opus-5-5",
+      status: "in_progress", only_if_open: true, model: "anthropic/claude-opus-5-5", backend: "claude-code", backend_model: "claude-opus-5-5",
       reasoning_effort: "high" });
   } finally {
     delete process.env.FAKE_CLAUDE_BARRIER;
@@ -2091,6 +2094,56 @@ test("a Codex step with no lead worker event still records its model, effort and
   assert.equal(judged.parent.phases[0].workers.find((worker: any) => worker.step_id === "codex_reviewer").status, "failed");
 });
 
+test("the lead restating an auto-recorded Codex worker the old way is accepted and changes nothing", async () => {
+  const h = harness({ ok: true, status: "READY" });
+  await h.handlers.get("before_agent_start")!({ prompt: "PI_ORCHESTRATION_RUN_V1" }, { cwd: "/tmp/target", ui: { notify() {} } });
+  await h.handlers.get("tool_result")!(routeFor("A"));
+  assert.equal(await h.handlers.get("tool_call")!({ toolName: "spawn_subagent", toolCallId: "r1",
+    input: { task: "review", label: "A:codex_reviewer" } }), undefined);
+  await h.handlers.get("tool_result")!({ toolName: "spawn_subagent", toolCallId: "r1", content: [{ type: "text", text: "ok" }],
+    details: { subagent_id: "s-r1", elapsedMs: 3 } });
+  const reviewer = { kind: "worker", phase: "A", step_id: "codex_reviewer" };
+  const habits = [
+    { ...reviewer, status: "completed", model: "gpt-6.1-sol" },                       // provider prefix dropped
+    { ...reviewer, status: "completed", model: CODEX_HIGH, reasoning_effort: "low" },  // plan said high
+    { ...reviewer, status: "in_progress", model: CODEX_HIGH },                         // start after the automatic completed
+    { ...reviewer, status: "completed", model: CODEX_HIGH, reasoning_effort: "high" },
+  ];
+  const replayed = replay([...eventsOf(h), ...habits], null);
+  assert.deepEqual(replayed.errors, []);
+  const worker = replayed.parent.phases[0].workers.find((item: any) => item.step_id === "codex_reviewer");
+  assert.deepEqual([worker.status, worker.model, worker.reasoning_effort, worker.auto_recorded], ["completed", CODEX_HIGH, "high", true]);
+  assert.equal(replayed.parent.worker_overrides, undefined, "a restatement is not an override");
+  // A real difference of judgment is still recorded, and a worker the lead alone recorded still conflicts.
+  const judged = replay([...eventsOf(h), { ...reviewer, status: "failed", blocker_code: "REVIEW_REJECTED" },
+    { kind: "worker", phase: "A", step_id: "lead_only", status: "completed", model: "m/one" },
+    { kind: "worker", phase: "A", step_id: "lead_only", status: "completed", model: "m/two" }], null);
+  assert.deepEqual(judged.errors.map((error) => error[1]), ["PARENT_EVENT_CONFLICT"]);
+  assert.equal(judged.parent.phases[0].workers.find((item: any) => item.step_id === "codex_reviewer").status, "failed");
+});
+
+test("a refused restatement of an extension-recorded worker never blocks; one of the lead's own workers still does", async () => {
+  const h = harness({ ok: true, status: "READY" }, false, true,
+    { workerRestatementResult: { ok: false, error_code: "PARENT_EVENT_CONFLICT" } });
+  await h.handlers.get("before_agent_start")!({ prompt: "PI_ORCHESTRATION_RUN_V1" }, { cwd: "/tmp/target", ui: { notify() {} } });
+  await h.handlers.get("tool_result")!(routeFor("A"));
+  const record = h.tools.get("orchestration_record");
+  assert.equal(await h.handlers.get("tool_call")!({ toolName: "spawn_subagent", toolCallId: "r1",
+    input: { task: "review", label: "A:codex_reviewer" } }), undefined);
+  await h.handlers.get("tool_result")!({ toolName: "spawn_subagent", toolCallId: "r1", content: [], details: { subagent_id: "s-r1" } });
+  const quiet = process.stderr.write;
+  process.stderr.write = (() => true) as typeof process.stderr.write;
+  try {
+    await record.execute("w", { action: "event", event: { kind: "worker", phase: "A", step_id: "codex_reviewer", status: "completed", model: "other/model" } });
+    assert.equal(await h.handlers.get("tool_call")!({ toolName: "spawn_subagent", toolCallId: "r2",
+      input: { task: "review", label: "A:codex_reviewer" } }), undefined, "the run is not blocked");
+    await record.execute("w", { action: "event", event: { kind: "worker", phase: "A", step_id: "lead_only", status: "completed", model: "m/two" } });
+    const blocked = await h.handlers.get("tool_call")!({ toolName: "spawn_subagent", toolCallId: "r3",
+      input: { task: "review", label: "A:codex_reviewer" } });
+    assert.match(blocked.reason, /provenance is blocked/);
+  } finally { process.stderr.write = quiet; }
+});
+
 test("work after an integration with its wave write refused still refuses COMPLETED", async () => {
   const dir = realpathSync(mkdtempSync(join(tmpdir(), "pico-regress-")));
   try {
@@ -2114,7 +2167,6 @@ test("work after an integration with its wave write refused still refuses COMPLE
     }
     events.push({ kind: "phase", phase: "A", status: "completed", route: "CODEX_CLAUDE_CODEX" });
     const refused = replay(events, "COMPLETED");
-    // (Re-running a completed step is a refused, non-blocking telemetry write; the finish is what matters.)
-    assert.deepEqual(refused.errors.map((error) => error[1]), ["PARENT_WORKER_TRANSITION_INVALID", "PARENT_WAVE_NOT_INTEGRATED"]);
+    assert.deepEqual(refused.errors.map((error) => error[1]), ["PARENT_WAVE_NOT_INTEGRATED"]);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });

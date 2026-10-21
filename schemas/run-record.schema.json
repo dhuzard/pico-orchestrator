@@ -496,6 +496,10 @@
                         "string",
                         "null"
                       ]
+                    },
+                    "auto_recorded": {
+                      "const": true,
+                      "description": "The lifecycle extension recorded this worker (start or terminal status). A lead restatement of it is then accepted leniently: the same model spelled canonically or not, a different reasoning effort (the routed plan's value stays), and an in_progress after a terminal status are no-ops."
                     }
                   }
                 }

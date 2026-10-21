@@ -48,6 +48,12 @@ All notable changes to PICO are recorded here. The format follows
   starts, and its terminal status (`only_if_open`, like ClaudeWorker's) when it returns, so the
   record names the reviewing model even when the lead records no worker event. The lead's own
   event still wins.
+- A lead that restates a worker the extension already recorded (the old habit for Codex steps) is
+  never an error: the same model with or without its provider prefix, a different
+  `reasoning_effort` (the routed plan's value is authoritative) and an `in_progress` after the
+  automatic terminal status are accepted as no-ops (`worker.auto_recorded`), and any remaining
+  refusal for such a worker never blocks the run. Codex workers now follow the ClaudeWorker rule in
+  the prompts: record one only when your judgment differs or to add a `blocker_code`.
 - A failed Claude step whose retry succeeded is now `completed`: after the last failure the
   same step must have started again on the same route and returned without error. The
   failure stays in `worker_overrides` (`by` `extension` or `lead`, `reason`
