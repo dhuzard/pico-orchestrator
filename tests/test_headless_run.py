@@ -273,6 +273,28 @@ class HeadlessRunTest(unittest.TestCase):
             hr.cancel(target=self.target, explicit_repo="acme/target", execution_id="exec-1", grace=1)
         self.assertFalse(hr.execution_alive(launched))
 
+    def test_cancel_never_signals_a_reused_pid(self):
+        launched = self.start(behavior="hang", wait=False)
+        if launched["pid_start"] is None:
+            self.skipTest("no /proc: pid start time unavailable")
+        path = hr.execution_path(session_scope.common_dir(self.target), "exec-1")
+        try:
+            # The pid is alive but its start time no longer matches: another process reused it.
+            record = json.loads(path.read_text())
+            path.write_text(json.dumps({**record, "pid_start": "1"}))
+            with unittest.mock.patch.object(hr.os, "killpg") as killpg:
+                cancelled = hr.cancel(target=self.target, explicit_repo="acme/target", execution_id="exec-1", grace=0.2)
+            killpg.assert_not_called()
+            self.assertEqual((cancelled["status"], cancelled["outcome"]), ("cancelled", "cancelled"))
+            self.assertEqual(cancelled["child_gone_reason"], "PID_REUSED")
+            self.assertIsNone(cancelled["pid"])
+            self.assertTrue(hr.pid_alive(launched["pid"]), "the process holding the pid was left alone")
+        finally:
+            try:
+                os.killpg(launched["pid"], 9)
+            except ProcessLookupError:
+                pass
+
     def test_failed_lease_handoff_stops_the_child_visibly(self):
         crashed = self.start(behavior="crash")
         real = run_lease.acquire

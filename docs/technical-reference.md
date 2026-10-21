@@ -1642,7 +1642,7 @@ reason. The launched lifecycle then verifies the resume checkpoint, so a
 checkout that moved since the crash refuses the resume with
 `RESUME_CHECKPOINT_DRIFT` and leaves the run `IN_PROGRESS`. `cancel` closes the
 run as the execution's lease owner; a run another owner has taken over is not
-closed (`cancel_error_code`). `status` and the execution's `run` block show
+closed (`cancel_error_code`). The execution records the child's pid start time; `status`, `cancel` and the workspace runner treat a live pid with another start time as a gone child (`child_gone_reason: PID_REUSED`), and `cancel` never signals it. `status` and the execution's `run` block show
 the lease holder (`run.lease`: state, stale reason, holder alive, owner, pid,
 host, heartbeat, expiry), as does Garden for each run.
 

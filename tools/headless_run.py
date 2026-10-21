@@ -301,9 +301,13 @@ def refresh(record: dict) -> dict:
         # A launch whose process id was never recorded: the outcome is uncertain.
         terminal = (record["run"] or {}).get("status") not in {None, "IN_PROGRESS"}
         record["status"] = "exited" if terminal else "interrupted"
-    if record["status"] == "launched" and not pid_alive(record.get("pid")):
+    if record["status"] == "launched" and not execution_alive(record):
         # Gone without this process observing the exit: terminal run means it
-        # ended normally, an open run means it was interrupted.
+        # ended normally, an open run means it was interrupted. A live pid with
+        # another start time is a different process that reused the pid: the
+        # child is gone, and that pid is never signalled.
+        if pid_alive(record.get("pid")):
+            record["child_gone_reason"] = "PID_REUSED"
         terminal = (record["run"] or {}).get("status") not in {None, "IN_PROGRESS"}
         record["status"] = "exited" if terminal else "interrupted"
         record["pid"] = None
@@ -540,15 +544,17 @@ def cancel(*, target: Path, explicit_repo: str, execution_id: str, grace: float 
         # the parent finds it already terminal with the cancellation code.
         _finish_cancelled(record)
         pid = record.get("pid")
-        if record["status"] == "launched" and pid_alive(pid):
+        # Signal only the process this execution launched: the pid and its start time must both match.
+        child = {"pid": pid, "pid_start": record.get("pid_start")}
+        if record["status"] == "launched" and execution_alive(child):
             try:
                 os.killpg(pid, signal.SIGTERM)
             except (ProcessLookupError, PermissionError):
                 pass
             deadline = time.monotonic() + grace
-            while pid_alive(pid) and time.monotonic() < deadline:
+            while execution_alive(child) and time.monotonic() < deadline:
                 time.sleep(0.05)
-            if pid_alive(pid):
+            if execution_alive(child):
                 try:
                     os.killpg(pid, signal.SIGKILL)
                 except (ProcessLookupError, PermissionError):
