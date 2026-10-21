@@ -22,11 +22,15 @@ Operations (JSON on stdin, closed JSON verdict on stdout):
   {"operation": "snapshot", "path"}
       digest of a checkout's HEAD, index, working-tree changes, and untracked
       files, used to detect a worker writing outside its bound worktree.
+  {"operation": "head", "path"}
+      the checkout's HEAD commit id (`head` is null when it has no commit), the
+      commit part of a failure signature.
 """
 from __future__ import annotations
 
 import hashlib
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -98,10 +102,23 @@ def snapshot(path: str, *, run=subprocess.run) -> dict:
     return {"ok": True, "digest": digest.hexdigest(), "status": entries[:200]}
 
 
+def head(path: str, *, run=subprocess.run) -> dict:
+    out = _git_out(Path(path), "rev-parse", "HEAD", run=run)
+    value = out.decode().strip() if out else ""
+    if _git_out(Path(path), "rev-parse", "--git-dir", run=run) is None:
+        return {"ok": False, "blocker_code": "SESSION_TARGET_UNRESOLVED"}
+    return {"ok": True, "head": value if re.fullmatch(r"[0-9a-f]{40,64}", value) else None}
+
+
 def main() -> int:
     try:
         payload = json.load(sys.stdin)
         operation = payload.get("operation", "check")
+        if operation == "head":
+            if not isinstance(payload["path"], str):
+                raise TypeError
+            print(json.dumps(head(payload["path"])))
+            return 0
         if operation == "snapshot":
             if not isinstance(payload["path"], str):
                 raise TypeError

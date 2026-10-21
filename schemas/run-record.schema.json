@@ -89,8 +89,43 @@
               "blocker_code": {"type": ["string", "null"]},
               "phase_status": {"type": "string", "description": "Status of the worker's phase when the override was recorded; a terminal value flags a phase outcome recorded before the override."},
               "by": {"enum": ["lead", "extension"]},
-              "reason": {"const": "retry_succeeded", "description": "Present when a retry of a failed step succeeded: the failure is replaced by completed, by the lead or by the extension's automatic record."},
+              "reason": {"enum": ["retry_succeeded", "prerequisite_blocker", "repeated_ineffective_action", "state_changed"], "description": "retry_succeeded: a retry of a failed step succeeded and replaced the failure (lead or extension). prerequisite_blocker: a failure with a prerequisite code (or blocker_kind prerequisite) made the step blocked with that code. repeated_ineffective_action: the extension refused another start of a step whose failure signature used up its retry budget and blocked it. state_changed: a step blocked that way was reopened as failed because its checkout HEAD or declared inputs changed."},
               "at": {"type": "string"}
+            }
+          }
+        },
+        "failure_retry_budget": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["retry_budget", "source"],
+          "description": "The per-signature retry budget the lifecycle extension applied to this run, and where it came from. Absent until the first retry gate.",
+          "properties": {
+            "retry_budget": {"type": "integer", "minimum": 0},
+            "source": {"enum": ["cli", "task", "manifest", "policy", "default", "env"]}
+          }
+        },
+        "failure_signatures": {
+          "type": "array",
+          "maxItems": 100,
+          "description": "Structured failure signatures of worker steps, oldest first (bounded: the oldest non-blocked entry is dropped when full). A signature is (task, step, route epoch, route, failure code, checkout HEAD, declared-input digest); `digest` is the SHA-256 of those fields. `count` is how many times that exact signature failed. Entries with kind `prerequisite` record an unresolved prerequisite (a blocked step with its own code) and never count toward a loop. When a counted signature has more failures than the retry budget allows, the next start of the step is refused and the entry is marked `blocked` (step blocked with REPEATED_INEFFECTIVE_ACTION). A successful retry of the step clears its entries.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["digest", "kind", "task_id", "step_id", "route_epoch", "route", "code", "head", "inputs_digest", "count", "first_at", "last_at", "blocked"],
+            "properties": {
+              "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+              "kind": {"enum": ["failure", "prerequisite"]},
+              "task_id": {"type": "string"},
+              "step_id": {"type": "string"},
+              "route_epoch": {"type": "integer", "minimum": 0},
+              "route": {"type": ["string", "null"]},
+              "code": {"type": "string"},
+              "head": {"type": ["string", "null"], "description": "Checkout HEAD at the failure (a new HEAD is a different signature)."},
+              "inputs_digest": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+              "count": {"type": "integer", "minimum": 1},
+              "first_at": {"type": "string"},
+              "last_at": {"type": "string"},
+              "blocked": {"type": "boolean"}
             }
           }
         },

@@ -1941,6 +1941,64 @@ then terminal, so a later resume returns `already_finished`; the time limit neve
 the lead-call stop never overrides an already terminal run. Garden and the scheduler show
 `lead calls used/limit`, and `benchmark_metrics` reports `calls.lead_limit`.
 
+**Repeated ineffective actions (`failure_retry_budget`).** The delegation policy's
+`repeated_failure` escalates a failing route; this detector stops a step that repeats the same
+failure without any change of state. It is deterministic and reads only structured fields.
+
+*Signature.* `failure_signature_digest` is the SHA-256 of (task id, step id, route epoch, route,
+failure code, checkout HEAD, inputs digest). The code is the worker result's `blocker_code`
+(ClaudeWorker and Codex `spawn_subagent`), else `WORKER_FAILED`; an abort (`ABORTED`) is not a
+failure. HEAD is the bound worktree's (else the target checkout's), read with
+`session_scope.py` `{"operation":"head"}` after the worker returned, so a worker that committed
+and then failed is at its new HEAD. The inputs digest is `PI_ORCHESTRATION_INPUTS_DIGEST`, which
+`workspace_run.launch` sets to the SHA-256 of `dispatch_inputs` as they stand at launch (the
+repository pin and each upstream task's pin, readiness, validated commit and contracts); absent
+outside a workspace launch. The extension sends `failure` events (written only by the extension:
+the lead's `orchestration_record` schema does not accept them) and the recorder keeps
+`parent_orchestration.failure_signatures`: `digest`, `kind`, the fields above, `count`,
+`first_at`, `last_at`, `blocked`. The list holds at most 100 entries (the oldest unblocked one is
+dropped first, so a blocked signature outlives it). The head is part of the signature, so the
+entry's `head` is the last HEAD it was seen at.
+
+*Gate.* Before `ClaudeWorker` or `spawn_subagent` starts a routed step, the extension sends
+`retry_gate` with the effective budget. The recorder refuses when some `failure` signature of that
+task, step and route epoch, at the current HEAD and inputs digest, has `count > retry_budget`: the
+budget counts retries after the first failure, so the default of 2 lets three failures happen and
+refuses the fourth start. A refusal records the step `blocked` with `REPEATED_INEFFECTIVE_ACTION`
+(a `worker_overrides` entry, `by: extension`, when it had failed), marks the signature `blocked`,
+and returns the signature to the extension, which blocks only that tool call with a reason naming
+the step, failure code, count, budget and signature. It never sets `parentBlocked`, never changes
+the phase and never touches other tasks; the lead may escalate the route, change the work and
+retry, or finish PARTIAL/BLOCKED, and #42 reconciles whatever is open. A gate that cannot be
+evaluated is diagnosed and lets the call through (it guards against waste, not against an unsafe
+action). If the state then changed (another HEAD or digest) and the step still stands blocked by a
+refusal, the next gate reopens it as `failed` with its earlier code (`reason: state_changed`) so
+the start is a normal retry; the signatures stay as the record. A different route epoch (an
+escalation) is a different signature outright. A retry that succeeds (#54's failed to completed
+override) clears the step's signatures for that epoch. The gate runs as the lease owner like every
+recorder write, so a non-owner cannot record failures or reopen a step.
+
+*Prerequisites.* A blocker is a prerequisite when the worker result carries `blocker_kind:
+prerequisite`, its code is in `PREREQUISITE_CODES` (`APPROVED_PILOT_INPUTS_UNAVAILABLE`,
+`PREREQUISITE_UNMET`, `MODEL_BACKEND_UNAVAILABLE`, `MODEL_AUTH_UNAVAILABLE`), or it ends in
+`_UNAVAILABLE` or `_MISSING_INPUT`. Such a failure blocks the step immediately with its own code,
+is recorded as a `prerequisite` signature (its count only shows how often the prerequisite was
+hit) and is never considered by the gate, however often it repeats and even with a budget of 0.
+Scientific validation can therefore keep reporting an unresolved approved input as a blocked step
+without being stopped as a loop.
+
+*Configuration.* `failure_retry_budget`, an integer from 0 to 1000 (`FAILURE_RETRY_BUDGET_INVALID`
+otherwise; 0 means no retry): `pico exec start --failure-retry-budget N` (source `cli`) or the
+workspace task's value (`task`), then the manifest's (`manifest`), then `limits.failure_retry_budget`
+in the target's `.pi/autonomy.yaml` (`policy`), then 2 (`default`). The launcher records it in the
+execution record (`failure_retry_budget`, `failure_retry_budget_source`, `inputs_digest`) and hands
+it to the child as `PI_ORCHESTRATION_FAILURE_RETRY_BUDGET`, `..._SOURCE` and
+`PI_ORCHESTRATION_INPUTS_DIGEST`; the extension reads the policy itself when none is given and an
+invalid value blocks the run closed. The run record keeps the applied value in
+`parent_orchestration.failure_retry_budget`. Like the lead-call pin, the environment hand-off is
+not a security boundary (the lead's shell inherits it). Not covered yet: failures of `pico workspace
+validate` checks are not recorded as signatures.
+
 **Checkout hygiene.** Before launching, the runner records the target's
 branch (or detached `HEAD`) and its linked worktrees. After the child exits it
 removes every worktree the run created that is clean (`git worktree remove`

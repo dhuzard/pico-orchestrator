@@ -117,6 +117,38 @@ All notable changes to PICO are recorded here. The format follows
 
 ### Added
 
+- Detection of repeated ineffective actions (issue #48). A failed worker step is recorded as
+  a structured failure signature in `parent_orchestration.failure_signatures`: (task, step,
+  route epoch, route, failure code, checkout HEAD, a digest of the declared inputs). The code
+  is the worker result's own `blocker_code` (else `WORKER_FAILED`); no free text is parsed.
+  Before the lifecycle extension starts a `ClaudeWorker` or `spawn_subagent` step it asks the
+  recorder (`retry_gate`): if one signature at the current HEAD and inputs has failed more
+  often than the per-signature retry budget allows (default 2 retries, so the third failure
+  exhausts it), the start is refused with `REPEATED_INEFFECTIVE_ACTION`, the step is recorded
+  `blocked` with that code and the lead is told why. The refusal never sets `parentBlocked`:
+  the phase, the run and every other task continue, and the lead may finish PARTIAL or
+  BLOCKED (reconciled as usual). A new commit, changed inputs, or a different route epoch is
+  a different signature, so the count starts again; a step the refusal blocked is reopened
+  as failed when the state changed; a successful retry (#54) clears the step's signatures.
+  A prerequisite blocker never counts toward a loop: a code in
+  `{APPROVED_PILOT_INPUTS_UNAVAILABLE, PREREQUISITE_UNMET, MODEL_BACKEND_UNAVAILABLE,
+  MODEL_AUTH_UNAVAILABLE}`, any code ending `_UNAVAILABLE` or `_MISSING_INPUT`, or a worker
+  result with `blocker_kind: prerequisite` blocks the step with its own code, immediately,
+  and is recorded with `kind: prerequisite` for visibility only. The budget is
+  `failure_retry_budget` (0 to 1000; 0 allows no retry): `pico exec start
+  --failure-retry-budget N`, a workspace task, a manifest default, or
+  `limits.failure_retry_budget` in `.pi/autonomy.yaml` (precedence: CLI/task, manifest,
+  repository policy, default 2). Workspace launches also pass a digest of the declared
+  dispatch inputs (`PI_ORCHESTRATION_INPUTS_DIGEST`). The signature list is bounded (100;
+  the oldest unblocked entry is dropped first). Compatibility: `schemas/workspace.schema.json`
+  and `schemas/autonomy.schema.json` gain the optional `failure_retry_budget`; the run record
+  gains optional `parent_orchestration.failure_signatures` and `failure_retry_budget`, and
+  the `worker_overrides[].reason` enum gains `prerequisite_blocker`,
+  `repeated_ineffective_action` and `state_changed`; execution records gain optional
+  `failure_retry_budget`, `failure_retry_budget_source` and `inputs_digest`. Existing
+  manifests, policies and records are valid and unchanged. Failures of `pico workspace
+  validate` checks are not yet fed into the signatures. Closes #48.
+
 - Optional maximum lead calls per run (issue #47), with a warning and a resumable stop.
   `max_lead_calls` is set per workspace task, as a manifest default,
   `pico exec start --max-lead-calls N`, or as `limits.max_lead_calls` in

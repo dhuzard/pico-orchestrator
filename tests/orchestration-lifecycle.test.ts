@@ -22,18 +22,20 @@ function harness(preflight: Record<string, unknown>, failEvent = false, verifyOk
                    workerRestatementResult?: Record<string, unknown>;
                    escalationWorkerConflict?: boolean; resumeResult?: Record<string, unknown>;
                    heartbeatResult?: Record<string, unknown>; eventResult?: Record<string, unknown>;
-                   clock?: () => number; failKind?: string } = {}) {
+                   clock?: () => number; failKind?: string;
+                   gateRefusal?: (input: Record<string, unknown>) => Record<string, unknown> | null } = {}) {
   const handlers = new Map<string, Handler>();
   const tools = new Map<string, any>();
   const calls: { script: string; args: string[]; input?: Record<string, unknown> }[] = [];
   // Parent checkout state as seen by the fake snapshot operation.
-  const checkout = { digest: "clean", status: [] as string[] };
+  const checkout = { digest: "clean", status: [] as string[], head: "a".repeat(40) };
   let escalated = false;
   const messages: { message: any; options?: any }[] = [];
   const command = async (script: string, args: string[], input?: Record<string, unknown>) => {
     calls.push({ script, args, input });
     if (script.endsWith("run_lease.py")) return options.heartbeatResult ?? { ok: true, state: "live" };
     if (script.endsWith("session_scope.py")) {
+      if (input?.operation === "head") return { ok: true, head: checkout.head };
       if (input?.operation === "snapshot") return { ok: true, digest: checkout.digest, status: [...checkout.status] };
       if (input?.operation === "worktree") return options.worktreeOk === false
         ? { ok: false, blocker_code: options.worktreeBlocker ?? "WORKER_WORKSPACE_INVALID" }
@@ -58,6 +60,10 @@ function harness(preflight: Record<string, unknown>, failEvent = false, verifyOk
     if (args[0] === "status" || args[0] === "resume") return { run_id: args[1], status: options.parentStatus ?? "IN_PROGRESS",
       reroute_phases: options.reroutePhases ?? [] };
     if (args[0] === "settle" && options.settleFails) return { ok: false, error_code: "PARENT_STORAGE_UNAVAILABLE" };
+    if (args[0] === "event" && input?.kind === "retry_gate" && options.failKind !== "retry_gate") {
+      const refusal = options.gateRefusal?.(input) ?? null;
+      return { ok: true, retry_gate: refusal ? { refused: true, ...refusal } : { refused: false } };
+    }
     if (args[0] === "event" && options.failKind && input?.kind === options.failKind) {
       return { ok: false, error_code: "PARENT_STORAGE_UNAVAILABLE" };
     }
@@ -2439,5 +2445,176 @@ test("when the stop checkpoint cannot be written the lease is kept, the agent is
     await h.handlers.get("agent_before_settle")!({ outcome: "aborted", continue: false });
     assert.equal(h.parentCalls("settle").length, 1, "the normal settle path ends the run");
     assert.equal(h.parentCalls("finish").length, 0);
+  });
+});
+
+// --- repeated ineffective actions (REPEATED_INEFFECTIVE_ACTION) ---
+async function withFailureBudget(env: Record<string, string | undefined>, options: Parameters<typeof harness>[3],
+                                 body: (h: ReturnType<typeof harness>) => Promise<void>) {
+  const names = ["PI_ORCHESTRATION_FAILURE_RETRY_BUDGET", "PI_ORCHESTRATION_FAILURE_RETRY_BUDGET_SOURCE", "PI_ORCHESTRATION_INPUTS_DIGEST"];
+  const saved = names.map((name) => process.env[name]);
+  for (const name of names) delete process.env[name];
+  for (const [name, value] of Object.entries(env)) if (value !== undefined) process.env[name] = value;
+  try {
+    const h = harness({ ok: true, status: "READY" }, false, true, options);
+    await h.handlers.get("before_agent_start")!({ prompt: "PI_ORCHESTRATION_RUN_V1" }, { cwd: "/tmp/target", ui: { notify() {} } });
+    await body(h);
+  } finally {
+    names.forEach((name, index) => { if (saved[index] === undefined) delete process.env[name]; else process.env[name] = saved[index]; });
+  }
+}
+const codexStep = async (h: ReturnType<typeof harness>, id: string, label: string,
+                         outcome: { fail?: boolean; details?: Record<string, unknown> } = {}) => {
+  const guard = await h.handlers.get("tool_call")!({ toolName: "spawn_subagent", toolCallId: id, input: { task: "go", label } });
+  if (guard) return { guard };
+  const after = await h.handlers.get("tool_result")!({ toolName: "spawn_subagent", toolCallId: id, isError: outcome.fail === true,
+    content: [{ type: "text", text: "done" }], details: { subagent_id: `s-${id}`, elapsedMs: 3, ...outcome.details } });
+  return { guard, after };
+};
+const eventsOfKind = (h: ReturnType<typeof harness>, kind: string) => eventsOf(h).filter((input: any) => input.kind === kind);
+
+test("the retry budget comes from the launcher, else the repository policy, else the default of 2", async () => {
+  const gateBudget = async (env: Record<string, string | undefined>, options: Parameters<typeof harness>[3] = {}) => {
+    let seen: Record<string, unknown> | undefined;
+    await withFailureBudget(env, options, async (h) => {
+      await h.handlers.get("tool_result")!(routeFor("A"));
+      await codexStep(h, "r1", "A:codex_reviewer");
+      seen = eventsOfKind(h, "retry_gate")[0] as Record<string, unknown>;
+    });
+    return seen;
+  };
+  const base = { kind: "retry_gate", phase: "A", step_id: "codex_reviewer", head: "a".repeat(40) };
+  assert.deepEqual(await gateBudget({}), { ...base, retry_budget: 2, source: "default" });
+  assert.deepEqual(await gateBudget({}, { limits: { ok: true, parallel_tasks: 3, failure_retry_budget: 0 } }),
+    { ...base, retry_budget: 0, source: "policy" }, "0 is a real policy value");
+  assert.deepEqual(await gateBudget({ PI_ORCHESTRATION_FAILURE_RETRY_BUDGET: "5", PI_ORCHESTRATION_FAILURE_RETRY_BUDGET_SOURCE: "task" },
+    { limits: { ok: true, parallel_tasks: 3, failure_retry_budget: 9 } }), { ...base, retry_budget: 5, source: "task" });
+  assert.deepEqual(await gateBudget({ PI_ORCHESTRATION_FAILURE_RETRY_BUDGET: "0" }), { ...base, retry_budget: 0, source: "env" });
+  const digest = "d".repeat(64);
+  assert.equal(((await gateBudget({ PI_ORCHESTRATION_INPUTS_DIGEST: digest })) as any).inputs_digest, digest);
+  assert.equal(((await gateBudget({ PI_ORCHESTRATION_INPUTS_DIGEST: "not-a-digest" })) as any).inputs_digest, undefined);
+});
+
+test("an invalid retry budget (environment or policy) blocks the run closed", async () => {
+  for (const [env, options] of [
+    [{ PI_ORCHESTRATION_FAILURE_RETRY_BUDGET: "-1" }, {}], [{ PI_ORCHESTRATION_FAILURE_RETRY_BUDGET: "two" }, {}],
+    [{ PI_ORCHESTRATION_FAILURE_RETRY_BUDGET: "10000" }, {}],
+    [{}, { limits: { ok: true, parallel_tasks: 3, failure_retry_budget: -2 } }],
+    [{}, { limits: { ok: true, parallel_tasks: 3, failure_retry_budget: 1.5 } }],
+  ] as [Record<string, string>, Parameters<typeof harness>[3]][]) {
+    await withFailureBudget(env, options, async (h) => {
+      const blocked = await h.handlers.get("tool_call")!({ toolName: "bash", toolCallId: "b", input: { command: "ls" } });
+      assert.equal(blocked.block, true);
+    });
+  }
+});
+
+test("a failed worker records a structured failure with its code, HEAD and inputs digest; an abort and a success record none", async () => {
+  const digest = "e".repeat(64);
+  await withFailureBudget({ PI_ORCHESTRATION_INPUTS_DIGEST: digest }, {}, async (h) => {
+    await h.handlers.get("tool_result")!(routeFor("A"));
+    await codexStep(h, "ok", "A:codex_reviewer");
+    assert.deepEqual(eventsOfKind(h, "failure"), []);
+    await codexStep(h, "bad", "A:codex_reviewer", { fail: true, details: { blocker_code: "TESTS_FAILED" } });
+    await codexStep(h, "plain", "A:codex_specifier", { fail: true });
+    await codexStep(h, "abort", "A:codex_specifier", { fail: true, details: { error: "ABORTED" } });
+    await codexStep(h, "ignored", "A:codex_specifier", { fail: true, details: { blocker_code: "lower case text" } });
+    assert.deepEqual(eventsOfKind(h, "failure"), [
+      { kind: "failure", phase: "A", step_id: "codex_reviewer", code: "TESTS_FAILED", head: "a".repeat(40), inputs_digest: digest },
+      { kind: "failure", phase: "A", step_id: "codex_specifier", code: "WORKER_FAILED", head: "a".repeat(40), inputs_digest: digest },
+      { kind: "failure", phase: "A", step_id: "codex_specifier", code: "WORKER_FAILED", head: "a".repeat(40), inputs_digest: digest },
+    ]);
+    // The structured code also names the automatic worker status.
+    const bad = eventsOfKind(h, "worker").find((e: any) => e.status === "failed" && e.step_id === "codex_reviewer") as any;
+    assert.equal(bad.blocker_code, "TESTS_FAILED");
+    // The failure is recorded before the worker's terminal status, so a prerequisite can block the step directly.
+    const order = eventsOf(h).map((e: any) => e.kind + ":" + (e.status ?? ""));
+    assert.ok(order.indexOf("failure:") < order.indexOf("worker:failed"));
+  });
+});
+
+test("a worker result that declares blocker_kind prerequisite is recorded as one even without an error", async () => {
+  await withFailureBudget({}, {}, async (h) => {
+    await h.handlers.get("tool_result")!(routeFor("A"));
+    await codexStep(h, "p1", "A:codex_reviewer", { details: { blocker_code: "APPROVED_PILOT_INPUTS_UNAVAILABLE", blocker_kind: "prerequisite" } });
+    await codexStep(h, "p2", "A:codex_specifier", { details: { blocker_code: "SOME_NOTE" } });
+    assert.deepEqual(eventsOfKind(h, "failure").map((e: any) => [e.step_id, e.code, e.blocker_kind]),
+      [["codex_reviewer", "APPROVED_PILOT_INPUTS_UNAVAILABLE", "prerequisite"]]);
+  });
+});
+
+test("a refused start blocks only that call: no worker starts, the run and other tasks go on", async () => {
+  const refuse = (input: Record<string, unknown>) => input.phase === "A" && input.step_id === "codex_reviewer"
+    ? { code: "REPEATED_INEFFECTIVE_ACTION", failure_code: "TESTS_FAILED", count: 3, retry_budget: 2, signature: "f".repeat(64) } : null;
+  await withFailureBudget({}, { gateRefusal: refuse }, async (h) => {
+    await h.handlers.get("tool_result")!(routeFor("A"));
+    await h.handlers.get("tool_result")!(routeFor("B"));
+    const before = h.calls.length;
+    const refused = await codexStep(h, "r1", "A:codex_reviewer");
+    assert.equal(refused.guard.block, true);
+    assert.match(refused.guard.reason, /^REPEATED_INEFFECTIVE_ACTION: step codex_reviewer of task A failed 3 times with TESTS_FAILED/);
+    assert.match(refused.guard.reason, /other tasks may continue/);
+    const after = h.calls.slice(before).filter((call) => call.script.endsWith("parent_orchestration.py")).map((call) => call.input?.kind);
+    assert.deepEqual(after, ["retry_gate"], "nothing started: no activity, worker or snapshot event for the refused call");
+    // The run is not blocked: status works, another task's worker starts, and so does another step of the same task.
+    const status = await h.tools.get("orchestration_record").execute("s", { action: "status" });
+    assert.equal(status.details.ok, true);
+    assert.equal((await codexStep(h, "r2", "B:codex_reviewer")).guard, undefined);
+    assert.equal((await codexStep(h, "r3", "A:codex_specifier")).guard, undefined);
+    assert.equal(await h.handlers.get("tool_call")!({ toolName: "bash", toolCallId: "b", input: { command: "ls" } }), undefined);
+  });
+});
+
+test("the gate asks with the checkout's HEAD, and a gate that cannot be evaluated lets the call through", async () => {
+  await withFailureBudget({}, {}, async (h) => {
+    await h.handlers.get("tool_result")!(routeFor("A", { workerMutation: "allowed" }));
+    h.checkout.head = "c".repeat(40);
+    await codexStep(h, "r1", "A:codex_reviewer");
+    assert.equal((eventsOfKind(h, "retry_gate")[0] as any).head, "c".repeat(40));
+    const heads = h.calls.filter((call) => call.script.endsWith("session_scope.py") && call.input?.operation === "head");
+    assert.ok(heads.length >= 1);
+  });
+  await withFailureBudget({}, { failKind: "retry_gate" }, async (h) => {
+    await h.handlers.get("tool_result")!(routeFor("A"));
+    assert.equal((await codexStep(h, "r1", "A:codex_reviewer")).guard, undefined);
+    assert.equal((await h.tools.get("orchestration_record").execute("s", { action: "status" })).details.ok, true);
+  });
+});
+
+test("a lead cannot send failure or gate events", async () => {
+  await withFailureBudget({}, {}, async (h) => {
+    const params = h.tools.get("orchestration_record").parameters;
+    for (const event of [{ kind: "failure", phase: "A", step_id: "s", code: "X" },
+      { kind: "retry_gate", phase: "A", step_id: "s", retry_budget: 99, source: "cli" }]) {
+      assert.equal(Value.Check(params, { action: "event", event }), false);
+    }
+  });
+});
+
+test("recorded end to end: the real recorder refuses the repeat, a new HEAD is a new signature, a prerequisite never trips", async () => {
+  await withFailureBudget({ PI_ORCHESTRATION_FAILURE_RETRY_BUDGET: "1", PI_ORCHESTRATION_FAILURE_RETRY_BUDGET_SOURCE: "cli" }, {}, async (h) => {
+    await h.handlers.get("tool_result")!(routeFor("A"));
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      await codexStep(h, `f${attempt}`, "A:codex_reviewer", { fail: true, details: { blocker_code: "TESTS_FAILED" } });
+    }
+    h.checkout.head = "9".repeat(40);
+    await codexStep(h, "moved", "A:codex_reviewer", { fail: true, details: { blocker_code: "TESTS_FAILED" } });
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      await codexStep(h, `p${attempt}`, "A:codex_specifier", { fail: true, details: { blocker_code: "APPROVED_PILOT_INPUTS_UNAVAILABLE" } });
+    }
+    const replayed = replay([...eventsOf(h)], null);
+    assert.deepEqual(replayed.errors, []);
+    assert.deepEqual(replayed.parent.failure_signatures.map((s: any) => [s.step_id, s.code, s.kind, s.count]).sort(),
+      [["codex_reviewer", "TESTS_FAILED", "failure", 1], ["codex_reviewer", "TESTS_FAILED", "failure", 2],
+       ["codex_specifier", "APPROVED_PILOT_INPUTS_UNAVAILABLE", "prerequisite", 4]].sort());
+    const workers = Object.fromEntries(replayed.parent.phases[0].workers.map((w: any) => [w.step_id, w]));
+    assert.deepEqual([workers.codex_specifier.status, workers.codex_specifier.blocker_code], ["blocked", "APPROVED_PILOT_INPUTS_UNAVAILABLE"]);
+    assert.equal(workers.codex_reviewer.status, "failed");
+    // The stuck step gated again at the old HEAD, through the recorder: refused with the budget of 1.
+    const gated = replay([...eventsOf(h), { kind: "retry_gate", phase: "A", step_id: "codex_reviewer", retry_budget: 1,
+      source: "cli", head: "a".repeat(40) }], null);
+    const blocked = gated.parent.phases[0].workers.find((w: any) => w.step_id === "codex_reviewer");
+    assert.deepEqual([blocked.status, blocked.blocker_code], ["blocked", "REPEATED_INEFFECTIVE_ACTION"]);
+    assert.equal(gated.parent.final_status, "IN_PROGRESS");
   });
 });

@@ -8,6 +8,7 @@ closed metadata, never prompts, issue bodies, environment values, or stderr.
 from __future__ import annotations
 
 import argparse
+import hashlib
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import json
@@ -517,6 +518,168 @@ def _lead_limit_event(parent: dict, event: dict) -> None:
         _checkpoint(parent, reason="lead_call_limit", phase=None)
 
 
+# Repeated ineffective actions (#48). A failure signature is (task, step, route epoch, route, failure code,
+# checkout HEAD, declared-input digest): deterministic and structured, never free text. Prerequisite codes
+# (an unresolved input or backend, which scientific validation may legitimately hit again and again) block the
+# step with their own code and never count toward a loop.
+REPEATED_ACTION_CODE = "REPEATED_INEFFECTIVE_ACTION"
+DEFAULT_FAILURE_RETRY_BUDGET = 2
+MAX_FAILURE_RETRY_BUDGET = 1000
+FAILURE_BUDGET_SOURCES = ("cli", "task", "manifest", "policy", "default", "env")
+MAX_FAILURE_SIGNATURES = 100
+PREREQUISITE_CODES = frozenset({"APPROVED_PILOT_INPUTS_UNAVAILABLE", "PREREQUISITE_UNMET",
+                                "MODEL_BACKEND_UNAVAILABLE", "MODEL_AUTH_UNAVAILABLE"})
+PREREQUISITE_SUFFIXES = ("_UNAVAILABLE", "_MISSING_INPUT")
+
+
+def is_prerequisite(code: str, blocker_kind: str | None = None) -> bool:
+    """A blocker the worker declared a prerequisite (`blocker_kind: prerequisite`), a code in the explicit set,
+    or any code ending in `_UNAVAILABLE` / `_MISSING_INPUT`."""
+    return (blocker_kind == "prerequisite" or code in PREREQUISITE_CODES
+            or code.endswith(PREREQUISITE_SUFFIXES))
+
+
+def failure_signature_digest(task_id: str, step_id: str, epoch: int, route: str | None, code: str,
+                             head: str | None, inputs_digest: str | None) -> str:
+    return hashlib.sha256(json.dumps([task_id, step_id, epoch, route, code, head, inputs_digest],
+                                     separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _step_state(parent: dict, event: dict) -> tuple[dict, str, int, str | None, str | None, str | None]:
+    phase = _phase(parent, event["phase"])
+    step_id = _safe(event.get("step_id"), ID_RE, "step id")
+    head = _safe(event.get("head"), COMMIT_RE, "head")
+    inputs_digest = event.get("inputs_digest")
+    if step_id is None or (inputs_digest is not None and (
+            not isinstance(inputs_digest, str) or not DIGEST_RE.fullmatch(inputs_digest))):
+        raise ParentRunError("invalid failure event", error_code="PARENT_EVENT_FIELDS_INVALID")
+    epoch = len(phase.get("escalations") or [])
+    route = (phase.get("escalations") or [{}])[-1].get("to_route") or phase["route"]
+    return phase, step_id, epoch, route, head, inputs_digest
+
+
+def _find_worker(phase: dict, step_id: str, epoch: int) -> dict | None:
+    return next((item for item in phase["workers"]
+                 if item["step_id"] == step_id and item.get("route_epoch", 0) == epoch), None)
+
+
+def _override(parent: dict, phase: dict, worker: dict, epoch: int, to_status: str, code: str | None,
+              reason: str) -> None:
+    """Append an extension override of a terminal worker record; silently skipped past the bounds."""
+    history = [item for item in parent.get("worker_overrides") or []
+               if (item["phase_id"], item["step_id"], item["route_epoch"]) == (phase["id"], worker["step_id"], epoch)]
+    if len(history) >= MAX_OVERRIDES_PER_WORKER or len(parent.get("worker_overrides") or []) >= MAX_WORKER_OVERRIDES:
+        return
+    parent.setdefault("worker_overrides", []).append({
+        "phase_id": phase["id"], "step_id": worker["step_id"], "route_epoch": epoch,
+        "from_status": worker["status"], "from_blocker_code": worker.get("blocker_code"),
+        "to_status": to_status, "blocker_code": code, "phase_status": phase["status"],
+        "by": "extension", "reason": reason, "at": _now()})
+
+
+def _block_step(parent: dict, phase: dict, step_id: str, epoch: int, code: str, reason: str) -> None:
+    """Make the step's worker blocked with `code`: directly when it is open, as a recorded override when it
+    failed. A blocked or completed worker is left as recorded; the phase and the run are never touched."""
+    worker = _find_worker(phase, step_id, epoch)
+    if worker is None:
+        worker = {"step_id": step_id, "model": None, "backend": None, "backend_model": None, "status": "not_started",
+                  "route_epoch": epoch, "blocker_code": None, "installed_backend_version": None,
+                  "required_backend_version": None}
+        phase["workers"].append(worker)
+    if worker["status"] == "failed":
+        _override(parent, phase, worker, epoch, "blocked", code, reason)
+    elif worker["status"] not in {"not_started", "in_progress"}:
+        return
+    worker["status"] = "blocked"
+    worker["blocker_code"] = code
+
+
+def _signatures(parent: dict) -> list[dict]:
+    return parent.setdefault("failure_signatures", [])
+
+
+def _clear_signatures(parent: dict, task_id: str, step_id: str, epoch: int) -> None:
+    """A successful retry of the step clears its signatures (all HEADs and inputs of that route epoch)."""
+    if parent.get("failure_signatures"):
+        parent["failure_signatures"] = [item for item in parent["failure_signatures"]
+                                        if (item["task_id"], item["step_id"], item["route_epoch"]) != (task_id, step_id, epoch)]
+        if not parent["failure_signatures"]:
+            del parent["failure_signatures"]
+
+
+def _failure_event(parent: dict, event: dict) -> None:
+    """Record one structured failure of a worker step, written only by the lifecycle extension.
+
+    A prerequisite blocker (see `is_prerequisite`) blocks the step with its own code, is recorded with kind
+    `prerequisite` and never counts. Anything else counts toward its signature; the loop gate is `retry_gate`.
+    """
+    phase, step_id, epoch, route, head, inputs_digest = _step_state(parent, event)
+    code = _safe(event.get("code"), CODE_RE, "failure code")
+    blocker_kind = event.get("blocker_kind")
+    if code is None or blocker_kind not in (None, "prerequisite"):
+        raise ParentRunError("invalid failure event", error_code="PARENT_EVENT_FIELDS_INVALID")
+    if code == REPEATED_ACTION_CODE:
+        return  # the gate's own outcome is never a failure to count
+    prerequisite = is_prerequisite(code, blocker_kind)
+    digest = failure_signature_digest(phase["id"], step_id, epoch, route, code, head, inputs_digest)
+    entries = _signatures(parent)
+    now = _now()
+    entry = next((item for item in entries if item["digest"] == digest), None)
+    if entry is None:
+        entry = {"digest": digest, "kind": "prerequisite" if prerequisite else "failure", "task_id": phase["id"],
+                 "step_id": step_id, "route_epoch": epoch, "route": route, "code": code, "head": head,
+                 "inputs_digest": inputs_digest, "count": 0, "first_at": now, "last_at": now, "blocked": False}
+    else:
+        entries.remove(entry)  # most recently updated last, so eviction drops the stalest
+    entry["count"] += 1
+    entry["last_at"] = now
+    entries.append(entry)
+    while len(entries) > MAX_FAILURE_SIGNATURES:
+        victim = next((item for item in entries if not item["blocked"]), entries[0])
+        entries.remove(victim)
+    if prerequisite:
+        _block_step(parent, phase, step_id, epoch, code, "prerequisite_blocker")
+
+
+def _retry_gate_event(parent: dict, event: dict) -> dict:
+    """Decide, before a worker starts, whether its step's current signature used up the retry budget.
+
+    Refused (`refused: true`): some counted signature of this task, step and route epoch, at this very HEAD and
+    input digest, failed more than `retry_budget` times (the first failure plus that many retries). The step is
+    recorded blocked with REPEATED_INEFFECTIVE_ACTION; the phase, the other tasks and the run are untouched.
+    Otherwise a step an earlier refusal blocked is reopened as failed (HEAD or inputs changed) so the start can
+    retry it.
+    """
+    phase, step_id, epoch, route, head, inputs_digest = _step_state(parent, event)
+    budget, source = event.get("retry_budget"), event.get("source")
+    if type(budget) is not int or not 0 <= budget <= MAX_FAILURE_RETRY_BUDGET:
+        raise ParentRunError("invalid failure retry budget", error_code="FAILURE_RETRY_BUDGET_INVALID")
+    if source not in FAILURE_BUDGET_SOURCES:
+        raise ParentRunError("invalid failure retry budget source", error_code="FAILURE_RETRY_BUDGET_INVALID")
+    parent["failure_retry_budget"] = {"retry_budget": budget, "source": source}
+    mine = [item for item in parent.get("failure_signatures") or []
+            if (item["task_id"], item["step_id"], item["route_epoch"]) == (phase["id"], step_id, epoch)]
+    exhausted = [item for item in mine if item["kind"] == "failure" and item["head"] == head
+                 and item["inputs_digest"] == inputs_digest and item["count"] > budget]
+    worker = _find_worker(phase, step_id, epoch)
+    if exhausted:
+        hit = max(exhausted, key=lambda item: item["count"])
+        hit["blocked"] = True
+        _block_step(parent, phase, step_id, epoch, REPEATED_ACTION_CODE, "repeated_ineffective_action")
+        return {"refused": True, "code": REPEATED_ACTION_CODE, "failure_code": hit["code"], "signature": hit["digest"],
+                "count": hit["count"], "retry_budget": budget, "step_id": step_id, "task_id": phase["id"]}
+    if worker is not None and worker["status"] == "blocked" and worker.get("blocker_code") == REPEATED_ACTION_CODE:
+        blocked = [item for item in mine if item["blocked"]]
+        if blocked:
+            previous = max(blocked, key=lambda item: item["last_at"])
+            _override(parent, phase, worker, epoch, "failed", previous["code"], "state_changed")
+            worker["status"] = "failed"
+            worker["blocker_code"] = previous["code"]
+            for item in blocked:
+                item["blocked"] = False
+    return {"refused": False, "retry_budget": budget}
+
+
 def _count(value: Any, field: str) -> int:
     if type(value) is not int or value < 0:
         raise ParentRunError(f"invalid {field}")
@@ -722,6 +885,8 @@ def _record_event_unlocked(run_id: str, event: dict, *, repo_root: Path = ROOT) 
         "lead_limit": {"kind", "state", "max_lead_calls", "source", "warn_at", "calls"},
         "lead_call_warning": {"kind", "calls"},
         "lead_call_limit_reached": {"kind", "calls"},
+        "failure": {"kind", "phase", "step_id", "code", "head", "inputs_digest", "blocker_kind"},
+        "retry_gate": {"kind", "phase", "step_id", "head", "inputs_digest", "retry_budget", "source"},
     }
     required = {
         "phase": {"kind", "phase", "status"},
@@ -741,6 +906,8 @@ def _record_event_unlocked(run_id: str, event: dict, *, repo_root: Path = ROOT) 
         "lead_limit": {"kind", "state"},
         "lead_call_warning": {"kind"},
         "lead_call_limit_reached": {"kind"},
+        "failure": {"kind", "phase", "step_id", "code"},
+        "retry_gate": {"kind", "phase", "step_id", "retry_budget", "source"},
     }
     if kind not in allowed or set(event) - allowed[kind]:
         raise ParentRunError("unsupported event or unexpected fields")
@@ -867,6 +1034,7 @@ def _record_event_unlocked(run_id: str, event: dict, *, repo_root: Path = ROOT) 
                         "by": "extension" if event.get("only_if_open") is True else "lead",
                         "reason": "retry_succeeded", "at": _now()}
             worker["blocker_code"] = None
+            _clear_signatures(parent, phase["id"], step_id, epoch)  # the retry worked: its failures no longer count
         elif prior in terminal:
             # The lead's judgment wins over an earlier record, but never silently: each override is
             # appended to `worker_overrides` with what it replaced. Allowed: completed -> failed/blocked
@@ -1035,6 +1203,12 @@ def _record_event_unlocked(run_id: str, event: dict, *, repo_root: Path = ROOT) 
         context["lead_calls"].append(call)
     elif kind in {"lead_limit", "lead_call_warning", "lead_call_limit_reached"}:
         _lead_limit_event(parent, event)
+    elif kind == "failure":
+        _failure_event(parent, event)
+    elif kind == "retry_gate":
+        gate = _retry_gate_event(parent, event)
+        provenance.update_parent_orchestration(repo_root, run_id, parent)
+        return {**parent, "retry_gate": gate}
     elif kind == "wave":
         _wave_event(parent, event)
         if event["status"] == "integrating":
@@ -1334,7 +1508,7 @@ def main() -> int:
                           "operation": args.command, "error_category": type(exc).__name__,
                           "error_code": error_code, "error": detail, "run_id": run_id,
                           "event_kind": event_kind if isinstance(event_kind, str) and
-                            event_kind in {"phase", "worker", "child", "mutation", "context", "usage", "wave", "concurrency"} else None,
+                            event_kind in {"phase", "worker", "child", "mutation", "context", "usage", "wave", "concurrency", "failure", "retry_gate"} else None,
                           "lifecycle_state": lifecycle_state, "validation_path": validation_path,
                           "orchestrator_commit": revision, "orchestrator_root": str(ROOT),
                           "resource_path": str(ROOT / ("schemas/run-record.schema.json" if
