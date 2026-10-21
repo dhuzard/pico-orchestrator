@@ -65,6 +65,7 @@
         },
         "worker_overrides": {
           "type": "array",
+          "maxItems": 200,
           "description": "Each time the lead replaced a terminal worker record (completed -> failed/blocked, failed -> blocked, or a failed/blocked worker restated with a different blocker code). The earlier status and blocker code are kept here; the worker holds the current ones.",
           "items": {
             "type": "object",

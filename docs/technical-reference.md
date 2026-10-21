@@ -1341,7 +1341,13 @@ versions), `to_status`, `blocker_code`, `phase_status`, `by: "lead"` and `at`,
 while the worker holds the current values. An override inside a phase that is
 already terminal is allowed (a phase cannot be reopened, and the lead's
 judgment must be able to win) and is flagged by `phase_status` being that
-terminal value. Older PICO versions reject `worker_overrides`.
+terminal value. The list is bounded: recoding a worker to a blocker code it
+already had in that route epoch is refused with
+`PARENT_WORKER_RECODE_REPEATED`, a worker takes at most 8 overrides, and a run
+at most 200 (`PARENT_WORKER_OVERRIDE_LIMIT`; the schema carries the same
+`maxItems`). These refusals change nothing and the lifecycle extension reports
+them to the lead without blocking the run. Older PICO versions reject
+`worker_overrides`.
 Coverage: `tests/test_reconcile_open.py`, `tests/orchestration-lifecycle.test.ts`.
 
 **Ownership.** Run records belong to the orchestrator installation whose

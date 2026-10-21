@@ -286,6 +286,25 @@ class WorkerJudgmentTest(_Base):
                         "only_if_open": "yes"})
         self.assertEqual(provenance.run_path(self.records, self.run_id).read_bytes(), before)
 
+    def test_alternating_recodes_are_refused_and_the_list_stays_bounded(self):
+        self.lead("blocked", blocker_code="CODE_A")
+        self.lead("blocked", blocker_code="CODE_B")
+        before = self.overrides()
+        with self.assertRaises(po.ParentRunError) as raised:  # A -> B -> A would start the alternation
+            self.lead("blocked", blocker_code="CODE_A")
+        self.assertEqual(raised.exception.error_code, "PARENT_WORKER_RECODE_REPEATED")
+        self.lead("blocked", blocker_code="CODE_B")  # restating the current code is a no-op
+        self.assertEqual(self.overrides(), before)
+        self.assertEqual(len(self.overrides()), 1)
+        for index in range(20):  # distinct codes are bounded per worker
+            try:
+                self.lead("blocked", blocker_code=f"CODE_{index}X")
+            except po.ParentRunError as error:
+                self.assertEqual(error.error_code, "PARENT_WORKER_OVERRIDE_LIMIT")
+        self.assertEqual(len(self.overrides()), po.MAX_OVERRIDES_PER_WORKER)
+        schema_limit = self.schema["properties"]["parent_orchestration"]["properties"]["worker_overrides"]["maxItems"]
+        self.assertEqual(schema_limit, po.MAX_WORKER_OVERRIDES)
+
     def test_unrelated_blocker_conflicts_still_refused(self):
         self.lead("in_progress", blocker_code="A_CODE")
         with self.assertRaises(po.ParentRunError) as raised:

@@ -31,6 +31,8 @@ const LEASE_LOST = new Set(["RUN_LEASE_LOST", "RUN_LEASE_NOT_HELD", "RUN_LEASE_P
 const LEASE_OWNER = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
 const LEASE_STATE = Symbol.for("pico.orchestration.lease");
 const OWNER_ENV = "PI_ORCHESTRATION_LEASE_OWNER";
+/** Parent refusals of a worker override that leave the record unchanged; they must never block the run. */
+const HARMLESS_REFUSALS = new Set(["PARENT_WORKER_RECODE_REPEATED", "PARENT_WORKER_OVERRIDE_LIMIT"]);
 const WORKER_TOOLS = new Set(["AskClaude", "ClaudeWorker", "spawn_subagent", "message_subagent"]);
 const CLAUDE_TOOLS = new Set(["AskClaude", "ClaudeWorker"]);
 const MARKER = "PI_ORCHESTRATION_RUN_V1";
@@ -1219,7 +1221,10 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
          || parentFailure?.error_code === "PARENT_ESCALATION_WORKERS_IN_FLIGHT");
       const ok = result.ok !== false && (params.action !== "status" || result.status === "IN_PROGRESS")
         && !(params.action === "status" && unresolvedRoute);
-      if (!ok) {
+      // A refused repeat or excess override of an already-terminal worker changes nothing: it is reported to the
+      // lead and never blocks the run.
+      const harmless = params.action === "event" && result.ok === false && HARMLESS_REFUSALS.has(String(result.error_code));
+      if (!ok && !harmless) {
         const failure = params.action === "status" && parentBlocked ? parentFailure ?? result : result;
         diagnose(params.action, failure);
         parentFailure = failure; parentBlocked = true; blockAllWorktrees();
@@ -1244,7 +1249,8 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
       const code = typeof effectiveResult.blocker_code === "string" ? effectiveResult.blocker_code
         : typeof effectiveResult.error_code === "string" ? effectiveResult.error_code : null;
       // The model reads only this text, never `details`, so the status line states ok/active explicitly.
-      const message = ok ? (params.action === "status"
+      const message = harmless ? `Worker override refused (${code}); nothing changed and the run is not blocked. Record a different judgment or leave the worker as recorded.`
+        : ok ? (params.action === "status"
           ? `Parent orchestration record ${observedRunId} is ready (ok: true, active: ${runId !== null}).`
         : params.action === "finish" ? completionSummary(result, observedRunId)
         : "Parent orchestration trace updated.")

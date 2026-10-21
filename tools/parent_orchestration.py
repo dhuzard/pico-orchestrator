@@ -33,6 +33,9 @@ STATUSES = {"COMPLETED", "BLOCKED", "FAILED", "PARTIAL"}
 PHASE_STATUSES = {"not_started", "in_progress", "completed", "blocked", "failed", "partial"}
 WORKER_STATUSES = {"not_started", "in_progress", "completed", "blocked", "failed"}
 RECONCILED_STATUS = "abandoned"
+# Bounds on `worker_overrides` (the schema carries the same global limit).
+MAX_WORKER_OVERRIDES = 200
+MAX_OVERRIDES_PER_WORKER = 8
 ROUTES = {"CODEX", "CLAUDE", "CLAUDE_CODEX", "CODEX_CLAUDE_CODEX"}
 ESCALATION_TARGETS = {
     "CODEX": {"CLAUDE_CODEX", "CODEX_CLAUDE_CODEX"},
@@ -662,6 +665,17 @@ def _record_event_unlocked(run_id: str, event: dict, *, repo_root: Path = ROOT) 
                                      and values.get("blocker_code") is not None):
                 raise ParentRunError("worker is already terminal", error_code="PARENT_WORKER_TRANSITION_INVALID")
             if reclassified or recoded:
+                history = [item for item in parent.get("worker_overrides") or []
+                           if (item["phase_id"], item["step_id"], item["route_epoch"]) == (phase["id"], step_id, epoch)]
+                seen = {worker.get("blocker_code")} | {code for item in history
+                                                       for code in (item["from_blocker_code"], item["blocker_code"])}
+                if recoded and values["blocker_code"] in seen:
+                    raise ParentRunError("worker was already recorded with this blocker code in this route epoch",
+                                         error_code="PARENT_WORKER_RECODE_REPEATED")
+                if (len(history) >= MAX_OVERRIDES_PER_WORKER
+                        or len(parent.get("worker_overrides") or []) >= MAX_WORKER_OVERRIDES):
+                    raise ParentRunError("too many overrides recorded for this worker or run",
+                                         error_code="PARENT_WORKER_OVERRIDE_LIMIT")
                 override = {"phase_id": phase["id"], "step_id": step_id, "route_epoch": epoch,
                             "from_status": prior, "from_blocker_code": worker.get("blocker_code")}
                 details = {key: worker[key] for key in ("installed_backend_version", "required_backend_version")

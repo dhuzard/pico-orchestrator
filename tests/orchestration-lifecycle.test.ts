@@ -1527,6 +1527,21 @@ test("a write refused because another owner holds the lease detaches without set
   assert.equal(h.parentCalls("settle").length, 0);
 });
 
+test("a refused repeat worker recode is reported to the lead without blocking the run", async () => {
+  for (const [code, blocks] of [["PARENT_WORKER_RECODE_REPEATED", false], ["PARENT_WORKER_OVERRIDE_LIMIT", false],
+                                ["PARENT_EVENT_CONFLICT", true]] as const) {
+    const h = harness({ ok: true }, false, true, { eventResult: { ok: false, error_code: code } });
+    await h.handlers.get("before_agent_start")!({ prompt: "PI_ORCHESTRATION_RUN_V1" });
+    const tool = h.tools.get("orchestration_record");
+    const refused = await tool.execute("e", { action: "event", event: { kind: "worker", phase: "p",
+      step_id: "claude_worker", status: "blocked", blocker_code: "CODE_A" } });
+    assert.match(refused.content[0].text, new RegExp(code), "the lead is told");
+    assert.equal(/^BLOCKED/.test(refused.content[0].text), blocks);
+    const status = await tool.execute("s", { action: "status" });
+    assert.equal(status.details.ok, !blocks, `${code}: status after the refusal`);
+  }
+});
+
 test("renewals failing past the lease lifetime detach the process and abort running workers", async () => {
   let now = 1_000_000;
   const h = harness({ ok: true }, false, true,
