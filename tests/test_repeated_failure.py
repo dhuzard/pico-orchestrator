@@ -166,50 +166,136 @@ class SignatureTest(StateTestCase):
 
     # --- prerequisite blockers ------------------------------------------------------------------------------
 
-    def test_a_repeated_prerequisite_blocker_never_trips_and_the_step_ends_blocked_with_its_own_code(self):
+    UNCHANGED = "PREREQUISITE_UNCHANGED"
+
+    def prerequisite(self, code="APPROVED_PILOT_INPUTS_UNAVAILABLE", head=HEAD_A, inputs=INPUTS_1, **extra):
+        self.start_worker()
+        payload = {"kind": "failure", "phase": "t1", "step_id": "claude_worker", "code": code, **extra}
+        if head:
+            payload["head"] = head
+        if inputs:
+            payload["inputs_digest"] = inputs
+        self.event(payload)
+        self.event({"kind": "worker", "phase": "t1", "step_id": "claude_worker", "status": "failed",
+                    "blocker_code": code, "only_if_open": True})
+
+    def test_a_prerequisite_blocked_step_is_not_restarted_until_head_or_inputs_change(self):
         code = "APPROVED_PILOT_INPUTS_UNAVAILABLE"
-        for _ in range(8):
-            self.start_worker()
-            self.event({"kind": "failure", "phase": "t1", "step_id": "claude_worker", "code": code,
-                        "head": HEAD_A, "inputs_digest": INPUTS_1})
-            self.event({"kind": "worker", "phase": "t1", "step_id": "claude_worker", "status": "failed",
-                        "blocker_code": code, "only_if_open": True})
-            self.assertFalse(self.gate(budget=0)["refused"], "a prerequisite never counts, even with no retries")
+        self.prerequisite(code)
         worker = self.worker()
         self.assertEqual((worker["status"], worker["blocker_code"]), ("blocked", code))
+        for _ in range(5):  # however often the lead asks, even with a budget of 0, it is not a loop
+            refused = self.gate(budget=0)
+            self.assertEqual((refused["refused"], refused["code"], refused["failure_code"]), (True, self.UNCHANGED, code))
+        worker = self.worker()
+        self.assertEqual((worker["status"], worker["blocker_code"]), ("blocked", code), "the step keeps its own code")
         [signature] = self.signatures()
-        self.assertEqual((signature["kind"], signature["count"], signature["blocked"]), ("prerequisite", 8, False))
+        self.assertEqual((signature["kind"], signature["count"], signature["blocked"]), ("prerequisite", 1, True))
         self.assertNotIn(REPEATED, str(self.parent(self.run_id)["phases"]))
+        self.assertEqual(self.parent(self.run_id)["phases"][0]["status"], "in_progress", "the phase is not blocked")
+        self.assertEqual(self.parent(self.run_id)["final_status"], "IN_PROGRESS")
         self.assert_valid()
 
-    def test_prerequisite_classification_is_explicit_and_deterministic(self):
+    def test_a_changed_head_reopens_a_prerequisite_blocked_step(self):
+        code = "APPROVED_PILOT_INPUTS_UNAVAILABLE"
+        self.prerequisite(code)
+        self.assertEqual(self.gate()["code"], self.UNCHANGED)
+        self.assertFalse(self.gate(head=HEAD_B)["refused"])
+        worker = self.worker()
+        self.assertEqual((worker["status"], worker["blocker_code"]), ("failed", code))
+        self.assertEqual(self.parent(self.run_id)["worker_overrides"][-1]["reason"], "state_changed")
+        # Still unresolved at the new state: blocked again with its own code, and not restartable again.
+        self.prerequisite(code, head=HEAD_B)
+        self.assertEqual(self.gate(head=HEAD_B)["code"], self.UNCHANGED)
+        self.assertEqual(self.worker()["blocker_code"], code)
+        self.assert_valid()
+
+    def test_changed_inputs_reopen_a_prerequisite_blocked_step(self):
+        code = "APPROVED_PILOT_INPUTS_UNAVAILABLE"
+        self.prerequisite(code)
+        self.assertEqual(self.gate(inputs=INPUTS_1)["code"], self.UNCHANGED)
+        self.assertFalse(self.gate(inputs=INPUTS_2)["refused"])
+        self.assertEqual(self.worker()["status"], "failed")
+        self.assert_valid()
+
+    def test_a_worker_chosen_code_ending_unavailable_is_not_a_prerequisite_and_does_not_escape_the_loop(self):
+        # The reviewer's probe: FOO_UNAVAILABLE restarted at the same HEAD must not be allowed every time.
+        for code in ("FOO_UNAVAILABLE", "BAR_MISSING_INPUT"):
+            self.assertFalse(po.is_prerequisite(code), code)
+        for _ in range(3):
+            self.fail(code="FOO_UNAVAILABLE")
+        refused = self.gate()
+        self.assertEqual((refused["refused"], refused["code"], refused["count"]), (True, REPEATED, 3))
+        self.assertEqual(self.signatures()[0]["kind"], "failure")
+
+    def test_a_flapping_backend_code_cannot_restart_at_the_same_state(self):
+        self.prerequisite("MODEL_BACKEND_UNAVAILABLE")
+        for _ in range(8):
+            self.assertEqual(self.gate()["code"], self.UNCHANGED)
+        self.assertEqual(self.signatures()[0]["count"], 1, "refused starts are not new failures")
+
+    def test_prerequisite_classification_is_a_closed_set_plus_the_workers_own_declaration(self):
         for code in ("APPROVED_PILOT_INPUTS_UNAVAILABLE", "MODEL_BACKEND_UNAVAILABLE", "MODEL_AUTH_UNAVAILABLE",
-                     "PREREQUISITE_UNMET", "ANYTHING_UNAVAILABLE", "CRT_MISSING_INPUT"):
+                     "PREREQUISITE_UNMET"):
             self.assertTrue(po.is_prerequisite(code), code)
-        for code in ("WORKER_FAILED", "TESTS_FAILED", "UNAVAILABLE_BUT_NOT_SUFFIX_X", "INPUT_MISSING", REPEATED):
+        for code in ("WORKER_FAILED", "TESTS_FAILED", "ANYTHING_UNAVAILABLE", "CRT_MISSING_INPUT", "INPUT_MISSING", REPEATED):
             self.assertFalse(po.is_prerequisite(code), code)
         self.assertTrue(po.is_prerequisite("WORKER_FAILED", "prerequisite"), "the worker may declare it")
 
     def test_a_worker_declared_prerequisite_blocks_the_step_even_with_an_ordinary_code(self):
-        self.start_worker()
-        self.event({"kind": "failure", "phase": "t1", "step_id": "claude_worker", "code": "NEEDS_REVIEWER_SIGNOFF",
-                    "blocker_kind": "prerequisite", "head": HEAD_A})
+        self.prerequisite("NEEDS_REVIEWER_SIGNOFF", blocker_kind="prerequisite")
         worker = self.worker()
         self.assertEqual((worker["status"], worker["blocker_code"]), ("blocked", "NEEDS_REVIEWER_SIGNOFF"))
-        for _ in range(5):
-            self.event({"kind": "failure", "phase": "t1", "step_id": "claude_worker", "code": "NEEDS_REVIEWER_SIGNOFF",
-                        "blocker_kind": "prerequisite", "head": HEAD_A})
-        self.assertFalse(self.gate(budget=0)["refused"])
+        self.assertEqual(self.gate(budget=0)["code"], self.UNCHANGED)
 
     def test_a_failed_step_that_later_hits_a_prerequisite_becomes_blocked_by_an_extension_override(self):
         self.fail()
         self.start_worker()
-        self.event({"kind": "failure", "phase": "t1", "step_id": "claude_worker", "code": "INPUT_MISSING_INPUT"})
+        self.event({"kind": "failure", "phase": "t1", "step_id": "claude_worker", "code": "PREREQUISITE_UNMET"})
         worker = self.worker()
-        self.assertEqual((worker["status"], worker["blocker_code"]), ("blocked", "INPUT_MISSING_INPUT"))
+        self.assertEqual((worker["status"], worker["blocker_code"]), ("blocked", "PREREQUISITE_UNMET"))
         override = self.parent(self.run_id)["worker_overrides"][-1]
         self.assertEqual((override["from_status"], override["by"], override["reason"]),
                          ("failed", "extension", "prerequisite_blocker"))
+
+    def test_a_refusal_of_a_prerequisite_blocked_step_that_failed_differently_is_on_the_record(self):
+        code = "APPROVED_PILOT_INPUTS_UNAVAILABLE"
+        self.prerequisite(code)
+        # The checkout moved on; the step failed differently there, over and over, while its record still
+        # shows the old prerequisite (the automatic status never overrides a recorded one).
+        for _ in range(4):
+            self.event({"kind": "failure", "phase": "t1", "step_id": "claude_worker", "code": "TESTS_FAILED",
+                        "head": HEAD_B, "inputs_digest": INPUTS_1})
+        self.assertEqual((self.worker()["status"], self.worker()["blocker_code"]), ("blocked", code))
+        # Gate at HEAD_B: the prerequisite entry is at HEAD_A (state changed) so the loop signature decides.
+        refused = self.gate(head=HEAD_B)
+        self.assertEqual((refused["refused"], refused["code"]), (True, REPEATED))
+        worker = self.worker()
+        self.assertEqual((worker["status"], worker["blocker_code"]), ("blocked", REPEATED))
+        override = self.parent(self.run_id)["worker_overrides"][-1]
+        self.assertEqual((override["from_status"], override["from_blocker_code"], override["to_status"],
+                          override["blocker_code"], override["by"], override["reason"]),
+                         ("blocked", code, "blocked", REPEATED, "extension", "retry_gate"))
+        self.assert_valid()
+
+    # --- an unknown HEAD is "no state change" ----------------------------------------------------------------
+
+    def test_an_unknown_head_neither_reopens_a_blocked_step_nor_resets_the_count(self):
+        for _ in range(3):
+            self.fail()
+        self.assertTrue(self.gate()["refused"])
+        again = self.gate(head=None)
+        self.assertEqual((again["refused"], again["code"]), (True, REPEATED))
+        self.assertEqual(self.worker()["blocker_code"], REPEATED, "not reopened")
+        self.assertEqual(self.signatures()[0]["count"], 3)
+        # With no signature at all an unknown HEAD simply lets the start through.
+        self.assertFalse(self.gate(phase="t2", head=None)["refused"])
+
+    def test_an_unknown_head_does_not_reopen_a_prerequisite_blocked_step(self):
+        self.prerequisite("PREREQUISITE_UNMET")
+        for _ in range(2):
+            self.assertEqual(self.gate(head=None)["code"], self.UNCHANGED)
+        self.assertEqual((self.worker()["status"], self.worker()["blocker_code"]), ("blocked", "PREREQUISITE_UNMET"))
 
     # --- run, other tasks, reconciliation, lease -----------------------------------------------------------
 

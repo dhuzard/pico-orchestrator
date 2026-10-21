@@ -130,11 +130,22 @@ All notable changes to PICO are recorded here. The format follows
   BLOCKED (reconciled as usual). A new commit, changed inputs, or a different route epoch is
   a different signature, so the count starts again; a step the refusal blocked is reopened
   as failed when the state changed; a successful retry (#54) clears the step's signatures.
-  A prerequisite blocker never counts toward a loop: a code in
+  A prerequisite blocker is recorded as blocked, not looped on: a code in the closed set
   `{APPROVED_PILOT_INPUTS_UNAVAILABLE, PREREQUISITE_UNMET, MODEL_BACKEND_UNAVAILABLE,
-  MODEL_AUTH_UNAVAILABLE}`, any code ending `_UNAVAILABLE` or `_MISSING_INPUT`, or a worker
-  result with `blocker_kind: prerequisite` blocks the step with its own code, immediately,
-  and is recorded with `kind: prerequisite` for visibility only. The budget is
+  MODEL_AUTH_UNAVAILABLE}`, or a worker result with `blocker_kind: prerequisite` (no naming
+  pattern is trusted, because the code is worker-chosen) blocks the step immediately with its
+  own code and never counts toward `REPEATED_INEFFECTIVE_ACTION`. Such a step cannot be
+  restarted until its HEAD or declared inputs change: the start is refused with
+  `PREREQUISITE_UNCHANGED` (not called a loop; it never blocks the run), and a changed state
+  reopens the step. An unknown HEAD (lookup failed) counts as no state change. For an unbound
+  step (a read-only reviewer) the HEAD is that of the task's bound mutating worktree, else the
+  main checkout. This replaces the original issue's "finish the run BLOCKED" criterion, per
+  the maintainer's refinement: the step is blocked, not the run, so other tasks continue;
+  repeated refused starts are bounded by the lead-call limit (#47) rather than by ending the run.
+  The declared-inputs digest covers pins, upstream readiness and validated commits of a
+  workspace dispatch, not the status of approved input files, and is absent in a single-repo
+  `pico exec`, where only HEAD resets the count (a follow-up could digest the declared input
+  paths). The budget is
   `failure_retry_budget` (0 to 1000; 0 allows no retry): `pico exec start
   --failure-retry-budget N`, a workspace task, a manifest default, or
   `limits.failure_retry_budget` in `.pi/autonomy.yaml` (precedence: CLI/task, manifest,

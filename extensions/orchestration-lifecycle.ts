@@ -668,12 +668,21 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
     }
     failureBudget = { value: DEFAULT_FAILURE_RETRY_BUDGET, source: "default" };
   }
-  /** The checkout HEAD a step runs against (its bound worktree, else the target checkout); null when unresolved. */
+  /**
+   * The HEAD a step's state is measured at: its own bound worktree; for an unbound step (a read-only reviewer) the
+   * task's bound mutating worktree, where the task's real commits land; the target checkout only when the task has
+   * none. Null when it cannot be resolved: the recorder then treats the state as unchanged.
+   */
   async function headOf(taskId: string, stepId: string): Promise<string | null> {
-    const path = workspaces.get(workspaceKey(taskId, stepId)) ?? targetCwd;
+    const own = workspaces.get(workspaceKey(taskId, stepId));
+    const prefix = `${taskId}\u0000`;
+    const taskBound = [...workspaces].find(([key]) => key.startsWith(prefix))?.[1];
+    const path = own ?? taskBound ?? targetCwd;
     if (!path) return null;
     const result = await command(SESSION_SCOPE, [], { operation: "head", path });
-    return result.ok === true && typeof result.head === "string" ? result.head : null;
+    if (result.ok === true && typeof result.head === "string" && /^[0-9a-f]{40,64}$/.test(result.head)) return result.head;
+    diagnose("failure_head", { ok: false, error_code: "FAILURE_HEAD_UNKNOWN", error_category: "HeadUnresolved", run_id: runId });
+    return null;
   }
   /** Digest of the declared inputs' status, set by the launcher; null when the run has none. */
   function inputsDigest(): string | null {
@@ -700,6 +709,11 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
     }
     const gate = result.retry_gate as Json | undefined;
     if (gate?.refused !== true) return undefined;
+    if (gate.code === "PREREQUISITE_UNCHANGED") {
+      return `PREREQUISITE_UNCHANGED: step ${stepId} of task ${taskId} is blocked by the unresolved prerequisite ${String(gate.failure_code)} ` +
+        `and neither the commit nor the declared inputs changed since. It is recorded blocked, not retried. Resolve the prerequisite ` +
+        `(a new commit or changed inputs) or leave the task PARTIAL or BLOCKED; other tasks may continue.`;
+    }
     return `REPEATED_INEFFECTIVE_ACTION: step ${stepId} of task ${taskId} failed ${String(gate.count)} times with ${String(gate.failure_code)} ` +
       `at the same commit and inputs (retry budget ${String(gate.retry_budget)}; signature ${String(gate.signature).slice(0, 12)}). ` +
       `The step is recorded blocked. Change something first (a new commit, different inputs, or escalate the route) or leave the task PARTIAL or BLOCKED; other tasks may continue.`;

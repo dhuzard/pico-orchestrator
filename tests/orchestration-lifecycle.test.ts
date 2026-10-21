@@ -28,14 +28,14 @@ function harness(preflight: Record<string, unknown>, failEvent = false, verifyOk
   const tools = new Map<string, any>();
   const calls: { script: string; args: string[]; input?: Record<string, unknown> }[] = [];
   // Parent checkout state as seen by the fake snapshot operation.
-  const checkout = { digest: "clean", status: [] as string[], head: "a".repeat(40) };
+  const checkout = { digest: "clean", status: [] as string[], head: "a".repeat(40), heads: {} as Record<string, string> };
   let escalated = false;
   const messages: { message: any; options?: any }[] = [];
   const command = async (script: string, args: string[], input?: Record<string, unknown>) => {
     calls.push({ script, args, input });
     if (script.endsWith("run_lease.py")) return options.heartbeatResult ?? { ok: true, state: "live" };
     if (script.endsWith("session_scope.py")) {
-      if (input?.operation === "head") return { ok: true, head: checkout.head };
+      if (input?.operation === "head") return { ok: true, head: checkout.heads[String(input.path)] ?? checkout.head };
       if (input?.operation === "snapshot") return { ok: true, digest: checkout.digest, status: [...checkout.status] };
       if (input?.operation === "worktree") return options.worktreeOk === false
         ? { ok: false, blocker_code: options.worktreeBlocker ?? "WORKER_WORKSPACE_INVALID" }
@@ -2574,6 +2574,13 @@ test("the gate asks with the checkout's HEAD, and a gate that cannot be evaluate
     const heads = h.calls.filter((call) => call.script.endsWith("session_scope.py") && call.input?.operation === "head");
     assert.ok(heads.length >= 1);
   });
+  // An unresolvable HEAD is sent as absent (the recorder treats it as "no state change").
+  await withFailureBudget({}, {}, async (h) => {
+    await h.handlers.get("tool_result")!(routeFor("A"));
+    h.checkout.head = "";
+    await codexStep(h, "r1", "A:codex_reviewer");
+    assert.equal((eventsOfKind(h, "retry_gate")[0] as any).head, undefined);
+  });
   await withFailureBudget({}, { failKind: "retry_gate" }, async (h) => {
     await h.handlers.get("tool_result")!(routeFor("A"));
     assert.equal((await codexStep(h, "r1", "A:codex_reviewer")).guard, undefined);
@@ -2616,5 +2623,35 @@ test("recorded end to end: the real recorder refuses the repeat, a new HEAD is a
     const blocked = gated.parent.phases[0].workers.find((w: any) => w.step_id === "codex_reviewer");
     assert.deepEqual([blocked.status, blocked.blocker_code], ["blocked", "REPEATED_INEFFECTIVE_ACTION"]);
     assert.equal(gated.parent.final_status, "IN_PROGRESS");
+  });
+});
+
+test("an unbound step is measured at the HEAD of the task's bound mutating worktree, not the main checkout", async () => {
+  await withFailureBudget({}, {}, async (h) => {
+    await h.handlers.get("tool_result")!(routeFor("A", { workerMutation: "allowed" }));
+    await h.handlers.get("tool_result")!(routeFor("B"));
+    await h.tools.get("orchestration_record").execute("b", { action: "bind_workspace", task_id: "A",
+      step_id: "claude_worker", path: "/tmp/wt-a" });
+    h.checkout.head = "a".repeat(40);              // the main checkout never moves
+    h.checkout.heads["/tmp/wt-a"] = "d".repeat(40); // the Claude worker committed in its own worktree
+    // A read-only Codex reviewer of task A has no worktree of its own: it follows the task's.
+    await codexStep(h, "r1", "A:codex_reviewer", { fail: true, details: { blocker_code: "TESTS_FAILED" } });
+    // A task with no bound worktree falls back to the main checkout.
+    await codexStep(h, "r2", "B:codex_reviewer", { fail: true, details: { blocker_code: "TESTS_FAILED" } });
+    const heads = Object.fromEntries((eventsOf(h) as any[]).filter((e) => e.kind === "retry_gate" || e.kind === "failure")
+      .map((e) => [`${e.kind}:${e.phase}`, e.head]));
+    assert.deepEqual(heads, { "retry_gate:A": "d".repeat(40), "failure:A": "d".repeat(40),
+      "retry_gate:B": "a".repeat(40), "failure:B": "a".repeat(40) });
+  });
+});
+
+test("a prerequisite refusal reads differently from a loop refusal and also blocks only the call", async () => {
+  const refuse = () => ({ code: "PREREQUISITE_UNCHANGED", failure_code: "MODEL_BACKEND_UNAVAILABLE", count: 1, retry_budget: 2, signature: "f".repeat(64) });
+  await withFailureBudget({}, { gateRefusal: refuse }, async (h) => {
+    await h.handlers.get("tool_result")!(routeFor("A"));
+    const refused = await codexStep(h, "r1", "A:codex_reviewer");
+    assert.match(refused.guard.reason, /^PREREQUISITE_UNCHANGED: step codex_reviewer of task A is blocked by the unresolved prerequisite MODEL_BACKEND_UNAVAILABLE/);
+    assert.doesNotMatch(refused.guard.reason, /REPEATED_INEFFECTIVE_ACTION/);
+    assert.equal((await h.tools.get("orchestration_record").execute("s", { action: "status" })).details.ok, true);
   });
 });

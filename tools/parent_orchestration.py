@@ -529,14 +529,13 @@ FAILURE_BUDGET_SOURCES = ("cli", "task", "manifest", "policy", "default", "env")
 MAX_FAILURE_SIGNATURES = 100
 PREREQUISITE_CODES = frozenset({"APPROVED_PILOT_INPUTS_UNAVAILABLE", "PREREQUISITE_UNMET",
                                 "MODEL_BACKEND_UNAVAILABLE", "MODEL_AUTH_UNAVAILABLE"})
-PREREQUISITE_SUFFIXES = ("_UNAVAILABLE", "_MISSING_INPUT")
+PREREQUISITE_UNCHANGED_CODE = "PREREQUISITE_UNCHANGED"
 
 
 def is_prerequisite(code: str, blocker_kind: str | None = None) -> bool:
-    """A blocker the worker declared a prerequisite (`blocker_kind: prerequisite`), a code in the explicit set,
-    or any code ending in `_UNAVAILABLE` / `_MISSING_INPUT`."""
-    return (blocker_kind == "prerequisite" or code in PREREQUISITE_CODES
-            or code.endswith(PREREQUISITE_SUFFIXES))
+    """A blocker the worker declared a prerequisite (`blocker_kind: prerequisite`) or a code in the closed
+    `PREREQUISITE_CODES` set. Codes are worker-chosen, so no naming pattern is trusted."""
+    return blocker_kind == "prerequisite" or code in PREREQUISITE_CODES
 
 
 def failure_signature_digest(task_id: str, step_id: str, epoch: int, route: str | None, code: str,
@@ -588,6 +587,9 @@ def _block_step(parent: dict, phase: dict, step_id: str, epoch: int, code: str, 
         phase["workers"].append(worker)
     if worker["status"] == "failed":
         _override(parent, phase, worker, epoch, "blocked", code, reason)
+    elif worker["status"] == "blocked" and reason == "repeated_ineffective_action" and worker.get("blocker_code") != code:
+        # Blocked earlier for another reason (a prerequisite): the refusal of the latest start is on the record.
+        _override(parent, phase, worker, epoch, "blocked", code, "retry_gate")
     elif worker["status"] not in {"not_started", "in_progress"}:
         return
     worker["status"] = "blocked"
@@ -639,12 +641,16 @@ def _failure_event(parent: dict, event: dict) -> None:
         entries.remove(victim)
     if prerequisite:
         _block_step(parent, phase, step_id, epoch, code, "prerequisite_blocker")
+        worker = _find_worker(phase, step_id, epoch)
+        entry["blocked"] = bool(worker and worker["status"] == "blocked" and worker.get("blocker_code") == code)
 
 
 def _retry_gate_event(parent: dict, event: dict) -> dict:
-    """Decide, before a worker starts, whether its step's current signature used up the retry budget.
+    """Decide, before a worker starts, whether its step may start again.
 
-    Refused (`refused: true`): some counted signature of this task, step and route epoch, at this very HEAD and
+    Refused with PREREQUISITE_UNCHANGED: the step is blocked by an unresolved prerequisite and neither its HEAD
+    nor its declared inputs changed (a prerequisite is recorded as blocked, not looped on).
+    Refused with REPEATED_INEFFECTIVE_ACTION: some counted signature of this task, step and route epoch, at this very HEAD and
     input digest, failed more than `retry_budget` times (the first failure plus that many retries). The step is
     recorded blocked with REPEATED_INEFFECTIVE_ACTION; the phase, the other tasks and the run are untouched.
     Otherwise a step an earlier refusal blocked is reopened as failed (HEAD or inputs changed) so the start can
@@ -659,19 +665,28 @@ def _retry_gate_event(parent: dict, event: dict) -> dict:
     parent["failure_retry_budget"] = {"retry_budget": budget, "source": source}
     mine = [item for item in parent.get("failure_signatures") or []
             if (item["task_id"], item["step_id"], item["route_epoch"]) == (phase["id"], step_id, epoch)]
-    exhausted = [item for item in mine if item["kind"] == "failure" and item["head"] == head
-                 and item["inputs_digest"] == inputs_digest and item["count"] > budget]
+    # An unknown HEAD (the lookup failed) is "no state change": it matches any recorded HEAD, so it can neither
+    # reset a count nor reopen a blocked step.
+    same_state = [item for item in mine if (head is None or item["head"] == head) and item["inputs_digest"] == inputs_digest]
     worker = _find_worker(phase, step_id, epoch)
+    stuck = [item for item in same_state if item["kind"] == "prerequisite" and item["blocked"]
+             and worker is not None and worker["status"] == "blocked" and worker.get("blocker_code") == item["code"]]
+    if stuck:
+        hit = max(stuck, key=lambda item: item["last_at"])
+        return {"refused": True, "code": PREREQUISITE_UNCHANGED_CODE, "failure_code": hit["code"],
+                "signature": hit["digest"], "count": hit["count"], "retry_budget": budget, "step_id": step_id,
+                "task_id": phase["id"]}
+    exhausted = [item for item in same_state if item["kind"] == "failure" and item["count"] > budget]
     if exhausted:
         hit = max(exhausted, key=lambda item: item["count"])
         hit["blocked"] = True
         _block_step(parent, phase, step_id, epoch, REPEATED_ACTION_CODE, "repeated_ineffective_action")
         return {"refused": True, "code": REPEATED_ACTION_CODE, "failure_code": hit["code"], "signature": hit["digest"],
                 "count": hit["count"], "retry_budget": budget, "step_id": step_id, "task_id": phase["id"]}
-    if worker is not None and worker["status"] == "blocked" and worker.get("blocker_code") == REPEATED_ACTION_CODE:
+    if head is not None and worker is not None and worker["status"] == "blocked":
         blocked = [item for item in mine if item["blocked"]]
-        if blocked:
-            previous = max(blocked, key=lambda item: item["last_at"])
+        previous = max(blocked, key=lambda item: item["last_at"]) if blocked else None
+        if previous is not None and worker.get("blocker_code") in {REPEATED_ACTION_CODE, previous["code"]}:
             _override(parent, phase, worker, epoch, "failed", previous["code"], "state_changed")
             worker["status"] = "failed"
             worker["blocker_code"] = previous["code"]

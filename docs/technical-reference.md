@@ -1948,12 +1948,18 @@ failure without any change of state. It is deterministic and reads only structur
 *Signature.* `failure_signature_digest` is the SHA-256 of (task id, step id, route epoch, route,
 failure code, checkout HEAD, inputs digest). The code is the worker result's `blocker_code`
 (ClaudeWorker and Codex `spawn_subagent`), else `WORKER_FAILED`; an abort (`ABORTED`) is not a
-failure. HEAD is the bound worktree's (else the target checkout's), read with
-`session_scope.py` `{"operation":"head"}` after the worker returned, so a worker that committed
-and then failed is at its new HEAD. The inputs digest is `PI_ORCHESTRATION_INPUTS_DIGEST`, which
-`workspace_run.launch` sets to the SHA-256 of `dispatch_inputs` as they stand at launch (the
-repository pin and each upstream task's pin, readiness, validated commit and contracts); absent
-outside a workspace launch. The extension sends `failure` events (written only by the extension:
+failure. HEAD is the step's own bound worktree's; for an unbound step (a read-only reviewer) it is
+the HEAD of the task's bound mutating worktree, where the task's real commits land; the main
+checkout only when the task has none. It is read with `session_scope.py` `{"operation":"head"}`
+after the worker returned, so a worker that committed and then failed is at its new HEAD. A HEAD
+that cannot be read is diagnosed and sent as absent: the recorder treats it as no state change (it
+matches any recorded HEAD, so it neither resets a count nor reopens a blocked step); with no
+signature recorded yet the start is simply allowed. The inputs digest is
+`PI_ORCHESTRATION_INPUTS_DIGEST`, which `workspace_run.launch` sets to the SHA-256 of
+`dispatch_inputs` as they stand at launch: the repository pin and each upstream task's pin,
+readiness, validated commit and contracts. It does **not** cover the status of approved input
+files, and it is absent in a single-repo `pico exec` (and outside a workspace launch), where only
+HEAD resets the count. A follow-up could digest the declared input paths. The extension sends `failure` events (written only by the extension:
 the lead's `orchestration_record` schema does not accept them) and the recorder keeps
 `parent_orchestration.failure_signatures`: `digest`, `kind`, the fields above, `count`,
 `first_at`, `last_at`, `blocked`. The list holds at most 100 entries (the oldest unblocked one is
@@ -1979,13 +1985,27 @@ override) clears the step's signatures for that epoch. The gate runs as the leas
 recorder write, so a non-owner cannot record failures or reopen a step.
 
 *Prerequisites.* A blocker is a prerequisite when the worker result carries `blocker_kind:
-prerequisite`, its code is in `PREREQUISITE_CODES` (`APPROVED_PILOT_INPUTS_UNAVAILABLE`,
-`PREREQUISITE_UNMET`, `MODEL_BACKEND_UNAVAILABLE`, `MODEL_AUTH_UNAVAILABLE`), or it ends in
-`_UNAVAILABLE` or `_MISSING_INPUT`. Such a failure blocks the step immediately with its own code,
-is recorded as a `prerequisite` signature (its count only shows how often the prerequisite was
-hit) and is never considered by the gate, however often it repeats and even with a budget of 0.
-Scientific validation can therefore keep reporting an unresolved approved input as a blocked step
-without being stopped as a loop.
+prerequisite`, or its code is in the closed set `PREREQUISITE_CODES`
+(`APPROVED_PILOT_INPUTS_UNAVAILABLE`, `PREREQUISITE_UNMET`, `MODEL_BACKEND_UNAVAILABLE`,
+`MODEL_AUTH_UNAVAILABLE`). No naming pattern (such as a `_UNAVAILABLE` suffix) is trusted: the code
+is worker-chosen, so a pattern would let any loop escape detection. Such a failure blocks the step
+immediately with its own code and is recorded as a `prerequisite` signature (`blocked: true`); it
+never counts toward `REPEATED_INEFFECTIVE_ACTION`, even with a budget of 0. A prerequisite is
+recorded as blocked, not looped on: while the step stands blocked by it and neither HEAD nor the
+inputs digest changed, the gate refuses another start with `PREREQUISITE_UNCHANGED` (distinct
+from the loop code, never `parentBlocked`; the refused start is not a new failure). A changed HEAD
+or digest reopens the step as `failed` with its prerequisite code (`reason: state_changed`) so the
+start is a normal retry. If a step blocked by a prerequisite later exhausts a loop signature at a
+changed state, the new refusal replaces the recorded code and is written to `worker_overrides`
+(`by: extension`, `reason: retry_gate`, `from_blocker_code` the prerequisite), so the record shows
+why the latest start was refused. Scientific validation can therefore report an unresolved approved
+input as a blocked step without being stopped as a loop and without being restarted blindly.
+
+*Step, not run.* The maintainer's refinement blocks the step, not the run, which replaces the
+original issue's "repeating it after the block finishes the run `BLOCKED`" criterion: a refusal
+must leave other tasks running, so it cannot end the run. Repeated refused starts of the same step
+are bounded by the lead-call limit (#47) and the wall-clock limit rather than by a run outcome;
+the lead is told at every refusal and can finish PARTIAL or BLOCKED itself.
 
 *Configuration.* `failure_retry_budget`, an integer from 0 to 1000 (`FAILURE_RETRY_BUDGET_INVALID`
 otherwise; 0 means no retry): `pico exec start --failure-retry-budget N` (source `cli`) or the
