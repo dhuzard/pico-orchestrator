@@ -617,7 +617,7 @@ function renderControls() {
     }
     box.append(title);
     if (repo.error_code) { box.append(el("small", "", repo.error_code)); list.append(box); continue; }
-    box.append(el("small", "", `${repo.source} · profile ${repo.profile || "—"} · PRs per ${repo.pr_granularity || "—"} · base ${repo.base_branch}`));
+    box.append(el("small", "", `${repo.source} · profile ${repo.profile || "—"} · PRs per ${repo.pr_granularity || "—"} · issues ${repo.issue_reference === "closes" ? "closed on merge" : "referenced (Refs)"} · base ${repo.base_branch}`));
     const flags = el("div", "perm-flags");
     const editable = new Set(controlState.enabled ? panels.editable_permissions || [] : []);
     for (const [name, on] of Object.entries(repo.permissions)) {

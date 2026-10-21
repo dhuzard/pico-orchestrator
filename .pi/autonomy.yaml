@@ -1,0 +1,36 @@
+# PICO's own execution authority policy, read when PICO orchestrates work in
+# this repository. Every permission stays off, as when this file did not exist;
+# grant one deliberately (for example from the Garden) when it is needed.
+profile: manual
+
+pr_granularity: batch
+
+# PICO's own PRs close the issue they resolve when they merge. Write `Refs #N`
+# by hand for a PR that only partly addresses an issue.
+issue_reference: closes
+
+permissions:
+  create_backlog_items: false
+  create_github_issues: false
+  create_worktrees: false
+  commit: false
+  push_branch: false
+  create_pr: false
+  comment_on_issue: false
+  comment_on_pr: false
+  mark_pr_ready: false
+
+  merge:
+    enabled: false
+    max_failure_cost: medium
+    require_ci: true
+    require_review_if_policy_demands: true
+
+  deploy: false
+
+limits:
+  parallel_tasks: 3
+  open_prs: 2
+  nested_agents_per_task: 4
+  repair_attempts: 2
+  replans: 3

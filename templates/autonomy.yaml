@@ -9,6 +9,11 @@ profile: guarded
 # one PR (when push_branch and create_pr allow it). task: one PR per task.
 pr_granularity: batch
 
+# refs: PR bodies reference their issue with `Refs #N`, which never closes it
+# (the safe default when a PR may only partly address an issue). closes: PR
+# bodies use `Closes #N`, so GitHub closes the issue when the PR merges.
+issue_reference: refs
+
 permissions:
   create_backlog_items: true
   create_github_issues: true

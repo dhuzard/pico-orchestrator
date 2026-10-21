@@ -26,6 +26,16 @@ Safety properties, all enforced here:
     owner/repo or the exact `{owner}/{repo}` gh placeholders, then one or two
     unique raw-string (`-f`, never typed `-F`) title/body fields in that
     order. Any other `gh api` argv fails before a subprocess is started.
+  - Two read-only `gh api -X GET` shapes serve the publication gate, which
+    must read the base branch and its issue policy from GitHub rather than
+    through local git (whose config every worktree shares):
+      gh api -X GET repos/<owner>/<repo>/git/ref/heads/<branch> --hostname github.com
+      gh api -X GET repos/<owner>/<repo>/contents/.pi/autonomy.yaml?ref=<sha> --hostname github.com
+    Both pin `--hostname github.com` and run without `GH_HOST`, so the
+    environment cannot redirect them to another host.
+    The branch is limited to `[A-Za-z0-9._-]` segments that start with a
+    letter or digit, separated by `/`
+    (no `..`), the ref to a full hex commit SHA, and nothing may follow.
   - No secrets/tokens are read, stored, or logged by this module. Whatever
     `gh` itself resolves from its own auth configuration is used implicitly
     by the `gh` binary; this module never inspects or forwards a token.
@@ -38,7 +48,10 @@ reconciling the result with local state) lives in tools/backlog.py.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -157,13 +170,106 @@ def _validate_pr_patch_argv(argv: list[str]) -> None:
         seen.append(key)
 
 
+_OWNER_REPO = r"([A-Za-z0-9][A-Za-z0-9_.-]*)/([A-Za-z0-9][A-Za-z0-9_.-]*)"
+_BRANCH = r"[A-Za-z0-9][A-Za-z0-9._-]*(?:/[A-Za-z0-9][A-Za-z0-9._-]*)*"
+_GET_BRANCH_RE = re.compile(rf"repos/{_OWNER_REPO}/git/ref/heads/({_BRANCH})")
+_GET_POLICY_RE = re.compile(rf"repos/{_OWNER_REPO}/contents/\.pi/autonomy\.yaml\?ref=([0-9a-f]{{40,64}})")
+POLICY_PATH = ".pi/autonomy.yaml"
+GITHUB_HOSTNAME = "github.com"
+
+
+def _validate_get_argv(argv: list[str]) -> None:
+    """Accept only `gh api -X GET <branch ref | policy contents endpoint> --hostname github.com`."""
+    def reject(reason: str) -> None:
+        raise GithubSyncError(f"internal error: gh api argv rejected ({reason}): {argv!r}")
+
+    if len(argv) != 7 or not all(isinstance(arg, str) for arg in argv):
+        reject("unexpected length")
+    if argv[5:] != ["--hostname", GITHUB_HOSTNAME]:
+        reject("the host must be pinned with --hostname github.com")
+    match = _GET_BRANCH_RE.fullmatch(argv[4]) or _GET_POLICY_RE.fullmatch(argv[4])
+    if not match:
+        reject("endpoint must be a branch ref or the .pi/autonomy.yaml contents at a commit")
+    try:
+        validate_repo(f"{match.group(1)}/{match.group(2)}")
+    except ValueError:
+        reject("invalid owner/repo")
+    if ".." in match.group(3):
+        reject("invalid branch")
+
+
+def validate_branch(branch: str) -> str:
+    if not isinstance(branch, str) or not re.fullmatch(_BRANCH, branch) or ".." in branch:
+        raise ValueError(f"branch must be [A-Za-z0-9._-] segments separated by '/', got {branch!r}")
+    return branch
+
+
+def _get_or_none(argv: list[str], context: str) -> Any:
+    """Run a fixed GET; None on HTTP 404, parsed JSON otherwise."""
+    env = {name: value for name, value in os.environ.items() if name != "GH_HOST"}
+    proc = _run(argv, env=env)
+    if proc.returncode != 0 and "HTTP 404" in (proc.stderr or ""):
+        return None
+    _require_success(proc, argv)
+    return _parse_json(proc, context)
+
+
+def branch_head(branch: str, *, repo: str) -> str | None:
+    """The commit SHA `branch` points to on GitHub, or None when the branch does not exist."""
+    validate_branch(branch)
+    argv = [GH_BINARY, "api", "-X", "GET", f"repos/{validate_repo(repo)}/git/ref/heads/{branch}",
+            "--hostname", GITHUB_HOSTNAME]
+    data = _get_or_none(argv, "gh api git/ref")
+    if data is None:
+        return None
+    if not isinstance(data, dict) or data.get("ref") != f"refs/heads/{branch}" \
+            or not isinstance(data.get("object"), dict) or data["object"].get("type") != "commit" \
+            or not isinstance(data["object"].get("sha"), str) \
+            or not re.fullmatch(r"[0-9a-f]{40,64}", data["object"]["sha"]):
+        raise GhOutputError("gh api git/ref: unexpected branch reference shape")
+    return data["object"]["sha"]
+
+
+def policy_file_at(commit: str, *, repo: str) -> dict | None:
+    """`.pi/autonomy.yaml` at an exact commit on GitHub, or None when it does not exist there.
+
+    Returns {"type", "path", "sha", "text"}: `type` is GitHub's content type
+    (`file`, `symlink`, `dir`, `submodule`); `text` is the decoded file for a
+    base64-encoded `file` and None otherwise. GitHub answers a symlink to a
+    file inside the repository with that file, so `path` says what was read.
+    """
+    if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40,64}", commit):
+        raise ValueError(f"commit must be a hex SHA, got {commit!r}")
+    argv = [GH_BINARY, "api", "-X", "GET", f"repos/{validate_repo(repo)}/contents/{POLICY_PATH}?ref={commit}",
+            "--hostname", GITHUB_HOSTNAME]
+    data = _get_or_none(argv, "gh api contents")
+    if data is None:
+        return None
+    if isinstance(data, list):
+        return {"type": "dir", "path": POLICY_PATH, "sha": None, "text": None}
+    if not isinstance(data, dict) or data.get("type") not in {"file", "symlink", "dir", "submodule"} \
+            or not isinstance(data.get("path"), str) or not isinstance(data.get("sha"), str) \
+            or not re.fullmatch(r"[0-9a-f]{40,64}", data["sha"]):
+        raise GhOutputError("gh api contents: unexpected content shape")
+    text = None
+    if data["type"] == "file" and data.get("encoding") == "base64" and isinstance(data.get("content"), str):
+        try:
+            text = base64.b64decode(data["content"], validate=False).decode("utf-8")
+        except (binascii.Error, UnicodeDecodeError) as exc:
+            raise GhOutputError("gh api contents: content is not base64 UTF-8") from exc
+    return {"type": data["type"], "path": data["path"], "sha": data["sha"], "text": text}
+
+
 def _validate_allowlisted(argv: list[str]) -> None:
     if not argv or argv[0] != GH_BINARY:
         raise GithubSyncError(f"internal error: argv must start with {GH_BINARY!r}, got {argv!r}")
     if len(argv) < 3:
         raise GithubSyncError(f"internal error: argv too short to contain a noun/verb pair: {argv!r}")
     if argv[1] == "api":
-        _validate_pr_patch_argv(argv)
+        if len(argv) > 3 and argv[2:4] == ["-X", "GET"]:
+            _validate_get_argv(argv)
+        else:
+            _validate_pr_patch_argv(argv)
         return
     pair = (argv[1], argv[2])
     if pair not in ALLOWED_COMMANDS:
@@ -172,7 +278,8 @@ def _validate_allowlisted(argv: list[str]) -> None:
         )
 
 
-def _run(argv: list[str], *, timeout: int = DEFAULT_TIMEOUT_SECONDS, cwd: str | None = None) -> subprocess.CompletedProcess:
+def _run(argv: list[str], *, timeout: int = DEFAULT_TIMEOUT_SECONDS, cwd: str | None = None,
+         env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
     """The single point every `gh` invocation passes through. Always
     `shell=False`, always argv-only, always allowlist-checked."""
     _validate_allowlisted(argv)
@@ -186,6 +293,7 @@ def _run(argv: list[str], *, timeout: int = DEFAULT_TIMEOUT_SECONDS, cwd: str | 
             text=True,
             timeout=timeout,
             cwd=cwd,
+            env=env,
         )
     except FileNotFoundError as exc:
         raise GhUnavailableError("the 'gh' CLI is not installed or not on PATH") from exc
