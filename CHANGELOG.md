@@ -16,9 +16,18 @@ All notable changes to PICO are recorded here. The format follows
 - A newcomer path at the top of the README: what PICO and Pi are, a diagram,
   prerequisites, a documentation index, and links to the contributing,
   security and conduct files.
+- Pico Garden has a read-only **Open issues** panel backed by `GET
+  /api/issues`. It lists up to 50 open issues per repository (every manifest
+  repository in workspace mode), with linked local `pico/issue-<n>` branches
+  and closing PRs. Identity resolution fails closed, a missing,
+  unauthenticated or rate-limited `gh` is shown explicitly, and results are
+  cached for 60 seconds.
 
 ### Security
 
+- With `pico watch --controls`, `/api/runs`, `/api/workspace` and
+  `/api/issues` now need the session token too (audit S4). The viewer sends
+  it on every poll.
 - Claude workers receive an allowlisted environment instead of the parent's
   full environment. GitHub, SSH-agent and npm credentials are withheld unless
   named in `PI_ORCHESTRATOR_WORKER_ENV_ALLOW`, and the worker result records the

@@ -6,6 +6,7 @@
   <meta name="theme-color" content="#f8f7f3">
   <title>Pico Garden · live orchestration</title>
   <link rel="stylesheet" href="/style.css">
+  <script src="/issues.js" defer></script>
   <script src="/app.js" defer></script>
 </head>
 <body>
@@ -80,6 +81,7 @@
         </aside>
       </div>
       </div>
+      <section id="issues-panel" class="panel issues-panel" aria-labelledby="issues-title" hidden><div class="section-heading"><div><p class="eyebrow">WAITING WORK</p><h2 id="issues-title">Open issues</h2></div><span id="issues-state" class="soft-count">read-only</span></div><div id="issues-list" class="issues-body"><p class="empty">Reading the repository's open issues…</p></div><p class="detail-note">Read from GitHub through gh, refreshed at most once a minute. A branch or PR is linked when its name has an issue-&lt;n&gt; token or its body closes the issue.</p></section>
       <footer><span>✿ Pico Garden</span><span id="footer-mode">Local, read-only · refreshes every 2 seconds</span></footer>
     </main>
   </div>

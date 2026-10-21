@@ -62,7 +62,7 @@ together with `main` after #18, #19 and #20.
 | Q10 lint | Fixed. `ruff` (E9, F, B) runs in CI, and all 17 findings are fixed (one intentional `noqa` with its reason). |
 | S6 action pinning | Fixed. Actions are pinned to SHAs, each checked against its upstream tag, with `persist-credentials: false`. CodeQL and Dependabot are added. Neither has run on GitHub yet. |
 | S3 Garden symlink write | Fixed. Symlinked `.pi` and `autonomy.yaml` are refused with `AUTONOMY_POLICY_PATH_UNSAFE`. Writes go through the shared atomic writer. Regression tests reproduce the attack. |
-| S4 token on reads | Partly fixed. `/api/controls` and `/api/branches` need the token when controls are on. `/api/runs` and `/api/workspace` are still open; the viewer would have to send the token on every poll. |
+| S4 token on reads | Fixed as the finding scoped it (#33). With `--controls` on, `/api/controls`, `/api/branches`, `/api/runs`, `/api/workspace` and the new `/api/issues` need the token, and the viewer sends it on every poll. The static page, script and stylesheet stay open, because the token reaches the page only in the URL fragment. Without `--controls` no endpoint needs a token, so a plain `pico watch` on a shared host still serves run metadata, and now open issue titles, to any local user. |
 | S5 Content-Length | Fixed. A malformed value returns 400 `CONTROL_BODY_INVALID`. |
 | Q2 headless lock | Fixed. Locks are held across start, status and cancel. A concurrency regression test fails without the lock. |
 | Q3 atomic writes | Fixed for the five fixed-temp-name writers. The four `mkstemp` writers are unchanged; they lack `fsync` but are otherwise safe. |

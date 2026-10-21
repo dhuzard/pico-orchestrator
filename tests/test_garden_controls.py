@@ -104,9 +104,16 @@ class GardenControlsTest(unittest.TestCase):
         self.assertEqual((status, data["enabled"]), (200, True))
         status, data = self.request("GET", "/api/branches?task=a1")
         self.assertEqual(status, 200)
-        # The plain read-only views are unchanged.
-        status, _ = self.request("GET", "/api/workspace", token=None)
+        # With controls on, the polled views need the token too (audit S4).
+        for path in ("/api/workspace", "/api/runs", "/api/issues"):
+            status, data = self.request("GET", path, token=None)
+            self.assertEqual((status, data["error_code"]), (403, "CONTROL_TOKEN_INVALID"), path)
+            self.assertNotIn("runs", data)
+            self.assertNotIn("repositories", data)
+        status, _ = self.request("GET", "/api/workspace")
         self.assertEqual(status, 200)
+        status, data = self.request("GET", "/api/runs")
+        self.assertEqual((status, data["workspace"]), (200, "ws"))
 
     def raw_post(self, content_length):
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
