@@ -641,6 +641,7 @@ process.stdin.on("end", () => {
     total_cost_usd: 0.0125, duration_ms: 7, session_id: "fake-session",
     permission_denials: prompt.includes("DENY") ? [{ tool_name: "Write", tool_use_id: "t1",
       tool_input: { file_path: path.join(process.cwd(), "CHANGELOG.md"), content: "x" } }] : [] }));
+  if (prompt.includes("FAIL")) { process.stdout.write(JSON.stringify({ type: "result", subtype: "error", is_error: true, result: "boom" })); process.exit(1); }
   if (prompt.includes("HANG")) { fs.writeFileSync(path.join(${JSON.stringify(dir)}, "hang.pid"), String(process.pid)); setInterval(() => {}, 1000); return; }
   const barrier = process.env.FAKE_CLAUDE_BARRIER;
   if (!barrier) return reply();
@@ -947,6 +948,31 @@ test("a read-only ClaudeWorker step runs read tools in the target checkout", asy
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+test("a ClaudeWorker result records the worker's terminal status without the lead", async () => {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "pico-claude-terminal-")));
+  const workspace = join(dir, "wt");
+  mkdirSync(workspace);
+  try {
+    const h = harness({ ok: true, status: "READY" }, false, true, { executable: fakeClaude(dir) });
+    await h.handlers.get("before_agent_start")!({ prompt: "PI_ORCHESTRATION_RUN_V1" }, { cwd: dir, ui: { notify() {} } });
+    await h.handlers.get("tool_result")!(routeFor("A", { workerMutation: "allowed" }));
+    await h.tools.get("orchestration_record").execute("b", { action: "bind_workspace", task_id: "A",
+      step_id: "claude_worker", path: workspace });
+    const terminal = () => h.parentCalls("event").map((call) => call.input!)
+      .filter((input) => input.kind === "worker" && ["completed", "failed", "blocked"].includes(String(input.status)));
+    const ok = await claudeWorkerRun(h, "ok", { prompt: "[pico-task A:claude_worker] go" });
+    assert.equal(ok.result!.isError, false);
+    assert.deepEqual(terminal(), [{ kind: "worker", phase: "A", step_id: "claude_worker", status: "completed" }]);
+    const bad = await claudeWorkerRun(h, "bad", { prompt: "[pico-task A:claude_worker] FAIL" });
+    assert.equal(bad.result!.isError, true);
+    const failed = terminal().at(-1)!;
+    assert.deepEqual([failed.phase, failed.step_id, failed.status], ["A", "claude_worker", "failed"]);
+    assert.match(String(failed.blocker_code), /^[A-Z][A-Z0-9_]{0,99}$/);
+    // Every write carries the lease owner.
+    assert.ok(h.parentCalls("event").every((call) => call.args.includes("--owner")));
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test("aborting a ClaudeWorker call kills its Claude Code process", async () => {
   const dir = realpathSync(mkdtempSync(join(tmpdir(), "pico-claude-abort-")));
   const workspace = join(dir, "wt");
@@ -968,6 +994,8 @@ test("aborting a ClaudeWorker call kills its Claude Code process", async () => {
     assert.equal(result.details.error, "ABORTED");
     assert.match(result.content.at(-1).text, /Orchestration blocker: WORKER_ABORTED/);
     assert.equal(after, undefined);
+    const aborted = h.parentCalls("event").map((call) => call.input!).filter((input) => input.kind === "worker").at(-1)!;
+    assert.deepEqual([aborted.status, aborted.blocker_code], ["blocked", "WORKER_ABORTED"]);
     assert.throws(() => process.kill(pid, 0), "the Claude Code child is gone");
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });

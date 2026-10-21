@@ -136,7 +136,7 @@ function renderActivity(run) {
     copy.append(el("small", "", `${at}${item.subagent_id ? ` · ${item.subagent_id}` : ""}`)); row.append(icon, copy); list.append(row);
   }
 }
-const normalizedStatus = (value) => ({ in_progress: "active", completed: "completed", partial: "blocked", blocked: "blocked", failed: "failed", not_started: "waiting" })[String(value || "").toLowerCase()] || "waiting";
+const normalizedStatus = (value) => ({ in_progress: "active", completed: "completed", partial: "blocked", interrupted: "blocked", blocked: "blocked", failed: "failed", not_started: "waiting" })[String(value || "").toLowerCase()] || "waiting";
 const timeLabel = (value) => value ? new Date(value).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "Time unknown";
 
 function agentNodes(run) {

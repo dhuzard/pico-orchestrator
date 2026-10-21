@@ -334,7 +334,7 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
   // toolCallId -> parent checkout snapshot taken before a worker call.
   const snapshots = new Map<string, { digest: string; status: string[] }>();
   // toolCallId -> worker call currently running.
-  const inFlight = new Map<string, { taskId: string | null; stepId: string | null; tool: string }>();
+  const inFlight = new Map<string, { taskId: string | null; stepId: string | null; tool: string; phase?: string }>();
   // toolCallId -> ClaudeWorker run the guard resolved; consumed by the tool's execute.
   const workerPlans = new Map<string, WorkerPlan>();
   let scopeViolation: string | null = null;
@@ -871,13 +871,14 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
       }
       snapshots.set(call.toolCallId, before);
       if (inFlight.size === 0) batchStart = Date.now();
-      inFlight.set(call.toolCallId, { taskId, stepId: step?.id ?? null, tool: call.toolName });
+      inFlight.set(call.toolCallId, { taskId, stepId: step?.id ?? null, tool: call.toolName,
+        phase: workerPlans.get(call.toolCallId)?.phase });
       if (runId) await observe({ kind: "activity", status: "started", tool: call.toolName,
         task_id: taskId, step_id: step?.id ?? null });
       batchPeak = Math.max(batchPeak, inFlight.size);
       workerStarts.set(call.toolCallId, Date.now());
       const plan = workerPlans.get(call.toolCallId);
-      // Observational: the parent still records the worker's terminal status itself.
+      // Observational: the lead may record the worker itself; the tool_result handler records its terminal status.
       if (plan) await observe({ kind: "worker", phase: plan.phase, step_id: plan.stepId, status: "in_progress",
         model: plan.canonical, backend: "claude-code", backend_model: plan.backendModel, reasoning_effort: plan.effort });
     }
@@ -955,6 +956,15 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
             cached_tokens: count(usage.cached_tokens), total_tokens: count(usage.total_tokens),
             ...(count(usage.cache_write_tokens) === null ? {} : { cache_write_tokens: count(usage.cache_write_tokens) }),
             ...(typeof cost === "number" && Number.isFinite(cost) && cost >= 0 ? { estimated_cost_usd: cost } : {}) });
+          // The worker's own terminal status, so a lead that never records it leaves nothing in_progress.
+          // An abort (lease loss, user stop) is blocked; any other failure is failed. A repeat of the same
+          // terminal status is idempotent in the parent; a conflicting one is refused there and only diagnosed.
+          if (worker?.phase && worker.stepId) {
+            const code = typeof details.blocker_code === "string" ? details.blocker_code : "WORKER_FAILED";
+            await observe({ kind: "worker", phase: worker.phase, step_id: worker.stepId,
+              ...(result.isError ? { status: details.error === "ABORTED" ? "blocked" : "failed", blocker_code: code }
+                                 : { status: "completed" }) });
+          }
         }
       } else {
         if (result.toolName === "spawn_subagent" && typeof details.subagent_id === "string" && !result.isError) {
@@ -1286,7 +1296,8 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
       return { content: [{ type: "text" as const, text: notes.filter(Boolean).join("\n\n") }], isError: !outcome.ok,
         details: { ok: outcome.ok, task_id: plan.taskId, step_id: plan.stepId, mode: plan.mode, cwd: plan.cwd,
           model: plan.canonical, backend: "claude-code", backend_model: plan.backendModel,
-          reasoning_effort: plan.effort, exit_code: outcome.exitCode, error: outcome.error, usage: outcome.usage,
+          reasoning_effort: plan.effort, exit_code: outcome.exitCode, error: outcome.error,
+          blocker_code: outcome.ok ? null : workerBlocker(outcome), usage: outcome.usage,
           duration_ms: outcome.durationMs, elapsed_ms: outcome.elapsedMs, session_id: outcome.sessionId,
           permission_denials: outcome.permissionDenials, denied_calls: outcome.deniedCalls,
           // Names only, never values, of parent environment variables withheld from the worker.

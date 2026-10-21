@@ -63,6 +63,24 @@
             "null"
           ]
         },
+        "reconciled": {
+          "type": "array",
+          "description": "Phases and workers that were still open when the run ended without COMPLETED. Each is set to interrupted; from_status keeps what was recorded. Absent on records that ended with nothing open.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "phase_id", "from_status", "to", "reason", "at"],
+            "properties": {
+              "kind": {"enum": ["phase", "worker"]},
+              "phase_id": {"type": "string"},
+              "step_id": {"type": "string"},
+              "from_status": {"enum": ["not_started", "in_progress"]},
+              "to": {"const": "interrupted"},
+              "reason": {"type": "string", "maxLength": 120},
+              "at": {"type": "string"}
+            }
+          }
+        },
         "mutations": {
           "type": "object",
           "additionalProperties": false,
@@ -107,7 +125,8 @@
                   "completed",
                   "blocked",
                   "failed",
-                  "partial"
+                  "partial",
+                  "interrupted"
                 ]
               },
               "route": {
@@ -414,7 +433,8 @@
                         "in_progress",
                         "completed",
                         "blocked",
-                        "failed"
+                        "failed",
+                        "interrupted"
                       ]
                     },
                     "blocker_code": {

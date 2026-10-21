@@ -28,8 +28,11 @@ import routing_engine as engine
 import run_lease
 
 STATUSES = {"COMPLETED", "BLOCKED", "FAILED", "PARTIAL"}
+# "interrupted" is written only by `_reconcile_open` when a run ends without a COMPLETED outcome;
+# it is never accepted from an event.
 PHASE_STATUSES = {"not_started", "in_progress", "completed", "blocked", "failed", "partial"}
 WORKER_STATUSES = {"not_started", "in_progress", "completed", "blocked", "failed"}
+RECONCILED_STATUS = "interrupted"
 ROUTES = {"CODEX", "CLAUDE", "CLAUDE_CODEX", "CODEX_CLAUDE_CODEX"}
 ESCALATION_TARGETS = {
     "CODEX": {"CLAUDE_CODEX", "CODEX_CLAUDE_CODEX"},
@@ -812,11 +815,40 @@ def _finish_unlocked(run_id: str, status: str, *, blocker_code: str | None = Non
             raise ParentRunError("mandatory independent review not completed for phase " + ", ".join(missing[:12]) +
                                  ". Run and record the review, or finish as PARTIAL",
                                  error_code="PARENT_REVIEW_MISSING")
+    else:
+        _reconcile_open(parent, status)
     parent["final_status"] = status
     parent["blocker_code"] = _safe(blocker_code, CODE_RE, "blocker code")
     return provenance.finish_run(repo_root, run_id, outcome=status.lower(),
                                  parent_orchestration=parent,
                                  orchestration_metrics=delegation_metrics(record, parent))
+
+
+def _reconcile_open(parent: dict, status: str) -> None:
+    """A run that ends without COMPLETED leaves no phase or worker open.
+
+    Each phase or worker still not_started or in_progress becomes `interrupted`, and the
+    transition is appended to `parent.reconciled` with its prior status. Events, activity
+    and every other field stay as recorded. A reconciled item is no longer open, so a
+    repeated call adds nothing.
+    """
+    open_states = {"not_started", "in_progress"}
+    at = _now()
+    reason = f"run finished {status}"
+    entries = parent.setdefault("reconciled", [])
+    for phase in parent["phases"]:
+        if phase["status"] in open_states:
+            entries.append({"kind": "phase", "phase_id": phase["id"], "from_status": phase["status"],
+                            "to": RECONCILED_STATUS, "reason": reason, "at": at})
+            phase["status"] = RECONCILED_STATUS
+        for worker in phase["workers"]:
+            if worker["status"] in open_states:
+                entries.append({"kind": "worker", "phase_id": phase["id"], "step_id": worker["step_id"],
+                                "from_status": worker["status"], "to": RECONCILED_STATUS,
+                                "reason": reason, "at": at})
+                worker["status"] = RECONCILED_STATUS
+    if not entries:
+        del parent["reconciled"]
 
 
 def settle(run_id: str, *, owner_id: str | None = None, repo_root: Path = ROOT) -> dict:
