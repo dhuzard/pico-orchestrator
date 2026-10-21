@@ -285,6 +285,36 @@ class ContractLifecycleTest(unittest.TestCase):
             wc.validate(manifest=manifest, task_id="a1", head="pico/a1")
         self.assertEqual(ctx.exception.code, "WORKSPACE_HEAD_UNRELATED")
 
+    def test_issue_reference_defaults_to_refs_and_closes_on_opt_in(self):
+        def body_after_dry_run(manifest):
+            preview = wc.publish(manifest=manifest, task_id="a1", adapter=self.fake)
+            self.assertEqual(preview["status"], "DRY_RUN", preview)
+            plan = wr._plan(manifest, access_check=None)
+            return (wc._scratch(plan, "a1") / "pr-body.md").read_text(encoding="utf-8"), preview
+
+        manifest = self.manifest()
+        self.schedule(manifest)
+        self.work("alpha", "pico/a1", "claims.json")
+        self.assertEqual(wc.validate(manifest=manifest, task_id="a1", head="pico/a1")["status"], "VALIDATED")
+        self.allow_publication("alpha")
+        body, preview = body_after_dry_run(manifest)
+        self.assertTrue(body.startswith("Refs #7\n"), body)
+        self.assertEqual(preview["plan"]["issue_reference"], "refs")
+
+        # The per-task opt-in writes Closes and authorizes it at the gate, though the repository says refs.
+        body, preview = body_after_dry_run(self.manifest(a1={"closes_issue": True}))
+        self.assertTrue(body.startswith("Closes #7\n"), body)
+        self.assertEqual(preview["plan"]["issue_reference"], "closes")
+        applied = self.publish(self.manifest(a1={"closes_issue": True}), "a1")
+        self.assertEqual(applied["status"], "COMPLETED", applied)
+        self.assertTrue(self.fake.created[0]["body"].startswith("Closes #7\n"))
+
+        # Without a task setting, the repository's issue_reference decides; closes_issue: false keeps Refs.
+        policy = self.repos["alpha"][0] / ".pi/autonomy.yaml"
+        policy.write_text(policy.read_text().replace("issue_reference: refs", "issue_reference: closes"))
+        self.assertTrue(body_after_dry_run(self.manifest())[0].startswith("Closes #7\n"))
+        self.assertTrue(body_after_dry_run(self.manifest(a1={"closes_issue": False}))[0].startswith("Refs #7\n"))
+
     def test_downstream_publication_requires_upstream_pr(self):
         # The manifest may declare a1 ready by hand; b1's PR must still link a real upstream PR.
         manifest = self.manifest(a1={"readiness": "ready_for_downstream"})
