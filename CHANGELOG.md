@@ -6,7 +6,28 @@ All notable changes to PICO are recorded here. The format follows
 
 ## [Unreleased]
 
+### Security
+
+- Publication permissions come from the remote base policy (issue #39).
+  `github_integration.publish` took `push_branch` and `create_pr` from the checkout's own
+  `.pi/autonomy.yaml`, which a worker can edit, commit on its `pico/` branch (it reaches the
+  integrated branch on integration) or symlink. It now uses the single API-read policy at the
+  verified GitHub base commit that already decides `issue_reference`; the working tree is never
+  an authority.
+
 ### Changed
+
+- Behavior change: a local-only permission edit no longer authorizes publication. Uncommitted,
+  locally committed or `pico/`-branch changes to `.pi/autonomy.yaml` are ignored for
+  `push_branch`/`create_pr`; the policy must be committed and pushed to the base branch on
+  GitHub. A missing base policy is `PUBLICATION_NOT_AUTHORIZED` (the Garden one-shot grant is
+  unchanged). A symlinked or uncommitted-edited `.pi/autonomy.yaml` in the checkout is refused
+  with `AUTONOMY_POLICY_PATH_UNSAFE` for every publication, not only closing ones. The plan
+  records `policy_blob` (always; replaces `issue_policy_blob`), `publication_permissions` and
+  `base_commit`, all bound by the plan hash. `publish` also returns `policy_drift` (informational
+  list of permissions where a committed checkout copy differs from the base). The Garden
+  permission panel and `set_permission` preview say a toggle does not affect publication until
+  committed and pushed to the base.
 
 - The lead records less (issue #43). The prompts no longer ask for `directive` or
   `feedback` interaction events or for optional phases such as `inspection`; `decision`,

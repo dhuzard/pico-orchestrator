@@ -22,7 +22,7 @@ task sets `closes_issue: true` (or omits it and .pi/autonomy.yaml at the base co
 sets `issue_reference: closes`); `closes_issue: false` always writes `Refs #N`.
 
 Publication goes through github_integration.publish unchanged: .pi/autonomy.yaml
-must grant push_branch and create_pr, the head must be a pico/ branch, the plan
+on the base branch on GitHub must grant push_branch and create_pr, the head must be a pico/ branch, the plan
 is a dry run until --apply with the reviewed --plan-hash, pushes are non-force,
 and the PR is a draft. Each repository gets its own PR, which links its
 upstream PRs; nothing here merges, marks ready, or pushes to a base branch.

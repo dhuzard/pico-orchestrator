@@ -308,6 +308,26 @@ class GardenControlsTest(unittest.TestCase):
                          {"source": "one_shot_grant", "granted_by": "garden", "granted": ["push_branch", "create_pr"]})
         self.assertEqual(record["garden_actions"][-1]["authorization"], "one_shot_grant")
 
+    def test_garden_toggle_does_not_authorize_publication_until_it_reaches_the_base(self):
+        self.validated_a1()
+        for permission in ("push_branch", "create_pr"):
+            _, preview = self.act(action="set_permission", repository="alpha", permission=permission, value=True)
+            self.assertIn("no effect on publication until it is committed and pushed", preview["preview"]["note"])
+            self.act(action="set_permission", repository="alpha", permission=permission, value=True,
+                     confirm=preview["confirm"])
+        _, refused = self.act(action="publish", task="a1")  # the toggled copy is uncommitted
+        self.assertEqual((refused["stage"], refused["error_code"]), ("refused", "AUTONOMY_POLICY_PATH_UNSAFE"))
+        _, committed = self.act(action="commit_policy", repository="alpha")
+        _, done = self.act(action="commit_policy", repository="alpha", confirm=committed["confirm"])
+        self.assertTrue(done["ok"], done)
+        # Committed locally, but GitHub's base branch still has no policy that allows it.
+        _, refused = self.act(action="publish", task="a1")
+        self.assertEqual((refused["stage"], refused["error_code"]), ("refused", "PUBLICATION_NOT_AUTHORIZED"))
+        self.assertEqual(self.fake.created, [])
+        self.fake.merge_policy("acme/alpha", (self.repos["alpha"][0] / ".pi" / "autonomy.yaml").read_text())
+        _, preview = self.act(action="publish", task="a1")  # pushed to the base: now authorized without a grant
+        self.assertEqual((preview["stage"], preview["preview"]["authorization"]), ("preview", "policy"))
+
     def test_permission_toggle_writes_a_reviewed_policy_diff(self):
         _, preview = self.act(action="set_permission", repository="alpha", permission="push_branch", value=True)
         self.assertEqual((preview["stage"], preview["preview"]["creates_file"]), ("preview", True))

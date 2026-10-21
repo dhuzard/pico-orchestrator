@@ -574,6 +574,58 @@ choose its body, and `workspace_contracts publish` returns that choice as
 `issue_reference_decision` (`closes`, `source: task | repository`,
 `base_commit`, `policy_blob`).
 
+**Publication permissions (`push_branch`, `create_pr`) come from the same
+remote base policy** (issue #39). `github_integration.publish` reads the base
+commit and `.pi/autonomy.yaml` once, through the API adapter described above,
+and that one blob decides both `issue_reference` and whether the PR may be
+pushed and opened. The working tree is never a source of authority: a worker
+can edit its tracked copy, commit a grant on its `pico/` branch (which reaches
+the integrated branch when the lead integrates), or symlink `.pi`. Order of
+checks, before any local ref is inspected:
+
+1. A symlinked `.pi` or `.pi/autonomy.yaml`, or one with any uncommitted
+   change in the checkout (modified, deleted or untracked), is refused with
+   `AUTONOMY_POLICY_PATH_UNSAFE`. This is a tamper signal; it applies even when
+   the base policy would grant.
+2. The base policy is read; a symlink, a `type`/`path` mismatch, a directory
+   or an unreadable file is `AUTONOMY_POLICY_PATH_UNSAFE` or
+   `AUTONOMY_POLICY_INVALID`, and a schema-invalid policy is
+   `AUTONOMY_POLICY_INVALID` (a one-shot grant never overrides these).
+3. A missing base branch or a base without the policy, or a policy that does
+   not set both permissions to `true`, is `PUBLICATION_NOT_AUTHORIZED`, unless
+   an in-process one-shot grant covers the withheld permissions (unchanged:
+   Garden-confirmed, never from the command line).
+
+The plan records `base_commit`, `policy_blob` (always, replacing the earlier
+`issue_policy_blob`, which was set only when the policy was consulted),
+`publication_permissions` (the two booleans the base policy evaluated to, so a
+grant shows `false`/`false` next to `authorization: one_shot_grant`) and
+`authorization`; all are in the hashed plan. A merge that changes the base
+policy between the dry run and the apply changes `base_commit` and so yields
+`GITHUB_STATE_CONFLICT`; a base change that withdraws the permissions is
+`PUBLICATION_NOT_AUTHORIZED` at apply time.
+
+*Drift.* A checkout whose committed `.pi/autonomy.yaml` differs from the base
+policy (an unmerged policy PR, a local integration that pulled ahead) is
+reported but not refused: `publish` returns `policy_drift`, the sorted
+permission names that differ. It is informational, not part of the plan hash,
+and can never grant more than the base policy. Refusing on drift (a candidate
+`AUTONOMY_POLICY_DRIFT`) was rejected: it would block publishing the very PR
+that proposes a policy change, and the uncommitted and symlink cases, which are
+the tamper cases, are already refused by step 1. A *committed* local grant
+that is not on the base simply does not authorize.
+
+Who else reads autonomy permissions (issue #39 audit):
+
+| Reader | Effect | Source |
+| --- | --- | --- |
+| `github_integration.publish` (push, draft PR); reached by `--publish`, `workspace_contracts.publish` and the Garden `publish` action | GitHub write | remote base policy (changed) |
+| Garden one-shot grant | in-process override for one reviewed plan | unchanged; covers only the two permissions the base withholds |
+| `github_integration.execute` (issue/label/comment operations), `backlog github-push` | GitHub write | gated by the parent's dry run, plan hash and `--allow-destructive`, not by autonomy permissions; nothing to change |
+| `headless_run.mutation_permitted` | decides whether `start` needs `--allow-mutation` for a local run | working tree, left: it can only add a prompt for the operator, it authorizes no GitHub write |
+| `autonomy_policy.limits` (`parallel_tasks`, `open_prs`, `pr_granularity`) | local scheduling | working tree, left |
+| Garden permissions panel | display and `set_permission`/`commit_policy` | checkout, left; its preview and panel say that publication ignores it until the change is committed and pushed to the base |
+
 The trust boundary stops at the push. The branch push itself still runs
 through local git (`git push` with the checkout's remote and config), so a
 worker that can write the shared `.git/config` can still redirect or alter
@@ -2018,7 +2070,8 @@ repository whose `.pi/autonomy.yaml` on GitHub's base branch sets
 commit, check results, contracts, `Depends on: owner/repo#N` lines, no
 objective or transcript, secret-scanned) goes to
 `github_integration.publish` unchanged: autonomy `push_branch` and
-`create_pr` are required (`PUBLICATION_NOT_AUTHORIZED`), the run is a dry run
+`create_pr` are required on the base branch's policy on GitHub
+(`PUBLICATION_NOT_AUTHORIZED`), the run is a dry run
 until `--apply` with the reviewed `--plan-hash`, the push is non-force, and the
 PR is a draft. The PR number and publication run id are recorded.
 
@@ -2191,7 +2244,7 @@ HMAC confirmation and are audited:
 **One-shot publication grant.** `github_integration.publish(..., grant=...)`
 accepts `{"one_shot": true, "granted_by": "<name>"}` from in-process callers
 only; there is no command-line flag, so `--publish` behaves exactly as before.
-A grant covers only the permissions the policy withholds (`push_branch`,
+A grant covers only the permissions the base-branch policy withholds (`push_branch`,
 `create_pr`), never an unreadable or invalid policy (`AUTONOMY_POLICY_INVALID`
 still blocks). The publication record's new optional `authorization` field
 (`source: policy | one_shot_grant`, `granted_by`, `granted`) and the plan hash

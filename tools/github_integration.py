@@ -413,36 +413,51 @@ def read_with_provenance(*, worktree: Path, explicit_repo: str | None = None,
 ONE_SHOT_PERMISSIONS = ("push_branch", "create_pr")
 
 
-def _publication_authority(worktree: Path, grant: dict | None = None) -> dict:
-    """Authorize publication from the autonomy policy, or from a one-shot grant.
+def _publication_authority(policy: dict | None, grant: dict | None = None) -> dict:
+    """Authorize publication from the base-branch autonomy policy, or from a one-shot grant.
 
-    A grant is passed in process only (never from the command line) by a caller
-    that has shown the exact reviewed plan and obtained an explicit
-    confirmation for it, such as the Garden. It covers only the permissions
-    the policy withholds for this single publication; an unreadable or invalid
-    policy is never overridden.
+    `policy` is the schema-valid `.pi/autonomy.yaml` GitHub reports at the
+    verified base commit (`_remote_policy`), or None when the base has none.
+    The working tree is never consulted: a worker can edit, commit or
+    symlink its own copy. A grant is passed in process only (never from the
+    command line) by a caller that has shown the exact reviewed plan and
+    obtained an explicit confirmation for it, such as the Garden. It covers
+    only the permissions the base policy withholds for this single
+    publication; an unreadable or invalid base policy is never overridden.
+    """
+    permissions = (policy or {}).get("permissions") or {}
+    evaluated = {name: permissions.get(name) is True for name in ONE_SHOT_PERMISSIONS}
+    missing = [name for name in ONE_SHOT_PERMISSIONS if not evaluated[name]]
+    if not missing:
+        return {"source": "policy", "granted_by": None, "granted": [], "permissions": evaluated}
+    if not (isinstance(grant, dict) and grant.get("one_shot") is True
+            and isinstance(grant.get("granted_by"), str) and re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", grant["granted_by"])):
+        detail = ".pi/autonomy.yaml on the base branch on GitHub is required for publication" if policy is None \
+            else "push_branch and create_pr must be granted by .pi/autonomy.yaml on the base branch on GitHub"
+        raise IntegrationError("PUBLICATION_NOT_AUTHORIZED", detail)
+    return {"source": "one_shot_grant", "granted_by": grant["granted_by"], "granted": missing,
+            "permissions": evaluated}
+
+
+def _policy_drift(worktree: Path, policy: dict | None) -> list[str]:
+    """Permissions the checkout's own `.pi/autonomy.yaml` sets differently from the base policy.
+
+    Informational only (see docs): it never grants anything and is not part of
+    the plan. Unreadable, symlinked or absent copies report nothing.
     """
     import autonomy_policy
     path = autonomy_policy.policy_path(worktree)
-    permissions = {name: False for name in ONE_SHOT_PERMISSIONS}
-    if path.is_file():
-        try:
-            policy = yaml.safe_load(path.read_text(encoding="utf-8"))
-            issues = autonomy_policy.validate(policy)
-        except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:
-            raise IntegrationError("AUTONOMY_POLICY_INVALID", "publication policy is unreadable") from exc
-        if issues:
-            raise IntegrationError("AUTONOMY_POLICY_INVALID", issues[0][:300])
-        permissions = policy["permissions"]
-    missing = [name for name in ONE_SHOT_PERMISSIONS if not permissions.get(name)]
-    if not missing:
-        return {"source": "policy", "granted_by": None, "granted": []}
-    if not (isinstance(grant, dict) and grant.get("one_shot") is True
-            and isinstance(grant.get("granted_by"), str) and re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", grant["granted_by"])):
-        detail = ".pi/autonomy.yaml is required for publication" if not path.is_file() \
-            else "push_branch and create_pr permissions are required"
-        raise IntegrationError("PUBLICATION_NOT_AUTHORIZED", detail)
-    return {"source": "one_shot_grant", "granted_by": grant["granted_by"], "granted": missing}
+    try:
+        if path.is_symlink() or not path.is_file():
+            return []
+        local = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, yaml.YAMLError):
+        return []
+    if not isinstance(local, dict) or not isinstance(local.get("permissions"), dict):
+        return []
+    base = (policy or {}).get("permissions") or {}
+    return sorted(name for name in local["permissions"]
+                  if local["permissions"].get(name) != base.get(name, False))
 
 
 # GitHub closes an issue when a PR body uses one of these keywords before an
@@ -474,23 +489,23 @@ def _git_top(worktree: Path) -> Path:
     return autonomy_policy.policy_path(worktree).parent.parent
 
 
-def remote_issue_reference(repo: str, base_commit: str | None, adapter=gh) -> tuple[str, str | None]:
-    """`issue_reference` in `.pi/autonomy.yaml` at `base_commit` on GitHub, and that policy blob's SHA.
+def _remote_policy(repo: str, base_commit: str | None, adapter=gh) -> tuple[dict | None, str | None]:
+    """The validated `.pi/autonomy.yaml` at `base_commit` on GitHub, and its blob SHA; (None, None) when absent.
 
     Both the base commit (`_remote_base_commit`) and the policy are read
     through the authenticated GitHub API adapter, never through local git:
     every worktree shares the repository's refs and git config (`refs/heads`,
     `refs/remotes`, `core.sshCommand`, `remote.<name>.uploadpack`,
     `include.path`, `git replace`), so anything local git reports about the
-    base branch can be forged by a worker. Without a base branch on GitHub or
-    a policy at that commit the answer is the safe default `refs` with no blob.
+    base branch can be forged by a worker. This one read feeds both the
+    publication permissions and `issue_reference`.
     """
     import autonomy_policy
     if base_commit is None:
-        return "refs", None
+        return None, None
     entry = adapter.policy_file_at(base_commit, repo=repo)
     if entry is None:
-        return "refs", None
+        return None, None
     if entry.get("type") == "symlink" or entry.get("path") != _POLICY_FILE:
         raise IntegrationError("AUTONOMY_POLICY_PATH_UNSAFE", "the committed .pi/autonomy.yaml is a symlink")
     if entry.get("type") != "file" or not isinstance(entry.get("text"), str):
@@ -502,11 +517,26 @@ def remote_issue_reference(repo: str, base_commit: str | None, adapter=gh) -> tu
     issues = autonomy_policy.validate(data)
     if issues:
         raise IntegrationError("AUTONOMY_POLICY_INVALID", f"committed policy: {issues[0]}"[:300])
-    return data.get("issue_reference", autonomy_policy.DEFAULTS["issue_reference"]), entry["sha"]
+    return data, entry["sha"]
+
+
+def _issue_reference(policy: dict | None) -> str:
+    import autonomy_policy
+    return (policy or {}).get("issue_reference", autonomy_policy.DEFAULTS["issue_reference"])
+
+
+def remote_issue_reference(repo: str, base_commit: str | None, adapter=gh) -> tuple[str, str | None]:
+    """`issue_reference` in `.pi/autonomy.yaml` at `base_commit` on GitHub, and that policy blob's SHA.
+
+    Without a base branch on GitHub or a policy at that commit the answer is
+    the safe default `refs` with no blob.
+    """
+    policy, blob = _remote_policy(repo, base_commit, adapter)
+    return _issue_reference(policy), blob
 
 
 def _require_clean_policy_checkout(worktree: Path) -> None:
-    """Refuse a symlinked or locally modified `.pi/autonomy.yaml` before trusting the committed policy."""
+    """Refuse a symlinked or uncommitted-edited `.pi/autonomy.yaml`: a tampered checkout is never published from."""
     top = _git_top(worktree)
     unsafe = "AUTONOMY_POLICY_PATH_UNSAFE"
     if (top / ".pi").is_symlink() or (top / _POLICY_FILE).is_symlink():
@@ -515,7 +545,7 @@ def _require_clean_policy_checkout(worktree: Path) -> None:
                           capture_output=True, text=True, timeout=10)
     if proc.returncode or proc.stdout.strip():
         raise IntegrationError(unsafe, ".pi/autonomy.yaml has uncommitted changes; commit it on the base "
-                                       "branch before publishing a PR that closes issues")
+                                       "branch before publishing")
 
 
 def _check_issue_reference(body: str, *, repository: str, policy_closes, closes_issue: int | None) -> dict:
@@ -615,13 +645,13 @@ def verified_issue_reference(repo: str, base: str, adapter=gh) -> tuple[str, str
     return (*remote_issue_reference(repo, base_commit, adapter), base_commit)
 
 
-def _publication_state(worktree: Path, repo: str, base: str, head: str, adapter=gh) -> dict:
+def _publication_state(worktree: Path, repo: str, base: str, head: str, adapter=gh,
+                       base_commit: str | None = None) -> dict:
     remote = _publication_remote(worktree, repo)
     commit = _git(worktree, "rev-parse", "--verify", f"refs/heads/{head}^{{commit}}")
     if not re.fullmatch(r"[0-9a-f]{40,64}", commit):
         raise IntegrationError("PUBLICATION_REF_INVALID", "head is not a local commit")
     remote_commit = _remote_head_commit(worktree, remote, head)
-    base_commit = _remote_base_commit(repo, base, adapter)
     prs = adapter.list_prs(base=base, head=head, repo=repo)
     open_prs = [pr for pr in prs if pr["state"].lower() == "open"]
     if len(open_prs) > 1:
@@ -643,10 +673,11 @@ def publish(*, worktree: Path, base: str, head: str, title: str, body_file: Path
     accepted only for an issue of this repository that either an in-process
     caller names in `closes_issue` (a workspace task with `closes_issue:
     true`), or that has its own `Closes #N` line while `.pi/autonomy.yaml` at
-    the base commit GitHub reports sets `issue_reference: closes` and the
-    checkout's copy is neither a symlink nor modified. Base commit and policy
+    the base commit GitHub reports sets `issue_reference: closes`. The same
+    single policy read supplies `push_branch`/`create_pr`. A symlinked or
+    uncommitted-edited checkout copy is refused. Base commit and policy
     are read through the GitHub API adapter, not local git. The plan records
-    both, so the plan hash binds them; a merge to the base between the dry
+    the base commit, policy blob and evaluated permissions, so the plan hash binds them; a merge to the base between the dry
     run and the apply therefore gives GITHUB_STATE_CONFLICT.
     """
     meta = {"target_repository": None, "target_worktree": str(worktree.resolve()), "phase": "publication",
@@ -656,13 +687,21 @@ def publish(*, worktree: Path, base: str, head: str, title: str, body_file: Path
                                   user_objective="Publish reviewed pico branch", route_task_result=None,
                                   starting_commit=None, github_integration=meta)
     plan = None
+    drift: list[str] = []
     outcome = "blocked"
     try:
         repo = resolve_target(worktree, explicit_repo)
         meta["target_repository"] = repo
-        authorization = _publication_authority(worktree, grant)
-        meta["authorization"] = authorization
+        # One API read of the base commit and one of the policy blob: they authorize push/PR and decide
+        # issue_reference. The checkout's own copy is never trusted, so a symlinked or uncommitted-edited
+        # one is refused, and nothing else is inspected before authorization.
+        _require_clean_policy_checkout(worktree)
         base = _branch(worktree, base, head=False)
+        base_commit = _remote_base_commit(repo, base, adapter)
+        policy, policy_blob = _remote_policy(repo, base_commit, adapter)
+        authorization = _publication_authority(policy, grant)
+        meta["authorization"] = {k: v for k, v in authorization.items() if k != "permissions"}
+        drift = _policy_drift(worktree, policy)
         head = _branch(worktree, head, head=True)
         if base == head:
             raise IntegrationError("PUBLICATION_REF_INVALID", "head and base must differ")
@@ -670,22 +709,16 @@ def publish(*, worktree: Path, base: str, head: str, title: str, body_file: Path
         body = _text(body_file.read_text(encoding="utf-8"), "body")
         if closes_issue is not None and (type(closes_issue) is not int or closes_issue < 1):
             raise IntegrationError("PUBLICATION_BODY_INVALID", "closes_issue must be an issue number")
-        state = _publication_state(worktree, repo, base, head, adapter)
-        policy_blob = None
+        state = _publication_state(worktree, repo, base, head, adapter, base_commit)
 
         def policy_closes() -> bool:
-            # Read only when the body would close an issue the caller did not name.
-            nonlocal policy_blob
-            policy_reference, policy_blob = remote_issue_reference(repo, state["base_commit"], adapter)
-            if policy_reference != "closes":
-                return False
-            _require_clean_policy_checkout(worktree)
-            return True
+            return _issue_reference(policy) == "closes"
         reference = _check_issue_reference(body, repository=repo, policy_closes=policy_closes,
                                            closes_issue=closes_issue)
         plan = {"repository": repo, "base": base, "head": head, **state,
                 "title": title, "body_sha256": hashlib.sha256(body.encode()).hexdigest(), "draft": True,
-                "authorization": authorization["source"], **reference, "issue_policy_blob": policy_blob}
+                "authorization": authorization["source"], **reference, "policy_blob": policy_blob,
+                "publication_permissions": authorization["permissions"]}
         digest = hashlib.sha256(json.dumps(plan, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         meta["mutations_planned"] = int(state["remote_commit"] != state["commit"]) + int(state["existing_pr"] is None)
         if not apply:
@@ -722,6 +755,7 @@ def publish(*, worktree: Path, base: str, head: str, title: str, body_file: Path
     provenance.finish_run(provenance_root, record["run_id"], outcome=outcome, github_integration=meta)
     return {"run_id": record["run_id"], "status": outcome.upper(), "blocker_code": meta["blocker_code"],
             "plan": plan, "plan_hash": digest if plan else None,
+            "policy_drift": drift,
             "pr": pr_number if outcome == "completed" else None,
             "mutations_applied": meta["mutations_applied"]}
 

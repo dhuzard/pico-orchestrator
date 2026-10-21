@@ -160,8 +160,12 @@ class ContractLifecycleTest(unittest.TestCase):
         path, _ = self.repos[repo]
         (path / ".pi").mkdir(exist_ok=True)
         policy = (REPO_ROOT / "templates/autonomy.yaml").read_text()
-        (path / ".pi/autonomy.yaml").write_text(policy.replace("push_branch: false", "push_branch: true")
-                                                .replace("create_pr: false", "create_pr: true"))
+        granting = policy.replace("push_branch: false", "push_branch: true").replace("create_pr: false", "create_pr: true")
+        (path / ".pi/autonomy.yaml").write_text(granting)
+        git("-C", str(path), "add", ".pi/autonomy.yaml")
+        git("-C", str(path), *COMMIT, "grant publication")
+        # Publication reads the policy GitHub has on the base branch, never the checkout's copy.
+        self.fake.merge_policy(f"acme/{repo}", granting)
 
     def schedule(self, manifest):
         return ws.run(manifest, access_check=None, pi_executable=str(self.pi), poll_seconds=0.05)
@@ -339,9 +343,10 @@ class ContractLifecycleTest(unittest.TestCase):
                                task_id="a1", adapter=self.fake)
             self.assertEqual((stray["status"], stray["blocker_code"]), ("BLOCKED", "PUBLICATION_BODY_INVALID"))
 
-        with self.subTest("an uncommitted repository policy changes nothing"):
+        with self.subTest("an uncommitted repository policy is refused"):
             policy.write_text(closes_policy)
-            self.assertTrue(dry_run(self.manifest())[0].startswith("Refs #7\n"))
+            blocked = wc.publish(manifest=self.manifest(), task_id="a1", adapter=self.fake)
+            self.assertEqual((blocked["status"], blocked["blocker_code"]), ("BLOCKED", "AUTONOMY_POLICY_PATH_UNSAFE"))
 
         git("-C", str(path), "add", ".pi/autonomy.yaml")
         git("-C", str(path), *COMMIT, "close issues on merge")
@@ -363,6 +368,29 @@ class ContractLifecycleTest(unittest.TestCase):
             applied = self.publish(self.manifest(a1={"closes_issue": True}), "a1")
             self.assertEqual(applied["status"], "COMPLETED", applied)
             self.assertTrue(self.fake.created[0]["body"].startswith("Closes #7\n"))
+
+    def test_workspace_publication_ignores_permissions_set_only_in_the_checkout(self):
+        manifest = self.manifest()
+        self.schedule(manifest)
+        self.work("alpha", "pico/a1", "claims.json")
+        self.assertEqual(wc.validate(manifest=manifest, task_id="a1", head="pico/a1")["status"], "VALIDATED")
+        path = self.repos["alpha"][0]
+        policy = path / ".pi/autonomy.yaml"
+        policy.parent.mkdir(exist_ok=True)
+        text = (REPO_ROOT / "templates/autonomy.yaml").read_text()
+        granting = text.replace("push_branch: false", "push_branch: true").replace("create_pr: false", "create_pr: true")
+        self.fake.merge_policy("acme/alpha", text)  # GitHub's base withholds both
+        with self.subTest("uncommitted edit"):
+            policy.write_text(granting)
+            blocked = wc.publish(manifest=manifest, task_id="a1", adapter=self.fake)
+            self.assertEqual(blocked["blocker_code"], "AUTONOMY_POLICY_PATH_UNSAFE")
+        with self.subTest("committed locally, not on GitHub"):
+            git("-C", str(path), "add", ".pi/autonomy.yaml")
+            git("-C", str(path), *COMMIT, "grant publication")
+            blocked = wc.publish(manifest=manifest, task_id="a1", adapter=self.fake)
+            self.assertEqual(blocked["blocker_code"], "PUBLICATION_NOT_AUTHORIZED")
+        self.assertEqual(self.fake.created, [])
+        self.assertEqual(git("--git-dir", str(self.bare["alpha"]), "for-each-ref"), "")
 
     def test_downstream_publication_requires_upstream_pr(self):
         # The manifest may declare a1 ready by hand; b1's PR must still link a real upstream PR.
