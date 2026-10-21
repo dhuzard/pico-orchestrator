@@ -399,6 +399,29 @@ The parent runs independent tasks in waves. Each task declares a write scope
 | `integrate_begin {wave_id}` | Starts integration; worker launches are refused until it ends. | `WAVE_UNKNOWN`, `INTEGRATION_WORKERS_IN_FLIGHT` |
 | `integrate_end {wave_id}` | Re-bases the parent-checkout snapshot after the parent's merges and closes the wave. | `INTEGRATION_NOT_STARTED`, `WORKER_SCOPE_UNVERIFIABLE` |
 
+A routed task started while no worker runs and no wave is declared gets its own implicit single-task wave
+(`auto-<hex>-<task>`); it is never grown and never lets tasks overlap: only an explicit `declare_wave` does, after its
+write-scope, parallel-limit and routing checks. `integrate_begin` and `integrate_end` accept `"auto"` for the one open
+implicit wave; with several open it fails with `WAVE_AUTO_AMBIGUOUS` (listing the ids) and with none with
+`WAVE_UNKNOWN`. At a non-COMPLETED finish every `declared` or `integrating` wave becomes `abandoned` (`reconciled`,
+kind `wave`). COMPLETED is refused with `PARENT_WAVE_INTEGRATING` while a current wave is `integrating`, and with
+`PARENT_WAVE_NOT_INTEGRATED` for any task whose bound worktree no integrated wave has covered since
+(`phase.workspace_bound`, set by the bind checkpoint and cleared when a wave containing the task is `integrated`; checked
+per task, so a missing wave record cannot hide it). `phase.bound_epochs` lists the route epochs that bound a worktree, so
+an escalation does not forget the old route's; a read-only task does not block COMPLETED.
+The extension never infers the integrate bracket: `integrated` would assert a merge it did not observe.
+
+Worker `activity` entries replace the lead's directive and feedback events. At start they carry `route`,
+`prompt_digest`, `goal` (the contract's `Goal:` line) and `prompt_excerpt` (first 300 characters after the task tag and
+goal line); on return `result_summary` (first 600 characters of the final text), `result_digest` and `commit_sha` when
+the result reports one. Text is single-line with control characters removed. Secret-like spans (provenance's content
+patterns plus GitHub fine-grained and GitLab tokens, Google API keys, JWTs, `password=`/`token=`/`secret=`
+assignments with a value of 16 or more characters without spaces, URLs with credentials, npm tokens and Stripe live keys) are masked in the whole text, bounded to eight
+times the recorded size, before the cut; an unbroken run of 16 or more characters left at the cut is dropped. The full
+text lives only in the Pi session transcript. A failed step may become `completed` only when, after its last failure, it
+was started again on the same route and that start returned without error: the failure is kept in `worker_overrides`
+with `reason: "retry_succeeded"` and `by: "extension"` or `"lead"`.
+
 Scope overlap is conservative: an entry's scope is its literal directory
 prefix up to the first glob segment, and two entries overlap when one prefix
 contains the other (`src/a/**` and `src/b/**` are disjoint; `src/*.ts`

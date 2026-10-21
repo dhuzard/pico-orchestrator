@@ -47,6 +47,7 @@ CODE_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,99}$")
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 MODEL_RE = re.compile(r"^[A-Za-z0-9_.:/-]{1,128}$")
 VERSION_RE = re.compile(r"^(?:>=)?[0-9]+\.[0-9]+\.[0-9]+$")
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 COMMIT_RE = re.compile(r"^[0-9a-f]{7,64}$")
 REFERENCE_RE = re.compile(r"^checkpoints/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/[0-9]{4}\.json$")
 REASONING_EFFORTS = {"low", "medium", "high"}
@@ -59,7 +60,16 @@ USAGE_BACKENDS = {"claude-code", "pi-subagent"}
 USAGE_COUNTERS = ("duration_ms", "input_tokens", "output_tokens", "cached_tokens", "cache_write_tokens", "total_tokens")
 # A wave groups routed tasks with disjoint write scopes that run concurrently;
 # it is integrated into the parent checkout only after all its workers return.
-WAVE_STATUSES = ("declared", "integrating", "integrated")
+WAVE_STATUSES = ("declared", "integrating", "integrated", "abandoned")
+# Statuses an event may set; "abandoned" is written only by `_reconcile_open` when a run ends without COMPLETED.
+WAVE_EVENT_STATUSES = WAVE_STATUSES[:3]
+WAVE_OPEN_STATUSES = {"declared", "integrating"}
+ACTIVITY_EXCERPT_CHARS = 300
+ACTIVITY_SUMMARY_CHARS = 600
+ACTIVITY_GOAL_CHARS = 200
+CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]+")
+COMMIT_RE = re.compile(r"^[0-9a-f]{7,40}$")
+DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 LOCK_WAIT_SECONDS = 5
 # Resume checkpoint (audit A10): the parent checkout's path, branch and HEAD at
 # the last phase boundary or worker approval, compared with the live checkout
@@ -156,6 +166,66 @@ def _safe(value: str | None, pattern: re.Pattern, field: str) -> str | None:
     if not isinstance(value, str) or not pattern.fullmatch(value) or provenance._contains_secret_like_content(value):
         raise ParentRunError(f"invalid {field}")
     return value
+
+
+def _retry_activity(parent: dict, phase: dict, step_id: str) -> tuple[bool, bool]:
+    """(started, succeeded): after the step's last recorded failure, has it been started again on its current
+    route, and did that start return without error? A start without a route never counts, and a start that has
+    not returned (or returned an error) is not a success."""
+    route = (phase.get("escalations") or [{}])[-1].get("to_route") or phase["route"]
+    last_failed = -1
+    start = -1
+    succeeded = False
+    for index, entry in enumerate(parent.get("activity") or []):
+        if entry.get("task_id") != phase["id"] or entry.get("step_id") != step_id:
+            continue
+        if entry["status"] == "failed":
+            last_failed, start, succeeded = index, -1, False
+        elif entry["status"] == "started" and entry.get("route") == route and last_failed >= 0:
+            start, succeeded = index, False
+        elif entry["status"] == "finished" and start > last_failed >= 0:
+            succeeded = True
+    return start > last_failed >= 0, succeeded
+
+
+SECRET_MASK = "[withheld]"
+# Credential shapes masked in recorded excerpts, on top of provenance's content patterns. Conservative: the
+# whole matching span is replaced, never the surrounding text.
+_EXCERPT_SECRET_PATTERNS = (
+    re.compile(r"github_pat_[A-Za-z0-9_]{20,}"),
+    re.compile(r"glpat-[A-Za-z0-9_-]{16,}"),
+    re.compile(r"AIza[0-9A-Za-z_-]{30,}"),
+    re.compile(r"eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]*"),
+    # An assignment masks only a secret-like value (16+ characters, no spaces): "token: 80 passes" is prose.
+    re.compile(r"(?i)\b(?:password|passwd|pwd|token|secret|api[_-]?key|apikey)\b\s*[:=]\s*[A-Za-z0-9_\-./+=]{16,}"),
+    re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s/:@]+:[^\s/@]+@\S*"),
+    re.compile(r"\bnpm_[A-Za-z0-9]{20,}"),
+    re.compile(r"\b[sr]k_(?:live|test)_[A-Za-z0-9]{10,}"),
+)
+
+
+def _mask_secrets(text: str) -> str:
+    for pattern in (*provenance._SECRET_CONTENT_PATTERNS, *_EXCERPT_SECRET_PATTERNS):
+        text = pattern.sub(SECRET_MASK, text)
+    return text
+
+
+def _bounded_text(value: str, limit: int) -> str:
+    """Single-line, control-free text of at most `limit` characters. Secret-like spans are masked in the whole
+    (bounded to 8x) text first and the cut comes last, so a token that straddles the cut is masked, not split;
+    a long unbroken run left at the cut is dropped as a possible partial token."""
+    text = " ".join(CONTROL_RE.sub(" ", ANSI_RE.sub("", value[:limit * 8])).split())
+    text = _mask_secrets(text)
+    if provenance._contains_secret_like_content(text):
+        return "[withheld: secret-like content]"
+    if len(text) > limit:
+        cut = text[:limit]
+        if not text[limit].isspace():
+            tail = re.search(r"\S{16,}$", cut)
+            if tail:
+                cut = cut[:tail.start()]
+        text = cut
+    return text.strip()
 
 
 def _parent(record: dict) -> dict:
@@ -427,7 +497,7 @@ def _wave_event(parent: dict, event: dict) -> None:
     for task_id in task_ids:
         _safe(task_id, ID_RE, "wave task id")
     status = event.get("status")
-    if status not in WAVE_STATUSES:
+    if status not in WAVE_EVENT_STATUSES:
         raise ParentRunError("invalid wave status", error_code="PARENT_WAVE_STATUS_INVALID")
     waves = parent.setdefault("waves", [])
     wave = next((item for item in waves if item["id"] == wave_id), None)
@@ -438,11 +508,14 @@ def _wave_event(parent: dict, event: dict) -> None:
         waves.append(wave)
     elif wave["task_ids"] != task_ids:
         raise ParentRunError("wave tasks conflict with prior event", error_code="PARENT_EVENT_CONFLICT")
-    elif WAVE_STATUSES.index(status) < WAVE_STATUSES.index(wave["status"]):
+    elif wave["status"] == "abandoned" or WAVE_STATUSES.index(status) < WAVE_STATUSES.index(wave["status"]):
         raise ParentRunError("wave cannot move backwards", error_code="PARENT_WAVE_TRANSITION_INVALID")
     wave["status"] = status
     for task_id in task_ids:
-        _phase(parent, task_id)["wave_id"] = wave_id
+        task_phase = _phase(parent, task_id)
+        task_phase["wave_id"] = wave_id
+        if status == "integrated":
+            task_phase.pop("workspace_bound", None)  # merged: its bound worktrees (every epoch) are covered
 
 
 def _topology(peak: int) -> str:
@@ -534,10 +607,11 @@ def _record_event_unlocked(run_id: str, event: dict, *, repo_root: Path = ROOT) 
         "wave": {"kind", "wave_id", "task_ids", "status"},
         "concurrency": {"kind", "peak_workers", "active_ms"},
         "spawn": {"kind"},
-        "activity": {"kind", "status", "tool", "task_id", "step_id", "subagent_id"},
+        "activity": {"kind", "status", "tool", "task_id", "step_id", "subagent_id", "route", "prompt_digest",
+                     "prompt_excerpt", "goal", "result_summary", "result_digest", "commit_sha"},
         "interaction": {"kind", "type", "summary", "task_id", "step_id", "subagent_id", "reply_to"},
         "lead_usage": {"kind", "model", "phase", "task_type", "turn_index", "duration_ms", "input_tokens", "output_tokens", "cached_tokens", "cache_write_tokens", "total_tokens", "estimated_cost_usd"},
-        "checkpoint": {"kind", "phase", "reason"},
+        "checkpoint": {"kind", "phase", "reason", "workspace_bound"},
     }
     required = {
         "phase": {"kind", "phase", "status"},
@@ -639,6 +713,14 @@ def _record_event_unlocked(run_id: str, event: dict, *, repo_root: Path = ROOT) 
                       "required_backend_version": None}
             phase["workers"].append(worker)
         prior = worker["status"]
+        automatic = event.get("only_if_open") is True
+        if worker.get("auto_recorded") and not automatic:
+            # The lead restating a worker the extension already recorded (the old habit) is never an error.
+            if prior in {"completed", "blocked", "failed"} and event["status"] in {"not_started", "in_progress"}:
+                return parent  # a start after the automatic terminal status: nothing to change
+            # The routed plan's reasoning effort is authoritative: a different value from the lead is a no-op.
+            event = {key: value for key, value in event.items()
+                     if not (key == "reasoning_effort" and worker.get("reasoning_effort") not in (None, value))}
         # Validate every field before anything can return or change, including the automatic no-op.
         if "only_if_open" in event and event["only_if_open"] is not True:
             raise ParentRunError("invalid worker event")
@@ -647,12 +729,32 @@ def _record_event_unlocked(run_id: str, event: dict, *, repo_root: Path = ROOT) 
         values = {key: _safe(event[key], pattern, key) for key, pattern in (
             ("model", MODEL_RE), ("backend", MODEL_RE), ("backend_model", MODEL_RE), ("blocker_code", CODE_RE),
             ("installed_backend_version", VERSION_RE), ("required_backend_version", VERSION_RE)) if key in event}
-        if event.get("only_if_open") is True and prior not in {"not_started", "in_progress"}:
+        retry_started, retry_succeeded = _retry_activity(parent, phase, step_id) if prior == "failed" else (False, False)
+        if prior == "failed" and event["status"] == "in_progress" and retry_started:
+            # The retry's own launch record: the failure stands (and stays visible) until the retry completes.
+            return parent
+        retried = prior == "failed" and event["status"] == "completed" and retry_succeeded
+        if event.get("only_if_open") is True and prior not in {"not_started", "in_progress"} and not retried:
             # The lifecycle's automatic record of a worker's raw result: never overrides a recorded status.
             return parent
         terminal = {"completed", "blocked", "failed"}
         override = None
-        if prior in terminal:
+        if retried:
+            # A later start of the same step after its failure: the retry's success replaces the failure. The
+            # failure stays in `worker_overrides`, recorded by the lead or by the extension's automatic record.
+            history = [item for item in parent.get("worker_overrides") or []
+                       if (item["phase_id"], item["step_id"], item["route_epoch"]) == (phase["id"], step_id, epoch)]
+            if (len(history) >= MAX_OVERRIDES_PER_WORKER
+                    or len(parent.get("worker_overrides") or []) >= MAX_WORKER_OVERRIDES):
+                raise ParentRunError("too many overrides recorded for this worker or run",
+                                     error_code="PARENT_WORKER_OVERRIDE_LIMIT")
+            override = {"phase_id": phase["id"], "step_id": step_id, "route_epoch": epoch,
+                        "from_status": prior, "from_blocker_code": worker.get("blocker_code"),
+                        "to_status": "completed", "blocker_code": None, "phase_status": phase["status"],
+                        "by": "extension" if event.get("only_if_open") is True else "lead",
+                        "reason": "retry_succeeded", "at": _now()}
+            worker["blocker_code"] = None
+        elif prior in terminal:
             # The lead's judgment wins over an earlier record, but never silently: each override is
             # appended to `worker_overrides` with what it replaced. Allowed: completed -> failed/blocked
             # and failed -> blocked (each with a blocker code), and a failed/blocked worker restated with
@@ -691,9 +793,15 @@ def _record_event_unlocked(run_id: str, event: dict, *, repo_root: Path = ROOT) 
             worker["reasoning_effort"] = event["reasoning_effort"]
         for key, value in values.items():
             replaced = key == "blocker_code" and override is not None
-            if worker.get(key) is not None and value != worker[key] and not replaced:
+            # The same model with or without its provider prefix (`gpt-5.2-codex` vs `openai-codex/gpt-5.2-codex`).
+            same_model = (key in {"model", "backend_model"} and worker.get(key) is not None
+                          and str(value).rsplit("/", 1)[-1] == str(worker[key]).rsplit("/", 1)[-1])
+            if worker.get(key) is not None and value != worker[key] and not replaced and not same_model:
                 raise ParentRunError("worker field conflicts with prior event", error_code="PARENT_EVENT_CONFLICT")
-            worker[key] = value
+            if not same_model:
+                worker[key] = value
+        if automatic:
+            worker["auto_recorded"] = True
         if override is not None:
             parent.setdefault("worker_overrides", []).append(override)
     elif kind == "child":
@@ -715,6 +823,35 @@ def _record_event_unlocked(run_id: str, event: dict, *, repo_root: Path = ROOT) 
         entry = {"at": datetime.now(timezone.utc).isoformat(), "status": event["status"], "tool": event["tool"]}
         for field in ("task_id", "step_id", "subagent_id"):
             entry[field] = _safe(event.get(field), ID_RE, field)
+        # Optional, set by the lifecycle extension at worker start: the routed route and a SHA-256 digest of
+        # the worker contract (the contract text itself is never recorded).
+        if event.get("route") is not None:
+            if event["route"] not in ROUTES:
+                raise ParentRunError("invalid activity route")
+            entry["route"] = event["route"]
+        if event.get("prompt_digest") is not None:
+            digest = event["prompt_digest"]
+            if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+                raise ParentRunError("invalid activity prompt digest")
+            entry["prompt_digest"] = digest
+        # Bounded text, set by the extension from what it observes: the start of the worker contract and the
+        # start of the worker's result. Sanitised here, never rejected: control characters are dropped,
+        # whitespace is collapsed, and secret-like text is replaced by a marker. The full text lives only in
+        # the Pi session transcript.
+        for field, limit in (("prompt_excerpt", ACTIVITY_EXCERPT_CHARS), ("goal", ACTIVITY_GOAL_CHARS),
+                             ("result_summary", ACTIVITY_SUMMARY_CHARS)):
+            if event.get(field) is not None:
+                if not isinstance(event[field], str):
+                    raise ParentRunError(f"invalid activity {field}")
+                entry[field] = _bounded_text(event[field], limit)
+        if event.get("result_digest") is not None:
+            if not isinstance(event["result_digest"], str) or not DIGEST_RE.fullmatch(event["result_digest"]):
+                raise ParentRunError("invalid activity result digest")
+            entry["result_digest"] = event["result_digest"]
+        if event.get("commit_sha") is not None:
+            if not isinstance(event["commit_sha"], str) or not COMMIT_RE.fullmatch(event["commit_sha"]):
+                raise ParentRunError("invalid activity commit sha")
+            entry["commit_sha"] = event["commit_sha"]
         parent.setdefault("activity", []).append(entry)
         parent["activity"] = parent["activity"][-500:]
     elif kind == "interaction":
@@ -793,6 +930,17 @@ def _record_event_unlocked(run_id: str, event: dict, *, repo_root: Path = ROOT) 
     elif kind == "checkpoint":
         if event["reason"] not in CHECKPOINT_EVENT_REASONS:
             raise ParentRunError("invalid checkpoint reason")
+        if "workspace_bound" in event and event["workspace_bound"] is not True:
+            raise ParentRunError("invalid checkpoint event")
+        if event.get("workspace_bound") is True:
+            # A bound worktree is the evidence that a mutating step may have run for this task and route epoch.
+            # `bound_epochs` keeps every epoch that bound one (an escalation never forgets the old route's
+            # worktree); `workspace_bound` stays true until an integrated wave covers the task.
+            bound = _phase(parent, event["phase"])
+            epoch = len(bound.get("escalations") or [])
+            if epoch not in bound.setdefault("bound_epochs", []):
+                bound["bound_epochs"].append(epoch)
+            bound["workspace_bound"] = True
         _checkpoint(parent, reason=event["reason"], phase=_safe(event["phase"], ID_RE, "phase id"))
     elif kind == "concurrency":
         context = parent.setdefault("context", empty_context())
@@ -854,6 +1002,23 @@ def _finish_unlocked(run_id: str, status: str, *, blocker_code: str | None = Non
             raise ParentRunError("unfinished: " + "; ".join(unfinished[:12]) +
                                  ". Record each as completed, blocked or failed, then finish again",
                                  error_code="PARENT_COMPLETION_INCOMPLETE")
+        # An integration begun and never ended leaves the parent checkout in an unknown state. A wave that was
+        # only declared (read-only work, nothing to merge) stays as recorded.
+        integrating = [wave["id"] for wave in parent.get("waves") or []
+                       if wave["status"] == "integrating" and _wave_is_current(phases, wave)]
+        if integrating:
+            raise ParentRunError("wave integration was begun and never ended: " + ", ".join(integrating[:12]) +
+                                 ". Record integrate_end, or finish as PARTIAL",
+                                 error_code="PARENT_WAVE_INTEGRATING")
+        # Checked per task, not per wave: a refused implicit-wave write leaves a bound task with no wave at all,
+        # and an escalation keeps the old route's worktree (`bound_epochs`) until an integrated wave covers it.
+        unmerged = [f"{phase['id']} (route epochs {phase.get('bound_epochs') or [0]})"
+                    for phase in phases if phase.get("workspace_bound")]
+        if unmerged:
+            raise ParentRunError("task with a bound worktree was never integrated: " + ", ".join(unmerged[:12]) +
+                                 ". Declare a wave for it and record integrate_begin and integrate_end, "
+                                 "or finish as PARTIAL",
+                                 error_code="PARENT_WAVE_NOT_INTEGRATED")
         missing = _missing_reviews(phases)
         if missing:
             raise ParentRunError("mandatory independent review not completed for phase " + ", ".join(missing[:12]) +
@@ -866,6 +1031,11 @@ def _finish_unlocked(run_id: str, status: str, *, blocker_code: str | None = Non
     return provenance.finish_run(repo_root, run_id, outcome=status.lower(),
                                  parent_orchestration=parent,
                                  orchestration_metrics=delegation_metrics(record, parent))
+
+
+def _wave_is_current(phases: list[dict], wave: dict) -> bool:
+    """A wave no later wave has superseded: some task of it still names it as its wave."""
+    return any(phase.get("wave_id") == wave["id"] for phase in phases if phase["id"] in wave["task_ids"])
 
 
 def _reconcile_open(parent: dict, status: str) -> None:
@@ -894,6 +1064,11 @@ def _reconcile_open(parent: dict, status: str) -> None:
                                 "route_epoch": epoch, "from_status": worker["status"],
                                 "to": RECONCILED_STATUS, "reason": reason, "at": at})
                 worker["status"] = RECONCILED_STATUS
+    for wave in parent.get("waves") or []:
+        if wave["status"] in WAVE_OPEN_STATUSES:
+            entries.append({"kind": "wave", "wave_id": wave["id"], "from_status": wave["status"],
+                            "to": RECONCILED_STATUS, "reason": reason, "at": at})
+            wave["status"] = RECONCILED_STATUS
     if not entries:
         del parent["reconciled"]
 

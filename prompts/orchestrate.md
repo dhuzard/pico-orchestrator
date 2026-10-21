@@ -19,9 +19,12 @@ worker dispatch. If the parent is blocked because multiple GitHub
 remotes need disambiguation, stop and ask the launcher to be rerun with the
 parent-authorized `--repo owner/repository` option; do not choose a remote by
 name or let a worker choose the target.
-For a phase event use `{"action":"event","event":{"kind":"phase",
-"phase":"inspection","status":"in_progress"}}` before inspection, then
-record `status: "completed"` when it finishes. The phase statuses are exactly
+Record a phase event only for a routed task's own phase (its route and its
+outcome): do not record optional phases such as `inspection`, which carry no
+route or outcome. A phase event looks like
+`{"action":"event","event":{"kind":"phase","phase":"<task id>","status":"completed"}}`.
+The lifecycle extension already records each routed phase as `in_progress` with
+its route when `route_task` succeeds. The phase statuses are exactly
 `not_started`, `in_progress`, `completed`, `blocked`, `failed`, and `partial`;
 `started` is invalid. A phase event requires `kind`, `phase`, and `status`;
 `route`, `policy_version`, and `blocker_code` are optional until known.
@@ -37,14 +40,15 @@ record; the escalation is appended. Valid reasons are `FAILED_ATTEMPTS`, `REVIEW
 `AMBIGUITY`, `ARCHITECTURE`, `SECURITY_SENSITIVE`, `SEMANTIC_RISK`, or
 `CONTEXT_BUDGET`. Never escalate without one. Context and worker-usage
 telemetry is recorded by the lifecycle extension itself; do not report it.
-The lifecycle extension records each ClaudeWorker's raw result itself, as
+The lifecycle extension records each ClaudeWorker's and each routed Codex subagent's model, effort and raw result itself, as
 `completed` on success, `failed` on error, or `blocked` on abort, and never
-overrides a status you already recorded. Record that worker yourself only when
+overrides a status you already recorded. Record such a worker yourself only when
 your judgment differs or you add a reason: after a review rejects a `completed`
 worker, record `failed` or `blocked` with a `blocker_code`; for a worker
 recorded `failed` or `blocked`, repeat the same status with your own
-`blocker_code` to replace the automatic one. Other workers (Codex subagents)
-are recorded by you as before.
+`blocker_code` to replace the automatic one. Codex subagents follow the same
+rule: record one only when your judgment differs or to add a `blocker_code`. A
+restatement of what the extension recorded is accepted and changes nothing.
 A run that ends without `COMPLETED` marks every phase and current-route worker
 still `not_started` or `in_progress` as `abandoned`, with a
 `parent_orchestration.reconciled` entry; you never record `abandoned`
@@ -130,12 +134,28 @@ Your job is to:
 9. integrate the wave between waves and validate the integrated result;
 10. continue with the next dependency-ready wave until no authorized work remains.
 
-For each delegated step, record a brief `interaction` directive before launch
-and a feedback summary after its result using `orchestration_record` events.
-Record a parent decision when feedback changes the next action. Use the
-returned interaction sequence as `reply_to` when linking steps. These are
+Do not record `interaction` directive or feedback events: the lifecycle
+extension records every worker call itself (task, step, route, a contract
+excerpt and digest, and on return a bounded result summary, result digest and
+any commit it reports). Record an `interaction` `decision` only when worker
+results change the next action, since it is your judgment. Use the returned
+interaction sequence as `reply_to` when linking a decision. These are
 single-line, non-secret summaries of observable work, never prompts, outputs,
 transcripts, or hidden reasoning. See the event contract below.
+
+Waves: declare one with `declare_wave` only when several tasks will run
+concurrently (their workers launched in one batch, disjoint write scopes);
+that is the only way tasks may run at the same time, and it checks write-scope
+overlap and the parallel limit. A task you start alone, with no other worker
+running and no wave declared, is recorded by the lifecycle extension as its own
+implicit single-task wave; it never lets tasks overlap (`WAVE_UNDECLARED`), and
+each task you run in turn gets its own. Integrate it with `integrate_begin` and
+`integrate_end` using `"wave_id":"auto"`. `auto` names the one open implicit
+wave: with several open it is refused (`WAVE_AUTO_AMBIGUOUS`, which lists the
+ids) and you name the wave by id; with none open it is `WAVE_UNKNOWN`. A run
+cannot finish `COMPLETED` while an integration was begun and never ended, or
+while a wave with a mutating task (a bound worktree) was never integrated;
+finish `PARTIAL` if it cannot be completed.
 
 ## Classification
 
@@ -402,13 +422,20 @@ the parent orchestrator.
 
 ### Conversation trace
 
-Use `orchestration_record` with `action: "event"` and an event shaped like
-`{"kind":"interaction","type":"directive","task_id":"<task>","step_id":"<step>","summary":"Inspect the save path and report the race."}`.
-After the worker returns, record `type: "feedback"` with a factual summary;
-when the parent chooses a next action, record `type: "decision"`. Each returned
-parent record contains the numbered `interactions` array. Link a feedback to
-its directive and a decision to its triggering feedback with `reply_to` set to
-the observed earlier `sequence`. Include `subagent_id` when known. Keep the
+The lifecycle extension records every worker call itself as an `activity`
+entry. At start: tool, task, step, routed route, a SHA-256 digest of the worker
+contract, its `Goal:` line, and the first 300 characters after the task tag and goal line. On return: the first 600 characters of
+the worker's final text (control characters removed, secret-like text withheld),
+a SHA-256 digest of all of it, and the commit it reports. The full text lives in
+the Pi session transcript, not in the record. Do not record `directive` or `feedback`
+interactions; they only repeat that entry and the worker's result.
+
+Record a `decision` when worker results change your next action, since it is
+your judgment and not mechanical: `{"kind":"interaction","type":"decision",
+"task_id":"<task>","step_id":"<step>","summary":"Re-plan the save path after the review found a race."}`.
+Each returned parent record contains the numbered `interactions` array. Link a
+decision to an earlier interaction with `reply_to` set to its observed
+`sequence`. Include `subagent_id` when known. Keep the
 summary under 180 characters and never copy prompts, raw worker output, paths with
 secrets, or hidden reasoning. These events explain observed coordination; do
 not invent a conversation for historical or unobserved work.
@@ -704,7 +731,10 @@ edit implementation or integration worktrees.
    `WORKER_WORKSPACE_PROTECTED_PATH`), then bind it with
    `orchestration_record`
    `{"action":"bind_workspace","task_id":"<task id>","step_id":"<step id>","path":"<worktree>"}`.
-4. Declare the wave:
+4. Declare the wave when more than one task will run concurrently. A task
+   started alone (no other worker running and no wave declared) is recorded by
+   the lifecycle extension as an implicit single-task wave; do not declare one.
+   Name it `"auto"` in `integrate_begin` and `integrate_end`. Declare the wave:
    `{"action":"declare_wave","wave_id":"wave-<n>","tasks":[{"task_id":"<id>","write_scope":["src/a/**"]}, ...]}`.
    It is rejected with `WAVE_SCOPE_OVERLAP` (overlapping scopes; a glob's
    literal directory prefix counts as its scope), `WAVE_LIMIT_EXCEEDED`,
@@ -727,6 +757,11 @@ that task's approval:
 - `ClaudeWorker`: the prompt starts with `[pico-task <task_id>:<step_id>]`
   (always, even with a single routed task).
 - `message_subagent` inherits the attribution of the spawn it continues.
+
+Open every worker contract with the task tag and then a one-sentence goal line,
+`Goal: <what this worker must achieve>`. The extension records that line as the
+call's `goal`, and the text after it as the contract excerpt, so the record says
+what each worker was asked without a lead call.
 
 With more than one routed task an unattributed call is blocked
 (`WORKER_TASK_UNATTRIBUTED`); a task without an approval is

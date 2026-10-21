@@ -1,6 +1,6 @@
 /** Parent-run trace and backend readiness boundary for /orchestrate. */
 import { spawn } from "node:child_process";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { hostname } from "node:os";
 import { dirname, join } from "node:path";
@@ -33,8 +33,14 @@ const LEASE_STATE = Symbol.for("pico.orchestration.lease");
 const OWNER_ENV = "PI_ORCHESTRATION_LEASE_OWNER";
 /** Parent refusals of a worker override that leave the record unchanged; they must never block the run. */
 const HARMLESS_REFUSALS = new Set(["PARENT_WORKER_RECODE_REPEATED", "PARENT_WORKER_OVERRIDE_LIMIT"]);
+/** Also harmless, but only for a worker the extension itself recorded: the lead restating it the old way. */
+const RESTATEMENT_REFUSALS = new Set(["PARENT_EVENT_CONFLICT", "PARENT_WORKER_TRANSITION_INVALID"]);
 const WORKER_TOOLS = new Set(["AskClaude", "ClaudeWorker", "spawn_subagent", "message_subagent"]);
 const CLAUDE_TOOLS = new Set(["AskClaude", "ClaudeWorker"]);
+function withoutAutomaticMarks(event: Json): Json {
+  const { only_if_open: _a, auto_recorded: _b, ...rest } = event;
+  return rest;
+}
 const MARKER = "PI_ORCHESTRATION_RUN_V1";
 const SESSION_ENTRY = "pi-orchestration-parent-v1";
 const MAX_OUTPUT = 256 * 1024;
@@ -57,6 +63,29 @@ const EFFORT = Type.Union(REASONING_EFFORTS.map((effort) => Type.Literal(effort)
 const DEFAULT_PARALLEL_TASKS = 3;
 const TAG_ID = "[A-Za-z0-9][A-Za-z0-9_.-]{0,127}";
 const LABEL_TAG = new RegExp(`^(${TAG_ID}):(${TAG_ID})$`);
+const EXCERPT_CHARS = 300;
+const SUMMARY_CHARS = 600;
+const GOAL_CHARS = 200;
+/**
+ * Single-line, control-free text, cut generously (8x the recorded size). The recorder masks secret-like text in
+ * this wider window first and only then cuts to the recorded size, so a token straddling that cut is masked whole.
+ */
+function rawWindow(value: string, recorded: number): string {
+  return value.replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, "").replace(/[\u0000-\u001f\u007f-\u009f]+/g, " ").replace(/\s+/g, " ").trim().slice(0, recorded * 8);
+}
+/** The goal line of a worker contract ("Goal: ..."), and the rest of it after the task tag and that line. */
+function contractParts(contract: string): { goal?: string; excerpt: string } {
+  let body = contract.replace(PROMPT_TAG, "").trim();
+  const goal = /^[ \t]*Goal:[ \t]*(.+)$/im.exec(body);
+  if (goal) body = `${body.slice(0, goal.index)}\n${body.slice(goal.index + goal[0].length)}`.trim();
+  return { goal: goal?.[1], excerpt: body };
+}
+/** The commit a worker result reports ("commit abc1234", "at 244fea7", or a bare 40-hex id), if any. */
+function reportedCommit(text: string): string | undefined {
+  const keyed = /\b(?:commit(?:ted)?|sha|HEAD)\b[^0-9a-f]{0,12}([0-9a-f]{7,40})\b/i.exec(text)
+    ?? /\b(?:at|as)\s+([0-9a-f]{7,40})\b(?=[\s;,.)]|$)/i.exec(text) ?? /\b([0-9a-f]{40})\b/.exec(text);
+  return keyed ? keyed[1].toLowerCase() : undefined;
+}
 const PROMPT_TAG = new RegExp(`^\\s*\\[pico-task (${TAG_ID}):(${TAG_ID})\\]`);
 const ESCALATION = Type.Union(["FAILED_ATTEMPTS", "REVIEW_FINDINGS", "AMBIGUITY", "ARCHITECTURE",
   "SECURITY_SENSITIVE", "SEMANTIC_RISK", "CONTEXT_BUDGET"].map((reason) => Type.Literal(reason)));
@@ -343,7 +372,16 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
   let lastPhase = "routing";
   let currentTurn: number | null = null;
   const messageStarts = new Map<number, number>();
+  // The explicitly declared wave: the only one under which tasks may run concurrently.
   let activeWave: { id: string; tasks: Map<string, string[]> } | null = null;
+  // Implicit single-task waves (one per task) recorded in this process and not yet integrated. They never
+  // allow concurrency; "auto" needs exactly one.
+  const implicitOpen = new Map<string, string[]>();
+  // Route epoch (escalations seen) of each task, and the epoch each implicit wave was recorded in.
+  const routeEpochs = new Map<string, number>();
+  const implicitEpoch = new Map<string, number>();
+  // Workers (phase, step) whose start or terminal status this extension recorded.
+  const autoWorkers = new Set<string>();
   let integrating: string | null = null;
   let batchStart = 0;
   let batchPeak = 0;
@@ -511,7 +549,7 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
   function resetRunState(): void {
     approvals.clear(); pendingRoutes.clear(); workspaces.clear(); snapshots.clear();
     subagentTasks.clear(); inFlight.clear(); claudeCalls.clear(); workerPlans.clear();
-    scopeViolation = null; activeWave = null; integrating = null; lastPhase = "routing";
+    scopeViolation = null; activeWave = null; integrating = null; implicitOpen.clear(); routeEpochs.clear(); implicitEpoch.clear(); autoWorkers.clear(); lastPhase = "routing";
     currentTurn = null; messageStarts.clear();
     batchStart = 0; batchPeak = 0;
     pendingReroutes.clear();
@@ -872,16 +910,47 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
         return { block: true, reason: "WORKER_SCOPE_UNVERIFIABLE: could not snapshot the parent checkout" };
       }
       snapshots.set(call.toolCallId, before);
+      // A routed task started while no worker runs and no wave is declared is a single-task wave: record it
+      // here so the lead need not. Concurrent work still needs the lead's declare_wave (gate above).
+      // Only a mutating step starts one, and only when the task has no open wave in its current route epoch:
+      // a read-only step (specifier, reviewer) never adds a wave, so after integration the phase keeps pointing
+      // at the integrated wave. A task that mutates again after integration starts a new one.
+      if (taskId && approval && step?.mode === "full" && inFlight.size === 0 && activeWave === null &&
+          ![...implicitOpen].some(([id, members]) => members.includes(taskId)
+            && implicitEpoch.get(id) === (routeEpochs.get(taskId) ?? 0))) await recordImplicitWave(taskId);
+      // A mutating step that starts in an already bound worktree re-marks the task as unintegrated, so work done
+      // after an earlier integration (no new bind) can never leave COMPLETED passing without integration.
+      if (runId && taskId && approval && step?.mode === "full") {
+        await observe({ kind: "checkpoint", phase: approval.phase, reason: "worker_approval", workspace_bound: true });
+      }
       if (inFlight.size === 0) batchStart = Date.now();
       inFlight.set(call.toolCallId, { taskId, stepId: step?.id ?? null, tool: call.toolName,
-        phase: workerPlans.get(call.toolCallId)?.phase });
+        phase: workerPlans.get(call.toolCallId)?.phase ?? (call.toolName === "spawn_subagent" && step ? approval?.phase : undefined) });
+      // The activity entry carries what a lead directive event used to: task, step, route, and a digest of
+      // the worker contract (never its text).
+      const fields = call.input as Record<string, unknown>;
+      const contract = [fields.prompt, fields.task, fields.message]
+        .find((value): value is string => typeof value === "string" && value.length > 0);
+      const parts = contract ? contractParts(contract) : null;
       if (runId) await observe({ kind: "activity", status: "started", tool: call.toolName,
-        task_id: taskId, step_id: step?.id ?? null });
+        task_id: taskId, step_id: step?.id ?? null,
+        ...(approval ? { route: approval.route } : {}),
+        ...(contract && parts ? { prompt_digest: createHash("sha256").update(contract).digest("hex"),
+                                  ...(parts.excerpt ? { prompt_excerpt: rawWindow(parts.excerpt, EXCERPT_CHARS) } : {}),
+                                  ...(parts.goal ? { goal: rawWindow(parts.goal, GOAL_CHARS) } : {}) } : {}) });
       batchPeak = Math.max(batchPeak, inFlight.size);
       workerStarts.set(call.toolCallId, Date.now());
       const plan = workerPlans.get(call.toolCallId);
+      // A routed Codex step: the validated model and reasoning effort are recorded here, so the record names
+      // which model ran even when the lead records nothing. The lead's own worker event still wins.
+      if (call.toolName === "spawn_subagent" && approval && step?.model) {
+        autoWorkers.add(workspaceKey(approval.phase, step.id));
+        await observe({ kind: "worker", phase: approval.phase, step_id: step.id, status: "in_progress", only_if_open: true, model: step.model,
+          ...(step.effort ? { reasoning_effort: step.effort } : {}) });
+      }
       // Observational: the lead may record the worker itself; the tool_result handler records its terminal status.
-      if (plan) await observe({ kind: "worker", phase: plan.phase, step_id: plan.stepId, status: "in_progress",
+      if (plan) autoWorkers.add(workspaceKey(plan.phase, plan.stepId));
+      if (plan) await observe({ kind: "worker", phase: plan.phase, step_id: plan.stepId, status: "in_progress", only_if_open: true,
         model: plan.canonical, backend: "claude-code", backend_model: plan.backendModel, reasoning_effort: plan.effort });
     }
     if (call.toolName === "route_task") {
@@ -921,8 +990,17 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
       }
     }
     await workerFinished(result.toolCallId);
-    if (runId && worker) await observe({ kind: "activity", status: result.isError ? "failed" : "finished",
-      tool: worker.tool, task_id: worker.taskId, step_id: worker.stepId });
+    if (runId && worker) {
+      // What the worker returned, bounded: the first part of its final text, a digest of all of it, and the
+      // commit it reports. This replaces the lead's feedback events; the full text stays in the Pi transcript.
+      const text = result.content.filter((item) => item.type === "text").map((item) => item.text).join("\n");
+      const commit = reportedCommit(text);
+      await observe({ kind: "activity", status: result.isError ? "failed" : "finished",
+        tool: worker.tool, task_id: worker.taskId, step_id: worker.stepId,
+        ...(text ? { result_summary: rawWindow(text, SUMMARY_CHARS),
+                     result_digest: createHash("sha256").update(text).digest("hex") } : {}),
+        ...(commit ? { commit_sha: commit } : {}) });
+    }
     const before = snapshots.get(result.toolCallId);
     snapshots.delete(result.toolCallId);
     if (runId && before) {
@@ -972,6 +1050,11 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
       } else {
         if (result.toolName === "spawn_subagent" && typeof details.subagent_id === "string" && !result.isError) {
           runSubagents.add(details.subagent_id);
+        }
+        // The worker's own terminal status, like ClaudeWorker's: it never overrides one the lead recorded.
+        if (worker?.phase && worker.stepId && result.toolName === "spawn_subagent") {
+          await observe({ kind: "worker", phase: worker.phase, step_id: worker.stepId, only_if_open: true,
+            ...(result.isError ? { status: "failed", blocker_code: "WORKER_FAILED" } : { status: "completed" }) });
         }
         const usage = (details.usage ?? {}) as Json;
         await observe({ kind: "usage", backend: "pi-subagent",
@@ -1073,6 +1156,23 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
              details: { ok, active: runId !== null, run_id: runId, result } };
   }
 
+  /**
+   * Record a single-task wave for a task the lead started without declaring one. Telemetry-grade: a refused
+   * write is diagnosed and leaves no wave, so the previous behaviour (no wave) applies and nothing blocks.
+   */
+  async function recordImplicitWave(taskId: string): Promise<void> {
+    if (!runId || parentBlocked) return;
+    // One implicit wave per task: it is never grown, and it never lets tasks run concurrently (the gate counts
+    // only an explicit declare_wave, which also checks write-scope overlap and the parallel limit).
+    // Unique across processes (a resumed run has no counter), so a repeated task never reuses an integrated wave.
+    const id = `auto-${randomBytes(4).toString("hex")}-${taskId}`.slice(0, 128);
+    const result = await command(PARENT, ["event", runId, ...ownerArgs()],
+      { kind: "wave", wave_id: id, task_ids: [taskId], status: "declared" });
+    if (result.ok === false) { diagnose("telemetry", result); return; }
+    implicitOpen.set(id, [taskId]);
+    implicitEpoch.set(id, routeEpochs.get(taskId) ?? 0);
+  }
+
   async function declareWave(waveId: string, tasks: { task_id: string; write_scope: string[] }[]) {
     if (integrating) return reply(false, `BLOCKED: INTEGRATION_IN_PROGRESS: wave ${integrating} is still integrating.`);
     if (inFlight.size > 0) return reply(false, "BLOCKED: WAVE_WORKERS_IN_FLIGHT: wait for running workers before declaring the next wave.");
@@ -1110,33 +1210,51 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
       return reply(false, "BLOCKED: parent provenance update failed; see diagnostic log.", parentFailure ?? {});
     }
     activeWave = { id: waveId, tasks: new Map(tasks.map((task) => [task.task_id, task.write_scope])) };
+    // An implicit wave whose tasks all joined this wave is superseded; any other stays open and visible.
+    for (const [id, members] of implicitOpen) {
+      if (members.every((task) => ids.includes(task))) { implicitOpen.delete(id); implicitEpoch.delete(id); }
+    }
     return reply(true, `Wave ${waveId} declared with ${ids.length} task(s) (limit ${limit}). Launch all their ready workers in one tool batch, each attributed "<task_id>:<step_id>".`,
       { wave_id: waveId, task_ids: ids, parallel_tasks: limit });
   }
 
-  async function integration(action: "integrate_begin" | "integrate_end", waveId: string) {
+  async function integration(action: "integrate_begin" | "integrate_end", requestedWaveId: string) {
+    // The lead names an implicitly recorded single-task wave as "auto".
+    let waveId = requestedWaveId;
+    if (requestedWaveId === "auto") {
+      if (implicitOpen.size > 1) {
+        return reply(false, `BLOCKED: WAVE_AUTO_AMBIGUOUS: ${implicitOpen.size} implicit waves are open (${[...implicitOpen.keys()].join(", ")}); name the one to integrate by its id.`);
+      }
+      if (implicitOpen.size === 0) {
+        return reply(false, `BLOCKED: WAVE_UNKNOWN: "auto" names the one open implicit wave, and none is open${activeWave ? ` (the declared wave is ${activeWave.id})` : ""}.`);
+      }
+      waveId = [...implicitOpen.keys()][0];
+    }
+    const members = activeWave?.id === waveId ? [...activeWave.tasks.keys()] : implicitOpen.get(waveId);
     if (action === "integrate_begin") {
-      if (!activeWave || activeWave.id !== waveId) return reply(false, `BLOCKED: WAVE_UNKNOWN: ${waveId} is not the declared wave.`);
+      if (!members) return reply(false, `BLOCKED: WAVE_UNKNOWN: ${waveId} is not an open wave.`);
       if (integrating) return reply(true, `Wave ${waveId} is already integrating.`);
       if (inFlight.size > 0) {
         return reply(false, `BLOCKED: INTEGRATION_WORKERS_IN_FLIGHT: ${inFlight.size} worker call(s) are still running; integrate only between waves.`);
       }
-      if (!await event({ kind: "wave", wave_id: waveId, task_ids: [...activeWave.tasks.keys()], status: "integrating" })) {
+      if (!await event({ kind: "wave", wave_id: waveId, task_ids: members, status: "integrating" })) {
         return reply(false, "BLOCKED: parent provenance update failed; see diagnostic log.", parentFailure ?? {});
       }
       integrating = waveId;
-      return reply(true, `Integration of wave ${waveId} started. Worker launches are refused until integrate_end.`);
+      return reply(true, `Integration of wave ${waveId} (task${members.length === 1 ? "" : "s"} ${members.join(", ")}) started. Worker launches are refused until integrate_end.`);
     }
-    if (integrating !== waveId || !activeWave) return reply(false, `BLOCKED: INTEGRATION_NOT_STARTED: wave ${waveId} is not integrating.`);
+    if (integrating !== waveId || !members) return reply(false, `BLOCKED: INTEGRATION_NOT_STARTED: wave ${waveId} is not integrating.`);
     // Re-base: the parent's own merges are the new reference for later worker snapshots.
     const rebased = await snapshot();
     if (!rebased) return reply(false, "BLOCKED: WORKER_SCOPE_UNVERIFIABLE: could not snapshot the parent checkout.");
     snapshots.clear();
-    if (!await event({ kind: "wave", wave_id: waveId, task_ids: [...activeWave.tasks.keys()], status: "integrated" })) {
+    if (!await event({ kind: "wave", wave_id: waveId, task_ids: members, status: "integrated" })) {
       return reply(false, "BLOCKED: parent provenance update failed; see diagnostic log.", parentFailure ?? {});
     }
     integrating = null;
-    activeWave = null;
+    implicitOpen.delete(waveId);
+    implicitEpoch.delete(waveId);
+    if (activeWave?.id === waveId) activeWave = null;
     return reply(true, `Wave ${waveId} integrated; the parent checkout snapshot is re-based. Plan the next dependency-ready wave.`,
       { wave_id: waveId, digest: rebased.digest });
   }
@@ -1144,7 +1262,7 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
   pi.registerTool({
     name: "orchestration_record",
     label: "Record parent orchestration outcome",
-    description: "Parent only: record phases, workers, child runs, mutation counts, concise numbered interaction summaries, or final status; bind mutating steps to prepared worktrees; declare waves; and bracket integration. Interaction events describe directives, feedback, and decisions with task/step ids and optional reply_to. Never include prompts, raw outputs, transcripts, or issue bodies.",
+    description: "Parent only: record phases, workers, child runs, mutation counts, concise numbered interaction summaries, or final status; bind mutating steps to prepared worktrees; declare waves; and bracket integration. Do not record directive or feedback interactions: the extension records each worker call itself, with task, step, route, a contract excerpt and digest, and a bounded result summary, digest and commit (the full text stays in the Pi session transcript). Record a decision interaction only for your own judgment, with task/step ids and optional reply_to. Never include prompts, raw outputs, transcripts, or issue bodies.",
     parameters: Type.Union([
       Type.Object({ action: Type.Literal("status") }, { additionalProperties: false }),
       Type.Object({ action: Type.Literal("bind_workspace"), task_id: Type.Optional(Type.String()),
@@ -1196,7 +1314,8 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
         const ok = checked.ok === true && typeof checked.path === "string";
         if (ok) {
           workspaces.set(workspaceKey(taskId, params.step_id), checked.path as string);
-          await event({ kind: "checkpoint", phase: approvals.get(taskId)?.phase ?? taskId, reason: "worker_approval" });
+          await event({ kind: "checkpoint", phase: approvals.get(taskId)?.phase ?? taskId, reason: "worker_approval",
+            workspace_bound: true });
         }
         return reply(ok, ok
           ? `Step ${params.step_id} of task ${taskId} is bound to worktree ${String(checked.path)}.`
@@ -1214,7 +1333,8 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
         : ["finish", runId, params.status, ...ownerArgs(),
            ...(params.blocker_code ? ["--blocker-code", params.blocker_code] : [])];
       const result = await command(PARENT, args,
-        params.action === "event" ? params.event as Json : undefined);
+        // `only_if_open` and `auto_recorded` mark the extension's own records: a lead payload never carries them.
+        params.action === "event" ? withoutAutomaticMarks(params.event as Json) : undefined);
       const observedRunId = runId;
       const unresolvedRoute = parentBlocked &&
         (parentFailure?.error_code === "PARENT_EVENT_CONFLICT" || parentFailure?.error_code === "PARENT_ESCALATION_INVALID"
@@ -1223,7 +1343,10 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
         && !(params.action === "status" && unresolvedRoute);
       // A refused repeat or excess override of an already-terminal worker changes nothing: it is reported to the
       // lead and never blocks the run.
-      const harmless = params.action === "event" && result.ok === false && HARMLESS_REFUSALS.has(String(result.error_code));
+      const restated = params.action === "event" && params.event.kind === "worker"
+        && autoWorkers.has(workspaceKey(params.event.phase, params.event.step_id));
+      const harmless = params.action === "event" && result.ok === false
+        && (HARMLESS_REFUSALS.has(String(result.error_code)) || (restated && RESTATEMENT_REFUSALS.has(String(result.error_code))));
       if (!ok && !harmless) {
         const failure = params.action === "status" && parentBlocked ? parentFailure ?? result : result;
         diagnose(params.action, failure);
@@ -1232,6 +1355,7 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
       if (params.action === "event" && params.event.kind === "escalation" && ok) {
         parentFailure = null; parentBlocked = false;
         pendingReroutes.add(params.event.phase);
+        routeEpochs.set(params.event.phase, (routeEpochs.get(params.event.phase) ?? 0) + 1);
         approvals.delete(params.event.phase);
         for (const key of workspaces.keys()) {
           if (key.startsWith(`${params.event.phase}\u0000`)) workspaces.delete(key);

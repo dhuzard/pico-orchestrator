@@ -6,6 +6,59 @@ All notable changes to PICO are recorded here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- The lead records less (issue #43). The prompts no longer ask for `directive` or
+  `feedback` interaction events or for optional phases such as `inspection`; `decision`,
+  status, bind, worker/phase outcomes, the integrate bracket and finish stay. Worker
+  contracts open with a `Goal:` line.
+- The extension's `activity` entries carry what those events carried: at start the routed
+  `route`, a `prompt_digest`, the contract's `goal` (200 characters) and a 300-character
+  `prompt_excerpt` taken after the task tag and goal line; on return a 600-character
+  `result_summary`, its `result_digest` and any reported `commit_sha`. Text is single-line
+  with control characters removed; credential shapes (tokens, JWTs, `password=` style
+  assignments with a 16+ character value, URLs with credentials, cloud and package-registry keys) are masked in the
+  whole text before it is cut, and an unbroken run left at the cut is dropped. The full
+  text lives in the Pi session transcript. Garden's Conversation view shows these entries.
+- A routed task started with no worker running and no wave declared gets its own implicit
+  single-task wave (never grown). Only an explicit `declare_wave` lets tasks run
+  concurrently (`WAVE_UNDECLARED`, write-scope overlap and the parallel limit are
+  unchanged). `integrate_begin`/`integrate_end` accept `"auto"` for the one open implicit
+  wave and refuse with `WAVE_AUTO_AMBIGUOUS` (several) or `WAVE_UNKNOWN` (none). A run that
+  ends without COMPLETED marks its open waves `abandoned` (`reconciled`, kind `wave`).
+  COMPLETED is refused with `PARENT_WAVE_INTEGRATING` while an integration was begun and not
+  ended, and with `PARENT_WAVE_NOT_INTEGRATED` for any task with a bound worktree that no
+  integrated wave has covered since (`phase.workspace_bound`, checked per task so a missing
+  wave record cannot hide it; `phase.bound_epochs` keeps the route epochs that bound one, so
+  an escalation does not forget the old route's worktree); read-only tasks do not block it.
+- Only a mutating step starts an implicit wave, and only when its task has no open wave in the
+  current route epoch: a read-only specifier or reviewer never adds one, so after integration
+  the phase keeps pointing at the integrated wave. A task that mutates again after integration
+  starts a new wave.
+- `benchmark_metrics.py --compare` matches waves by their task set and route epoch (raw ids kept
+  as `ids` metadata) and integrate facts by that key, so `wave-1` and `auto-...` are the same
+  wave. Optional phases (like `inspection`) are listed under
+  "Dropped optional phases" (`provenance.dropped_optional_phases`) instead of as missing facts, but only
+  for the allow-listed `inspection` phase when it was `completed` with no blocker, route, worker, wave or
+  escalation; every other phase (a blocked `routing` phase, say) stays missing.
+- A mutating worker that starts in an already bound worktree re-marks its task unintegrated
+  (`workspace_bound`), so work done after an earlier integration whose new wave write was refused
+  still refuses COMPLETED with `PARENT_WAVE_NOT_INTEGRATED`.
+- The extension records a routed Codex step's `model` and `reasoning_effort` when its subagent
+  starts, and its terminal status (`only_if_open`, like ClaudeWorker's) when it returns, so the
+  record names the reviewing model even when the lead records no worker event. The lead's own
+  event still wins.
+- A lead that restates a worker the extension already recorded (the old habit for Codex steps) is
+  never an error: the same model with or without its provider prefix, a different
+  `reasoning_effort` (the routed plan's value is authoritative) and an `in_progress` after the
+  automatic terminal status are accepted as no-ops (`worker.auto_recorded`), and any remaining
+  refusal for such a worker never blocks the run. Codex workers now follow the ClaudeWorker rule in
+  the prompts: record one only when your judgment differs or to add a `blocker_code`.
+- A failed Claude step whose retry succeeded is now `completed`: after the last failure the
+  same step must have started again on the same route and returned without error. The
+  failure stays in `worker_overrides` (`by` `extension` or `lead`, `reason`
+  `retry_succeeded`) within the existing bounds.
+
 ### Fixed
 
 - A run that ends PARTIAL, BLOCKED, FAILED or settled no longer leaves phases or

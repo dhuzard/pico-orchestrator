@@ -237,8 +237,10 @@ def provenance_facts(record: dict, interaction_types: tuple[str, ...] = (),
                      session_bind_keys: list[tuple[str, str]] | None = None) -> list[dict]:
     """Phase, worker, wave, bind, integrate and finish facts of a run record, each with a semantic key.
 
-    Keys are identities (phase id, phase/step/epoch, wave id), never positions, so order does not matter.
-    A wave contributes one `wave` fact (its tasks) and, per status reached, `integrate` begin/end facts.
+    Keys are identities (phase id, phase/step/epoch, a wave's task set and route epoch), never positions or
+    ids that a lead or the extension chose, so order and naming do not matter. Waves with the same task set and
+    route epoch are one wave fact (the furthest status any of them reached), with `integrate` begin/end facts
+    keyed by that task set; the raw wave ids are kept as `ids` metadata, outside the compared value.
     Bind: the run record has no standalone bind event. With a lead session, binds are the
     `bind_workspace` calls in it (`session_bind_keys`, from `session_binds`); without one they are
     an optional record `binds` list plus ClaudeWorker `started` activity. Every bind is keyed by
@@ -251,7 +253,7 @@ def provenance_facts(record: dict, interaction_types: tuple[str, ...] = (),
     for phase in parent.get("phases") or []:
         facts.append(_fact("phase", [phase.get("id")], {
             "status": phase.get("status"), "route": phase.get("route"), "blocker_code": phase.get("blocker_code"),
-            "wave_id": phase.get("wave_id"), "escalations": len(phase.get("escalations") or [])}))
+            "in_wave": bool(phase.get("wave_id")), "escalations": len(phase.get("escalations") or [])}))
         for worker in phase.get("workers") or []:
             facts.append(_fact("worker", [phase.get("id"), worker.get("step_id"), worker.get("route_epoch", 0)], {
                 "status": worker.get("status"), "backend": worker.get("backend"), "model": worker.get("model"),
@@ -260,13 +262,22 @@ def provenance_facts(record: dict, interaction_types: tuple[str, ...] = (),
         facts.append(_fact("worker", ["override", override.get("phase_id"), override.get("step_id"),
                                       override.get("route_epoch"), override.get("from_status"), override.get("to_status")],
                            {"blocker_code": override.get("blocker_code")}))
+    escalations = {phase.get("id"): len(phase.get("escalations") or []) for phase in parent.get("phases") or []}
+    waves: dict[tuple, dict] = {}
     for wave in parent.get("waves") or []:
-        reached = WAVE_STATUSES.index(wave["status"]) if wave.get("status") in WAVE_STATUSES else -1
-        facts.append(_fact("wave", [wave.get("id")], {"task_ids": sorted(map(str, wave.get("task_ids") or []))}))
-        if reached >= 1:
-            facts.append(_fact("integrate", [wave.get("id"), "begin"], {}))
-        if reached >= 2:
-            facts.append(_fact("integrate", [wave.get("id"), "end"], {}))
+        tasks = tuple(sorted(map(str, wave.get("task_ids") or [])))
+        epoch = max((escalations.get(task, 0) for task in tasks), default=0)
+        entry = waves.setdefault((tasks, epoch), {"ids": [], "reached": -1})
+        entry["ids"].append(wave.get("id"))
+        if wave.get("status") in WAVE_STATUSES:
+            entry["reached"] = max(entry["reached"], WAVE_STATUSES.index(wave["status"]))
+    for (tasks, epoch), entry in sorted(waves.items()):
+        key = [",".join(tasks), epoch]
+        facts.append({**_fact("wave", key, {"task_ids": list(tasks)}), "ids": entry["ids"]})
+        if entry["reached"] >= 1:
+            facts.append({**_fact("integrate", [*key, "begin"], {}), "ids": entry["ids"]})
+        if entry["reached"] >= 2:
+            facts.append({**_fact("integrate", [*key, "end"], {}), "ids": entry["ids"]})
     binds: dict[tuple[str, str], str] = {}
     if session_bind_keys is not None:
         binds = {key: "session" for key in session_bind_keys}
@@ -312,6 +323,29 @@ def diff_facts(before: list[dict], after: list[dict]) -> list[dict]:
         elif index[ident] != fact["value"]:
             missing.append({**fact, "reason": "differs", "after": index[ident]})
     return sorted(missing, key=lambda f: (f["category"], f["key"], f["reason"]))
+
+
+# Phases a lead recorded only as bookkeeping. Anything else, such as `routing`, can carry a blocker or an outcome.
+OPTIONAL_PHASE_IDS = frozenset({"inspection"})
+
+
+def split_dropped_optional(before_facts: list[dict], missing: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Separate phases that carried no route, no worker and no wave (like `inspection`) from the missing facts.
+
+    Only phases on the allow-list `OPTIONAL_PHASE_IDS` count, and only when they were `completed` with no
+    blocker code, route, worker, wave or escalation. They stay listed as dropped optional phases rather than
+    lost evidence; every other phase (a blocked `routing` phase, say) stays missing.
+    """
+    with_workers = {f["key"][0] for f in before_facts if f["category"] == "worker" and f["key"][0] != "override"}
+    dropped, lost = [], []
+    for fact in missing:
+        value = fact["value"]
+        optional = (fact["category"] == "phase" and fact["reason"] == "absent" and fact["key"][0] in OPTIONAL_PHASE_IDS
+                    and value.get("status") == "completed" and not value.get("blocker_code")
+                    and not value.get("route") and not value.get("in_wave") and not value.get("escalations")
+                    and fact["key"][0] not in with_workers)
+        (dropped if optional else lost).append(fact)
+    return dropped, lost
 
 
 def provenance_diff(before: dict, after: dict, interaction_types: tuple[str, ...] = ()) -> list[dict]:
@@ -467,13 +501,15 @@ def _delta(before: Any, after: Any) -> dict | None:
     return {"before": before, "after": after, "delta": None, "percent": None}
 
 
-def provenance_completeness(before: dict, after: dict) -> list[dict]:
-    """Missing facts across the runs of two reports, paired by task (or by position when runs carry no task)."""
+def provenance_completeness(before: dict, after: dict) -> tuple[list[dict], list[dict], list[dict]]:
+    """(missing, bind-source mismatches, dropped optional phases) across the runs of two reports, paired by task
+    (or by position when runs carry no task). Dropped optional phases are listed but do not make the run incomplete."""
     def keyed(report):
         return {(r.get("task") or f"#{i}"): r for i, r in enumerate(report["runs"])}
     b, a = keyed(before), keyed(after)
     missing = []
     mismatched = []
+    dropped = []
     for task, run in sorted(b.items()):
         counterpart = a.get(task)
         if counterpart is None:
@@ -486,9 +522,10 @@ def provenance_completeness(before: dict, after: dict) -> list[dict]:
             mismatched.append({"task": task, "before": sources[0], "after": sources[1]})
             before_facts = [f for f in before_facts if f["category"] != "bind"]
             after_facts = [f for f in after_facts if f["category"] != "bind"]
-        for fact in diff_facts(before_facts, after_facts):
-            missing.append({"task": task, **fact})
-    return missing, mismatched
+        gone, lost = split_dropped_optional(before_facts, diff_facts(before_facts, after_facts))
+        missing.extend({"task": task, **fact} for fact in lost)
+        dropped.extend({"task": task, **fact} for fact in gone)
+    return missing, mismatched, dropped
 
 
 def unresolved_binds(report: dict) -> list[dict]:
@@ -513,9 +550,10 @@ def compare(before: dict, after: dict) -> dict:
                               for n in TOKEN_NAMES.values()}
                           for b in sorted(set(bt["tokens"]["workers"]) | set(at["tokens"]["workers"]))},
     }
-    missing, mismatched = provenance_completeness(before, after)
+    missing, mismatched, dropped = provenance_completeness(before, after)
     return {"before": before, "after": after, "deltas": deltas,
             "provenance": {"complete": not missing and not mismatched, "missing": missing,
+                           "dropped_optional_phases": dropped,
                            "bind_source_mismatch": bool(mismatched), "bind_sources": mismatched,
                            "unresolved_binds": {"before": unresolved_binds(before), "after": unresolved_binds(after)}}}
 
@@ -571,6 +609,10 @@ def render_compare(result: dict) -> str:
                  f"({len(prov['missing'])} BEFORE fact(s) missing from AFTER)")
     for m in prov["missing"]:
         lines.append(f"  {m.get('task')}: {m['category']} {'/'.join(m['key'])} ({m['reason']})")
+    if prov["dropped_optional_phases"]:
+        lines.append("Dropped optional phases (no route, workers or wave in BEFORE; listed, not counted as missing)")
+        for m in prov["dropped_optional_phases"]:
+            lines.append(f"  {m.get('task')}: phase {m['key'][0]} ({m['value'].get('status')})")
     if prov["bind_source_mismatch"]:
         lines.append("  bind_source_mismatch: binds were observed through different sources, so they are not compared:")
         for item in prov["bind_sources"]:

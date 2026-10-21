@@ -329,20 +329,32 @@ function renderTimeline(run) {
 
 function renderConversation(run) {
   const list = $("conversation-list"); list.replaceChildren();
-  const items = run?.interactions || [];
+  // The parent's recorded interactions, plus what the extension recorded for each worker call: the start of
+  // its contract (directive) and the start of its result (feedback). Text only; the full text is in the
+  // Pi session transcript.
+  const recorded = (run?.interactions || []).map((item) => ({ ...item, label: String(item.sequence), id: `conversation-step-${item.sequence}` }));
+  const observed = (run?.activity || []).flatMap((entry, index) => {
+    const text = entry.status === "started" ? entry.prompt_excerpt || entry.goal : entry.result_summary;
+    if (!text || !entry.task_id || !entry.step_id) return [];
+    return [{ type: entry.status === "started" ? "directive" : "feedback",
+      summary: entry.status === "started" ? [entry.goal, entry.prompt_excerpt].filter(Boolean).join(" — ") : text, task_id: entry.task_id, step_id: entry.step_id,
+      subagent_id: entry.subagent_id, at: entry.at, label: "•", id: `conversation-activity-${index}`, commit: entry.commit_sha, failed: entry.status === "failed" }];
+  });
+  const items = [...recorded, ...observed].sort((a, b) => String(a.at || "").localeCompare(String(b.at || "")));
   $("conversation-count").textContent = `${items.length} ${items.length === 1 ? "step" : "steps"}`;
   if (!items.length) {
-    list.append(el("p", "empty", "No directive or feedback summaries were recorded for this run."));
+    list.append(el("p", "empty", "No worker contracts, results or decisions were recorded for this run."));
     return;
   }
   for (const item of items) {
     const card = el("article", `conversation-card ${item.type}`);
-    card.id = `conversation-step-${item.sequence}`;
+    card.id = item.id;
     const head = el("div", "conversation-card-head");
-    head.append(el("span", "conversation-number", String(item.sequence)),
+    head.append(el("span", "conversation-number", item.label),
       el("strong", "", item.type === "directive" ? "Parent → worker" : item.type === "feedback" ? "Worker → parent" : "Parent decides"),
       el("time", "", timeLabel(item.at)));
     card.append(head, el("p", "conversation-summary", item.summary));
+    if (item.commit) card.append(el("small", "", `commit ${item.commit}`));
     const footer = el("div", "conversation-card-footer");
     footer.append(el("span", "", `${item.task_id} · ${item.step_id}${item.subagent_id ? ` · ${item.subagent_id}` : ""}`));
     if (item.reply_to != null) {
