@@ -7,6 +7,7 @@ non-force publication path runs without network access.
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import subprocess
 import sys
@@ -38,6 +39,22 @@ class FakeGithub:
     def __init__(self):
         self.created = []
         self.checks = {}
+        self.heads = {}  # (repo, branch) -> commit, as the GitHub API reports it
+        self.policies = {}  # (repo, commit) -> contents entry for .pi/autonomy.yaml
+
+    def branch_head(self, branch, *, repo):
+        return self.heads.get((repo, branch))
+
+    def policy_file_at(self, commit, *, repo):
+        return self.policies.get((repo, commit))
+
+    def merge_policy(self, repo, text, branch="main"):
+        """GitHub's base branch moves to a new commit carrying `text` as .pi/autonomy.yaml."""
+        commit = hashlib.sha1(f"{repo}:{branch}:{len(self.heads) + len(self.policies)}".encode()).hexdigest()
+        self.heads[(repo, branch)] = commit
+        self.policies[(repo, commit)] = {"type": "file", "path": ".pi/autonomy.yaml",
+                                         "sha": hashlib.sha1(text.encode()).hexdigest(), "text": text}
+        return commit
 
     def list_prs(self, *, base, head, repo):
         return [{"number": c["number"], "state": "OPEN"} for c in self.created if c["head"] == head and c["repo"] == repo]
@@ -284,6 +301,68 @@ class ContractLifecycleTest(unittest.TestCase):
         with self.assertRaises(wr.WorkspaceRunError) as ctx:
             wc.validate(manifest=manifest, task_id="a1", head="pico/a1")
         self.assertEqual(ctx.exception.code, "WORKSPACE_HEAD_UNRELATED")
+
+    def test_issue_reference_defaults_to_refs_and_closes_on_opt_in(self):
+        def dry_run(manifest):
+            preview = wc.publish(manifest=manifest, task_id="a1", adapter=self.fake)
+            self.assertEqual(preview["status"], "DRY_RUN", preview)
+            plan = wr._plan(manifest, access_check=None)
+            return (wc._scratch(plan, "a1") / "pr-body.md").read_text(encoding="utf-8"), preview
+
+        manifest = self.manifest()
+        self.schedule(manifest)
+        self.work("alpha", "pico/a1", "claims.json")
+        self.assertEqual(wc.validate(manifest=manifest, task_id="a1", head="pico/a1")["status"], "VALIDATED")
+        self.allow_publication("alpha")
+        path = self.repos["alpha"][0]
+        policy = path / ".pi/autonomy.yaml"
+        refs_policy = policy.read_text()
+        closes_policy = refs_policy.replace("issue_reference: refs", "issue_reference: closes")
+        github_main = self.fake.merge_policy("acme/alpha", refs_policy)
+
+        with self.subTest("default writes Refs"):
+            body, preview = dry_run(manifest)
+            self.assertTrue(body.startswith("Refs #7\n"), body)
+            self.assertEqual(preview["plan"]["issue_reference"], "refs")
+            self.assertEqual(preview["issue_reference_decision"],
+                             {"closes": False, "source": "repository", "base_commit": github_main,
+                              "policy_blob": self.fake.policies[("acme/alpha", github_main)]["sha"]})
+
+        with self.subTest("closes_issue: true writes Closes, though the repository says refs"):
+            body, preview = dry_run(self.manifest(a1={"closes_issue": True}))
+            self.assertTrue(body.startswith("Closes #7\n"), body)
+            self.assertEqual(preview["plan"]["issue_reference"], "closes")
+            self.assertEqual(preview["issue_reference_decision"]["source"], "task")
+
+        with self.subTest("the opt-in may close only the task's own issue"):
+            stray = wc.publish(manifest=self.manifest(a1={"closes_issue": True, "title": "Claim adapter, fixes #8"}),
+                               task_id="a1", adapter=self.fake)
+            self.assertEqual((stray["status"], stray["blocker_code"]), ("BLOCKED", "PUBLICATION_BODY_INVALID"))
+
+        with self.subTest("an uncommitted repository policy changes nothing"):
+            policy.write_text(closes_policy)
+            self.assertTrue(dry_run(self.manifest())[0].startswith("Refs #7\n"))
+
+        git("-C", str(path), "add", ".pi/autonomy.yaml")
+        git("-C", str(path), *COMMIT, "close issues on merge")
+        with self.subTest("a policy committed locally but not on GitHub changes nothing"):
+            self.assertTrue(dry_run(self.manifest())[0].startswith("Refs #7\n"))
+
+        github_main = self.fake.merge_policy("acme/alpha", closes_policy)
+        with self.subTest("the policy at GitHub's base commit decides when the task is silent"):
+            body, preview = dry_run(self.manifest())
+            self.assertTrue(body.startswith("Closes #7\n"), body)
+            self.assertEqual(preview["plan"]["closes_issues"], [7])
+            self.assertEqual(preview["plan"]["base_commit"], github_main)
+            self.assertEqual(preview["issue_reference_decision"]["closes"], True)
+
+        with self.subTest("closes_issue: false keeps Refs"):
+            self.assertTrue(dry_run(self.manifest(a1={"closes_issue": False}))[0].startswith("Refs #7\n"))
+
+        with self.subTest("an applied opt-in publishes Closes"):
+            applied = self.publish(self.manifest(a1={"closes_issue": True}), "a1")
+            self.assertEqual(applied["status"], "COMPLETED", applied)
+            self.assertTrue(self.fake.created[0]["body"].startswith("Closes #7\n"))
 
     def test_downstream_publication_requires_upstream_pr(self):
         # The manifest may declare a1 ready by hand; b1's PR must still link a real upstream PR.

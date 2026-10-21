@@ -2,7 +2,8 @@
 
 <!-- What changed and why? Keep this decision-oriented. -->
 
-Refs #
+<!-- Closes the issue on merge. Use `Refs #N` instead if this PR only partly addresses it. -->
+Closes #
 
 ## Changes
 
@@ -32,4 +33,4 @@ Refs #
 - [ ] PR is bounded to its stated scope
 - [ ] Documentation/configuration is updated where required
 - [ ] No secrets, generated junk, or unrelated changes are included
-- [ ] Issue closure is deferred until acceptance unless auto-close is explicitly intended
+- [ ] `Closes #N` only if this PR fully resolves the issue; otherwise `Refs #N`

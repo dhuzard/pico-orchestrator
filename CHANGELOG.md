@@ -41,6 +41,24 @@ All notable changes to PICO are recorded here. The format follows
 - A newcomer path at the top of the README: what PICO and Pi are, a diagram,
   prerequisites, a documentation index, and links to the contributing,
   security and conduct files.
+- `issue_reference: refs | closes` in `.pi/autonomy.yaml` (default `refs`)
+  and an optional `closes_issue` on workspace tasks, so a published PR can
+  say `Closes #N` and close its issue on merge. The publication gate accepts
+  `Closes #N` only when the policy or the task opts in, and now refuses any
+  unauthorized closing keyword anywhere in the body. The gate reads the
+  base commit and the policy through the GitHub API (never local git refs
+  or config), binds both into the plan hash, and refuses issues outside the
+  declared ones or the PR's repository. Because the plan binds the base
+  commit, a merge to the base between dry run and apply now gives
+  `GITHUB_STATE_CONFLICT`, also for `Refs`-only PRs.
+  PICO's own `.pi/autonomy.yaml` sets `closes`, and the pull request
+  template uses `Closes #`.
+- Compatibility: an older PICO rejects a `.pi/autonomy.yaml` that contains
+  `issue_reference` with `AUTONOMY_POLICY_INVALID`, because the schema does
+  not allow unknown keys. Update PICO before adding the key to a repository
+  that other installs also read. `.pi/autonomy.yaml` is now tracked in this
+  repository, so every worker worktree inherits it, and a Garden permission
+  toggle leaves a tracked modification until it is committed.
 
 ### Security
 

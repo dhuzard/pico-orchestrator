@@ -17,6 +17,10 @@ the required version. Qualification tasks launch no child run: their checks run
 across repositories once every dependency is validated, each repository at its
 dependency's validated commit (or its pin).
 
+Each PR body references the task's issue with `Refs #N`, or `Closes #N` when the
+task sets `closes_issue: true` (or omits it and .pi/autonomy.yaml at the base commit GitHub reports
+sets `issue_reference: closes`); `closes_issue: false` always writes `Refs #N`.
+
 Publication goes through github_integration.publish unchanged: .pi/autonomy.yaml
 must grant push_branch and create_pr, the head must be a pico/ branch, the plan
 is a dry run until --apply with the reviewed --plan-hash, pushes are non-force,
@@ -179,11 +183,34 @@ def validate(*, manifest: Path, task_id: str, head: str | None = None) -> dict:
             "error_code": None if passed else "WORKSPACE_CHECK_FAILED", "checks": results, "observed": entry["observed"]}
 
 
-def pr_body(plan: dict, task: dict, repo: dict, observed: dict) -> str:
+def issue_reference_decision(task: dict, repo: dict, adapter=gh) -> dict:
+    """Whether the task's PR closes its issue on merge, and what decided it.
+
+    An explicit `closes_issue` on the task wins (`source: task`); without one,
+    the task follows its repository's `issue_reference` (default `refs`) at the
+    base commit GitHub reports (`source: repository`), the same value the
+    publication gate trusts.
+    """
+    if isinstance(task.get("closes_issue"), bool):
+        return {"closes": task["closes_issue"], "source": "task", "base_commit": None, "policy_blob": None}
+    try:
+        reference, blob, base_commit = github_integration.verified_issue_reference(
+            repo["repository"], repo.get("base_branch", "main"), adapter)
+    except github_integration.IntegrationError as exc:
+        raise WorkspaceRunError(exc.code, exc.detail) from exc
+    except (gh.GithubSyncError, ValueError) as exc:
+        raise WorkspaceRunError("GITHUB_READ_FAILED", "could not read the base branch's issue policy") from exc
+    return {"closes": reference == "closes", "source": "repository", "base_commit": base_commit,
+            "policy_blob": blob}
+
+
+def pr_body(plan: dict, task: dict, repo: dict, observed: dict, decision: dict | None = None) -> str:
     tasks = {t["id"]: t for t in plan["tasks"]}
     repos = {r["id"]: r for r in plan["repositories"]}
     every = workspace_run.observed_state(plan["workspace_id"])
-    lines = [f"Refs #{task['issue']}", "",
+    decision = decision if decision is not None else issue_reference_decision(task, repo)
+    keyword = "Closes" if decision["closes"] else "Refs"
+    lines = [f"{keyword} #{task['issue']}", "",
              f"Part of workspace `{plan['workspace_id']}`, task `{task['id']}`: {task['title']}", "",
              f"Validated commit: `{observed['validated_commit']}`"]
     for check in observed.get("checks") or []:
@@ -225,7 +252,8 @@ def publish(*, manifest: Path, task_id: str, apply: bool = False, plan_hash: str
     checkout = Path(repo["resolved_path"])
     if _commit_of(checkout, f"refs/heads/{observed['head_branch']}") != observed["validated_commit"]:
         raise WorkspaceRunError("WORKSPACE_HEAD_CHANGED", "the head moved since validation; validate again")
-    body = pr_body(plan, task, repo, observed)
+    decision = issue_reference_decision(task, repo, adapter)
+    body = pr_body(plan, task, repo, observed, decision)
     scratch = _scratch(plan, task_id)
     scratch.mkdir(parents=True, exist_ok=True)
     body_file = scratch / "pr-body.md"
@@ -233,14 +261,15 @@ def publish(*, manifest: Path, task_id: str, apply: bool = False, plan_hash: str
     result = github_integration.publish(worktree=checkout, base=repo["base_branch"], head=observed["head_branch"],
                                         title=task["title"], body_file=body_file, explicit_repo=repo["repository"],
                                         apply=apply, expected_plan_hash=plan_hash, adapter=adapter,
-                                        provenance_root=headless_run.ROOT, grant=grant)
+                                        provenance_root=headless_run.ROOT, grant=grant,
+                                        closes_issue=task["issue"] if task.get("closes_issue") is True else None)
     if result["status"] == "COMPLETED" and result.get("pr"):
         def mutate(obs: dict) -> None:
             obs["pr"] = {"number": result["pr"], "repository": repo["repository"],
                          "publication_run_id": result["run_id"], "published_at": _now()}
         _update(plan, manifest, task_id, mutate)
     ok = result["status"] in {"DRY_RUN", "COMPLETED"}
-    return {"ok": ok, "task_id": task_id, **result}
+    return {"ok": ok, "task_id": task_id, **result, "issue_reference_decision": decision}
 
 
 def ci(*, manifest: Path, task_id: str, adapter=gh) -> dict:
