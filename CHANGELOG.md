@@ -6,6 +6,14 @@ All notable changes to PICO are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- `pico workspace launch` now refuses with `WORKSPACE_BUDGET_EXHAUSTED` when the
+  workspace budget is exhausted (it previously spent past it; only the
+  scheduler and the Garden checked). `--ignore-budget` overrides explicitly and
+  is recorded as `budget_override`. Found by the scientific-evidence-pilot run.
+  Refs #6.
+
 ### Added
 
 - `CONTRIBUTING.md` with the development checks, the rules for routing and

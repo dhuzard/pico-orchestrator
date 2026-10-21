@@ -1880,6 +1880,22 @@ and qualification checks still run. Raising the budget in the manifest lets
 the next scheduler run dispatch them. The Garden shows spend against the
 budget, and the schedule preview refuses to launch while it is exhausted.
 
+A direct `pico workspace launch` (also with `--resume`) applies the same gate:
+while the budget is exhausted it is refused with `WORKSPACE_BUDGET_EXHAUSTED`,
+whose message gives spent against limit. `--ignore-budget` (`ignore_budget=True`
+in `workspace_run.launch`) overrides it explicitly; the override is never
+silent, because the task entry in the workspace record gains
+`budget_override` (UTC time, exhausted limits and the spend at launch). The
+check runs only when a child would actually start or resume: a repeat launch
+that is a no-op (such as `already_finished`) is never refused and records no
+override. It runs outside the workspace lock, so two simultaneous direct
+launches can both pass it; this is accepted because spend is only known after
+runs finish. The scheduler has already gated its own dispatch and passes the
+internal `budget_checked=True`, which skips the check and records nothing
+(`ignore_budget` is reserved for explicit user overrides).
+The spend computation is `workspace_run.budget_state`
+(`workspace_scheduler.budget_state` remains as an alias).
+
 **Committing a policy change.** The Garden's `commit_policy` action commits
 only `.pi/autonomy.yaml` (`git commit --only`), with the repository's own Git
 identity, and only when `HEAD` is the repository's `base_branch`

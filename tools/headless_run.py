@@ -299,7 +299,7 @@ def refresh(record: dict) -> dict:
 
 def start(*, target: Path, explicit_repo: str, execution_id: str, objective: str, allow_mutation: bool = False,
           resume: bool = False, pi_executable: str = "pi", python: str = sys.executable,
-          wait: bool = True) -> dict:
+          wait: bool = True, before_spawn=None) -> dict:
     if not objective.strip() or len(objective) > 20000:
         raise HeadlessError("OBJECTIVE_INVALID", "objective must be a non-empty string under 20000 characters")
     if provenance._contains_secret_like_content(objective):
@@ -311,7 +311,8 @@ def start(*, target: Path, explicit_repo: str, execution_id: str, objective: str
     with locked_record(path):
         launched = _launch_locked(path, worktree=worktree, identity=identity, common=common,
                                   execution_id=execution_id, objective=objective, allow_mutation=allow_mutation,
-                                  resume=resume, pi_executable=pi_executable, python=python)
+                                  resume=resume, pi_executable=pi_executable, python=python,
+                                  before_spawn=before_spawn)
     if isinstance(launched, dict):
         return launched
     record, child, log, before = launched
@@ -338,7 +339,7 @@ def start(*, target: Path, explicit_repo: str, execution_id: str, objective: str
 
 
 def _launch_locked(path: Path, *, worktree: Path, identity: str, common: Path, execution_id: str, objective: str,
-                   allow_mutation: bool, resume: bool, pi_executable: str, python: str):
+                   allow_mutation: bool, resume: bool, pi_executable: str, python: str, before_spawn=None):
     """Return the settled record, or (record, child, log, checkout_before) for a new launch. Caller holds the lock."""
     record = load_record(path)
     if record is not None:
@@ -368,6 +369,9 @@ def _launch_locked(path: Path, *, worktree: Path, identity: str, common: Path, e
             return record
     elif resume:
         raise HeadlessError("EXECUTION_UNKNOWN", "nothing to resume for this execution id")
+
+    if before_spawn is not None:
+        before_spawn()  # a child will start or resume: callers may still refuse here
 
     granted = mutation_permitted(worktree)
     if granted and not allow_mutation:
