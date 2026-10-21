@@ -66,6 +66,17 @@ const LEAD_LIMIT_ENV = "PI_ORCHESTRATION_MAX_LEAD_CALLS";
 const LEAD_LIMIT_SOURCE_ENV = "PI_ORCHESTRATION_MAX_LEAD_CALLS_SOURCE";
 const LEAD_WARN_ENV = "PI_ORCHESTRATION_LEAD_CALLS_WARN_AT";
 const LEAD_LIMIT_SOURCES = new Set(["cli", "task", "manifest", "policy"]);
+/**
+ * Repeated ineffective actions: how many retries a step gets after the same structured failure (task, step,
+ * route epoch, failure code, checkout HEAD, declared-input digest) before it is blocked with
+ * REPEATED_INEFFECTIVE_ACTION. The launcher sets the environment; otherwise .pi/autonomy.yaml, else the default.
+ */
+const FAILURE_BUDGET_ENV = "PI_ORCHESTRATION_FAILURE_RETRY_BUDGET";
+const FAILURE_BUDGET_SOURCE_ENV = "PI_ORCHESTRATION_FAILURE_RETRY_BUDGET_SOURCE";
+const INPUTS_DIGEST_ENV = "PI_ORCHESTRATION_INPUTS_DIGEST";
+const FAILURE_BUDGET_SOURCES = new Set(["cli", "task", "manifest", "policy"]);
+export const DEFAULT_FAILURE_RETRY_BUDGET = 2;
+const FAILURE_CODE = /^[A-Z][A-Z0-9_]{0,99}$/;
 /** Lead calls allowed after the limit is reached, so the lead can record an explicit outcome. */
 export const LEAD_CALL_GRACE = 2;
 /** Longest wait for aborted workers to settle before the stop checkpoint and lease release. */
@@ -405,6 +416,8 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
   let leadLimit: { max: number; source: string; calls: number; warnAt: number | null; warned: boolean; reached: boolean } | null = null;
   // Set once the extension itself stopped the run at the limit (left IN_PROGRESS for a resume): every later tool call is refused.
   let limitStopped: string | null = null;
+  // Retry budget for repeated failure signatures; resolved at run start (null before that and after the run).
+  let failureBudget: { value: number; source: string } | null = null;
   let sessionId: string | null = null;
   let leaseTimer: ReturnType<typeof setInterval> | null = null;
   const leaseIdentity = leaseProcessState();
@@ -531,6 +544,7 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
     startHeartbeat(result);
     // A resumed run is bound by the effective limit too, counting from the calls already made.
     await configureLeadLimit();
+    await configureFailureBudget();
   }
 
   function diagnose(operation: string, result: Json): void {
@@ -565,7 +579,7 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
     approvals.clear(); pendingRoutes.clear(); workspaces.clear(); snapshots.clear();
     subagentTasks.clear(); inFlight.clear(); claudeCalls.clear(); workerPlans.clear();
     scopeViolation = null; activeWave = null; integrating = null; implicitOpen.clear(); routeEpochs.clear(); implicitEpoch.clear(); autoWorkers.clear(); lastPhase = "routing";
-    currentTurn = null; messageStarts.clear(); leadLimit = null;
+    currentTurn = null; messageStarts.clear(); leadLimit = null; failureBudget = null;
     batchStart = 0; batchPeak = 0;
     pendingReroutes.clear();
   }
@@ -625,6 +639,104 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
     const own = count((recorded?.lead_call_limit as Json | undefined)?.calls_seen) ?? 0;
     leadLimit = { max, source, calls: Math.max(telemetry, own), warnAt, warned: false, reached: false };
     await crossThresholds();
+  }
+  /**
+   * Resolve the per-signature retry budget (launcher environment, else the repository policy, else the default).
+   * An invalid value blocks the run closed rather than being dropped.
+   */
+  async function configureFailureBudget(): Promise<void> {
+    failureBudget = null;
+    if (!runId) return;
+    const invalid = () => {
+      parentBlocked = true; blockAllWorktrees();
+      parentFailure = { ok: false, error_code: "FAILURE_RETRY_BUDGET_INVALID", error_category: "InvalidFailureRetryBudget" };
+      diagnose("failure_retry_budget", parentFailure);
+    };
+    const raw = process.env[FAILURE_BUDGET_ENV];
+    if (raw !== undefined && raw !== "") {
+      if (!/^(0|[1-9][0-9]{0,3})$/.test(raw)) return invalid();
+      const named = process.env[FAILURE_BUDGET_SOURCE_ENV];
+      failureBudget = { value: Number(raw), source: named !== undefined && FAILURE_BUDGET_SOURCES.has(named) ? named : "env" };
+      return;
+    }
+    const limits = await command(AUTONOMY, ["limits", "--worktree", targetCwd ?? "."]);
+    const configured = limits.ok === false ? null : limits.failure_retry_budget;
+    if (configured !== undefined && configured !== null) {
+      if (typeof configured !== "number" || !Number.isInteger(configured) || configured < 0 || configured > 1000) return invalid();
+      failureBudget = { value: configured, source: "policy" };
+      return;
+    }
+    failureBudget = { value: DEFAULT_FAILURE_RETRY_BUDGET, source: "default" };
+  }
+  /**
+   * The HEAD a step's state is measured at: its own bound worktree; for an unbound step (a read-only reviewer) the
+   * task's bound mutating worktree, where the task's real commits land; the target checkout only when the task has
+   * none. Null when it cannot be resolved: the recorder then treats the state as unchanged.
+   */
+  async function headOf(taskId: string, stepId: string): Promise<string | null> {
+    const own = workspaces.get(workspaceKey(taskId, stepId));
+    const prefix = `${taskId}\u0000`;
+    const taskBound = [...workspaces].find(([key]) => key.startsWith(prefix))?.[1];
+    const path = own ?? taskBound ?? targetCwd;
+    if (!path) return null;
+    const result = await command(SESSION_SCOPE, [], { operation: "head", path });
+    if (result.ok === true && typeof result.head === "string" && /^[0-9a-f]{40,64}$/.test(result.head)) return result.head;
+    diagnose("failure_head", { ok: false, error_code: "FAILURE_HEAD_UNKNOWN", error_category: "HeadUnresolved", run_id: runId });
+    return null;
+  }
+  /** Digest of the declared inputs' status, set by the launcher; null when the run has none. */
+  function inputsDigest(): string | null {
+    const value = process.env[INPUTS_DIGEST_ENV];
+    return value !== undefined && /^[0-9a-f]{64}$/.test(value) ? value : null;
+  }
+  /**
+   * The retry gate: before a routed worker starts, ask the record whether this step's current failure signature
+   * (same HEAD and inputs) has used up the retry budget. A refusal blocks only this call: the step is recorded
+   * blocked, the run and the other tasks continue. A gate that cannot be evaluated is diagnosed and lets the
+   * call through (it only guards against wasted work, never against an unsafe action).
+   */
+  async function retryGate(taskId: string, phase: string, stepId: string): Promise<string | undefined> {
+    if (!runId || !failureBudget) return undefined;
+    const head = await headOf(taskId, stepId);
+    const digest = inputsDigest();
+    const result = await command(PARENT, ["event", runId, ...ownerArgs()],
+      { kind: "retry_gate", phase, step_id: stepId, retry_budget: failureBudget.value, source: failureBudget.source,
+        ...(head ? { head } : {}), ...(digest ? { inputs_digest: digest } : {}) });
+    if (result.ok === false) {
+      if (LEASE_LOST.has(String(result.error_code))) detach(result);
+      else diagnose("retry_gate", result);
+      return undefined;
+    }
+    const gate = result.retry_gate as Json | undefined;
+    if (gate?.refused !== true) return undefined;
+    if (gate.code === "PREREQUISITE_UNCHANGED") {
+      return `PREREQUISITE_UNCHANGED: step ${stepId} of task ${taskId} is blocked by the unresolved prerequisite ${String(gate.failure_code)} ` +
+        `and neither the commit nor the declared inputs changed since. It is recorded blocked, not retried. Resolve the prerequisite ` +
+        `(a new commit or changed inputs) or leave the task PARTIAL or BLOCKED; other tasks may continue.`;
+    }
+    return `REPEATED_INEFFECTIVE_ACTION: step ${stepId} of task ${taskId} failed ${String(gate.count)} times with ${String(gate.failure_code)} ` +
+      `at the same commit and inputs (retry budget ${String(gate.retry_budget)}; signature ${String(gate.signature).slice(0, 12)}). ` +
+      `The step is recorded blocked. Change something first (a new commit, different inputs, or escalate the route) or leave the task PARTIAL or BLOCKED; other tasks may continue.`;
+  }
+  /** The structured failure code a worker result carries (its own blocker_code), else WORKER_FAILED. */
+  function failureCode(details: Json): string {
+    return typeof details.blocker_code === "string" && FAILURE_CODE.test(details.blocker_code) ? details.blocker_code : "WORKER_FAILED";
+  }
+  /**
+   * Record a failed worker (not an abort) as a failure signature, or a result that declares its own
+   * blocker_kind: "prerequisite". Only structured fields are read; the record classifies the code
+   * (tools/parent_orchestration.py is_prerequisite). Free text is never parsed.
+   */
+  async function recordWorkerFailure(worker: { taskId: string | null; stepId: string | null; phase?: string },
+                                     isError: boolean, details: Json, code: string): Promise<void> {
+    if (!runId || !worker.taskId || !worker.stepId || !worker.phase) return;
+    const declared = details.blocker_kind === "prerequisite";
+    if (isError ? details.error === "ABORTED" : !(declared && typeof details.blocker_code === "string")) return;
+    const head = await headOf(worker.taskId, worker.stepId);
+    const digest = inputsDigest();
+    await observe({ kind: "failure", phase: worker.phase, step_id: worker.stepId, code,
+      ...(declared ? { blocker_kind: "prerequisite" } : {}),
+      ...(head ? { head } : {}), ...(digest ? { inputs_digest: digest } : {}) });
   }
   /** Warn once at the warning threshold; at the limit, restrict tools to status and finish. */
   async function crossThresholds(): Promise<void> {
@@ -854,6 +966,7 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
     const started = await command(CONTEXT, ["start", runId!, ...ownerArgs()], { cwd: ctx.cwd });
     if (started.ok === false) diagnose("context_start", started);
     await configureLeadLimit();
+    await configureFailureBudget();
     budget = initialBudgetState();
     startHeartbeat(result);
   });
@@ -1046,6 +1159,15 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
         const reason = guardCodex(call.input, approval, step);
         if (reason) return { block: true, reason };
       }
+      // A step whose failure signature used up its retry budget is refused here, before any state is taken.
+      if (approval && step && (call.toolName === "ClaudeWorker" || call.toolName === "spawn_subagent")) {
+        const refusal = await retryGate(approval.taskId, approval.phase, step.id);
+        if (refusal) {
+          claudeCalls.delete(call.toolCallId);
+          workerPlans.delete(call.toolCallId);
+          return { block: true, reason: refusal };
+        }
+      }
       // Workers must never write to the parent checkout: compare it before and after.
       const before = await snapshot();
       if (!before) {
@@ -1185,7 +1307,8 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
           // the raw result only: it never overrides a status the lead already recorded, and the lead may later
           // record a different judgment (completed -> failed/blocked with a blocker code) or add its own code.
           if (worker?.phase && worker.stepId) {
-            const code = typeof details.blocker_code === "string" ? details.blocker_code : "WORKER_FAILED";
+            const code = failureCode(details);
+            await recordWorkerFailure(worker, result.isError === true, details, code);
             await observe({ kind: "worker", phase: worker.phase, step_id: worker.stepId, only_if_open: true,
               ...(result.isError ? { status: details.error === "ABORTED" ? "blocked" : "failed", blocker_code: code }
                                  : { status: "completed" }) });
@@ -1197,8 +1320,10 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
         }
         // The worker's own terminal status, like ClaudeWorker's: it never overrides one the lead recorded.
         if (worker?.phase && worker.stepId && result.toolName === "spawn_subagent") {
+          const code = failureCode(details);
+          await recordWorkerFailure(worker, result.isError === true, details, code);
           await observe({ kind: "worker", phase: worker.phase, step_id: worker.stepId, only_if_open: true,
-            ...(result.isError ? { status: "failed", blocker_code: "WORKER_FAILED" } : { status: "completed" }) });
+            ...(result.isError ? { status: "failed", blocker_code: code } : { status: "completed" }) });
         }
         const usage = (details.usage ?? {}) as Json;
         await observe({ kind: "usage", backend: "pi-subagent",

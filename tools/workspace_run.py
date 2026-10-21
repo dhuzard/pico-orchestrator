@@ -185,6 +185,13 @@ def dispatch_inputs(plan: dict, task: dict, repo: dict) -> dict:
             "orchestrator_revision": plan["orchestrator_revision"]}
 
 
+def _inputs_digest(plan: dict, task: dict, repo: dict) -> str:
+    """SHA-256 of the declared inputs as they stand now (not the first dispatch's saved copy), so a failure
+    signature changes when an upstream pin, readiness, validated commit or contract changes."""
+    fresh = dispatch_inputs(plan, task, repo)
+    return hashlib.sha256(json.dumps(fresh, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
 def objective_for(plan: dict, task: dict, repo: dict, inputs: dict | None = None) -> str:
     inputs = inputs or dispatch_inputs(plan, task, repo)
     def describe(u: dict) -> str:
@@ -221,7 +228,8 @@ def _entry(record: dict, task: dict, repo: dict, execution: dict, inputs: dict |
                   "trace_path": run.get("trace_path"), "last_seen": _now()})
     # Time limit of the current launch (absent keys clear a previous launch's values).
     for key in ("max_duration_seconds", "deadline_at", "deadline_epoch", "stop_reason", "time_limit",
-                "max_lead_calls", "max_lead_calls_source", "lead_calls_warn_at"):
+                "max_lead_calls", "max_lead_calls_source", "lead_calls_warn_at",
+                "failure_retry_budget", "failure_retry_budget_source", "inputs_digest"):
         if execution.get(key) is not None:
             entry[key] = execution[key]
         else:
@@ -408,6 +416,13 @@ def launch(*, manifest: Path, task_id: str, allow_mutation: bool = False, resume
     else:
         max_lead_calls, lead_source = None, "cli"
     lead_warn_at = task.get("lead_calls_warn_at") or plan.get("lead_calls_warn_at")
+    # Same precedence for the failure retry budget (0 is a real value: no retry), then the repository policy.
+    if task.get("failure_retry_budget") is not None:
+        failure_budget, failure_source = task["failure_retry_budget"], "task"
+    elif plan.get("failure_retry_budget") is not None:
+        failure_budget, failure_source = plan["failure_retry_budget"], "manifest"
+    else:
+        failure_budget, failure_source = None, "cli"
 
     def budget_gate() -> None:
         # Runs only when a child would really start or resume, never for a repeat launch that is a no-op.
@@ -460,7 +475,9 @@ def launch(*, manifest: Path, task_id: str, allow_mutation: bool = False, resume
                                        resume=resume, wait=wait, pi_executable=pi_executable,
                                        before_spawn=budget_gate, takeover=takeover_stale_lease,
                                        max_duration_seconds=max_duration, max_lead_calls=max_lead_calls,
-                                       max_lead_calls_source=lead_source, lead_calls_warn_at=lead_warn_at)
+                                       max_lead_calls_source=lead_source, lead_calls_warn_at=lead_warn_at,
+                                       failure_retry_budget=failure_budget, failure_retry_budget_source=failure_source,
+                                       inputs_digest=_inputs_digest(plan, task, repo))
     except headless_run.HeadlessError as exc:
         raise WorkspaceRunError(exc.code, exc.detail) from exc
     with locked_workspace(plan["workspace_id"]):

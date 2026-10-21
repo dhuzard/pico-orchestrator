@@ -317,6 +317,7 @@ def plan_tasks(tasks: list[dict], repository_ids: set[str],
                         "max_duration_seconds": task.get("max_duration_seconds"),
                         "max_lead_calls": task.get("max_lead_calls"),
                         "lead_calls_warn_at": task.get("lead_calls_warn_at"),
+                        "failure_retry_budget": task.get("failure_retry_budget"),
                         "provides": task.get("provides") or [],
                         "requires": task.get("requires") or [], "checks": task.get("checks") or [],
                         "depends_on": deps[task_id], "blocks": sorted(dependents[task_id]),
@@ -357,6 +358,7 @@ def plan(manifest_path: Path, *, access_check: AccessCheck | None = gh_access, s
             "budget": manifest.get("budget"), "max_duration_seconds": manifest.get("max_duration_seconds"),
             "max_lead_calls": manifest.get("max_lead_calls"),
             "lead_calls_warn_at": manifest.get("lead_calls_warn_at"),
+            "failure_retry_budget": manifest.get("failure_retry_budget"),
             "tasks": tasks, "waves": waves, "summary": summarize_tasks(tasks), "blockers": blockers,
             "mutations": {"git": 0, "github": 0, "workers": 0}}
 

@@ -68,6 +68,11 @@ LEAD_LIMIT_SOURCE_ENV = "PI_ORCHESTRATION_MAX_LEAD_CALLS_SOURCE"
 LEAD_WARN_ENV = "PI_ORCHESTRATION_LEAD_CALLS_WARN_AT"
 LEAD_LIMIT_SOURCES = ("cli", "task", "manifest")  # explicit sources; `policy` is resolved below
 LEAD_LIMIT_CODE = "LEAD_CALL_LIMIT"
+# The per-signature retry budget (repeated ineffective actions, #48) and the declared-input digest travel the same way.
+FAILURE_BUDGET_ENV = "PI_ORCHESTRATION_FAILURE_RETRY_BUDGET"
+FAILURE_BUDGET_SOURCE_ENV = "PI_ORCHESTRATION_FAILURE_RETRY_BUDGET_SOURCE"
+INPUTS_DIGEST_ENV = "PI_ORCHESTRATION_INPUTS_DIGEST"
+FAILURE_BUDGET_SOURCES = ("cli", "task", "manifest")  # `policy` and the default are resolved by the extension
 # A resumed session must not carry the run marker: the lifecycle answers the
 # marker by settling the restored run and starting a new one. Without it,
 # session_start restores the IN_PROGRESS run and the agent continues it.
@@ -116,6 +121,25 @@ def validate_max_lead_calls(value, source: str = "cli") -> tuple[int | None, str
     if source not in LEAD_LIMIT_SOURCES:
         raise HeadlessError("MAX_LEAD_CALLS_INVALID", f"max_lead_calls source must be one of {', '.join(LEAD_LIMIT_SOURCES)}")
     return value, source
+
+
+def validate_failure_retry_budget(value, source: str = "cli") -> tuple[int | None, str | None]:
+    """None means no explicit budget (the extension then reads the repository policy, else the default 2)."""
+    if value is None:
+        return None, None
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 1000:
+        raise HeadlessError("FAILURE_RETRY_BUDGET_INVALID", "failure_retry_budget must be an integer from 0 to 1000")
+    if source not in FAILURE_BUDGET_SOURCES:
+        raise HeadlessError("FAILURE_RETRY_BUDGET_INVALID", f"failure_retry_budget source must be one of {', '.join(FAILURE_BUDGET_SOURCES)}")
+    return value, source
+
+
+def validate_inputs_digest(value) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+        raise HeadlessError("INPUTS_DIGEST_INVALID", "inputs_digest must be a SHA-256 hex digest")
+    return value
 
 
 def validate_lead_calls_warn_at(value) -> int | None:
@@ -430,8 +454,13 @@ def start(*, target: Path, explicit_repo: str, execution_id: str, objective: str
           resume: bool = False, pi_executable: str = "pi", python: str = sys.executable,
           wait: bool = True, before_spawn=None, takeover: bool = False,
           max_duration_seconds: int | None = None, max_lead_calls: int | None = None,
-          max_lead_calls_source: str = "cli", lead_calls_warn_at: int | None = None) -> dict:
+          max_lead_calls_source: str = "cli", lead_calls_warn_at: int | None = None,
+          failure_retry_budget: int | None = None, failure_retry_budget_source: str = "cli",
+          inputs_digest: str | None = None) -> dict:
     max_duration_seconds = validate_max_duration(max_duration_seconds)
+    failure_retry_budget, failure_retry_budget_source = validate_failure_retry_budget(
+        failure_retry_budget, failure_retry_budget_source)
+    inputs_digest = validate_inputs_digest(inputs_digest)
     max_lead_calls, max_lead_calls_source = validate_max_lead_calls(max_lead_calls, max_lead_calls_source)
     lead_calls_warn_at = validate_lead_calls_warn_at(lead_calls_warn_at)
     if takeover and not resume:
@@ -452,7 +481,9 @@ def start(*, target: Path, explicit_repo: str, execution_id: str, objective: str
                                   resume=resume, pi_executable=pi_executable, python=python,
                                   before_spawn=before_spawn, takeover=takeover,
                                   max_duration_seconds=max_duration_seconds, max_lead_calls=max_lead_calls,
-                                  max_lead_calls_source=max_lead_calls_source, lead_calls_warn_at=lead_calls_warn_at)
+                                  max_lead_calls_source=max_lead_calls_source, lead_calls_warn_at=lead_calls_warn_at,
+                                  failure_retry_budget=failure_retry_budget,
+                                  failure_retry_budget_source=failure_retry_budget_source, inputs_digest=inputs_digest)
     if isinstance(launched, dict):
         return launched
     record, child, log, before = launched
@@ -507,7 +538,8 @@ def _launch_locked(path: Path, *, worktree: Path, identity: str, common: Path, e
                    allow_mutation: bool, resume: bool, pi_executable: str, python: str, before_spawn=None,
                    takeover: bool = False, max_duration_seconds: int | None = None,
                    max_lead_calls: int | None = None, max_lead_calls_source: str | None = None,
-                   lead_calls_warn_at: int | None = None):
+                   lead_calls_warn_at: int | None = None, failure_retry_budget: int | None = None,
+                   failure_retry_budget_source: str | None = None, inputs_digest: str | None = None):
     """Return the settled record, or (record, child, log, checkout_before) for a new launch. Caller holds the lock."""
     record = load_record(path)
     if record is not None:
@@ -572,8 +604,14 @@ def _launch_locked(path: Path, *, worktree: Path, identity: str, common: Path, e
     identity_env = _backend_identity(worktree, python)
     env = dict(os.environ)
     # An explicit limit is handed to the child; otherwise the extension falls back to the repository policy.
-    for name in (LEAD_LIMIT_ENV, LEAD_LIMIT_SOURCE_ENV, LEAD_WARN_ENV):
+    for name in (LEAD_LIMIT_ENV, LEAD_LIMIT_SOURCE_ENV, LEAD_WARN_ENV, FAILURE_BUDGET_ENV, FAILURE_BUDGET_SOURCE_ENV,
+                 INPUTS_DIGEST_ENV):
         env.pop(name, None)
+    if failure_retry_budget is not None:
+        env.update({FAILURE_BUDGET_ENV: str(failure_retry_budget),
+                    FAILURE_BUDGET_SOURCE_ENV: failure_retry_budget_source or "cli"})
+    if inputs_digest is not None:
+        env[INPUTS_DIGEST_ENV] = inputs_digest
     if max_lead_calls is not None:
         env.update({LEAD_LIMIT_ENV: str(max_lead_calls), LEAD_LIMIT_SOURCE_ENV: max_lead_calls_source or "cli"})
         if lead_calls_warn_at is not None:
@@ -639,8 +677,14 @@ def _launch_locked(path: Path, *, worktree: Path, identity: str, common: Path, e
         # earlier launch's limit (the caller passes it again).
         launched_at = clock()
         for stale in ("max_duration_seconds", "deadline_at", "deadline_epoch", "stop_reason", "time_limit",
-                      "max_lead_calls", "max_lead_calls_source", "lead_calls_warn_at"):
+                      "max_lead_calls", "max_lead_calls_source", "lead_calls_warn_at",
+                      "failure_retry_budget", "failure_retry_budget_source", "inputs_digest"):
             record.pop(stale, None)
+        if failure_retry_budget is not None:
+            record.update({"failure_retry_budget": failure_retry_budget,
+                           "failure_retry_budget_source": failure_retry_budget_source})
+        if inputs_digest is not None:
+            record["inputs_digest"] = inputs_digest
         if max_lead_calls is not None:
             record.update({"max_lead_calls": max_lead_calls, "max_lead_calls_source": max_lead_calls_source})
             if lead_calls_warn_at is not None:
@@ -826,6 +870,10 @@ def main(argv: list[str] | None = None) -> int:
                                 "lead has made this many model calls; default: the repository's .pi/autonomy.yaml limits.max_lead_calls, else no limit")
             p.add_argument("--lead-calls-warn-at", type=int, default=None, metavar="N",
                            help="tell the lead once to converge at this lead call (default: 80%% of the limit, rounded down)")
+            p.add_argument("--failure-retry-budget", type=int, default=None, metavar="N",
+                           help="retries a worker step gets after the same structured failure (same task, step, route epoch, "
+                                "failure code, HEAD and inputs) before it is blocked with REPEATED_INEFFECTIVE_ACTION; "
+                                "default: the repository's .pi/autonomy.yaml limits.failure_retry_budget, else 2")
             p.add_argument("--pi", default=os.environ.get("PI_EXECUTABLE", "pi"), help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     try:
@@ -834,7 +882,7 @@ def main(argv: list[str] | None = None) -> int:
                            objective=args.objective, allow_mutation=args.allow_mutation, resume=args.resume,
                            pi_executable=args.pi, wait=not args.no_wait, takeover=args.takeover_stale_lease,
                            max_duration_seconds=args.max_duration, max_lead_calls=args.max_lead_calls,
-                           lead_calls_warn_at=args.lead_calls_warn_at)
+                           lead_calls_warn_at=args.lead_calls_warn_at, failure_retry_budget=args.failure_retry_budget)
         elif args.command == "status":
             record = status(target=args.target, explicit_repo=args.repo, execution_id=args.execution_id)
         else:

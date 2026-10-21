@@ -173,6 +173,11 @@
             "minimum": 1,
             "description": "Optional lead call at which the lead is told once to converge for this task; overrides the manifest default. Must be below the effective max_lead_calls. Omitted: the manifest default, else the repository policy, else 80% of max_lead_calls."
           },
+          "failure_retry_budget": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Optional per-signature retry budget for this task's child execution; overrides the manifest default for how many times a worker step may be retried after a structured failure that repeats unchanged (same task, step, route epoch, failure code, worktree HEAD and declared-input digest) before the step is blocked with REPEATED_INEFFECTIVE_ACTION. 0 allows no retry. Prerequisite blockers never count. Omitted: the manifest default, else the repository's .pi/autonomy.yaml limits.failure_retry_budget, else 2."
+          },
           "depends_on": {
             "type": "array",
             "items": {
@@ -250,6 +255,11 @@
       "type": "integer",
       "minimum": 1,
       "description": "Optional default lead call at which the lead is told once to converge. A task's own lead_calls_warn_at overrides it. Must be below the effective max_lead_calls."
+    },
+    "failure_retry_budget": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Optional default per-signature retry budget for each child execution; a task's own failure_retry_budget overrides it for how many times a worker step may be retried after a structured failure that repeats unchanged (same task, step, route epoch, failure code, worktree HEAD and declared-input digest) before the step is blocked with REPEATED_INEFFECTIVE_ACTION. 0 allows no retry. Prerequisite blockers never count. Omitted: the repository's .pi/autonomy.yaml limits.failure_retry_budget, else 2."
     },
     "budget": {
       "description": "Optional spend limit across the workspace's child runs. The scheduler launches nothing once it is reached; running children are not stopped. max_cost_usd uses backend-reported cost, which only Claude workers report today, so it is a lower bound.",

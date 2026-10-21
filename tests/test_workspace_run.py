@@ -440,6 +440,15 @@ class WorkspaceTimeLimitTest(WorkspaceRunFixture):
             os.waitpid(pid, 0)
         except ChildProcessError:
             pass
+        # SIGKILL is delivered asynchronously: wait until the whole group is gone,
+        # so no grandchild still writes into the state directory during cleanup.
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            try:
+                os.killpg(pid, 0)
+            except (ProcessLookupError, PermissionError):
+                return
+            time.sleep(0.02)
 
     def test_no_limit_in_the_manifest_leaves_the_child_unlimited(self):
         manifest = self.limited_manifest()

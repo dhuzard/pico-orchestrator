@@ -325,6 +325,16 @@ warned once at 80% (`lead_calls_warn_at`), limited to `status` and `finish` at t
 and then the run is stopped but left `IN_PROGRESS` (`LEAD_CALL_LIMIT`) so that
 `--resume --max-lead-calls <higher N>` can continue it; the same limit is refused with
 `LEAD_CALL_LIMIT_EXHAUSTED`. No limit is set by default.
+`--failure-retry-budget N` (or `failure_retry_budget` on a workspace task, a manifest default,
+or `limits.failure_retry_budget` in `.pi/autonomy.yaml`; default 2) bounds retries of the same
+structured worker failure at the same commit and inputs: once spent, the next start of that
+step is refused with `REPEATED_INEFFECTIVE_ACTION` and the step is recorded blocked, while
+the run and the other tasks continue. A changed commit, input or route starts a new count,
+and an unresolved prerequisite (for example `APPROVED_PILOT_INPUTS_UNAVAILABLE`) is a
+blocked step with its own code, never a loop: it cannot restart until the commit or the declared
+inputs change (`PREREQUISITE_UNCHANGED`). Only the step is blocked, never the run; repeated
+refused starts are bounded by the lead-call limit. In a single-repo `pico exec` there is no
+inputs digest, so only a new commit resets the count.
 
 ### Act from the Garden: validate, request PR, check CI, promote
 

@@ -13,6 +13,9 @@ The parent orchestrator reads these values from it:
   resumable only with a raised limit, `stopped_reason: LEAD_CALL_LIMIT`).
   `limits.lead_calls_warn_at` (optional) is the call at which the lead is told
   once to converge (default 80% of the limit). Absent means no limit;
+- `limits.failure_retry_budget` (optional): how many retries a worker step gets
+  after the same structured failure before the extension blocks it with
+  `REPEATED_INEFFECTIVE_ACTION` (default 2);
 - `pr_granularity`: `batch` (one push and one PR per integrated wave batch) or
   `task` (one PR per task);
 - `issue_reference`: `refs` (PR bodies say `Refs #N`, which never closes the
@@ -74,7 +77,7 @@ def limits(worktree: Path) -> dict:
     if issues:
         raise AutonomyPolicyError(issues[0])
     configured = data.get("limits", {})
-    optional = {name: configured[name] for name in ("max_lead_calls", "lead_calls_warn_at") if name in configured}
+    optional = {name: configured[name] for name in ("max_lead_calls", "lead_calls_warn_at", "failure_retry_budget") if name in configured}
     return {"ok": True, "source": str(RELATIVE_PATH), **optional,
             "parallel_tasks": configured.get("parallel_tasks", DEFAULTS["parallel_tasks"]),
             "open_prs": configured.get("open_prs", DEFAULTS["open_prs"]),
