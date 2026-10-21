@@ -66,7 +66,10 @@ function renderCompletion(run) {
   }[status] || ["◒", "Run ended", ended ? `Finished ${ended}` : cap(status)];
   $("run-message-icon").textContent = copy[0];
   $("run-message-title").textContent = copy[1];
-  $("run-message-detail").textContent = copy[2];
+  // Single-owner run lease: who may continue this run, and whether that owner still answers.
+  const lease = run?.lease;
+  const holder = lease ? ` · ${lease.state === "stale" ? "Stale lease" : "Held"} by ${lease.owner_id} (pid ${lease.pid} on ${lease.host})${lease.state === "stale" ? `: ${lease.stale_reason}` : ""}` : "";
+  $("run-message-detail").textContent = copy[2] + holder;
   const links = $("run-links"); links.replaceChildren();
   for (const link of run?.links || []) {
     if (link.kind !== "pr") continue;

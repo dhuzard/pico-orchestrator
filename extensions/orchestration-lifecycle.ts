@@ -1,6 +1,7 @@
 /** Parent-run trace and backend readiness boundary for /orchestrate. */
 import { spawn } from "node:child_process";
 import { realpathSync } from "node:fs";
+import { hostname } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -17,6 +18,12 @@ const PREFLIGHT = join(ROOT, "tools", "backend_preflight.py");
 const SESSION_SCOPE = join(ROOT, "tools", "session_scope.py");
 const CONTEXT = join(ROOT, "tools", "context_budget.py");
 const AUTONOMY = join(ROOT, "tools", "autonomy_policy.py");
+const LEASE = join(ROOT, "tools", "run_lease.py");
+/** Renewal period of the single-owner run lease (tools/run_lease.py; default expiry 300 s). */
+export const LEASE_HEARTBEAT_MS = 60_000;
+/** Lease answers meaning another process now owns the run: this process detaches from it. */
+const LEASE_LOST = new Set(["RUN_LEASE_LOST", "RUN_LEASE_NOT_HELD"]);
+const LEASE_OWNER = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
 const WORKER_TOOLS = new Set(["AskClaude", "ClaudeWorker", "spawn_subagent", "message_subagent"]);
 const CLAUDE_TOOLS = new Set(["AskClaude", "ClaudeWorker"]);
 const MARKER = "PI_ORCHESTRATION_RUN_V1";
@@ -91,6 +98,20 @@ function isWorktreeAdd(call: { toolName: string; input: Record<string, unknown> 
   return (call.toolName === "bash" || call.toolName === "powershell") && typeof call.input.command === "string"
     && /\bgit\s+(?:-\S+\s+)*worktree\s+add\b/.test(call.input.command);
 }
+/**
+ * Lease owner id of this Pi process for a session. A launcher (headless_run)
+ * hands its own owner id down through PI_ORCHESTRATION_LEASE_OWNER; otherwise
+ * host, pid and session make it stable across a reload in the same process
+ * and distinct for any other process.
+ */
+export function leaseOwner(sessionId: string | null, env: NodeJS.ProcessEnv = process.env,
+                           pid = process.pid, host = hostname()): string {
+  const explicit = env.PI_ORCHESTRATION_LEASE_OWNER;
+  if (typeof explicit === "string" && LEASE_OWNER.test(explicit)) return explicit;
+  const clean = (value: string) => value.replace(/[^A-Za-z0-9_.-]/g, "-").slice(0, 40);
+  return `pi-${clean(host || "host")}-${pid}-${clean(sessionId ?? "nosession")}`.slice(0, 128);
+}
+
 function count(value: unknown): number | null {
   return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : null;
 }
@@ -308,6 +329,35 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
   let recordedPeak = 0;
   let compactionFailed = false;
   let sessionId: string | null = null;
+  let leaseTimer: ReturnType<typeof setInterval> | null = null;
+
+  const owner = () => leaseOwner(sessionId);
+  const leaseArgs = () => ["--owner", owner(), "--pid", String(process.pid)];
+  function stopHeartbeat(): void {
+    if (leaseTimer) clearInterval(leaseTimer);
+    leaseTimer = null;
+  }
+  function startHeartbeat(): void {
+    stopHeartbeat();
+    leaseTimer = setInterval(() => { void renewLease(); }, LEASE_HEARTBEAT_MS);
+    leaseTimer.unref?.();
+  }
+  /** Renew the run lease; when another owner holds it now, detach without settling its run. */
+  async function renewLease(): Promise<void> {
+    const id = runId;
+    if (!id) { stopHeartbeat(); return; }
+    const result = await command(LEASE, ["heartbeat", id, ...leaseArgs()]);
+    if (result.ok !== false || runId !== id) return;
+    diagnose("lease_heartbeat", result);
+    if (!LEASE_LOST.has(String(result.error_code))) return;
+    stopHeartbeat();
+    runId = null;
+    lastRunId = id;
+    parentBlocked = true;
+    parentFailure = result;
+    blockAllWorktrees();
+    resetRunState();
+  }
 
   const workspaceKey = (taskId: string, stepId: string) => `${taskId}\u0000${stepId}`;
   const worktreeReady = () => !parentBlocked && [...approvals.values()].some((approval) => approval.worktreeReady);
@@ -342,8 +392,11 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
       return;
     }
     targetCwd = ctx.cwd;
-    const args = ["status", data.run_id, "--worktree", ctx.cwd];
+    // Resume = verify identity, take the single-owner run lease, verify the
+    // resume checkpoint. A held or stale lease and checkpoint drift fail closed.
+    const args = ["resume", data.run_id, "--worktree", ctx.cwd];
     if (process.env.PI_TARGET_REPOSITORY) args.push("--repo", process.env.PI_TARGET_REPOSITORY);
+    args.push(...leaseArgs());
     const result = await command(PARENT, args);
     if (result.status !== "IN_PROGRESS" || result.run_id !== data.run_id) {
       if (result.ok === false) { parentBlocked = true; parentFailure = result; lastRunId = data.run_id; }
@@ -361,6 +414,7 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
       if (typeof phase === "string") pendingReroutes.add(phase);
     }
     budget = initialBudgetState();
+    startHeartbeat();
   }
 
   function diagnose(operation: string, result: Json): void {
@@ -504,6 +558,7 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
     lastTerminal = result;
     persist(false);
     runId = null;
+    stopHeartbeat();
     parentBlocked = false;
     parentFailure = null;
     runSubagents.clear();
@@ -542,6 +597,7 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
     targetCwd = ctx.cwd;
     const explicit = process.env.PI_TARGET_REPOSITORY;
     if (explicit) args.push("--repo", explicit);
+    args.push(...leaseArgs());
     const result = await command(PARENT, args);
     runId = typeof result.run_id === "string" ? result.run_id : null;
     if (runId) { lastRunId = runId; lastTerminal = null; persist(true); }
@@ -558,6 +614,7 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
     const started = await command(CONTEXT, ["start", runId!], { cwd: ctx.cwd });
     if (started.ok === false) diagnose("context_start", started);
     budget = initialBudgetState();
+    startHeartbeat();
   });
 
   type ClaudeRoute = { block: string } | { approval: RouteApproval; step: StepApproval; backend: Json;
@@ -917,6 +974,8 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
         backend_device: claude.backend_device, backend_inode: claude.backend_inode } : null,
       steps });
     pendingReroutes.delete(taskId);
+    // Worker approval is a resume checkpoint: the parent checkout as approved.
+    await event({ kind: "checkpoint", phase, reason: "worker_approval" });
     const claudeEffort = claude ? assignedEffort(route, claude.step_id) : null;
     if (claude) await event({ kind: "worker", phase, step_id: claude.step_id,
       status: "not_started", model: claude.model, backend: "claude-code",
@@ -1028,7 +1087,9 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
         }
         const result = parentFailure ?? { ok: false, error_category: "NoActiveParentRun" };
         diagnose(params.action, result);
-        return { content: [{ type: "text", text: "BLOCKED: no active parent orchestration record. Start with /orchestrate <objective> in this Pi session, or resume the saved session; recorder writes outside that run are prohibited. See diagnostic log." }],
+        const code = typeof result.error_code === "string" && /^[A-Z][A-Z0-9_]{0,99}$/.test(result.error_code)
+          ? ` (${result.error_code})` : "";
+        return { content: [{ type: "text", text: `BLOCKED${code}: no active parent orchestration record. Start with /orchestrate <objective> in this Pi session, or resume the saved session; recorder writes outside that run are prohibited. See diagnostic log.` }],
                  details: { ok: false, active: false, run_id: null as string | null, result } };
       }
       if (params.action === "status" && pendingReroutes.size > 0 && !parentBlocked) {
@@ -1051,7 +1112,10 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
           ? await command(SESSION_SCOPE, [], { operation: "worktree", target_cwd: targetCwd, path: params.path })
           : { ok: false };
         const ok = checked.ok === true && typeof checked.path === "string";
-        if (ok) workspaces.set(workspaceKey(taskId, params.step_id), checked.path as string);
+        if (ok) {
+          workspaces.set(workspaceKey(taskId, params.step_id), checked.path as string);
+          await event({ kind: "checkpoint", phase: approvals.get(taskId)?.phase ?? taskId, reason: "worker_approval" });
+        }
         return reply(ok, ok
           ? `Step ${params.step_id} of task ${taskId} is bound to worktree ${String(checked.path)}.`
           : checked.blocker_code === "WORKER_WORKSPACE_PROTECTED_PATH"
@@ -1093,6 +1157,7 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
         lastTerminal = result;
         persist(false);
         runId = null;
+        stopHeartbeat();
         blockAllWorktrees();
       }
       const effectiveResult = ok ? result : parentFailure ?? result;
@@ -1155,6 +1220,7 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
     // Worker tools block within one turn: anything still marked in flight never reported a result.
     for (const id of [...inFlight.keys()]) { snapshots.delete(id); await workerFinished(id); }
     workerPlans.clear();
+    if (runId) await renewLease();
     if (!runId || parentBlocked || !budget) return;
     const tokens = ctx.getContextUsage()?.tokens;
     if (typeof tokens !== "number") return;
@@ -1201,7 +1267,9 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
 
   pi.on("session_shutdown", async (event) => {
     if (event.reason === "quit" || event.reason === "new" || event.reason === "fork") await settle();
-    // Reload and explicit resume preserve the durable identity in this session.
+    // Reload and explicit resume preserve the durable identity in this session;
+    // the restoring instance renews the lease under the same owner id.
+    stopHeartbeat();
   });
   pi.on("agent_before_settle", async (event, ctx) => {
     if (event.outcome === "aborted" && !event.continue && !compactionFailed &&

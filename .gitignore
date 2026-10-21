@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 provenance/checkpoints/
 provenance/runs/*.lock
+provenance/leases/

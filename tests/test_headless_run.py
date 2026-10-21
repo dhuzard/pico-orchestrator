@@ -51,6 +51,7 @@ def pcmd(*a):
     return json.loads(out.stdout)
 existing = glob.glob(os.path.join(sdir, f"*_{sid}.jsonl"))
 run_id = None
+owner = os.environ.get("PI_ORCHESTRATION_LEASE_OWNER") or f"fake-{os.getpid()}"
 marker = "PI_ORCHESTRATION_RUN_V1" in prompt
 if existing and marker:
     # Real lifecycle: before_agent_start settles the restored run and starts anew.
@@ -65,11 +66,16 @@ if existing:
         e = json.loads(line)
         if e.get("type") == "custom" and e.get("customType") == "pi-orchestration-parent-v1":
             run_id = e["data"]["run_id"]
-    st = pcmd("status", run_id, "--worktree", os.getcwd(), "--repo", os.environ["PI_TARGET_REPOSITORY"])
-    assert st.get("status") == "IN_PROGRESS", st
+    # Real lifecycle restore: verify identity, take the run lease, verify the resume checkpoint.
+    st = pcmd("resume", run_id, "--worktree", os.getcwd(), "--repo", os.environ["PI_TARGET_REPOSITORY"],
+              "--owner", owner, "--pid", str(os.getpid()))
+    if st.get("status") != "IN_PROGRESS":
+        print(json.dumps({"type": "fake", "run_id": run_id, "resume_refused": st}))
+        sys.exit(4)
     session_file = existing[0]
 else:
-    started = pcmd("start", "--worktree", os.getcwd(), "--repo", os.environ["PI_TARGET_REPOSITORY"])
+    started = pcmd("start", "--worktree", os.getcwd(), "--repo", os.environ["PI_TARGET_REPOSITORY"],
+                   "--owner", owner, "--pid", str(os.getpid()))
     run_id = started["run_id"]
     session_file = os.path.join(sdir, f"20261019T000000_{sid}.jsonl")
     with open(session_file, "a") as f:
@@ -190,8 +196,24 @@ class HeadlessRunTest(unittest.TestCase):
         again = self.start(behavior="finish")
         self.assertEqual(again["outcome"], "resume_required")
         self.assertEqual(again["launches"], 1)
-        resumed = self.start(behavior="finish", resume=True)
+        # The crashed process still names the lease: stale, recoverable only by an explicit takeover.
+        self.assertEqual(crashed["run"]["lease"]["state"], "stale")
+        self.assertEqual(crashed["run"]["lease"]["stale_reason"], "OWNER_PROCESS_DEAD")
+        with self.assertRaises(hr.HeadlessError) as refused:
+            self.start(behavior="finish", resume=True)
+        self.assertEqual(refused.exception.code, "RUN_LEASE_STALE")
+        self.assertEqual(self.status()["launches"], 1)
+        with self.assertRaises(hr.HeadlessError) as invalid:
+            self.start(behavior="finish", takeover=True)
+        self.assertEqual(invalid.exception.code, "TAKEOVER_REQUIRES_RESUME")
+        resumed = self.start(behavior="finish", resume=True, takeover=True)
         self.assertEqual(resumed["outcome"], "resumed")
+        trace = provenance.get_run(hr.ROOT, crashed["run_id"])["parent_orchestration"]
+        self.assertEqual([item["reason"] for item in trace["lease_takeovers"]], ["HEADLESS_RESUME_TAKEOVER"])
+        self.assertEqual(trace["lease_takeovers"][0]["stale_reason"], "OWNER_PROCESS_DEAD")
+        self.assertEqual([check["status"] for check in trace["resume_checks"]], ["verified"])
+        # The explicit outcome released the lease.
+        self.assertIsNone(resumed["run"]["lease"])
         self.assertEqual(resumed["launches"], 2)
         self.assertEqual(resumed["run_id"], crashed["run_id"])
         self.assertEqual(resumed["run"]["status"], "PARTIAL")
@@ -224,7 +246,7 @@ class HeadlessRunTest(unittest.TestCase):
         self.assertEqual(observed["status"], "interrupted")
         blocked = self.start(behavior="finish")
         self.assertEqual(blocked["outcome"], "resume_required")
-        resumed = self.start(behavior="finish", resume=True)
+        resumed = self.start(behavior="finish", resume=True, takeover=True)
         self.assertEqual(resumed["run"]["status"], "PARTIAL")
         self.assertEqual(resumed["run_id"], observed["run_id"])
 

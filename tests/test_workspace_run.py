@@ -120,7 +120,11 @@ class WorkspaceRunTest(unittest.TestCase):
         os.environ["FAKE_PI_BEHAVIOR"] = "finish"
         blocked = self.launch(manifest, "b1")
         self.assertEqual(blocked["task"]["outcome"], "resume_required")
-        resumed = self.launch(manifest, "b1", resume=True)
+        # The crashed child's lease is stale: resume without an explicit takeover is refused.
+        with self.assertRaises(wr.WorkspaceRunError) as refused:
+            self.launch(manifest, "b1", resume=True)
+        self.assertEqual(refused.exception.code, "RUN_LEASE_STALE")
+        resumed = self.launch(manifest, "b1", resume=True, takeover_stale_lease=True)
         self.assertEqual(resumed["task"]["run_id"], crashed["task"]["run_id"])
         self.assertEqual(resumed["task"]["run_status"], "PARTIAL")
         self.assertEqual(resumed["task"]["launches"], 2)
@@ -156,7 +160,7 @@ class WorkspaceRunTest(unittest.TestCase):
         hr.start(target=self.repos["alpha"][0], explicit_repo="acme/alpha", execution_id="ws--a1",
                  objective=legacy, pi_executable=str(self.pi))
         os.environ["FAKE_PI_BEHAVIOR"] = "finish"
-        resumed = self.launch(manifest, "a1", resume=True)
+        resumed = self.launch(manifest, "a1", resume=True, takeover_stale_lease=True)
         self.assertEqual(resumed["task"]["launches"], 2)
         saved = hr.status(target=self.repos["alpha"][0], explicit_repo="acme/alpha", execution_id="ws--a1")
         self.assertEqual(saved["objective"], legacy)

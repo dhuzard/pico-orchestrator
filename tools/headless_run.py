@@ -46,6 +46,7 @@ import autonomy_policy  # noqa: E402
 import github_integration  # noqa: E402
 import parent_orchestration  # noqa: E402
 import provenance  # noqa: E402
+import run_lease  # noqa: E402
 import session_scope  # noqa: E402
 import workspace_plan  # noqa: E402
 
@@ -57,6 +58,8 @@ RECORD_VERSION = 1
 EXECUTION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 MUTATING_PERMISSIONS = ("create_worktrees", "commit", "push_branch", "create_pr", "mark_pr_ready", "merge", "deploy")
 TERMINATE_GRACE_SECONDS = 10
+LEASE_OWNER_ENV = "PI_ORCHESTRATION_LEASE_OWNER"
+LEASE_TAKEOVER_REASON = "HEADLESS_RESUME_TAKEOVER"
 # A resumed session must not carry the run marker: the lifecycle answers the
 # marker by settling the restored run and starting a new one. Without it,
 # session_start restores the IN_PROGRESS run and the agent continues it.
@@ -201,7 +204,7 @@ def run_status(run_id: str | None) -> dict | None:
         record = provenance.get_run(ROOT, run_id)
         parent = record.get("parent_orchestration") or {}
         return {"run_id": run_id, "status": parent.get("final_status"), "blocker_code": parent.get("blocker_code"),
-                "trace_path": str(provenance.run_path(ROOT, run_id))}
+                "trace_path": str(provenance.run_path(ROOT, run_id)), "lease": run_lease.summary(run_id)}
     except (provenance.ProvenanceError, OSError, KeyError, TypeError):
         return {"run_id": run_id, "status": None, "blocker_code": "PARENT_PROVENANCE_UNAVAILABLE", "trace_path": None}
 
@@ -297,9 +300,30 @@ def refresh(record: dict) -> dict:
     return record
 
 
+def lease_owner(execution_id: str) -> str:
+    """A fresh lease owner per launch: a relaunch never silently inherits a crashed launch's lease."""
+    return f"headless-{hashlib.sha256(execution_id.encode()).hexdigest()[:12]}-{uuid.uuid4().hex[:12]}"
+
+
+def claim_run_lease(run_id: str, owner: str, *, takeover: bool) -> dict:
+    """Take the lease of a run this launch resumes. Live: RUN_LEASE_HELD. Stale: RUN_LEASE_STALE unless taken over."""
+    try:
+        return run_lease.acquire(run_id, owner, pid=os.getpid())
+    except run_lease.LeaseError as exc:
+        if exc.code != run_lease.STALE or not takeover:
+            hint = "; pass --takeover-stale-lease with --resume to recover it" if exc.code == run_lease.STALE else ""
+            raise HeadlessError(exc.code, exc.detail + hint) from exc
+    try:
+        return run_lease.takeover(run_id, owner, reason=LEASE_TAKEOVER_REASON, pid=os.getpid())
+    except run_lease.LeaseError as exc:
+        raise HeadlessError(exc.code, exc.detail) from exc
+
+
 def start(*, target: Path, explicit_repo: str, execution_id: str, objective: str, allow_mutation: bool = False,
           resume: bool = False, pi_executable: str = "pi", python: str = sys.executable,
-          wait: bool = True) -> dict:
+          wait: bool = True, takeover: bool = False) -> dict:
+    if takeover and not resume:
+        raise HeadlessError("TAKEOVER_REQUIRES_RESUME", "--takeover-stale-lease applies only to --resume")
     if not objective.strip() or len(objective) > 20000:
         raise HeadlessError("OBJECTIVE_INVALID", "objective must be a non-empty string under 20000 characters")
     if provenance._contains_secret_like_content(objective):
@@ -311,7 +335,7 @@ def start(*, target: Path, explicit_repo: str, execution_id: str, objective: str
     with locked_record(path):
         launched = _launch_locked(path, worktree=worktree, identity=identity, common=common,
                                   execution_id=execution_id, objective=objective, allow_mutation=allow_mutation,
-                                  resume=resume, pi_executable=pi_executable, python=python)
+                                  resume=resume, pi_executable=pi_executable, python=python, takeover=takeover)
     if isinstance(launched, dict):
         return launched
     record, child, log, before = launched
@@ -338,7 +362,7 @@ def start(*, target: Path, explicit_repo: str, execution_id: str, objective: str
 
 
 def _launch_locked(path: Path, *, worktree: Path, identity: str, common: Path, execution_id: str, objective: str,
-                   allow_mutation: bool, resume: bool, pi_executable: str, python: str):
+                   allow_mutation: bool, resume: bool, pi_executable: str, python: str, takeover: bool = False):
     """Return the settled record, or (record, child, log, checkout_before) for a new launch. Caller holds the lock."""
     record = load_record(path)
     if record is not None:
@@ -389,6 +413,15 @@ def _launch_locked(path: Path, *, worktree: Path, identity: str, common: Path, e
                 provenance.STATE_ENV: str(state_root()), "PI_ORCHESTRATION_EXECUTION_ID": execution_id})
     run = run_status(record.get("run_id")) or {}
     continuing = resume and run.get("status") == "IN_PROGRESS"
+    # The launched Pi takes the run lease under this owner id: on start for a
+    # new run, and on resume through the lifecycle's restore. For a resume the
+    # run id is already known, so the lease is claimed here, before anything
+    # launches; a live or stale lease of another owner refuses the resume.
+    owner = lease_owner(execution_id)
+    if continuing:
+        claim_run_lease(record["run_id"], owner, takeover=takeover)
+    env[LEASE_OWNER_ENV] = owner
+    record["lease_owner"] = owner
     # Persist intent before the process exists, so a crash in between is seen
     # as an uncertain launch on restart rather than as never launched.
     record.update({"status": "launching", "pid": None})
@@ -407,7 +440,18 @@ def _launch_locked(path: Path, *, worktree: Path, identity: str, common: Path, e
         log.close()
         record["status"] = "created" if record["launches"] == 0 else "interrupted"
         save_record(path, record)
+        if continuing:
+            try:
+                run_lease.release(record["run_id"], owner)
+            except (run_lease.LeaseError, OSError):
+                pass
         raise HeadlessError("PI_UNAVAILABLE", f"cannot launch {pi_executable}: {exc}") from exc
+    if continuing:
+        # Hand the lease to the launched process, so its liveness is what keeps the lease live.
+        try:
+            run_lease.acquire(record["run_id"], owner, pid=child.pid)
+        except (run_lease.LeaseError, OSError):
+            pass  # the child renews it under the same owner on restore
     record.update({"status": "launched", "pid": child.pid, "launches": record["launches"] + 1,
                    "started_at": _now(), "exit_code": None, "outcome": "resumed" if resume else "launched"})
     save_record(path, record)
@@ -497,6 +541,8 @@ def main(argv: list[str] | None = None) -> int:
             p.add_argument("--allow-mutation", action="store_true",
                            help="required when the target's autonomy policy grants any mutating permission")
             p.add_argument("--resume", action="store_true", help="relaunch an interrupted execution into the same parent run")
+            p.add_argument("--takeover-stale-lease", action="store_true",
+                           help="with --resume: explicitly recover a stale run lease (recorded in provenance)")
             p.add_argument("--no-wait", action="store_true", help="return after launching instead of waiting for exit")
             p.add_argument("--pi", default=os.environ.get("PI_EXECUTABLE", "pi"), help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
@@ -504,7 +550,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "start":
             record = start(target=args.target, explicit_repo=args.repo, execution_id=args.execution_id,
                            objective=args.objective, allow_mutation=args.allow_mutation, resume=args.resume,
-                           pi_executable=args.pi, wait=not args.no_wait)
+                           pi_executable=args.pi, wait=not args.no_wait, takeover=args.takeover_stale_lease)
         elif args.command == "status":
             record = status(target=args.target, explicit_repo=args.repo, execution_id=args.execution_id)
         else:

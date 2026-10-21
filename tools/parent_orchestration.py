@@ -12,6 +12,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 import json
 import math
+import os
 import re
 import subprocess
 import sys
@@ -23,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import provenance
 import github_integration
 import routing_engine as engine
+import run_lease
 
 STATUSES = {"COMPLETED", "BLOCKED", "FAILED", "PARTIAL"}
 PHASE_STATUSES = {"not_started", "in_progress", "completed", "blocked", "failed", "partial"}
@@ -52,13 +54,21 @@ USAGE_COUNTERS = ("duration_ms", "input_tokens", "output_tokens", "cached_tokens
 # it is integrated into the parent checkout only after all its workers return.
 WAVE_STATUSES = ("declared", "integrating", "integrated")
 LOCK_WAIT_SECONDS = 5
+# Resume checkpoint (audit A10): the parent checkout's path, branch and HEAD at
+# the last phase boundary or worker approval, compared with the live checkout
+# before a resumed run may continue.
+CHECKPOINT_EVENT_REASONS = {"worker_approval"}
+CHECKPOINT_FIELDS = ("worktree", "branch", "head")
+MAX_RESUME_CHECKS = 50
 POLICY_PATH = ROOT / "routing" / "default-policy.yaml"
 TASK_TYPES = frozenset(json.loads((ROOT / "schemas" / "task.schema.json").read_text())["properties"]["task_type"]["enum"])
 
 
 class ParentRunError(Exception):
-    def __init__(self, detail: str, *, error_code: str = "PARENT_EVENT_INVALID"):
+    def __init__(self, detail: str, *, error_code: str = "PARENT_EVENT_INVALID", details: dict | None = None):
         self.error_code = error_code
+        # Closed, non-secret metadata (lease holder, expected/actual checkpoint) for the caller.
+        self.details = details
         super().__init__(detail)
 
 
@@ -124,7 +134,44 @@ def _parent(record: dict) -> dict:
     return parent
 
 
-def start(*, worktree: Path, explicit_repo: str | None = None, repo_root: Path = ROOT) -> dict:
+def _now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def capture_checkout(worktree: Path) -> dict:
+    """Live path, branch (null when detached) and HEAD (null without commits) of a checkout."""
+    def git(*args: str) -> str | None:
+        try:
+            result = subprocess.run(["git", "-C", str(worktree), *args], shell=False,
+                                    capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        return (result.stdout.strip() or None) if result.returncode == 0 else None
+    return {"worktree": str(Path(worktree).resolve()), "branch": git("symbolic-ref", "--quiet", "--short", "HEAD"),
+            "head": git("rev-parse", "--verify", "--quiet", "HEAD")}
+
+
+def _checkpoint(parent: dict, *, reason: str, phase: str | None = None, worktree: Path | None = None) -> None:
+    """Persist the checkout at a boundary. A record without a known worktree (legacy) is left alone."""
+    previous = parent.get("checkpoint")
+    if worktree is None:
+        if not isinstance(previous, dict) or not previous.get("worktree"):
+            return
+        worktree = Path(previous["worktree"])
+    live = capture_checkout(worktree)
+    phase = phase or (previous or {}).get("phase") or "start"
+    if isinstance(previous, dict):
+        if previous.get("phase") == phase and all(previous.get(field) == live[field] for field in CHECKPOINT_FIELDS):
+            return  # nothing moved: a repeated event leaves the record byte-identical
+        sequence = previous.get("sequence", 0) + 1
+    else:
+        sequence = 1
+    parent["checkpoint"] = {**live, "phase": phase, "reason": reason, "recorded_at": _now(), "sequence": sequence}
+
+
+def start(*, worktree: Path, explicit_repo: str | None = None, repo_root: Path = ROOT,
+          owner_id: str | None = None, pid: int | None = None) -> dict:
+    """Create the parent run; with `owner_id`, the caller also takes the run's lease."""
     parent = {"target_repository": None, "policy_version": None, "phases": [],
               "mutations": {"github": 0, "code": 0}, "final_status": "IN_PROGRESS", "blocker_code": None,
               "context": empty_context()}
@@ -132,18 +179,100 @@ def start(*, worktree: Path, explicit_repo: str | None = None, repo_root: Path =
                                   user_objective="Parent orchestration run",
                                   route_task_result=None, starting_commit=None,
                                   parent_orchestration=parent)
+    lease = None
     try:
         parent["target_repository"] = github_integration.resolve_target(worktree, explicit_repo)
+        _checkpoint(parent, reason="run_start", phase="start", worktree=worktree)
         provenance.update_parent_orchestration(repo_root, record["run_id"], parent)
+        if owner_id is not None:
+            lease = run_lease.acquire(record["run_id"], owner_id, pid=pid, repo_root=repo_root)["lease"]
     except github_integration.IntegrationError as exc:
         # The record already exists even when target resolution fails.
+        finish(record["run_id"], "BLOCKED", blocker_code=exc.code, repo_root=repo_root)
+    except run_lease.LeaseError as exc:
         finish(record["run_id"], "BLOCKED", blocker_code=exc.code, repo_root=repo_root)
     except Exception:
         # Keep the trace terminal even when Git discovery itself fails.
         finish(record["run_id"], "FAILED", blocker_code="TARGET_RESOLUTION_FAILED", repo_root=repo_root)
     current = provenance.get_run(repo_root, record["run_id"])["parent_orchestration"]
-    return {"run_id": record["run_id"], "target_repository": current["target_repository"],
-            "status": current["final_status"], "blocker_code": current["blocker_code"]}
+    result = {"run_id": record["run_id"], "target_repository": current["target_repository"],
+              "status": current["final_status"], "blocker_code": current["blocker_code"]}
+    if lease is not None and current["final_status"] == "IN_PROGRESS":
+        result["lease"] = lease
+    return result
+
+
+def _lease_failure(exc: run_lease.LeaseError) -> ParentRunError:
+    return ParentRunError(exc.detail, error_code=exc.code,
+                          details={"lease": exc.lease, "lease_state": exc.state, "stale_reason": exc.stale_reason})
+
+
+def _verify_checkpoint_unlocked(run_id: str, worktree: Path, owner_id: str, repo_root: Path) -> dict:
+    """Compare the recorded checkpoint with the live checkout; record the check; block on any difference.
+
+    Caller holds the run lock and the run lease. A missing checkpoint (a record
+    from before checkpoints existed) cannot be verified and fails closed, like
+    drift: the run is finished BLOCKED before anything can mutate, and the
+    expected and actual values stay in the record. Nothing is ever re-based.
+    """
+    record = provenance.get_run(repo_root, run_id)
+    parent = _parent(record)
+    expected = parent.get("checkpoint")
+    live = capture_checkout(worktree)
+    if not isinstance(expected, dict):
+        check = {"at": _now(), "owner_id": owner_id, "status": "unverified",
+                 "reason_code": "RESUME_CHECKPOINT_MISSING", "mismatches": []}
+    else:
+        mismatches = [{"field": field, "expected": expected.get(field), "actual": live[field]}
+                      for field in CHECKPOINT_FIELDS if expected.get(field) != live[field]]
+        check = {"at": _now(), "owner_id": owner_id, "status": "drift" if mismatches else "verified",
+                 "reason_code": "RESUME_CHECKPOINT_DRIFT" if mismatches else None, "mismatches": mismatches}
+    parent.setdefault("resume_checks", []).append(check)
+    parent["resume_checks"] = parent["resume_checks"][-MAX_RESUME_CHECKS:]
+    provenance.update_parent_orchestration(repo_root, run_id, parent)
+    if check["status"] != "verified":
+        _finish_unlocked(run_id, "BLOCKED", blocker_code=check["reason_code"], repo_root=repo_root)
+    return {"check": check, "checkpoint": expected, "live": live}
+
+
+def resume(run_id: str, *, worktree: Path, owner_id: str, pid: int | None = None,
+           explicit_repo: str | None = None, repo_root: Path = ROOT) -> dict:
+    """Continue an IN_PROGRESS run in a new process: verify identity, take the lease, verify the checkpoint.
+
+    A terminal run returns its status without a lease. A live lease of another
+    owner fails closed (RUN_LEASE_HELD), a stale one too (RUN_LEASE_STALE,
+    recoverable only by `run_lease.py takeover`). Checkpoint drift or a missing
+    checkpoint finishes the run BLOCKED (RESUME_CHECKPOINT_DRIFT /
+    RESUME_CHECKPOINT_MISSING) and releases the lease.
+    """
+    current = status(run_id, repo_root=repo_root, worktree=worktree, explicit_repo=explicit_repo)
+    if current["status"] != "IN_PROGRESS":
+        return current
+    try:
+        lease = run_lease.acquire(run_id, owner_id, pid=pid, repo_root=repo_root)["lease"]
+    except run_lease.LeaseError as exc:
+        raise _lease_failure(exc) from exc
+    try:
+        with _run_lock(repo_root, run_id):
+            verdict = _verify_checkpoint_unlocked(run_id, worktree, owner_id, repo_root)
+    except BaseException:
+        # Never keep a lease this call could not finish verifying.
+        try:
+            run_lease.release(run_id, owner_id, repo_root=repo_root)
+        except (run_lease.LeaseError, OSError):
+            pass
+        raise
+    check = verdict["check"]
+    if check["status"] != "verified":
+        run_lease.release_for_outcome(run_id, repo_root=repo_root)
+        detail = ("run has no resume checkpoint and cannot be verified" if check["status"] == "unverified"
+                  else "checkout differs from the resume checkpoint: " +
+                  ", ".join(f"{item['field']} expected {item['expected']} actual {item['actual']}"
+                            for item in check["mismatches"]))
+        raise ParentRunError(detail, error_code=check["reason_code"],
+                             details={"expected": verdict["checkpoint"], "actual": verdict["live"],
+                                      "mismatches": check["mismatches"]})
+    return {**current, "lease": lease, "checkpoint": verdict["checkpoint"]}
 
 
 def status(run_id: str, *, repo_root: Path = ROOT, worktree: Path | None = None,
@@ -357,6 +486,7 @@ def _record_event_unlocked(run_id: str, event: dict, *, repo_root: Path = ROOT) 
         "activity": {"kind", "status", "tool", "task_id", "step_id", "subagent_id"},
         "interaction": {"kind", "type", "summary", "task_id", "step_id", "subagent_id", "reply_to"},
         "lead_usage": {"kind", "model", "phase", "task_type", "turn_index", "duration_ms", "input_tokens", "output_tokens", "cached_tokens", "total_tokens"},
+        "checkpoint": {"kind", "phase", "reason"},
     }
     required = {
         "phase": {"kind", "phase", "status"},
@@ -372,6 +502,7 @@ def _record_event_unlocked(run_id: str, event: dict, *, repo_root: Path = ROOT) 
         "activity": {"kind", "status", "tool"},
         "interaction": {"kind", "type", "summary", "task_id", "step_id"},
         "lead_usage": {"kind", "model"},
+        "checkpoint": {"kind", "phase", "reason"},
     }
     if kind not in allowed or set(event) - allowed[kind]:
         raise ParentRunError("unsupported event or unexpected fields")
@@ -439,6 +570,7 @@ def _record_event_unlocked(run_id: str, event: dict, *, repo_root: Path = ROOT) 
             if event["escalation_reason"] not in ESCALATION_REASONS:
                 raise ParentRunError("invalid escalation reason", error_code="PARENT_ESCALATION_REASON_INVALID")
             phase["escalation_reason"] = event["escalation_reason"]
+        _checkpoint(parent, reason="phase_boundary", phase=phase["id"])
     elif kind == "worker":
         phase = _phase(parent, event["phase"])
         step_id = _safe(event.get("step_id"), ID_RE, "step id")
@@ -554,6 +686,12 @@ def _record_event_unlocked(run_id: str, event: dict, *, repo_root: Path = ROOT) 
         context["lead_calls"].append(call)
     elif kind == "wave":
         _wave_event(parent, event)
+        if event["status"] == "integrated":
+            _checkpoint(parent, reason="wave_integrated")
+    elif kind == "checkpoint":
+        if event["reason"] not in CHECKPOINT_EVENT_REASONS:
+            raise ParentRunError("invalid checkpoint reason")
+        _checkpoint(parent, reason=event["reason"], phase=_safe(event["phase"], ID_RE, "phase id"))
     elif kind == "concurrency":
         context = parent.setdefault("context", empty_context())
         peak = _count(event["peak_workers"], "peak workers")
@@ -569,6 +707,7 @@ def _record_event_unlocked(run_id: str, event: dict, *, repo_root: Path = ROOT) 
                 if type(value) is not int or value < 0:
                     raise ParentRunError("invalid mutation count")
                 parent["mutations"][key] = value
+        _checkpoint(parent, reason="mutation_recorded")
     if kind in {"worker", "usage", "spawn", "lead_usage"}:
         provenance.update_parent_orchestration(repo_root, run_id, parent,
                                                orchestration_metrics=delegation_metrics(record, parent))
@@ -580,7 +719,15 @@ def _record_event_unlocked(run_id: str, event: dict, *, repo_root: Path = ROOT) 
 def finish(run_id: str, status: str, *, blocker_code: str | None = None,
            repo_root: Path = ROOT) -> dict:
     with _run_lock(repo_root, run_id):
-        return _finish_unlocked(run_id, status, blocker_code=blocker_code, repo_root=repo_root)
+        record = _finish_unlocked(run_id, status, blocker_code=blocker_code, repo_root=repo_root)
+    # An explicit outcome ends the lease. Taken after the run lock: takeover
+    # holds the lease lock while it writes provenance, so the order is never reversed.
+    if record.get("outcome") != "in_progress":
+        try:
+            run_lease.release_for_outcome(run_id, repo_root=repo_root)
+        except (run_lease.LeaseError, OSError):
+            pass  # a leftover lease of a terminal run cannot resume it: resume checks status first
+    return record
 
 
 def _finish_unlocked(run_id: str, status: str, *, blocker_code: str | None = None,
@@ -680,6 +827,14 @@ def main() -> int:
     p_start = sub.add_parser("start")
     p_start.add_argument("--worktree", type=Path, required=True)
     p_start.add_argument("--repo")
+    p_start.add_argument("--owner", help="take the run lease for this owner id")
+    p_start.add_argument("--pid", type=int, help="lease owner process (default: the caller)")
+    p_resume = sub.add_parser("resume")
+    p_resume.add_argument("run_id")
+    p_resume.add_argument("--worktree", type=Path, required=True)
+    p_resume.add_argument("--repo")
+    p_resume.add_argument("--owner", required=True)
+    p_resume.add_argument("--pid", type=int, help="lease owner process (default: the caller)")
     p_event = sub.add_parser("event")
     p_event.add_argument("run_id")
     p_finish = sub.add_parser("finish")
@@ -696,7 +851,11 @@ def main() -> int:
     event_kind = None
     try:
         if args.command == "start":
-            result = start(worktree=args.worktree, explicit_repo=args.repo)
+            result = start(worktree=args.worktree, explicit_repo=args.repo, owner_id=args.owner,
+                           pid=args.pid if args.pid is not None else (os.getppid() if args.owner else None))
+        elif args.command == "resume":
+            result = resume(args.run_id, worktree=args.worktree, owner_id=args.owner, explicit_repo=args.repo,
+                            pid=args.pid if args.pid is not None else os.getppid())
         elif args.command == "event":
             payload = json.load(sys.stdin)
             event_kind = payload.get("kind") if isinstance(payload, dict) else None
@@ -709,6 +868,11 @@ def main() -> int:
             result = terminal_response(settle(args.run_id))
         print(json.dumps(result, sort_keys=True))
         return 0
+    except run_lease.LeaseError as exc:
+        print(json.dumps({"ok": False, "component": "parent_orchestration", "operation": args.command,
+                          "error_category": "LeaseError", **exc.payload(),
+                          "run_id": getattr(args, "run_id", None)}, sort_keys=True))
+        return 1
     except (ParentRunError, provenance.ProvenanceError, ValueError, json.JSONDecodeError,
             OSError) as exc:
         detail = str(exc) if isinstance(exc, ParentRunError) else None
@@ -744,7 +908,8 @@ def main() -> int:
                           "orchestrator_commit": revision, "orchestrator_root": str(ROOT),
                           "resource_path": str(ROOT / ("schemas/run-record.schema.json" if
                             error_code in {"PARENT_SCHEMA_INVALID", "PARENT_STORAGE_UNAVAILABLE"}
-                            else "tools/parent_orchestration.py"))}))
+                            else "tools/parent_orchestration.py")),
+                          **({"details": exc.details} if isinstance(exc, ParentRunError) and exc.details else {})}))
         return 1
 
 

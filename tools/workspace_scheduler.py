@@ -24,7 +24,9 @@ restart never launches a second child for a recorded task. Children survive a
 scheduler crash (each runs in its own session) and are observed again, not
 relaunched. An interrupted child is an uncertain outcome: it is reported as
 needs_reconciliation and only relaunched, into the same parent run, when
---resume-interrupted is passed explicitly.
+--resume-interrupted is passed explicitly. That flag is also the explicit
+takeover of the interrupted child's stale run lease (recorded in the run's
+provenance); a child whose lease is still live is refused with RUN_LEASE_HELD.
 
 Exit codes: 0 every dispatched task ended COMPLETED or PARTIAL and nothing
 failed; 1 anything failed, was refused, needs reconciliation or is blocked by
@@ -248,7 +250,8 @@ def run(manifest: Path, *, max_parallel: int | None = None, allow_mutation: bool
                         (session["resumed"] if resume else session["dispatched"]).append(tid)
                         owned[tid] = pool.submit(workspace_run.launch, manifest=manifest, task_id=tid,
                                                  allow_mutation=allow_mutation, resume=resume, wait=True,
-                                                 access_check=None, pi_executable=pi_executable)
+                                                 access_check=None, pi_executable=pi_executable,
+                                                 takeover_stale_lease=resume)
                     running.add(tid)
                     busy.add(repo_of[tid])
                     _record_session(plan["workspace_id"], manifest, plan, session)

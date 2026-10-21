@@ -8,6 +8,17 @@ All notable changes to PICO are recorded here. The format follows
 
 ### Added
 
+- Single-owner run lease (`tools/run_lease.py`: `acquire`, `heartbeat`,
+  `release`, `status`, `takeover`). A second process that resumes a run with
+  a live lease fails with `RUN_LEASE_HELD`; a stale lease is recovered only by
+  an explicit takeover recorded in the run's provenance. New and resumed runs
+  take the lease, the lifecycle renews it, and every explicit outcome releases
+  it. Garden and `pico exec status` show the holder (audit A3, mitigated).
+- Verified resume checkpoint: the parent checkout's worktree, branch, HEAD and
+  phase are recorded at each boundary and worker approval, and a resume whose
+  checkout moved is blocked with `RESUME_CHECKPOINT_DRIFT` instead of being
+  re-based (audit A10, mitigated). `pico exec start --resume` now needs
+  `--takeover-stale-lease` to continue a crashed launch.
 - `CONTRIBUTING.md` with the development checks, the rules for routing and
   policy changes, pull request expectations and the licensing stance.
 - `CODE_OF_CONDUCT.md` (Contributor Covenant 2.1).

@@ -228,7 +228,8 @@ def _entry(record: dict, task: dict, repo: dict, execution: dict, inputs: dict |
 
 
 def launch(*, manifest: Path, task_id: str, allow_mutation: bool = False, resume: bool = False, wait: bool = True,
-           access_check=headless_run.workspace_plan.gh_access, pi_executable: str = "pi") -> dict:
+           access_check=headless_run.workspace_plan.gh_access, pi_executable: str = "pi",
+           takeover_stale_lease: bool = False) -> dict:
     plan = _plan(manifest, access_check=access_check)
     task, repo = _task(plan, task_id)
     if task["kind"] == "qualification":
@@ -265,7 +266,8 @@ def launch(*, manifest: Path, task_id: str, allow_mutation: bool = False, resume
         execution = headless_run.start(target=checkout, explicit_repo=repo["repository"],
                                        execution_id=execution_id(plan["workspace_id"], task_id),
                                        objective=objective, allow_mutation=allow_mutation,
-                                       resume=resume, wait=wait, pi_executable=pi_executable)
+                                       resume=resume, wait=wait, pi_executable=pi_executable,
+                                       takeover=takeover_stale_lease)
     except headless_run.HeadlessError as exc:
         raise WorkspaceRunError(exc.code, exc.detail) from exc
     with locked_workspace(plan["workspace_id"]):
@@ -332,6 +334,8 @@ def main(argv: list[str] | None = None) -> int:
         if name == "launch":
             p.add_argument("--allow-mutation", action="store_true")
             p.add_argument("--resume", action="store_true")
+            p.add_argument("--takeover-stale-lease", action="store_true",
+                           help="with --resume: explicitly recover a stale run lease (recorded in provenance)")
             p.add_argument("--no-wait", action="store_true")
             p.add_argument("--pi", default=os.environ.get("PI_EXECUTABLE", "pi"), help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
@@ -339,7 +343,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "launch":
             result = launch(manifest=args.manifest, task_id=args.task, allow_mutation=args.allow_mutation,
-                            resume=args.resume, wait=not args.no_wait, access_check=access, pi_executable=args.pi)
+                            resume=args.resume, wait=not args.no_wait, access_check=access, pi_executable=args.pi,
+                            takeover_stale_lease=args.takeover_stale_lease)
             ok = result["task"]["execution_status"] == "launched" or result["task"]["run_status"] in {"COMPLETED", "PARTIAL"}
         elif args.command == "status":
             result = status(manifest=args.manifest, task_id=args.task, access_check=access)
