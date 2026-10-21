@@ -343,7 +343,8 @@ class SchedulerEnforcesTimeLimitTest(SchedulerFixture):
     def test_scheduler_observes_a_child_past_its_deadline_and_it_ends_cancelled(self):
         import headless_run
         clock = [3_000_000.0]
-        with unittest.mock.patch.object(headless_run, "clock", lambda: clock[0]):
+        with unittest.mock.patch.object(headless_run, "clock", lambda: clock[0]), \
+                unittest.mock.patch.object(headless_run, "boot_elapsed", lambda record: None):
             os.environ["FAKE_PI_BEHAVIOR"] = "hang"
             manifest = self.manifest([{"id": "a1", "repository": "alpha", "title": "Alpha", "max_duration_seconds": 30}])
             launched = wr.launch(manifest=manifest, task_id="a1", access_check=None, pi_executable=str(self.pi), wait=False)

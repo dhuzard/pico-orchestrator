@@ -178,9 +178,17 @@ def mutation_permitted(worktree: Path) -> list[str]:
     return [name for name in MUTATING_PERMISSIONS if permissions.get(name) is True]
 
 
+# Children this process launched and is waiting for, by pid. Their liveness is read through the Popen
+# object: reaping them behind its back with waitpid would make Popen.wait() report exit status 0.
+_OWN_CHILDREN: dict[int, subprocess.Popen] = {}
+
+
 def pid_alive(pid: int | None) -> bool:
     if not isinstance(pid, int) or pid <= 0:
         return False
+    own = _OWN_CHILDREN.get(pid)
+    if own is not None:
+        return own.poll() is None
     try:
         # Reap our own exited child so a zombie never reads as alive.
         reaped, _ = os.waitpid(pid, os.WNOHANG)
@@ -382,11 +390,13 @@ def start(*, target: Path, explicit_repo: str, execution_id: str, objective: str
         return launched
     record, child, log, before = launched
     if not wait:
+        _OWN_CHILDREN.pop(child.pid, None)
         log.close()
         return record
     try:
         exit_code = _wait_for_child(child, path, record)
     finally:
+        _OWN_CHILDREN.pop(child.pid, None)
         log.close()
     with locked_record(path):
         current = load_record(path) or {}
@@ -413,12 +423,12 @@ def _wait_for_child(child, path: Path, record: dict) -> int:
     if record.get("deadline_epoch") is None:
         return child.wait()
     while True:
-        remaining = record["deadline_epoch"] - clock()
+        remaining = time_limit_remaining(record)
         try:
-            return child.wait(timeout=min(WAIT_POLL_SECONDS, max(0.05, remaining)))
+            return child.wait(timeout=min(WAIT_POLL_SECONDS, max(0.05, remaining or 0)))
         except subprocess.TimeoutExpired:
             pass
-        if clock() >= record["deadline_epoch"]:
+        if time_limit_remaining(record) == 0:
             with locked_record(path):
                 current = load_record(path)
                 if current is not None:
@@ -506,6 +516,7 @@ def _launch_locked(path: Path, *, worktree: Path, identity: str, common: Path, e
     try:
         child = subprocess.Popen(argv, cwd=str(worktree), env=env, shell=False, stdin=subprocess.DEVNULL,
                                  stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+        _OWN_CHILDREN[child.pid] = child
     except OSError as exc:
         log.close()
         record["status"] = "created" if record["launches"] == 0 else "interrupted"
@@ -571,7 +582,28 @@ def time_limit_remaining(record: dict, now: float | None = None) -> float | None
     deadline = record.get("deadline_epoch")
     if not isinstance(deadline, (int, float)) or isinstance(deadline, bool):
         return None
+    if now is None:
+        elapsed = boot_elapsed(record)
+        if elapsed is not None:
+            return max(0.0, record["max_duration_seconds"] - elapsed)
     return max(0.0, deadline - (clock() if now is None else now))
+
+
+def boot_elapsed(record: dict) -> float | None:
+    """Seconds since the child started, from /proc, or None where that is unavailable.
+
+    The child's start time (`pid_start`, clock ticks since boot) and /proc/uptime share one boot-time
+    clock, so a wall-clock jump (NTP step, WSL2 resuming after host sleep) neither stops a child early
+    nor lets it run late. Without /proc, enforcement falls back to the wall clock (`deadline_epoch`).
+    """
+    start = record.get("pid_start")
+    if not isinstance(start, str) or not start.isdigit():
+        return None
+    try:
+        uptime = float(Path("/proc/uptime").read_text().split()[0])
+        return uptime - int(start) / os.sysconf("SC_CLK_TCK")
+    except (OSError, ValueError, IndexError):
+        return None
 
 
 def enforce_time_limit(record: dict, grace: float = TERMINATE_GRACE_SECONDS) -> bool:
@@ -631,7 +663,10 @@ def _stop_locked(record: dict, grace: float, code: str) -> None:
     limit_stop = code == TIME_LIMIT_CODE
     elapsed = None
     if limit_stop and record.get("deadline_epoch") is not None:
-        elapsed = round(clock() - (record["deadline_epoch"] - record["max_duration_seconds"]), 3)
+        elapsed = boot_elapsed(record)
+        if elapsed is None:
+            elapsed = clock() - (record["deadline_epoch"] - record["max_duration_seconds"])
+        elapsed = round(elapsed, 3)
     if record.get("run_id") is None:
         record["run_id"] = discover_run_id(Path(record["session_dir"]), record["session_id"])
     # Close the run before signalling, so a graceful Pi shutdown that settles

@@ -1726,7 +1726,13 @@ finished `BLOCKED` with `EXECUTION_TIME_LIMIT` as the lease owner (so a run
 another owner has taken over is not closed), then the child's process group
 gets SIGTERM and, after the grace period, SIGKILL, only while the pid and its
 recorded start time still match (`execution_alive`; a reused pid is never
-signalled). The execution ends `status: cancelled`, `outcome: time_limit`,
+signalled). **Clock.** Where `/proc` is available, elapsed time is the boot-clock
+time since the child's recorded `pid_start` (against `/proc/uptime`), so a
+wall-clock jump (NTP step, WSL2 resuming from host sleep) does not stop a child
+early or late. Elsewhere it falls back to the wall clock (`deadline_epoch`), which
+can then be off by such a jump; displays computed from the workspace record
+always use `deadline_epoch`. A killed child records its real signal status
+as `exit_code` (negative), never 0. The execution ends `status: cancelled`, `outcome: time_limit`,
 `stop_reason: EXECUTION_TIME_LIMIT` with a `time_limit` block
 (`max_duration_seconds`, `elapsed_seconds`, `deadline_at`, `stopped_at`). A
 child that ended on its own before the check keeps its own outcome, and the

@@ -404,6 +404,9 @@ class WorkspaceTimeLimitTest(WorkspaceRunFixture):
         patch = unittest.mock.patch.object(hr, "clock", lambda: self.clock[0])
         patch.start()
         self.addCleanup(patch.stop)
+        boot = unittest.mock.patch.object(hr, "boot_elapsed", lambda record: None)  # the fake wall clock drives these
+        boot.start()
+        self.addCleanup(boot.stop)
         os.environ["FAKE_PI_BEHAVIOR"] = "hang"
 
     def limited_manifest(self, default=None, overrides=None):

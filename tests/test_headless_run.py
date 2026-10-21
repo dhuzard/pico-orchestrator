@@ -526,6 +526,9 @@ class HeadlessRunTest(HeadlessFixture):
         self.assertEqual(data["error_code"], "EXECUTION_UNKNOWN")
 
 
+REAL_BOOT_ELAPSED = hr.boot_elapsed
+
+
 class FakeClock:
     """Injectable wall clock: tests move time explicitly instead of sleeping."""
 
@@ -545,6 +548,10 @@ class ExecutionTimeLimitTest(HeadlessFixture):
         patch = unittest.mock.patch.object(hr, "clock", self.clock)
         patch.start()
         self.addCleanup(patch.stop)
+        # The fake wall clock drives these tests; test_boot_clock_ignores_wall_clock_jumps covers /proc.
+        boot = unittest.mock.patch.object(hr, "boot_elapsed", lambda record: None)
+        boot.start()
+        self.addCleanup(boot.stop)
 
     def launch_hanging(self, execution_id="exec-1", **kwargs):
         launched = self.start(execution_id=execution_id, behavior="hang", wait=False, **kwargs)
@@ -650,6 +657,41 @@ class ExecutionTimeLimitTest(HeadlessFixture):
         self.assertEqual(record["run"]["status"], "BLOCKED")
         self.assertEqual(record["run"]["blocker_code"], "EXECUTION_TIME_LIMIT")
         self.assertIsNone(record["pid"])
+        self.assertLess(record["exit_code"], 0, "a killed child reports its signal, never 0")
+
+    def test_a_waiting_launcher_records_the_signal_when_cancelled_from_elsewhere(self):
+        results = []
+        thread = threading.Thread(target=lambda: results.append(self.start(behavior="hang")))
+        thread.start()
+        path = None
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            found = list((self.state / "executions").rglob("exec-1.json"))
+            if found and json.loads(found[0].read_text()).get("status") == "launched":
+                path = found[0]
+                break
+            time.sleep(0.05)
+        self.assertIsNotNone(path)
+        while hr.discover_run_id(Path(json.loads(path.read_text())["session_dir"]),
+                                 json.loads(path.read_text())["session_id"]) is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        hr.cancel(target=self.target, explicit_repo="acme/target", execution_id="exec-1", grace=2)
+        thread.join(10)
+        self.assertEqual((results[0]["status"], results[0]["outcome"]), ("cancelled", "cancelled"))
+        self.assertLess(results[0]["exit_code"], 0)
+
+    def test_boot_clock_ignores_wall_clock_jumps(self):
+        launched = self.launch_hanging(max_duration_seconds=100)
+        if launched["pid_start"] is None or not Path("/proc/uptime").exists():
+            self.skipTest("no /proc")
+        with unittest.mock.patch.object(hr, "boot_elapsed", REAL_BOOT_ELAPSED):
+            self.clock.now += 10 ** 6  # the wall clock jumps a million seconds: the child has not run that long
+            self.assertEqual(self.status()["status"], "launched")
+            self.assertLess(hr.boot_elapsed(launched), 30)
+            self.assertEqual(round(hr.time_limit_remaining(launched)), round(100 - hr.boot_elapsed(launched)))
+            # And a child that really ran past its limit on the boot clock is stopped with the wall clock untouched.
+            with unittest.mock.patch.object(hr, "boot_elapsed", lambda record: 101.0):
+                self.assertEqual(self.status()["stop_reason"], "EXECUTION_TIME_LIMIT")
 
     def test_invalid_limits_are_refused_before_anything_launches(self):
         for bad in (0, -5, True, "60", 1.5):
