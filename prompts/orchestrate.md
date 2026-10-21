@@ -1038,9 +1038,12 @@ Read the policy's `issue_reference` from `python3
 (the default) means PR bodies reference each issue with `Refs #N`, which never
 closes it; `closes` means `Closes #N`, so GitHub closes the issue when a human
 merges the PR. Even under `closes`, write `Refs #N` for an issue the PR only
-partly addresses. The publication gate refuses any closing keyword
-(`Closes`/`Fixes`/`Resolves #N`) unless the policy says `closes`
-(`PUBLICATION_BODY_INVALID`); never work around it.
+partly addresses, and give each closed issue its own `Closes #N` line. The
+publication gate trusts only the policy committed on the base branch and
+refuses any closing keyword (`Closes`/`Fixes`/`Resolves`, including in code
+or comments) that policy does not authorize, or that targets another
+repository (`PUBLICATION_BODY_INVALID`, `AUTONOMY_POLICY_PATH_UNSAFE`). Never
+edit `.pi/autonomy.yaml` to get past it.
 After integration, use the trusted adapter's publication mode: write the
 reviewed PR body to a local file, then call `python3
 "$ORCH_ROOT/tools/github_integration.py" --worktree <target> --publish

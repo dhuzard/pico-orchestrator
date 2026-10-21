@@ -20,9 +20,17 @@ All notable changes to PICO are recorded here. The format follows
   and an optional `closes_issue` on workspace tasks, so a published PR can
   say `Closes #N` and close its issue on merge. The publication gate accepts
   `Closes #N` only when the policy or the task opts in, and now refuses any
-  unauthorized closing keyword anywhere in the body. PICO's own
-  `.pi/autonomy.yaml` sets `closes`, and the pull request template uses
-  `Closes #`.
+  unauthorized closing keyword anywhere in the body. The gate reads the
+  policy committed on the base branch, binds its blob into the plan hash,
+  and refuses issues outside the declared ones or the PR's repository.
+  PICO's own `.pi/autonomy.yaml` sets `closes`, and the pull request
+  template uses `Closes #`.
+- Compatibility: an older PICO rejects a `.pi/autonomy.yaml` that contains
+  `issue_reference` with `AUTONOMY_POLICY_INVALID`, because the schema does
+  not allow unknown keys. Update PICO before adding the key to a repository
+  that other installs also read. `.pi/autonomy.yaml` is now tracked in this
+  repository, so every worker worktree inherits it, and a Garden permission
+  toggle leaves a tracked modification until it is committed.
 
 ### Security
 
