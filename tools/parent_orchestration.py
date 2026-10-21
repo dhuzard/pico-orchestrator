@@ -683,10 +683,13 @@ def _retry_gate_event(parent: dict, event: dict) -> dict:
         _block_step(parent, phase, step_id, epoch, REPEATED_ACTION_CODE, "repeated_ineffective_action")
         return {"refused": True, "code": REPEATED_ACTION_CODE, "failure_code": hit["code"], "signature": hit["digest"],
                 "count": hit["count"], "retry_budget": budget, "step_id": step_id, "task_id": phase["id"]}
-    if head is not None and worker is not None and worker["status"] == "blocked":
+    if worker is not None and worker["status"] == "blocked":
         blocked = [item for item in mine if item["blocked"]]
         previous = max(blocked, key=lambda item: item["last_at"]) if blocked else None
-        if previous is not None and worker.get("blocker_code") in {REPEATED_ACTION_CODE, previous["code"]}:
+        # An unknown HEAD is no change by itself, but changed inputs still reopen the step (else its result
+        # write would be a no-op on a blocked worker).
+        changed = previous is not None and (head is not None or previous["inputs_digest"] != inputs_digest)
+        if changed and worker.get("blocker_code") in {REPEATED_ACTION_CODE, previous["code"]}:
             _override(parent, phase, worker, epoch, "failed", previous["code"], "state_changed")
             worker["status"] = "failed"
             worker["blocker_code"] = previous["code"]

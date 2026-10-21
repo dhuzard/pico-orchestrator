@@ -291,6 +291,17 @@ class SignatureTest(StateTestCase):
         # With no signature at all an unknown HEAD simply lets the start through.
         self.assertFalse(self.gate(phase="t2", head=None)["refused"])
 
+    def test_an_unknown_head_with_changed_inputs_still_reopens_the_step(self):
+        self.prerequisite("PREREQUISITE_UNMET")
+        self.assertEqual(self.gate(head=None)["code"], self.UNCHANGED)
+        self.assertFalse(self.gate(head=None, inputs=INPUTS_2)["refused"])
+        self.assertEqual((self.worker()["status"], self.worker()["blocker_code"]), ("failed", "PREREQUISITE_UNMET"))
+        for _ in range(3):
+            self.fail(code="STUCK")
+        self.assertTrue(self.gate()["refused"])
+        self.assertFalse(self.gate(head=None, inputs=INPUTS_2)["refused"])
+        self.assertEqual(self.worker()["status"], "failed")
+
     def test_an_unknown_head_does_not_reopen_a_prerequisite_blocked_step(self):
         self.prerequisite("PREREQUISITE_UNMET")
         for _ in range(2):

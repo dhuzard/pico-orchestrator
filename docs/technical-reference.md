@@ -1998,7 +1998,12 @@ or digest reopens the step as `failed` with its prerequisite code (`reason: stat
 start is a normal retry. If a step blocked by a prerequisite later exhausts a loop signature at a
 changed state, the new refusal replaces the recorded code and is written to `worker_overrides`
 (`by: extension`, `reason: retry_gate`, `from_blocker_code` the prerequisite), so the record shows
-why the latest start was refused. Scientific validation can therefore report an unresolved approved
+why the latest start was refused. The ways out of `PREREQUISITE_UNCHANGED` are a new commit in
+the task's worktree (even an empty one), changed declared inputs, or an escalation to a new route
+epoch. A change outside git (an approved file arriving untracked) is invisible to the digest.
+Otherwise only that step stays blocked, and the lead can finish PARTIAL. With an unknown HEAD,
+changed inputs still reopen the step. A new commit resets every signature count, as specified, so
+a cheap commit can reset a loop; the lead-call limit (#47) remains the overall bound. Scientific validation can therefore report an unresolved approved
 input as a blocked step without being stopped as a loop and without being restarted blindly.
 
 *Step, not run.* The maintainer's refinement blocks the step, not the run, which replaces the
