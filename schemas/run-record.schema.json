@@ -65,7 +65,7 @@
         },
         "reconciled": {
           "type": "array",
-          "description": "Phases and workers that were still open when the run ended without COMPLETED. Each is set to interrupted; from_status keeps what was recorded. Absent on records that ended with nothing open.",
+          "description": "Phases and workers that were still open when the run ended without COMPLETED. Each is set to abandoned; from_status keeps what was recorded. Absent on records that ended with nothing open.",
           "items": {
             "type": "object",
             "additionalProperties": false,
@@ -74,8 +74,9 @@
               "kind": {"enum": ["phase", "worker"]},
               "phase_id": {"type": "string"},
               "step_id": {"type": "string"},
+              "route_epoch": {"type": "integer", "minimum": 0, "description": "Route epoch of a reconciled worker."},
               "from_status": {"enum": ["not_started", "in_progress"]},
-              "to": {"const": "interrupted"},
+              "to": {"const": "abandoned"},
               "reason": {"type": "string", "maxLength": 120},
               "at": {"type": "string"}
             }
@@ -126,7 +127,7 @@
                   "blocked",
                   "failed",
                   "partial",
-                  "interrupted"
+                  "abandoned"
                 ]
               },
               "route": {
@@ -434,7 +435,7 @@
                         "completed",
                         "blocked",
                         "failed",
-                        "interrupted"
+                        "abandoned"
                       ]
                     },
                     "blocker_code": {

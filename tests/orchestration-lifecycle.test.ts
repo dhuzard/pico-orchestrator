@@ -962,11 +962,12 @@ test("a ClaudeWorker result records the worker's terminal status without the lea
       .filter((input) => input.kind === "worker" && ["completed", "failed", "blocked"].includes(String(input.status)));
     const ok = await claudeWorkerRun(h, "ok", { prompt: "[pico-task A:claude_worker] go" });
     assert.equal(ok.result!.isError, false);
-    assert.deepEqual(terminal(), [{ kind: "worker", phase: "A", step_id: "claude_worker", status: "completed" }]);
+    assert.deepEqual(terminal(), [{ kind: "worker", phase: "A", step_id: "claude_worker", only_if_open: true, status: "completed" }]);
     const bad = await claudeWorkerRun(h, "bad", { prompt: "[pico-task A:claude_worker] FAIL" });
     assert.equal(bad.result!.isError, true);
     const failed = terminal().at(-1)!;
     assert.deepEqual([failed.phase, failed.step_id, failed.status], ["A", "claude_worker", "failed"]);
+    assert.equal(failed.only_if_open, true, "the automatic record never overrides the lead");
     assert.match(String(failed.blocker_code), /^[A-Z][A-Z0-9_]{0,99}$/);
     // Every write carries the lease owner.
     assert.ok(h.parentCalls("event").every((call) => call.args.includes("--owner")));

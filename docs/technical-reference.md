@@ -1306,6 +1306,35 @@ are not part of the comparison. Coverage: `tests/test_run_lease.py`,
 `tests/orchestration-lifecycle.test.ts`, `tests/external-cwd-lifecycle.test.ts`
 and `tests/test_headless_run.py`.
 
+**Open work at the end of a run (issue #42).** A run that finishes `PARTIAL`,
+`BLOCKED`, `FAILED` or is settled leaves nothing `not_started` or
+`in_progress`. `parent_orchestration.py finish` sets each such phase, and each
+worker of the phase's current route epoch, to the status `abandoned` and
+appends one entry to `parent_orchestration.reconciled`: `kind` (`phase` or
+`worker`), `phase_id`, `step_id` and `route_epoch` (workers), `from_status`
+(`not_started` or `in_progress`), `to` (`abandoned`), `reason` (`run finished
+<STATUS>`) and `at`. Events, activity, escalations and every other recorded
+field are unchanged, so the prior status is always recoverable from
+`reconciled`. Workers of an earlier route epoch were superseded by an
+escalation and, as in the `COMPLETED` check, are left as recorded. A finish on
+a terminal run changes nothing, and a record that ended with nothing open has
+no `reconciled` field. `COMPLETED` still refuses any open phase or current-epoch
+worker. `abandoned` is only ever written by the finish; an event cannot set it,
+and it is unrelated to the headless execution state `interrupted`. The Garden
+shows it as "Abandoned (run ended PARTIAL)". Records from before this change
+validate and display unchanged; older PICO versions reject `reconciled` and
+`abandoned` (`additionalProperties: false`, status enums).
+
+**ClaudeWorker results.** When a ClaudeWorker result arrives the lifecycle
+extension records the worker's raw outcome with the lease owner: `completed`
+on success, `failed` with a blocker code on error, `blocked` on abort. The
+event carries `only_if_open`, so it never overrides a status the lead already
+recorded. The lead's judgment wins: it may move a `completed` worker to
+`failed` or `blocked` by recording that status with a `blocker_code`, and may
+restate a `failed` or `blocked` worker with its own `blocker_code`, which
+replaces the automatic one. Other changes of a terminal worker stay refused.
+Coverage: `tests/test_reconcile_open.py`, `tests/orchestration-lifecycle.test.ts`.
+
 **Ownership.** Run records belong to the orchestrator installation whose
 `tools/` write them (`ROOT/provenance/runs/`). That holds even when Pi runs
 from an external target repository. The target is identified inside the record

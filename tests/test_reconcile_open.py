@@ -15,7 +15,6 @@ sys.path.insert(0, str(ROOT / "tools"))
 import parent_orchestration as po
 import provenance
 
-PILOT_RUN = Path.home() / ".local/state/pi-coding-orchestrator/runs/run-a1f934f4cbaa.json"
 OPEN = {"not_started", "in_progress"}
 
 
@@ -26,7 +25,7 @@ def open_items(record: dict) -> list[str]:
                if w["status"] in OPEN])
 
 
-class ReconcileOpenTest(unittest.TestCase):
+class _Base(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         base = Path(self.tmp.name)
@@ -41,6 +40,9 @@ class ReconcileOpenTest(unittest.TestCase):
 
     def tearDown(self):
         self.tmp.cleanup()
+
+
+class ReconcileOpenTest(_Base):
 
     def open_run(self) -> str:
         run_id = po.start(worktree=self.target, repo_root=self.records)["run_id"]
@@ -62,11 +64,13 @@ class ReconcileOpenTest(unittest.TestCase):
         self.assertEqual(provenance.validate_run_record(after, self.schema), [])
         parent, old = after["parent_orchestration"], before["parent_orchestration"]
         entries = parent["reconciled"]
-        self.assertEqual([(e["kind"], e["phase_id"], e.get("step_id"), e["from_status"]) for e in entries],
-                         [("phase", "busy", None, "in_progress"), ("worker", "busy", "claude_worker", "in_progress"),
-                          ("phase", "idle", None, "not_started")])
+        self.assertEqual([(e["kind"], e["phase_id"], e.get("step_id"), e.get("route_epoch"), e["from_status"])
+                          for e in entries],
+                         [("phase", "busy", None, None, "in_progress"),
+                          ("worker", "busy", "claude_worker", 0, "in_progress"),
+                          ("phase", "idle", None, None, "not_started")])
         for entry in entries:
-            self.assertEqual((entry["to"], entry["reason"]), ("interrupted", f"run finished {status}"))
+            self.assertEqual((entry["to"], entry["reason"]), ("abandoned", f"run finished {status}"))
         # Nothing recorded earlier changes except the statuses named in `reconciled`.
         self.assertEqual(parent["activity"], old["activity"])
         self.assertEqual(parent["phases"][0], old["phases"][0])
@@ -125,23 +129,106 @@ class ReconcileOpenTest(unittest.TestCase):
         self.assertEqual(provenance.validate_run_record(record, self.schema), [])
         self.assertEqual(open_items(record), ["phase busy", "phase idle", "worker busy/claude_worker"])
 
-    @unittest.skipUnless(PILOT_RUN.exists(), "the CRT pilot record is not on this machine")
-    def test_real_crt_pilot_record_has_nothing_left_open(self):
-        original = json.loads(PILOT_RUN.read_text())
-        self.assertEqual(open_items(original), ["phase crt-export-verification-repair",
-                                                "worker crt-claim-export/claude_worker"])
-        record = copy.deepcopy(original)  # the copy is reopened; the pilot file is never written
-        record.update(outcome="in_progress", ended_at=None)
-        record["parent_orchestration"]["final_status"] = "IN_PROGRESS"
-        target = provenance.run_path(self.records, record["run_id"])
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(json.dumps(record))
-        finished = po._finish_unlocked(record["run_id"], "PARTIAL", repo_root=self.records)
+    def test_sanitized_crt_pilot_record_has_nothing_left_open(self):
+        """Phases and workers of the real CRT pilot run (run-a1f934f4cbaa), anonymized, reopened and finished."""
+        fixture = json.loads((ROOT / "tests/fixtures/partial-run-open-work.json").read_text())
+        run_id = po.start(worktree=self.target, repo_root=self.records)["run_id"]
+        parent = provenance.get_run(self.records, run_id)["parent_orchestration"]
+        parent["phases"] = copy.deepcopy(fixture["phases"])
+        provenance.update_parent_orchestration(self.records, run_id, parent)
+        before = provenance.get_run(self.records, run_id)
+        self.assertEqual(open_items(before), ["phase phase-3", "worker phase-2/claude_worker"])
+        finished = po.finish(run_id, "PARTIAL", repo_root=self.records)
         self.assertEqual(open_items(finished), [])
-        self.assertEqual([e["from_status"] for e in finished["parent_orchestration"]["reconciled"]],
-                         ["in_progress", "in_progress"])
-        self.assertEqual(finished["parent_orchestration"]["activity"], original["parent_orchestration"]["activity"])
-        self.assertEqual(open_items(json.loads(PILOT_RUN.read_text())), open_items(original))
+        self.assertEqual(provenance.validate_run_record(finished, self.schema), [])
+        done = finished["parent_orchestration"]
+        self.assertEqual([(e["kind"], e["phase_id"], e.get("step_id"), e["from_status"]) for e in done["reconciled"]],
+                         [("worker", "phase-2", "claude_worker", "in_progress"),
+                          ("phase", "phase-3", None, "in_progress")])
+        self.assertEqual([p["status"] for p in done["phases"]], ["completed", "partial", "abandoned"])
+
+    def test_only_current_route_epoch_workers_are_reconciled(self):
+        run_id = po.start(worktree=self.target, repo_root=self.records)["run_id"]
+
+        def event(data):
+            po.record_event(run_id, data, repo_root=self.records)
+
+        event({"kind": "phase", "phase": "p", "status": "in_progress", "route": "CLAUDE_CODEX"})
+        event({"kind": "worker", "phase": "p", "step_id": "codex_reviewer", "status": "not_started"})
+        event({"kind": "escalation", "phase": "p", "from_route": "CLAUDE_CODEX",
+               "to_route": "CODEX_CLAUDE_CODEX", "reason": "REVIEW_FINDINGS"})
+        event({"kind": "phase", "phase": "p", "status": "in_progress", "route": "CODEX_CLAUDE_CODEX"})
+        event({"kind": "worker", "phase": "p", "step_id": "claude_worker", "status": "in_progress"})
+        record = po.finish(run_id, "PARTIAL", repo_root=self.records)
+        workers = {(w["step_id"], w["route_epoch"]): w["status"] for w in record["parent_orchestration"]["phases"][0]["workers"]}
+        self.assertEqual(workers, {("codex_reviewer", 0): "not_started", ("claude_worker", 1): "abandoned"})
+        self.assertEqual([(e["kind"], e.get("step_id"), e.get("route_epoch"))
+                          for e in record["parent_orchestration"]["reconciled"]],
+                         [("phase", None, None), ("worker", "claude_worker", 1)])
+        self.assertEqual(provenance.validate_run_record(record, self.schema), [])
+
+
+class WorkerJudgmentTest(_Base):
+    """The lead's judgment wins over the lifecycle's automatic worker record."""
+
+    def setUp(self):
+        super().setUp()
+        self.run_id = po.start(worktree=self.target, repo_root=self.records)["run_id"]
+        self.event({"kind": "phase", "phase": "p", "status": "in_progress", "route": "CLAUDE_CODEX"})
+        self.event({"kind": "worker", "phase": "p", "step_id": "claude_worker", "status": "in_progress"})
+
+    def event(self, data):
+        return po.record_event(self.run_id, data, repo_root=self.records)
+
+    def worker(self):
+        return provenance.get_run(self.records, self.run_id)["parent_orchestration"]["phases"][0]["workers"][0]
+
+    def auto(self, status, **extra):
+        return self.event({"kind": "worker", "phase": "p", "step_id": "claude_worker", "status": status,
+                           "only_if_open": True, **extra})
+
+    def lead(self, status, **extra):
+        return self.event({"kind": "worker", "phase": "p", "step_id": "claude_worker", "status": status, **extra})
+
+    def test_case_a_auto_failed_then_lead_failed_with_its_own_code_merges(self):
+        self.auto("failed", blocker_code="WORKER_FAILED")
+        self.lead("failed", blocker_code="MODEL_BACKEND_UNAVAILABLE")
+        self.assertEqual((self.worker()["status"], self.worker()["blocker_code"]), ("failed", "MODEL_BACKEND_UNAVAILABLE"))
+        self.lead("failed")  # restating without a code is safe
+        self.assertEqual(self.worker()["blocker_code"], "MODEL_BACKEND_UNAVAILABLE")
+
+    def test_case_b_auto_completed_then_lead_rejects_it(self):
+        self.auto("completed")
+        self.lead("failed", blocker_code="REVIEW_REJECTED")
+        self.assertEqual((self.worker()["status"], self.worker()["blocker_code"]), ("failed", "REVIEW_REJECTED"))
+
+    def test_lead_blocked_after_auto_completed(self):
+        self.auto("completed")
+        self.lead("blocked", blocker_code="REVIEW_REJECTED")
+        self.assertEqual(self.worker()["status"], "blocked")
+
+    def test_downgrade_needs_a_reason_and_nothing_else_reopens(self):
+        self.auto("completed")
+        for status, extra in (("failed", {}), ("in_progress", {}), ("not_started", {})):
+            with self.assertRaises(po.ParentRunError) as raised:
+                self.lead(status, **extra)
+            self.assertEqual(raised.exception.error_code, "PARENT_WORKER_TRANSITION_INVALID")
+        self.lead("failed", blocker_code="REVIEW_REJECTED")
+        with self.assertRaises(po.ParentRunError):
+            self.lead("completed")
+
+    def test_automatic_record_never_overrides_a_recorded_status(self):
+        self.lead("failed", blocker_code="REVIEW_REJECTED")
+        before = provenance.run_path(self.records, self.run_id).read_bytes()
+        self.auto("completed")
+        self.auto("failed", blocker_code="WORKER_FAILED")
+        self.assertEqual(provenance.run_path(self.records, self.run_id).read_bytes(), before)
+
+    def test_unrelated_blocker_conflicts_still_refused(self):
+        self.lead("in_progress", blocker_code="A_CODE")
+        with self.assertRaises(po.ParentRunError) as raised:
+            self.lead("in_progress", blocker_code="OTHER_CODE")
+        self.assertEqual(raised.exception.error_code, "PARENT_EVENT_CONFLICT")
 
 
 if __name__ == "__main__":

@@ -110,14 +110,14 @@ function renderTasks(run) {
     const head = el("summary", "task-head");
     head.append(el("span", `task-glyph ${phase.status}`, phase.status === "completed" ? "✿" : "✦"));
     const title = el("span", "task-name"); title.append(el("strong", "", phase.id), el("small", "", `Route ${phase.route || "pending"}${phase.wave_id ? ` · ${phase.wave_id}` : ""}`)); head.append(title);
-    head.append(el("span", `task-status ${phase.status}`, cap(phase.status)), el("span", "chevron", "›")); card.append(head);
+    head.append(el("span", `task-status ${phase.status}`, statusLabel(run, phase)), el("span", "chevron", "›")); card.append(head);
     const details = el("div", "task-detail");
     if (phase.wave_id) details.append(el("p", "wave", `◇ In ${phase.wave_id}`));
     if (!phase.workers?.length) details.append(el("p", "no-workers", "No helpers have joined this task yet."));
     for (const worker of phase.workers || []) {
       const row = el("div", "worker-row"); row.append(el("span", `worker-dot ${worker.status}`));
       const copy = el("div", "worker-copy"); copy.append(el("strong", "", worker.step_id), el("small", "", [worker.backend, worker.model].filter(Boolean).join(" · ") || "Model pending"));
-      row.append(copy, el("span", "worker-state", cap(worker.status))); details.append(row);
+      row.append(copy, el("span", "worker-state", statusLabel(run, phase, worker))); details.append(row);
     }
     card.append(details); list.append(card);
   }
@@ -136,7 +136,14 @@ function renderActivity(run) {
     copy.append(el("small", "", `${at}${item.subagent_id ? ` · ${item.subagent_id}` : ""}`)); row.append(icon, copy); list.append(row);
   }
 }
-const normalizedStatus = (value) => ({ in_progress: "active", completed: "completed", partial: "blocked", interrupted: "blocked", blocked: "blocked", failed: "failed", not_started: "waiting" })[String(value || "").toLowerCase()] || "waiting";
+// "Abandoned (run ended PARTIAL)": reconciled work the run ended without finishing, never shown as running.
+const abandonedLabel = (run, phaseId, stepId) => {
+  const entry = (run?.reconciled || []).find((item) => item.phase_id === phaseId && (stepId ? item.kind === "worker" && item.step_id === stepId : item.kind === "phase"));
+  const ended = String(entry?.reason || "").replace(/^run finished /, "");
+  return ended ? `Abandoned (run ended ${ended})` : "Abandoned";
+};
+const statusLabel = (run, phase, worker) => (worker || phase).status === "abandoned" ? abandonedLabel(run, phase.id, worker?.step_id) : cap((worker || phase).status);
+const normalizedStatus = (value) => ({ in_progress: "active", completed: "completed", partial: "blocked", abandoned: "abandoned", blocked: "blocked", failed: "failed", not_started: "waiting" })[String(value || "").toLowerCase()] || "waiting";
 const timeLabel = (value) => value ? new Date(value).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "Time unknown";
 
 function agentNodes(run) {
@@ -161,7 +168,7 @@ function agentNodes(run) {
   for (const phase of phases) {
     for (const worker of phase.workers || []) {
       if (nodes.some((node) => node.kind === "subagent" && node.task === phase.id && node.label === worker.step_id.replaceAll("_", " "))) continue;
-      nodes.push({ key: `worker/${phase.id}/${worker.step_id}`, kind: "worker", label: worker.step_id.replaceAll("_", " "), task: phase.id, stepId: worker.step_id, status: normalizedStatus(worker.status), model: worker.model || "Model not recorded", backend: worker.backend || "pi-subagent", identity: worker.step_id });
+      nodes.push({ key: `worker/${phase.id}/${worker.step_id}`, kind: "worker", label: worker.step_id.replaceAll("_", " "), task: phase.id, stepId: worker.step_id, status: normalizedStatus(worker.status), label_text: worker.status === "abandoned" ? abandonedLabel(run, phase.id, worker.step_id) : undefined, model: worker.model || "Model not recorded", backend: worker.backend || "pi-subagent", identity: worker.step_id });
     }
   }
   return nodes;
@@ -175,7 +182,7 @@ function nodeButton(node, x, y) {
   button.dataset.agent = node.key;
   button.title = `${node.label} · ${node.task || "run"}`;
   button.setAttribute("aria-label", `${node.kind === "lead" ? "Lead agent" : node.kind}, ${node.label}, ${node.status}, task ${node.task || "run"}`);
-  button.append(el("span", "agent-face", node.kind === "lead" ? "✿" : node.kind === "subagent" ? "✦" : "●"), el("strong", "", node.label), el("small", "", node.kind === "lead" ? "lead" : `${node.kind} · ${node.task}`), el("span", "node-state", node.status === "completed" ? "✓ Completed" : node.status === "active" ? "● Working" : node.status === "blocked" ? "! Blocked" : node.status === "failed" ? "× Failed" : "○ Waiting"));
+  button.append(el("span", "agent-face", node.kind === "lead" ? "✿" : node.kind === "subagent" ? "✦" : "●"), el("strong", "", node.label), el("small", "", node.kind === "lead" ? "lead" : `${node.kind} · ${node.task}`), el("span", "node-state", node.status === "completed" ? "✓ Completed" : node.status === "active" ? "● Working" : node.status === "blocked" ? "! Blocked" : node.status === "failed" ? "× Failed" : node.status === "abandoned" ? "– Abandoned" : "○ Waiting"));
   button.addEventListener("click", () => { state.agent = node.key; document.querySelectorAll(".agent-node").forEach((item) => item.classList.toggle("selected", item.dataset.agent === node.key)); renderAgentDetail(selectedRun(), node); });
   return button;
 }
@@ -194,7 +201,7 @@ function renderAgentDetail(run, selected) {
   box.append(el("span", `detail-symbol ${node.status}`, node.kind === "lead" ? "✿" : node.kind === "subagent" ? "✦" : "●"));
   box.append(el("p", "eyebrow", node.kind === "lead" ? "AT THE CENTER" : node.kind === "subagent" ? "SUBAGENT" : "WORKER"));
   box.append(el("h3", "", node.label));
-  box.append(el("p", `detail-status ${node.status}`, node.status === "active" ? "Working" : cap(node.status)));
+  box.append(el("p", `detail-status ${node.status}`, node.status === "active" ? "Working" : node.label_text || cap(node.status)));
   const facts = el("dl", "agent-facts");
   const addFact = (term, value) => { facts.append(el("dt", "", term), el("dd", "", value)); };
   addFact("Task", node.task || "The whole run");
@@ -298,7 +305,7 @@ function timelineMoments(run) {
     const action = event.status === "started" ? "started" : event.status === "spawned" ? "joined" : event.tool === "spawn_subagent" && event.status === "finished" ? "spawn request finished" : event.status === "finished" ? "finished" : event.status === "failed" ? "failed" : cap(event.status);
     return { at: event.at, status: event.status === "spawned" || event.status === "started" ? "active" : event.status === "failed" ? "failed" : "completed", title: `${actor} ${action}`, detail: [event.task_id, event.step_id].filter(Boolean).join(" · ") };
   });
-  return (run.phases || []).map((phase) => ({ at: null, status: normalizedStatus(phase.status), title: phase.id, detail: `Phase ${cap(phase.status)}` }));
+  return (run.phases || []).map((phase) => ({ at: null, status: normalizedStatus(phase.status), title: phase.id, detail: `Phase ${statusLabel(run, phase)}` }));
 }
 
 function renderTimeline(run) {

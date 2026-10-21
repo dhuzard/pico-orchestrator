@@ -37,6 +37,18 @@ record; the escalation is appended. Valid reasons are `FAILED_ATTEMPTS`, `REVIEW
 `AMBIGUITY`, `ARCHITECTURE`, `SECURITY_SENSITIVE`, `SEMANTIC_RISK`, or
 `CONTEXT_BUDGET`. Never escalate without one. Context and worker-usage
 telemetry is recorded by the lifecycle extension itself; do not report it.
+The lifecycle extension records each ClaudeWorker's raw result itself, as
+`completed` on success, `failed` on error, or `blocked` on abort, and never
+overrides a status you already recorded. Record that worker yourself only when
+your judgment differs or you add a reason: after a review rejects a `completed`
+worker, record `failed` or `blocked` with a `blocker_code`; for a worker
+recorded `failed` or `blocked`, repeat the same status with your own
+`blocker_code` to replace the automatic one. Other workers (Codex subagents)
+are recorded by you as before.
+A run that ends without `COMPLETED` marks every phase and current-route worker
+still `not_started` or `in_progress` as `abandoned`, with a
+`parent_orchestration.reconciled` entry; you never record `abandoned`
+yourself, and `COMPLETED` still requires every phase and worker to be closed.
 Repeating the same event is safe; a conflicting route, worker identity,
 or terminal status is rejected. Always record observed values only.
 

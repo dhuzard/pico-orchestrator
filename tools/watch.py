@@ -122,7 +122,7 @@ def public_run(record: dict, directory: Path | None = None) -> dict:
         "started_at": record.get("started_at"), "ended_at": record.get("ended_at"),
         "status": parent.get("final_status") or record.get("outcome"),
         "blocker_code": parent.get("blocker_code"),
-        "phases": phases, "waves": parent.get("waves") or [],
+        "phases": phases, "reconciled": parent.get("reconciled") or [], "waves": parent.get("waves") or [],
         "activity": parent.get("activity") or [],
         "interactions": interactions,
         "links": publication_links(record, directory) if directory else [],

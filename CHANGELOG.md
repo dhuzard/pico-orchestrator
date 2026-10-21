@@ -10,15 +10,16 @@ All notable changes to PICO are recorded here. The format follows
 
 - A run that ends PARTIAL, BLOCKED, FAILED or settled no longer leaves phases or
   workers `in_progress`. Finishing without COMPLETED sets each still-open phase
-  and worker (`not_started` or `in_progress`) to `interrupted` and appends it to
+  and worker (`not_started` or `in_progress`) to `abandoned` and appends it to
   the new `parent_orchestration.reconciled` list (`kind`, `phase_id`, `step_id`,
   `from_status`, `to`, `reason`, `at`); events, activity and every other field
   stay as recorded, and a repeated finish adds nothing. COMPLETED still refuses
   open work. The lifecycle extension now records a ClaudeWorker's terminal status
   (`completed`, `failed`, or `blocked` on abort) when its result arrives, so the
-  lead no longer has to. The Garden shows interrupted work as blocked, not
-  running. Older records still validate and display; records written by this
-  version carry `reconciled` and `interrupted`, which older PICO versions reject
+  lead no longer has to; the lead's judgment wins (completed -> failed/blocked with
+  a blocker code, or its own blocker code on a failed worker). The Garden shows it as "Abandoned (run ended PARTIAL)", not
+  running; workers of an earlier route epoch are left as recorded. Older records still validate and display; records written by this
+  version carry `reconciled` and `abandoned`, which older PICO versions reject
   (`additionalProperties: false`, status enums). Fixes #42.
 - `pico workspace launch` now refuses with `WORKSPACE_BUDGET_EXHAUSTED` when the
   workspace budget is exhausted (it previously spent past it; only the

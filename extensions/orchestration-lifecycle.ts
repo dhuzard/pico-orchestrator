@@ -957,11 +957,12 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
             ...(count(usage.cache_write_tokens) === null ? {} : { cache_write_tokens: count(usage.cache_write_tokens) }),
             ...(typeof cost === "number" && Number.isFinite(cost) && cost >= 0 ? { estimated_cost_usd: cost } : {}) });
           // The worker's own terminal status, so a lead that never records it leaves nothing in_progress.
-          // An abort (lease loss, user stop) is blocked; any other failure is failed. A repeat of the same
-          // terminal status is idempotent in the parent; a conflicting one is refused there and only diagnosed.
+          // An abort (lease loss, user stop) is blocked; any other failure is failed. `only_if_open` makes this
+          // the raw result only: it never overrides a status the lead already recorded, and the lead may later
+          // record a different judgment (completed -> failed/blocked with a blocker code) or add its own code.
           if (worker?.phase && worker.stepId) {
             const code = typeof details.blocker_code === "string" ? details.blocker_code : "WORKER_FAILED";
-            await observe({ kind: "worker", phase: worker.phase, step_id: worker.stepId,
+            await observe({ kind: "worker", phase: worker.phase, step_id: worker.stepId, only_if_open: true,
               ...(result.isError ? { status: details.error === "ABORTED" ? "blocked" : "failed", blocker_code: code }
                                  : { status: "completed" }) });
           }

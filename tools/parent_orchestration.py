@@ -28,11 +28,11 @@ import routing_engine as engine
 import run_lease
 
 STATUSES = {"COMPLETED", "BLOCKED", "FAILED", "PARTIAL"}
-# "interrupted" is written only by `_reconcile_open` when a run ends without a COMPLETED outcome;
+# "abandoned" is written only by `_reconcile_open` when a run ends without a COMPLETED outcome;
 # it is never accepted from an event.
 PHASE_STATUSES = {"not_started", "in_progress", "completed", "blocked", "failed", "partial"}
 WORKER_STATUSES = {"not_started", "in_progress", "completed", "blocked", "failed"}
-RECONCILED_STATUS = "interrupted"
+RECONCILED_STATUS = "abandoned"
 ROUTES = {"CODEX", "CLAUDE", "CLAUDE_CODEX", "CODEX_CLAUDE_CODEX"}
 ESCALATION_TARGETS = {
     "CODEX": {"CLAUDE_CODEX", "CODEX_CLAUDE_CODEX"},
@@ -523,7 +523,7 @@ def _record_event_unlocked(run_id: str, event: dict, *, repo_root: Path = ROOT) 
     allowed = {
         "phase": {"kind", "phase", "status", "route", "routing", "policy_version", "blocker_code", "escalation_reason"},
         "escalation": {"kind", "phase", "from_route", "to_route", "reason"},
-        "worker": {"kind", "phase", "step_id", "model", "backend", "backend_model", "reasoning_effort", "status", "blocker_code", "installed_backend_version", "required_backend_version"},
+        "worker": {"kind", "phase", "step_id", "only_if_open", "model", "backend", "backend_model", "reasoning_effort", "status", "blocker_code", "installed_backend_version", "required_backend_version"},
         "child": {"kind", "phase", "run_id"},
         "mutation": {"kind", "github", "code"},
         "context": {"kind", "starting_commit", "baseline_tokens", "context_tokens", "working_tokens", "compaction"},
@@ -635,8 +635,19 @@ def _record_event_unlocked(run_id: str, event: dict, *, repo_root: Path = ROOT) 
                       "blocker_code": None, "installed_backend_version": None,
                       "required_backend_version": None}
             phase["workers"].append(worker)
-        if worker["status"] in {"completed", "blocked", "failed"} and event["status"] != worker["status"]:
-            raise ParentRunError("worker is already terminal", error_code="PARENT_WORKER_TRANSITION_INVALID")
+        prior = worker["status"]
+        if event.get("only_if_open") is True:
+            # The lifecycle's automatic record of a worker's raw result: never overrides a status already recorded.
+            if prior not in {"not_started", "in_progress"}:
+                return parent
+        elif "only_if_open" in event:
+            raise ParentRunError("invalid worker event")
+        if prior in {"completed", "blocked", "failed"} and event["status"] != prior:
+            # The lead's judgment wins over the automatic record: a completed worker may be
+            # marked failed or blocked, with its reason (blocker_code). Nothing else reopens.
+            if not (prior == "completed" and event["status"] in {"failed", "blocked"}
+                    and event.get("blocker_code") is not None):
+                raise ParentRunError("worker is already terminal", error_code="PARENT_WORKER_TRANSITION_INVALID")
         worker["status"] = event["status"]
         if "reasoning_effort" in event:
             if event["reasoning_effort"] not in REASONING_EFFORTS:
@@ -649,7 +660,10 @@ def _record_event_unlocked(run_id: str, event: dict, *, repo_root: Path = ROOT) 
                              ("required_backend_version", VERSION_RE)):
             if key in event:
                 value = _safe(event[key], pattern, key)
-                if worker.get(key) is not None and value != worker[key]:
+                # A terminal worker restated by the lead may take the lead's own blocker code
+                # in place of the automatically recorded one.
+                restated = key == "blocker_code" and prior in {"failed", "blocked"} and event["status"] == prior
+                if worker.get(key) is not None and value != worker[key] and not restated:
                     raise ParentRunError("worker field conflicts with prior event", error_code="PARENT_EVENT_CONFLICT")
                 worker[key] = value
     elif kind == "child":
@@ -827,7 +841,7 @@ def _finish_unlocked(run_id: str, status: str, *, blocker_code: str | None = Non
 def _reconcile_open(parent: dict, status: str) -> None:
     """A run that ends without COMPLETED leaves no phase or worker open.
 
-    Each phase or worker still not_started or in_progress becomes `interrupted`, and the
+    Each phase, and each worker of the phase's current route epoch, still not_started or in_progress becomes `abandoned`, and the
     transition is appended to `parent.reconciled` with its prior status. Events, activity
     and every other field stay as recorded. A reconciled item is no longer open, so a
     repeated call adds nothing.
@@ -837,15 +851,18 @@ def _reconcile_open(parent: dict, status: str) -> None:
     reason = f"run finished {status}"
     entries = parent.setdefault("reconciled", [])
     for phase in parent["phases"]:
+        epoch = len(phase.get("escalations") or [])
         if phase["status"] in open_states:
             entries.append({"kind": "phase", "phase_id": phase["id"], "from_status": phase["status"],
                             "to": RECONCILED_STATUS, "reason": reason, "at": at})
             phase["status"] = RECONCILED_STATUS
         for worker in phase["workers"]:
-            if worker["status"] in open_states:
+            # Workers of an earlier route epoch were superseded by an escalation; like the COMPLETED
+            # check, they are left exactly as recorded.
+            if worker["status"] in open_states and worker.get("route_epoch", 0) == epoch:
                 entries.append({"kind": "worker", "phase_id": phase["id"], "step_id": worker["step_id"],
-                                "from_status": worker["status"], "to": RECONCILED_STATUS,
-                                "reason": reason, "at": at})
+                                "route_epoch": epoch, "from_status": worker["status"],
+                                "to": RECONCILED_STATUS, "reason": reason, "at": at})
                 worker["status"] = RECONCILED_STATUS
     if not entries:
         del parent["reconciled"]
