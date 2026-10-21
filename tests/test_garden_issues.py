@@ -243,9 +243,11 @@ class IssuesRobustnessTest(IssuesFixture):
     def test_git_timeout_or_missing_git_fails_only_that_repository(self):
         other = self.second_repo()
         real_run = subprocess.run
+        # macOS temp paths resolve through a symlink (/var -> /private/var).
+        paths = {str(self.repo), str(self.repo.resolve())}
         for error in (subprocess.TimeoutExpired(["git"], 10), FileNotFoundError("git")):
             def run(argv, *args, error=error, **kwargs):
-                if str(self.repo) in argv:
+                if paths & set(argv):
                     raise error
                 return real_run(argv, *args, **kwargs)
             with self.subTest(error=type(error).__name__), patch.object(gi.github_integration.subprocess, "run", run):
