@@ -612,6 +612,14 @@ and the apply changes `policy_commit` and so yields `GITHUB_STATE_CONFLICT`; a
 change that withdraws the permissions is `PUBLICATION_NOT_AUTHORIZED` at apply
 time.
 
+*Root of trust.* The repository's default branch on GitHub is now the root of
+trust for publication. Whoever can push to it, merge into it, or change which
+branch is the default (a repository admin) controls `push_branch`,
+`create_pr` and `issue_reference` for every publication. Protect the default
+branch: require pull request review and disallow direct pushes (and restrict
+who can change the default branch or edit branch protection). PICO cannot
+verify these settings; they are the operator's responsibility.
+
 *Drift.* A checkout whose `.pi/autonomy.yaml` (committed or dirty) differs from
 the authorizing policy is reported but not refused: `publish` returns
 `policy_drift`, the sorted permission names that differ. It is informational,
@@ -637,6 +645,12 @@ enforced by `github_integration.execute` or `backlog github-push`. Those paths
 rely on the parent's dry run and plan hash (and `--allow-destructive` for
 closes) alone; a policy that sets these permissions to `false` does not stop
 them. Do not treat those three flags as a control until #58 lands.
+
+**Trust boundary summary.** Publication authority rests on the default branch
+on GitHub (see "Root of trust" above) and on the Garden session token for
+one-shot grants. Agent-side tool denylists do not fully stop a same-user
+process (S1, #59): a process running as the user can read the token or call
+`gh` directly, so they are not a substitute for branch protection.
 
 **Garden one-shot grant trust (follow-up: #59).** The grant trusts whoever
 holds the Garden session token. `pico watch` prints the token, so a process

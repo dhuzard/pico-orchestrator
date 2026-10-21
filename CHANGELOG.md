@@ -16,6 +16,8 @@ All notable changes to PICO are recorded here. The format follows
   read) that also decides `issue_reference`. The caller's `--base` only chooses where the PR
   points and is never authority, so a `pico/` branch on GitHub cannot authorize itself. The
   working tree is never an authority.
+- The default branch is now the root of trust for publication: protect it (required review, no
+  direct pushes). Agent-side tool denylists do not fully stop a same-user process (S1, #59).
 - Removed `backlog github-pr-create`: it ran `gh pr create` for any base and head with no
   permission check, dry run or plan hash. Open PRs with `github_integration --publish` (or
   `pico workspace publish`) and link them with `github-pr-link`.
