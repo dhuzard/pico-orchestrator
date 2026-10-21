@@ -584,16 +584,16 @@ class LifecycleTest(unittest.TestCase):
         with self.assertRaises(po.ParentRunError) as refused:   # ... a bound worktree makes it mutating
             parent.finish("COMPLETED")
         self.assertEqual(refused.exception.error_code, "PARENT_WAVE_NOT_INTEGRATED")
-        self.assertIn("auto-rw", str(refused.exception))
-        self.assertNotIn("auto-ro", str(refused.exception))
+        self.assertIn("rw (route", str(refused.exception))
+        self.assertNotIn("ro (route", str(refused.exception))
         parent.event({"kind": "wave", "wave_id": "auto-rw", "task_ids": ["rw"], "status": "integrating"})
         parent.event({"kind": "wave", "wave_id": "auto-rw", "task_ids": ["rw"], "status": "integrated"})
         self.assertEqual(parent.finish("COMPLETED")["outcome"], "completed")
 
     def test_credential_shapes_are_masked_before_the_cut_so_none_survives_or_splits(self):
         secrets = ["github_pat_" + "A1b2C3d4E5" * 3, "glpat-" + "x1y2z3" * 5, "AIza" + "Sy" * 20,
-                   "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NSJ9.c2lnbmF0dXJl", "password=hunter2hunter2",
-                   "token: abcdef123456", "secret = s3cr3tvalue", "https://user:pa55w0rd@example.com/x",
+                   "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NSJ9.c2lnbmF0dXJl", "password=hunter2hunter2xx",
+                   "token: abcdef1234567890", "secret = s3cr3tvalue12345", "https://user:pa55w0rd@example.com/x",
                    "npm_" + "q" * 36, "sk_live_" + "Z" * 24, "rk_live_" + "Y" * 24]
         parent = po.ParentRun(worktree=self.target, repo_root=self.records)
         for secret in secrets:
@@ -611,6 +611,32 @@ class LifecycleTest(unittest.TestCase):
         # An unbroken run left at the cut is dropped as a possible partial token.
         cut = po._bounded_text("a " * 290 + "b" * 40, 600)
         self.assertEqual(cut, ("a " * 290).strip())
+
+    def test_assignment_masking_needs_a_secret_like_value_so_prose_is_kept(self):
+        for prose in ("token: 80 passes", "secret = none left", "the token budget was 5", "password: n/a"):
+            self.assertEqual(po._bounded_text(f"ran {prose} today", 600), f"ran {prose} today")
+        self.assertEqual(po._bounded_text("ran token: abcdef1234567890xyz today", 600), "ran [withheld] today")
+
+    def test_a_bound_task_without_a_wave_or_after_an_escalation_still_needs_integration(self):
+        parent = po.ParentRun(worktree=self.target, repo_root=self.records)
+        parent.event({"kind": "phase", "phase": "rw", "status": "in_progress", "route": "CODEX"})
+        parent.event({"kind": "checkpoint", "phase": "rw", "reason": "worker_approval", "workspace_bound": True})
+        parent.event({"kind": "escalation", "phase": "rw", "from_route": "CODEX", "to_route": "CODEX_CLAUDE_CODEX",
+                      "reason": "REVIEW_FINDINGS"})
+        parent.event({"kind": "phase", "phase": "rw", "status": "completed", "route": "CODEX_CLAUDE_CODEX"})
+        # No wave was ever recorded (a refused implicit-wave write), and the old route's worktree is remembered.
+        with self.assertRaises(po.ParentRunError) as refused:
+            parent.finish("COMPLETED")
+        self.assertEqual(refused.exception.error_code, "PARENT_WAVE_NOT_INTEGRATED")
+        self.assertIn("rw (route epochs [0])", str(refused.exception))
+        parent.event({"kind": "checkpoint", "phase": "rw", "reason": "worker_approval", "workspace_bound": True})
+        phase = provenance.get_run(self.records, parent.run_id)["parent_orchestration"]["phases"][0]
+        self.assertEqual(phase["bound_epochs"], [0, 1])
+        for status in ("declared", "integrating", "integrated"):
+            parent.event({"kind": "wave", "wave_id": "w", "task_ids": ["rw"], "status": status})
+        with self.assertRaises(po.ParentRunError) as past:   # integration done: the next check (review) now speaks
+            parent.finish("COMPLETED")
+        self.assertEqual(past.exception.error_code, "PARENT_REVIEW_MISSING")
 
     def test_a_declared_wave_never_integrated_does_not_block_completion_and_a_superseded_one_is_ignored(self):
         parent = po.ParentRun(worktree=self.target, repo_root=self.records)

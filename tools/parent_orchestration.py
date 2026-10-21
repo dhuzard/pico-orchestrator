@@ -196,7 +196,8 @@ _EXCERPT_SECRET_PATTERNS = (
     re.compile(r"glpat-[A-Za-z0-9_-]{16,}"),
     re.compile(r"AIza[0-9A-Za-z_-]{30,}"),
     re.compile(r"eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]*"),
-    re.compile(r"(?i)\b(?:password|passwd|pwd|token|secret|api[_-]?key|apikey)\b\s*[:=]\s*\S+"),
+    # An assignment masks only a secret-like value (16+ characters, no spaces): "token: 80 passes" is prose.
+    re.compile(r"(?i)\b(?:password|passwd|pwd|token|secret|api[_-]?key|apikey)\b\s*[:=]\s*[A-Za-z0-9_\-./+=]{16,}"),
     re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s/:@]+:[^\s/@]+@\S*"),
     re.compile(r"\bnpm_[A-Za-z0-9]{20,}"),
     re.compile(r"\b[sr]k_(?:live|test)_[A-Za-z0-9]{10,}"),
@@ -511,7 +512,10 @@ def _wave_event(parent: dict, event: dict) -> None:
         raise ParentRunError("wave cannot move backwards", error_code="PARENT_WAVE_TRANSITION_INVALID")
     wave["status"] = status
     for task_id in task_ids:
-        _phase(parent, task_id)["wave_id"] = wave_id
+        task_phase = _phase(parent, task_id)
+        task_phase["wave_id"] = wave_id
+        if status == "integrated":
+            task_phase.pop("workspace_bound", None)  # merged: its bound worktrees (every epoch) are covered
 
 
 def _topology(peak: int) -> str:
@@ -643,7 +647,6 @@ def _record_event_unlocked(run_id: str, event: dict, *, repo_root: Path = ROOT) 
             raise ParentRunError("invalid phase route escalation", error_code="PARENT_ESCALATION_INVALID")
         if any(worker["status"] == "in_progress" for worker in phase["workers"]):
             raise ParentRunError("phase workers are still in progress", error_code="PARENT_ESCALATION_WORKERS_IN_FLIGHT")
-        phase.pop("workspace_bound", None)
         phase.setdefault("escalations", []).append({"from_route": current,
             "to_route": event["to_route"], "reason": event["reason"],
             "at": datetime.now(timezone.utc).isoformat(), "confirmed": False})
@@ -917,7 +920,13 @@ def _record_event_unlocked(run_id: str, event: dict, *, repo_root: Path = ROOT) 
             raise ParentRunError("invalid checkpoint event")
         if event.get("workspace_bound") is True:
             # A bound worktree is the evidence that a mutating step may have run for this task and route epoch.
-            _phase(parent, event["phase"])["workspace_bound"] = True
+            # `bound_epochs` keeps every epoch that bound one (an escalation never forgets the old route's
+            # worktree); `workspace_bound` stays true until an integrated wave covers the task.
+            bound = _phase(parent, event["phase"])
+            epoch = len(bound.get("escalations") or [])
+            if epoch not in bound.setdefault("bound_epochs", []):
+                bound["bound_epochs"].append(epoch)
+            bound["workspace_bound"] = True
         _checkpoint(parent, reason=event["reason"], phase=_safe(event["phase"], ID_RE, "phase id"))
     elif kind == "concurrency":
         context = parent.setdefault("context", empty_context())
@@ -987,12 +996,14 @@ def _finish_unlocked(run_id: str, status: str, *, blocker_code: str | None = Non
             raise ParentRunError("wave integration was begun and never ended: " + ", ".join(integrating[:12]) +
                                  ". Record integrate_end, or finish as PARTIAL",
                                  error_code="PARENT_WAVE_INTEGRATING")
-        unmerged = [wave["id"] for wave in parent.get("waves") or [] if wave["status"] == "declared"
-                    and _wave_is_current(phases, wave)
-                    and any(phase.get("workspace_bound") for phase in phases if phase["id"] in wave["task_ids"])]
+        # Checked per task, not per wave: a refused implicit-wave write leaves a bound task with no wave at all,
+        # and an escalation keeps the old route's worktree (`bound_epochs`) until an integrated wave covers it.
+        unmerged = [f"{phase['id']} (route epochs {phase.get('bound_epochs') or [0]})"
+                    for phase in phases if phase.get("workspace_bound")]
         if unmerged:
-            raise ParentRunError("wave with a mutating task was never integrated: " + ", ".join(unmerged[:12]) +
-                                 ". Record integrate_begin and integrate_end, or finish as PARTIAL",
+            raise ParentRunError("task with a bound worktree was never integrated: " + ", ".join(unmerged[:12]) +
+                                 ". Declare a wave for it and record integrate_begin and integrate_end, "
+                                 "or finish as PARTIAL",
                                  error_code="PARENT_WAVE_NOT_INTEGRATED")
         missing = _missing_reviews(phases)
         if missing:

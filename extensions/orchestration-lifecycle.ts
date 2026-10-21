@@ -1205,7 +1205,7 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
         return reply(false, "BLOCKED: parent provenance update failed; see diagnostic log.", parentFailure ?? {});
       }
       integrating = waveId;
-      return reply(true, `Integration of wave ${waveId} started. Worker launches are refused until integrate_end.`);
+      return reply(true, `Integration of wave ${waveId} (task${members.length === 1 ? "" : "s"} ${members.join(", ")}) started. Worker launches are refused until integrate_end.`);
     }
     if (integrating !== waveId || !members) return reply(false, `BLOCKED: INTEGRATION_NOT_STARTED: wave ${waveId} is not integrating.`);
     // Re-base: the parent's own merges are the new reference for later worker snapshots.
