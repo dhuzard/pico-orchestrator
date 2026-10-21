@@ -1039,11 +1039,10 @@ Read the policy's `issue_reference` from `python3
 closes it; `closes` means `Closes #N`, so GitHub closes the issue when a human
 merges the PR. Even under `closes`, write `Refs #N` for an issue the PR only
 partly addresses, and give each closed issue its own `Closes #N` line. The
-publication gate trusts only the policy committed at the base commit the
-GitHub remote reports (fetch the base branch first; otherwise it fails with
-`PUBLICATION_BASE_NOT_FETCHED`) and refuses any closing keyword (`Closes`/`Fixes`/`Resolves`, including in code
-or comments) that policy does not authorize, or that targets another
-repository (`PUBLICATION_BODY_INVALID`, `AUTONOMY_POLICY_PATH_UNSAFE`). Never
+publication gate reads the policy from the base branch on GitHub, never
+from the local checkout, and refuses any closing keyword
+(`Closes`/`Fixes`/`Resolves`, including in code or comments) that policy does
+not authorize, or that targets another repository (`PUBLICATION_BODY_INVALID`, `AUTONOMY_POLICY_PATH_UNSAFE`). Never
 edit `.pi/autonomy.yaml` to get past it.
 After integration, use the trusted adapter's publication mode: write the
 reviewed PR body to a local file, then call `python3

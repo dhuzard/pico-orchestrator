@@ -521,26 +521,41 @@ must be authorized, or the gate refuses with `PUBLICATION_BODY_INVALID`:
   `Closes #N` line, so a batch PR can close every issue it resolves.
 
 Closed issues must be in the PR's own repository. `issue_reference` is read
-from `.pi/autonomy.yaml` at the base commit the verified GitHub remote
-reports (`git ls-remote <remote> refs/heads/<base>`), never from a local ref
-or the working tree: every worktree can rewrite `refs/heads/<base>` and
-`refs/remotes/...`, so an uncommitted edit, a policy committed on the `pico/`
-branch or a forged local base ref cannot authorize closing. The policy is
-read from that commit with `git --no-replace-objects ls-tree`/`cat-file`, so
-a local `git replace` cannot substitute it, and validated against the
-schema. When the remote base commit is not in the local object store, a
-closing publication fails with `PUBLICATION_BASE_NOT_FETCHED` (fetch the
-base branch and retry); a remote without the base branch means `refs`.
-Before trusting a `closes` policy, the gate also refuses with
-`AUTONOMY_POLICY_PATH_UNSAFE` when `.pi` or the policy file is a symlink (in
-the checkout or in the base commit) or `git status` shows the policy
-modified. The policy is consulted only when the body would close an issue
-the caller did not name. The dry-run plan records `base_commit`,
-`issue_reference`, `closes_issues`, the policy blob SHA (`issue_policy_blob`,
-when consulted) and the body hash, so the reviewed `plan_hash` binds all of
-them. A workspace task without `closes_issue` reads the same remote base
-commit to choose its body, and falls back to `Refs #N` when that commit has
-not been fetched. The match ignores Markdown structure: GitHub
+from `.pi/autonomy.yaml` at the base branch's current commit **as the GitHub
+API reports it**, through the authenticated `gh` adapter
+(`github_sync.branch_head`: `gh api -X GET repos/<repo>/git/ref/heads/<base>`;
+`github_sync.policy_file_at`: `gh api -X GET
+repos/<repo>/contents/.pi/autonomy.yaml?ref=<sha>`, both fixed argv with
+shape validation), and validated against the schema. Local git is never asked
+about the base branch: every worktree shares the repository's refs and git
+config, so a forged `refs/heads/<base>` or `refs/remotes/...`, a `git
+replace`, or a `core.sshCommand`, `remote.<name>.uploadpack` or
+`include.path` that serves a fake remote cannot authorize closing, and
+neither can an uncommitted edit or a policy committed on the `pico/` branch.
+A base branch or policy that GitHub does not have means `refs`. GitHub
+reports a symlink at `.pi/autonomy.yaml` as `type: symlink` (or, for a
+symlink to a file in the repository, as that file under another `path`);
+both are refused with `AUTONOMY_POLICY_PATH_UNSAFE`, as is a symlinked or
+locally modified policy in the checkout. Base branch names are limited to
+`[A-Za-z0-9._-]` segments separated by `/` (`PUBLICATION_REF_INVALID`). The
+policy is consulted only when the body would close an issue the caller did
+not name. The dry-run plan records `base_commit`, `issue_reference`,
+`closes_issues`, the policy blob SHA (`issue_policy_blob`, when consulted)
+and the body hash, so the reviewed `plan_hash` binds all of them. Because
+`base_commit` is in the plan, any merge to the base branch between the dry
+run and the apply makes the apply fail with `GITHUB_STATE_CONFLICT`, even
+for a PR that only says `Refs #N`; review a fresh dry run and apply again. A
+workspace task without `closes_issue` reads the same GitHub base commit to
+choose its body, and `workspace_contracts publish` returns that choice as
+`issue_reference_decision` (`closes`, `source: task | repository`,
+`base_commit`, `policy_blob`).
+
+The trust boundary stops at the push. The branch push itself still runs
+through local git (`git push` with the checkout's remote and config), so a
+worker that can write the shared `.git/config` can still redirect or alter
+the push; the gate cannot protect against that. Isolating workers from the
+parent repository's git config is tracked with worker isolation (S1) and #39.
+The match ignores Markdown structure: GitHub
 does not act on keywords in code spans or HTML comments, but the gate refuses
 them there too rather than reimplement GitHub's parser. Backlog-generated PR
 bodies stay `Refs #N` in every mode, because a backlog item's issue closes
@@ -1725,7 +1740,8 @@ the validated commit (`WORKSPACE_HEAD_CHANGED`). Every upstream implementation
 task must already have a PR, unless it is `merged`
 (`WORKSPACE_UPSTREAM_UNPUBLISHED`). The body (`Refs #<issue>`, or
 `Closes #<issue>` when the task sets `closes_issue: true` or omits it in a
-repository whose committed `.pi/autonomy.yaml` sets `issue_reference: closes`; validated
+repository whose `.pi/autonomy.yaml` on GitHub's base branch sets
+`issue_reference: closes`; validated
 commit, check results, contracts, `Depends on: owner/repo#N` lines, no
 objective or transcript, secret-scanned) goes to
 `github_integration.publish` unchanged: autonomy `push_branch` and
