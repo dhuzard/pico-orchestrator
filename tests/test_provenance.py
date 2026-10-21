@@ -1716,7 +1716,9 @@ class ProvenanceRunLockTest(unittest.TestCase):
             provenance.add_step(self.repo_root, "run-lock", task_id=f"T{index}", status="in_progress")
             provenance.update_step(self.repo_root, "run-lock", f"T{index}", status="completed")
 
-        with ThreadPoolExecutor(max_workers=8) as pool:
+        # This test checks that no step is lost, not the lock timeout (see
+        # test_held_lock_bounds_every_writer); give queued writers room on slow runners.
+        with patch.object(provenance, "RUN_LOCK_WAIT_SECONDS", 120), ThreadPoolExecutor(max_workers=8) as pool:
             list(pool.map(add, range(16)))
         steps = provenance.get_run(self.repo_root, "run-lock")["steps"]
         self.assertEqual(sorted(step["task_id"] for step in steps), sorted(f"T{index}" for index in range(16)))
