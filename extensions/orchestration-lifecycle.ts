@@ -59,9 +59,20 @@ const TAG_ID = "[A-Za-z0-9][A-Za-z0-9_.-]{0,127}";
 const LABEL_TAG = new RegExp(`^(${TAG_ID}):(${TAG_ID})$`);
 const EXCERPT_CHARS = 300;
 const SUMMARY_CHARS = 600;
-/** Bounded, single-line, control-free text for the record; the recorder bounds and screens it again. */
-function boundedText(value: string, limit: number): string {
-  return value.replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, "").replace(/[\u0000-\u001f\u007f-\u009f]+/g, " ").replace(/\s+/g, " ").trim().slice(0, limit);
+const GOAL_CHARS = 200;
+/**
+ * Single-line, control-free text, cut generously (8x the recorded size). The recorder masks secret-like text in
+ * this wider window first and only then cuts to the recorded size, so a token straddling that cut is masked whole.
+ */
+function rawWindow(value: string, recorded: number): string {
+  return value.replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, "").replace(/[\u0000-\u001f\u007f-\u009f]+/g, " ").replace(/\s+/g, " ").trim().slice(0, recorded * 8);
+}
+/** The goal line of a worker contract ("Goal: ..."), and the rest of it after the task tag and that line. */
+function contractParts(contract: string): { goal?: string; excerpt: string } {
+  let body = contract.replace(PROMPT_TAG, "").trim();
+  const goal = /^[ \t]*Goal:[ \t]*(.+)$/im.exec(body);
+  if (goal) body = `${body.slice(0, goal.index)}\n${body.slice(goal.index + goal[0].length)}`.trim();
+  return { goal: goal?.[1], excerpt: body };
 }
 /** The commit a worker result reports ("commit abc1234", "at 244fea7", or a bare 40-hex id), if any. */
 function reportedCommit(text: string): string | undefined {
@@ -355,8 +366,10 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
   let lastPhase = "routing";
   let currentTurn: number | null = null;
   const messageStarts = new Map<number, number>();
-  let activeWave: { id: string; tasks: Map<string, string[]>; implicit?: boolean } | null = null;
-  // Implicit single-task waves recorded in this process and not yet integrated; "auto" needs exactly one.
+  // The explicitly declared wave: the only one under which tasks may run concurrently.
+  let activeWave: { id: string; tasks: Map<string, string[]> } | null = null;
+  // Implicit single-task waves (one per task) recorded in this process and not yet integrated. They never
+  // allow concurrency; "auto" needs exactly one.
   const implicitOpen = new Map<string, string[]>();
   let integrating: string | null = null;
   let batchStart = 0;
@@ -888,8 +901,8 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
       snapshots.set(call.toolCallId, before);
       // A routed task started while no worker runs and no wave is declared is a single-task wave: record it
       // here so the lead need not. Concurrent work still needs the lead's declare_wave (gate above).
-      if (taskId && approval && inFlight.size === 0 && (activeWave === null || activeWave.implicit === true) &&
-          !(activeWave && activeWave.tasks.has(taskId))) await recordImplicitWave(taskId);
+      if (taskId && approval && inFlight.size === 0 && activeWave === null &&
+          ![...implicitOpen.values()].some((members) => members.includes(taskId))) await recordImplicitWave(taskId);
       if (inFlight.size === 0) batchStart = Date.now();
       inFlight.set(call.toolCallId, { taskId, stepId: step?.id ?? null, tool: call.toolName,
         phase: workerPlans.get(call.toolCallId)?.phase });
@@ -898,11 +911,13 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
       const fields = call.input as Record<string, unknown>;
       const contract = [fields.prompt, fields.task, fields.message]
         .find((value): value is string => typeof value === "string" && value.length > 0);
+      const parts = contract ? contractParts(contract) : null;
       if (runId) await observe({ kind: "activity", status: "started", tool: call.toolName,
         task_id: taskId, step_id: step?.id ?? null,
         ...(approval ? { route: approval.route } : {}),
-        ...(contract ? { prompt_digest: createHash("sha256").update(contract).digest("hex"),
-                         prompt_excerpt: boundedText(contract, EXCERPT_CHARS) } : {}) });
+        ...(contract && parts ? { prompt_digest: createHash("sha256").update(contract).digest("hex"),
+                                  ...(parts.excerpt ? { prompt_excerpt: rawWindow(parts.excerpt, EXCERPT_CHARS) } : {}),
+                                  ...(parts.goal ? { goal: rawWindow(parts.goal, GOAL_CHARS) } : {}) } : {}) });
       batchPeak = Math.max(batchPeak, inFlight.size);
       workerStarts.set(call.toolCallId, Date.now());
       const plan = workerPlans.get(call.toolCallId);
@@ -954,7 +969,7 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
       const commit = reportedCommit(text);
       await observe({ kind: "activity", status: result.isError ? "failed" : "finished",
         tool: worker.tool, task_id: worker.taskId, step_id: worker.stepId,
-        ...(text ? { result_summary: boundedText(text, SUMMARY_CHARS),
+        ...(text ? { result_summary: rawWindow(text, SUMMARY_CHARS),
                      result_digest: createHash("sha256").update(text).digest("hex") } : {}),
         ...(commit ? { commit_sha: commit } : {}) });
     }
@@ -1114,17 +1129,14 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
    */
   async function recordImplicitWave(taskId: string): Promise<void> {
     if (!runId || parentBlocked) return;
-    // An implicit wave that is not yet integrated is never replaced: while no worker runs it takes the next task
-    // that starts alone, so one wave covers the tasks the lead ran one after another.
-    const current = activeWave?.implicit === true ? activeWave : null;
+    // One implicit wave per task: it is never grown, and it never lets tasks run concurrently (the gate counts
+    // only an explicit declare_wave, which also checks write-scope overlap and the parallel limit).
     // Unique across processes (a resumed run has no counter), so a repeated task never reuses an integrated wave.
-    const id = current?.id ?? `auto-${randomBytes(4).toString("hex")}-${taskId}`.slice(0, 128);
-    const taskIds = [...(current ? current.tasks.keys() : []), taskId];
+    const id = `auto-${randomBytes(4).toString("hex")}-${taskId}`.slice(0, 128);
     const result = await command(PARENT, ["event", runId, ...ownerArgs()],
-      { kind: "wave", wave_id: id, task_ids: taskIds, status: "declared" });
+      { kind: "wave", wave_id: id, task_ids: [taskId], status: "declared" });
     if (result.ok === false) { diagnose("telemetry", result); return; }
-    activeWave = { id, tasks: new Map(taskIds.map((task) => [task, [] as string[]])), implicit: true };
-    implicitOpen.set(id, taskIds);
+    implicitOpen.set(id, [taskId]);
   }
 
   async function declareWave(waveId: string, tasks: { task_id: string; write_scope: string[] }[]) {
@@ -1177,34 +1189,35 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
       if (implicitOpen.size > 1) {
         return reply(false, `BLOCKED: WAVE_AUTO_AMBIGUOUS: ${implicitOpen.size} implicit waves are open (${[...implicitOpen.keys()].join(", ")}); name the one to integrate by its id.`);
       }
-      if (!activeWave?.implicit || !implicitOpen.has(activeWave.id)) {
-        return reply(false, `BLOCKED: WAVE_UNKNOWN: "auto" names the open implicit wave, and none is active${activeWave ? ` (the active wave is ${activeWave.id})` : ""}.`);
+      if (implicitOpen.size === 0) {
+        return reply(false, `BLOCKED: WAVE_UNKNOWN: "auto" names the one open implicit wave, and none is open${activeWave ? ` (the declared wave is ${activeWave.id})` : ""}.`);
       }
-      waveId = activeWave.id;
+      waveId = [...implicitOpen.keys()][0];
     }
+    const members = activeWave?.id === waveId ? [...activeWave.tasks.keys()] : implicitOpen.get(waveId);
     if (action === "integrate_begin") {
-      if (!activeWave || activeWave.id !== waveId) return reply(false, `BLOCKED: WAVE_UNKNOWN: ${waveId} is not the declared wave.`);
+      if (!members) return reply(false, `BLOCKED: WAVE_UNKNOWN: ${waveId} is not an open wave.`);
       if (integrating) return reply(true, `Wave ${waveId} is already integrating.`);
       if (inFlight.size > 0) {
         return reply(false, `BLOCKED: INTEGRATION_WORKERS_IN_FLIGHT: ${inFlight.size} worker call(s) are still running; integrate only between waves.`);
       }
-      if (!await event({ kind: "wave", wave_id: waveId, task_ids: [...activeWave.tasks.keys()], status: "integrating" })) {
+      if (!await event({ kind: "wave", wave_id: waveId, task_ids: members, status: "integrating" })) {
         return reply(false, "BLOCKED: parent provenance update failed; see diagnostic log.", parentFailure ?? {});
       }
       integrating = waveId;
       return reply(true, `Integration of wave ${waveId} started. Worker launches are refused until integrate_end.`);
     }
-    if (integrating !== waveId || !activeWave) return reply(false, `BLOCKED: INTEGRATION_NOT_STARTED: wave ${waveId} is not integrating.`);
+    if (integrating !== waveId || !members) return reply(false, `BLOCKED: INTEGRATION_NOT_STARTED: wave ${waveId} is not integrating.`);
     // Re-base: the parent's own merges are the new reference for later worker snapshots.
     const rebased = await snapshot();
     if (!rebased) return reply(false, "BLOCKED: WORKER_SCOPE_UNVERIFIABLE: could not snapshot the parent checkout.");
     snapshots.clear();
-    if (!await event({ kind: "wave", wave_id: waveId, task_ids: [...activeWave.tasks.keys()], status: "integrated" })) {
+    if (!await event({ kind: "wave", wave_id: waveId, task_ids: members, status: "integrated" })) {
       return reply(false, "BLOCKED: parent provenance update failed; see diagnostic log.", parentFailure ?? {});
     }
     integrating = null;
     implicitOpen.delete(waveId);
-    activeWave = null;
+    if (activeWave?.id === waveId) activeWave = null;
     return reply(true, `Wave ${waveId} integrated; the parent checkout snapshot is re-based. Plan the next dependency-ready wave.`,
       { wave_id: waveId, digest: rebased.digest });
   }
@@ -1264,7 +1277,8 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
         const ok = checked.ok === true && typeof checked.path === "string";
         if (ok) {
           workspaces.set(workspaceKey(taskId, params.step_id), checked.path as string);
-          await event({ kind: "checkpoint", phase: approvals.get(taskId)?.phase ?? taskId, reason: "worker_approval" });
+          await event({ kind: "checkpoint", phase: approvals.get(taskId)?.phase ?? taskId, reason: "worker_approval",
+            workspace_bound: true });
         }
         return reply(ok, ok
           ? `Step ${params.step_id} of task ${taskId} is bound to worktree ${String(checked.path)}.`

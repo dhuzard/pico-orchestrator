@@ -334,9 +334,10 @@ function renderConversation(run) {
   // Pi session transcript.
   const recorded = (run?.interactions || []).map((item) => ({ ...item, label: String(item.sequence), id: `conversation-step-${item.sequence}` }));
   const observed = (run?.activity || []).flatMap((entry, index) => {
-    const text = entry.status === "started" ? entry.prompt_excerpt : entry.result_summary;
+    const text = entry.status === "started" ? entry.prompt_excerpt || entry.goal : entry.result_summary;
     if (!text || !entry.task_id || !entry.step_id) return [];
-    return [{ type: entry.status === "started" ? "directive" : "feedback", summary: text, task_id: entry.task_id, step_id: entry.step_id,
+    return [{ type: entry.status === "started" ? "directive" : "feedback",
+      summary: entry.status === "started" ? [entry.goal, entry.prompt_excerpt].filter(Boolean).join(" — ") : text, task_id: entry.task_id, step_id: entry.step_id,
       subagent_id: entry.subagent_id, at: entry.at, label: "•", id: `conversation-activity-${index}`, commit: entry.commit_sha, failed: entry.status === "failed" }];
   });
   const items = [...recorded, ...observed].sort((a, b) => String(a.at || "").localeCompare(String(b.at || "")));

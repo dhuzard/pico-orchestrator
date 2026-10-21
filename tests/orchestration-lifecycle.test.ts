@@ -1924,26 +1924,73 @@ const done = (h: ReturnType<typeof harness>, id: string, text = "ok") => h.handl
   toolName: "spawn_subagent", toolCallId: id, content: [{ type: "text", text }], details: { subagent_id: `sub-${id}` } });
 const spawnCall = (id: string, label: string) => ({ toolName: "spawn_subagent", toolCallId: id, input: { task: "t", label } });
 
-test("tasks run in turn share one implicit wave: no dangling wave, and auto integrates all of it", async () => {
+test("implicit waves are one per task and never let tasks overlap; auto needs exactly one open", async () => {
   const h = harness({ ok: true, status: "READY" });
   await h.handlers.get("before_agent_start")!({ prompt: "PI_ORCHESTRATION_RUN_V1" }, { cwd: "/tmp/target", ui: { notify() {} } });
   for (const id of ["A", "B"]) await h.handlers.get("tool_result")!(routeFor(id));
   const record = h.tools.get("orchestration_record");
-  // The reviewer's interleaving: specifier A, specifier B, reviewer A, then integrate.
-  for (const [id, label] of [["a1", "A:codex_specifier"], ["b1", "B:codex_specifier"], ["a2", "A:codex_reviewer"]]) {
+  // The reviewer's interleaving: specifier A, specifier B, then both reviewers at once.
+  for (const [id, label] of [["a1", "A:codex_specifier"], ["b1", "B:codex_specifier"]]) {
     assert.equal(await h.handlers.get("tool_call")!(spawnCall(id, label)), undefined);
     await done(h, id);
   }
+  assert.equal(await h.handlers.get("tool_call")!(spawnCall("a2", "A:codex_reviewer")), undefined);
+  const overlap = await h.handlers.get("tool_call")!(spawnCall("b2", "B:codex_reviewer"));
+  assert.match(overlap.reason, /WAVE_UNDECLARED/);
+  await done(h, "a2");
+  // Two implicit waves are open, one per task: auto names neither, the lead names one.
+  const waves = h.calls.filter((call) => call.input?.kind === "wave");
+  assert.deepEqual(waves.map((call) => call.input!.task_ids), [["A"], ["B"]]);
+  const ambiguous = await record.execute("i", { action: "integrate_begin", wave_id: "auto" });
+  assert.match(ambiguous.content[0].text, /WAVE_AUTO_AMBIGUOUS/);
+  assert.equal((await record.execute("i", { action: "integrate_begin", wave_id: waves[0].input!.wave_id })).details.ok, true);
+  assert.equal((await record.execute("i", { action: "integrate_end", wave_id: waves[0].input!.wave_id })).details.ok, true);
+  // With one left, auto resolves to it.
   assert.equal((await record.execute("i", { action: "integrate_begin", wave_id: "auto" })).details.ok, true);
   assert.equal((await record.execute("i", { action: "integrate_end", wave_id: "auto" })).details.ok, true);
   const replayed = replay(eventsOf(h), null);
   assert.deepEqual(replayed.errors, []);
-  const waves = replayed.parent.waves;
-  assert.deepEqual(waves.map((wave: any) => [wave.task_ids, wave.status]), [[["A", "B"], "integrated"]]);
-  assert.deepEqual(replayed.parent.phases.map((phase: any) => phase.wave_id), [waves[0].id, waves[0].id]);
-  // Integrated: the next task starts a new wave rather than reopening it.
+  assert.deepEqual(replayed.parent.waves.map((wave: any) => [wave.task_ids, wave.status]), [[["A"], "integrated"], [["B"], "integrated"]]);
+  // Only an explicit wave allows overlap, after the write-scope and limit checks.
+  assert.equal((await record.execute("w", { action: "declare_wave", wave_id: "w", tasks: [
+    { task_id: "A", write_scope: ["x/**"] }, { task_id: "B", write_scope: ["x/y/**"] }] })).details.ok, false);
+  assert.equal((await record.execute("w", { action: "declare_wave", wave_id: "w", tasks: [
+    { task_id: "A", write_scope: ["a/**"] }, { task_id: "B", write_scope: ["b/**"] }] })).details.ok, true);
   assert.equal(await h.handlers.get("tool_call")!(spawnCall("a3", "A:codex_reviewer")), undefined);
-  assert.equal(replay(eventsOf(h), null).parent.waves.length, 2);
+  assert.equal(await h.handlers.get("tool_call")!(spawnCall("b3", "B:codex_reviewer")), undefined);
+});
+
+test("an unintegrated wave of a mutating task refuses COMPLETED; the contract goal and excerpt are recorded", async () => {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "pico-goal-")));
+  try {
+    const h = harness({ ok: true, status: "READY" }, false, true, { executable: fakeClaude(dir) });
+    await h.handlers.get("before_agent_start")!({ prompt: "PI_ORCHESTRATION_RUN_V1" }, { cwd: dir, ui: { notify() {} } });
+    const record = h.tools.get("orchestration_record");
+    await h.handlers.get("tool_result")!(routeFor("A", { workerMutation: "allowed" }));
+    const workspace = join(dir, "wt");
+    mkdirSync(workspace);
+    await record.execute("b", { action: "bind_workspace", task_id: "A", step_id: "claude_worker", path: workspace });
+    const contract = `[pico-task A:codex_specifier]\nGoal: Find the race in the save path.\nContext: ${"boilerplate ".repeat(40)}`;
+    assert.equal(await h.handlers.get("tool_call")!({ toolName: "spawn_subagent", toolCallId: "g1",
+      input: { task: contract, label: "A:codex_specifier" } }), undefined);
+    await done(h, "g1");
+    for (const step of ["codex_specifier", "claude_worker", "codex_reviewer"]) {
+      await record.execute("w", { action: "event", event: { kind: "worker", phase: "A", step_id: step, status: "completed",
+        ...(step === "claude_worker" ? {} : { model: CODEX_HIGH }) } });
+    }
+    await record.execute("p", { action: "event", event: { kind: "phase", phase: "A", status: "completed", route: "CODEX_CLAUDE_CODEX" } });
+    const refused = replay(eventsOf(h), "COMPLETED");
+    assert.deepEqual(refused.errors.map((error) => error[1]), ["PARENT_WAVE_NOT_INTEGRATED"]);
+    const started = replay(eventsOf(h), null).parent.activity.find((entry: any) => entry.status === "started");
+    assert.equal(started.goal, "Find the race in the save path.");
+    assert.match(started.prompt_excerpt, /^Context: boilerplate/);
+    assert.doesNotMatch(started.prompt_excerpt, /pico-task|Goal:/);
+    assert.ok(started.prompt_excerpt.length <= 300);
+    // Integrated, it completes.
+    await record.execute("i", { action: "integrate_begin", wave_id: "auto" });
+    await record.execute("i", { action: "integrate_end", wave_id: "auto" });
+    assert.deepEqual(replay(eventsOf(h), "COMPLETED").errors, []);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
 test("a declared wave after an implicit one supersedes it; auto then refuses clearly", async () => {
@@ -1956,7 +2003,6 @@ test("a declared wave after an implicit one supersedes it; auto then refuses cle
   // Not integrated and not part of the next wave: it stays open and visible.
   assert.equal((await record.execute("w", { action: "declare_wave", wave_id: "w2", tasks: [
     { task_id: "B", write_scope: ["b/**"] }, { task_id: "C", write_scope: ["c/**"] }] })).details.ok, true);
-  assert.match((await record.execute("i", { action: "integrate_begin", wave_id: "auto" })).content[0].text, /WAVE_UNKNOWN/);
   assert.equal((await record.execute("i", { action: "integrate_begin", wave_id: "w2" })).details.ok, true);
   assert.equal((await record.execute("i", { action: "integrate_end", wave_id: "w2" })).details.ok, true);
   // A new implicit wave while the earlier one is still open: two are open, so auto names none of them.

@@ -407,6 +407,10 @@
                 "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$",
                 "description": "The wave this routed task (phase) last ran in. Absent for tasks never declared in a wave."
               },
+              "workspace_bound": {
+                "const": true,
+                "description": "A worktree was bound for a step of this task in its current route epoch: a mutating worker may have run, so its wave must be integrated before COMPLETED."
+              },
               "workers": {
                 "type": "array",
                 "items": {
@@ -678,7 +682,12 @@
               "prompt_excerpt": {
                 "type": "string",
                 "maxLength": 300,
-                "description": "First 300 characters of the worker contract, control characters removed, secret-like text withheld. The full text lives in the Pi session transcript."
+                "description": "First 300 characters of the worker contract after its task tag and goal line, control characters removed, secret-like spans masked before the cut. The full text lives in the Pi session transcript."
+              },
+              "goal": {
+                "type": "string",
+                "maxLength": 200,
+                "description": "The contract's one-sentence goal line (Goal: ...), bounded and masked like the excerpt."
               },
               "result_summary": {
                 "type": "string",

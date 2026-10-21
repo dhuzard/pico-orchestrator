@@ -444,20 +444,20 @@ class LifecycleTest(unittest.TestCase):
     def test_activity_text_is_bounded_single_line_and_never_leaks_secrets(self):
         parent = po.ParentRun(worktree=self.target, repo_root=self.records)
         parent.event({"kind": "activity", "status": "started", "tool": "ClaudeWorker", "task_id": "t",
-                      "step_id": "s", "prompt_excerpt": "a\x00b\nc" + "x" * 400})
+                      "step_id": "s", "prompt_excerpt": "a\x00b\nc" + " x" * 200})
         parent.event({"kind": "activity", "status": "finished", "tool": "ClaudeWorker", "task_id": "t",
-                      "step_id": "s", "result_summary": "Committed at 244fea7\n\x1b[31m80 passes" + "y" * 900,
+                      "step_id": "s", "result_summary": "Committed at 244fea7\n\x1b[31m80 passes" + " y" * 450,
                       "result_digest": "b" * 64, "commit_sha": "244fea7"})
         parent.event({"kind": "activity", "status": "finished", "tool": "ClaudeWorker", "task_id": "t",
                       "step_id": "s", "result_summary": "token ghp_" + "x" * 30})
         started, finished, leaked = provenance.get_run(self.records, parent.run_id)["parent_orchestration"]["activity"]
         self.assertEqual(started["prompt_excerpt"][:5], "a b c")
-        self.assertEqual(len(started["prompt_excerpt"]), 300)
+        self.assertTrue(298 <= len(started["prompt_excerpt"]) <= 300)
         self.assertTrue(finished["result_summary"].startswith("Committed at 244fea7 80 passes"))
-        self.assertEqual(len(finished["result_summary"]), 600)
+        self.assertTrue(598 <= len(finished["result_summary"]) <= 600)
         self.assertNotIn("\n", finished["result_summary"])
         self.assertEqual((finished["commit_sha"], finished["result_digest"]), ("244fea7", "b" * 64))
-        self.assertEqual(leaked["result_summary"], "[withheld: secret-like content]")
+        self.assertEqual(leaked["result_summary"], "token [withheld]")
         for bad in ({"commit_sha": "zz"}, {"result_digest": "short"}, {"result_summary": 7}):
             with self.assertRaises(po.ParentRunError):
                 parent.event({"kind": "activity", "status": "finished", "tool": "ClaudeWorker", **bad})
@@ -477,6 +477,14 @@ class LifecycleTest(unittest.TestCase):
         parent.event({"kind": "worker", "phase": "t", "step_id": "claude_worker", "only_if_open": True,
                       "status": "failed", "blocker_code": "WORKER_FAILED"})
 
+    @staticmethod
+    def restart(parent, finish=False):
+        parent.event({"kind": "activity", "status": "started", "tool": "ClaudeWorker", "task_id": "t",
+                      "step_id": "claude_worker", "route": "CLAUDE_CODEX"})
+        if finish:
+            parent.event({"kind": "activity", "status": "finished", "tool": "ClaudeWorker", "task_id": "t",
+                          "step_id": "claude_worker"})
+
     def worker(self, parent):
         phases = provenance.get_run(self.records, parent.run_id)["parent_orchestration"]["phases"]
         return next(p for p in phases if p["id"] == "t")["workers"][0]
@@ -491,8 +499,15 @@ class LifecycleTest(unittest.TestCase):
         with self.assertRaises(po.ParentRunError) as refused:
             parent.event({"kind": "worker", "phase": "t", "step_id": "claude_worker", "status": "completed"})
         self.assertEqual(refused.exception.error_code, "PARENT_WORKER_TRANSITION_INVALID")
-        parent.event({"kind": "activity", "status": "started", "tool": "ClaudeWorker", "task_id": "t",
-                      "step_id": "claude_worker", "route": "CLAUDE_CODEX"})
+        self.restart(parent)
+        # Started but not returned: still failed, for the extension and for the lead alike.
+        parent.event({"kind": "worker", "phase": "t", "step_id": "claude_worker", "only_if_open": True,
+                      "status": "completed"})
+        self.assertEqual(self.worker(parent)["status"], "failed")
+        with self.assertRaises(po.ParentRunError):
+            parent.event({"kind": "worker", "phase": "t", "step_id": "claude_worker", "status": "completed"})
+        parent.event({"kind": "activity", "status": "finished", "tool": "ClaudeWorker", "task_id": "t",
+                      "step_id": "claude_worker"})
         parent.event({"kind": "worker", "phase": "t", "step_id": "claude_worker", "only_if_open": True,
                       "status": "completed"})
         worker = self.worker(parent)
@@ -501,11 +516,30 @@ class LifecycleTest(unittest.TestCase):
         self.assertEqual([(o["from_status"], o["to_status"], o["by"], o["reason"], o["from_blocker_code"])
                           for o in overrides], [("failed", "completed", "extension", "retry_succeeded", "WORKER_FAILED")])
 
+    def test_a_retry_that_fails_after_an_early_completed_stays_failed(self):
+        parent = self.retry_run()
+        self.start_and_fail(parent)
+        # A start with no route is not a retry; a retry still running is not a success.
+        parent.event({"kind": "activity", "status": "started", "tool": "ClaudeWorker", "task_id": "t",
+                      "step_id": "claude_worker"})
+        parent.event({"kind": "activity", "status": "finished", "tool": "ClaudeWorker", "task_id": "t",
+                      "step_id": "claude_worker"})
+        with self.assertRaises(po.ParentRunError):
+            parent.event({"kind": "worker", "phase": "t", "step_id": "claude_worker", "status": "completed"})
+        self.restart(parent)
+        with self.assertRaises(po.ParentRunError):   # the lead records completed before the retry returned
+            parent.event({"kind": "worker", "phase": "t", "step_id": "claude_worker", "status": "completed"})
+        parent.event({"kind": "activity", "status": "failed", "tool": "ClaudeWorker", "task_id": "t",
+                      "step_id": "claude_worker"})   # the retry fails
+        parent.event({"kind": "worker", "phase": "t", "step_id": "claude_worker", "only_if_open": True,
+                      "status": "completed"})
+        self.assertEqual(self.worker(parent)["status"], "failed")
+        self.assertNotIn("worker_overrides", provenance.get_run(self.records, parent.run_id)["parent_orchestration"])
+
     def test_lead_may_record_a_successful_retry_and_overrides_stay_bounded(self):
         parent = self.retry_run()
         self.start_and_fail(parent)
-        parent.event({"kind": "activity", "status": "started", "tool": "ClaudeWorker", "task_id": "t",
-                      "step_id": "claude_worker", "route": "CLAUDE_CODEX"})
+        self.restart(parent, finish=True)
         parent.event({"kind": "worker", "phase": "t", "step_id": "claude_worker", "status": "completed"})
         first = provenance.get_run(self.records, parent.run_id)["parent_orchestration"]["worker_overrides"]
         self.assertEqual(first[0]["by"], "lead")
@@ -514,8 +548,7 @@ class LifecycleTest(unittest.TestCase):
             for _ in range(po.MAX_OVERRIDES_PER_WORKER):
                 parent.event({"kind": "worker", "phase": "t", "step_id": "claude_worker", "status": "failed",
                               "blocker_code": "REVIEW_REJECTED"})
-                parent.event({"kind": "activity", "status": "started", "tool": "ClaudeWorker", "task_id": "t",
-                              "step_id": "claude_worker", "route": "CLAUDE_CODEX"})
+                self.restart(parent, finish=True)
                 parent.event({"kind": "worker", "phase": "t", "step_id": "claude_worker", "status": "completed"})
         self.assertEqual(limit.exception.error_code, "PARENT_WORKER_OVERRIDE_LIMIT")
 
@@ -524,22 +557,60 @@ class LifecycleTest(unittest.TestCase):
         for task in ("a", "b"):
             parent.event({"kind": "phase", "phase": task, "status": "completed", "route": "CODEX"})
         parent.event({"kind": "wave", "wave_id": "auto-1", "task_ids": ["a"], "status": "declared"})
-        parent.event({"kind": "wave", "wave_id": "auto-1", "task_ids": ["a", "b"], "status": "declared"})
-        with self.assertRaises(po.ParentRunError):   # only growth by appending
-            parent.event({"kind": "wave", "wave_id": "auto-1", "task_ids": ["b"], "status": "declared"})
+        with self.assertRaises(po.ParentRunError) as grown:   # a wave never grows
+            parent.event({"kind": "wave", "wave_id": "auto-1", "task_ids": ["a", "b"], "status": "declared"})
+        self.assertEqual(grown.exception.error_code, "PARENT_EVENT_CONFLICT")
+        parent.event({"kind": "wave", "wave_id": "auto-2", "task_ids": ["b"], "status": "declared"})
+        parent.event({"kind": "wave", "wave_id": "auto-2", "task_ids": ["b"], "status": "integrated"})
         with self.assertRaises(po.ParentRunError):   # abandoned is never an event status
-            parent.event({"kind": "wave", "wave_id": "auto-1", "task_ids": ["a", "b"], "status": "abandoned"})
-        parent.event({"kind": "wave", "wave_id": "auto-1", "task_ids": ["a", "b"], "status": "integrating"})
-        with self.assertRaises(po.ParentRunError):   # no longer growable once integration began
-            parent.event({"kind": "wave", "wave_id": "auto-1", "task_ids": ["a", "b", "c"], "status": "declared"})
+            parent.event({"kind": "wave", "wave_id": "auto-1", "task_ids": ["a"], "status": "abandoned"})
+        parent.event({"kind": "wave", "wave_id": "auto-1", "task_ids": ["a"], "status": "integrating"})
         with self.assertRaises(po.ParentRunError) as refused:
             parent.finish("COMPLETED")
         self.assertEqual(refused.exception.error_code, "PARENT_WAVE_INTEGRATING")
         record = parent.finish("PARTIAL")
         waves = record["parent_orchestration"]["waves"]
-        self.assertEqual([(w["id"], w["status"]) for w in waves], [("auto-1", "abandoned")])
+        self.assertEqual([(w["id"], w["status"]) for w in waves], [("auto-1", "abandoned"), ("auto-2", "integrated")])
         self.assertEqual(record["parent_orchestration"]["reconciled"][-1]["kind"], "wave")
         self.assertEqual(record["parent_orchestration"]["reconciled"][-1]["from_status"], "integrating")
+
+    def test_completed_is_refused_for_an_unintegrated_wave_with_a_mutating_task_only(self):
+        parent = po.ParentRun(worktree=self.target, repo_root=self.records)
+        for task in ("ro", "rw"):
+            parent.event({"kind": "phase", "phase": task, "status": "completed", "route": "CODEX"})
+        parent.event({"kind": "wave", "wave_id": "auto-ro", "task_ids": ["ro"], "status": "declared"})
+        parent.event({"kind": "wave", "wave_id": "auto-rw", "task_ids": ["rw"], "status": "declared"})
+        parent.event({"kind": "checkpoint", "phase": "rw", "reason": "worker_approval", "workspace_bound": True})
+        with self.assertRaises(po.ParentRunError) as refused:   # ... a bound worktree makes it mutating
+            parent.finish("COMPLETED")
+        self.assertEqual(refused.exception.error_code, "PARENT_WAVE_NOT_INTEGRATED")
+        self.assertIn("auto-rw", str(refused.exception))
+        self.assertNotIn("auto-ro", str(refused.exception))
+        parent.event({"kind": "wave", "wave_id": "auto-rw", "task_ids": ["rw"], "status": "integrating"})
+        parent.event({"kind": "wave", "wave_id": "auto-rw", "task_ids": ["rw"], "status": "integrated"})
+        self.assertEqual(parent.finish("COMPLETED")["outcome"], "completed")
+
+    def test_credential_shapes_are_masked_before_the_cut_so_none_survives_or_splits(self):
+        secrets = ["github_pat_" + "A1b2C3d4E5" * 3, "glpat-" + "x1y2z3" * 5, "AIza" + "Sy" * 20,
+                   "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NSJ9.c2lnbmF0dXJl", "password=hunter2hunter2",
+                   "token: abcdef123456", "secret = s3cr3tvalue", "https://user:pa55w0rd@example.com/x",
+                   "npm_" + "q" * 36, "sk_live_" + "Z" * 24, "rk_live_" + "Y" * 24]
+        parent = po.ParentRun(worktree=self.target, repo_root=self.records)
+        for secret in secrets:
+            for pad in (0, 590, 596):   # the credential starts well before, and just before, the 600 cut
+                parent.event({"kind": "activity", "status": "finished", "tool": "ClaudeWorker", "task_id": "t",
+                              "step_id": "s", "result_summary": "w " * (pad // 2) + secret + " tail words"})
+        activity = provenance.get_run(self.records, parent.run_id)["parent_orchestration"]["activity"]
+        self.assertEqual(len(activity), len(secrets) * 3)
+        for entry, secret in zip(activity, [s for s in secrets for _ in range(3)], strict=True):
+            text = entry["result_summary"]
+            self.assertLessEqual(len(text), 600)
+            # No credential, and no fragment long enough to be one, survives (a cut token is dropped or masked).
+            for fragment in (secret[:12], secret[-12:]):
+                self.assertNotIn(fragment, text, secret)
+        # An unbroken run left at the cut is dropped as a possible partial token.
+        cut = po._bounded_text("a " * 290 + "b" * 40, 600)
+        self.assertEqual(cut, ("a " * 290).strip())
 
     def test_a_declared_wave_never_integrated_does_not_block_completion_and_a_superseded_one_is_ignored(self):
         parent = po.ParentRun(worktree=self.target, repo_root=self.records)

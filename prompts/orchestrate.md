@@ -143,17 +143,18 @@ single-line, non-secret summaries of observable work, never prompts, outputs,
 transcripts, or hidden reasoning. See the event contract below.
 
 Waves: declare one with `declare_wave` only when several tasks will run
-concurrently (their workers launched in one batch, disjoint write scopes). A
-task you start alone, with no other worker running and no wave declared, is
-recorded by the lifecycle extension as an implicit single-task wave, and
-tasks you then run one after another join that same wave until you integrate
-it; do not declare these. Integrate it with `integrate_begin` and
-`integrate_end` using `"wave_id":"auto"`; `auto` is refused
-(`WAVE_AUTO_AMBIGUOUS`, `WAVE_UNKNOWN`) when several implicit waves are open
-or none is active, and then you name the wave by the id in the reply. Two
-tasks running at the same time without a declared wave are refused
-(`WAVE_UNDECLARED`). A run cannot finish `COMPLETED` while an integration was
-begun and never ended; finish `PARTIAL` if it cannot be completed.
+concurrently (their workers launched in one batch, disjoint write scopes);
+that is the only way tasks may run at the same time, and it checks write-scope
+overlap and the parallel limit. A task you start alone, with no other worker
+running and no wave declared, is recorded by the lifecycle extension as its own
+implicit single-task wave; it never lets tasks overlap (`WAVE_UNDECLARED`), and
+each task you run in turn gets its own. Integrate it with `integrate_begin` and
+`integrate_end` using `"wave_id":"auto"`. `auto` names the one open implicit
+wave: with several open it is refused (`WAVE_AUTO_AMBIGUOUS`, which lists the
+ids) and you name the wave by id; with none open it is `WAVE_UNKNOWN`. A run
+cannot finish `COMPLETED` while an integration was begun and never ended, or
+while a wave with a mutating task (a bound worktree) was never integrated;
+finish `PARTIAL` if it cannot be completed.
 
 ## Classification
 
@@ -422,7 +423,7 @@ the parent orchestrator.
 
 The lifecycle extension records every worker call itself as an `activity`
 entry. At start: tool, task, step, routed route, a SHA-256 digest of the worker
-contract and its first 300 characters. On return: the first 600 characters of
+contract, its `Goal:` line, and the first 300 characters after the task tag and goal line. On return: the first 600 characters of
 the worker's final text (control characters removed, secret-like text withheld),
 a SHA-256 digest of all of it, and the commit it reports. The full text lives in
 the Pi session transcript, not in the record. Do not record `directive` or `feedback`
@@ -755,6 +756,11 @@ that task's approval:
 - `ClaudeWorker`: the prompt starts with `[pico-task <task_id>:<step_id>]`
   (always, even with a single routed task).
 - `message_subagent` inherits the attribution of the spawn it continues.
+
+Open every worker contract with the task tag and then a one-sentence goal line,
+`Goal: <what this worker must achieve>`. The extension records that line as the
+call's `goal`, and the text after it as the contract excerpt, so the record says
+what each worker was asked without a lead call.
 
 With more than one routed task an unattributed call is blocked
 (`WORKER_TASK_UNATTRIBUTED`); a task without an approval is

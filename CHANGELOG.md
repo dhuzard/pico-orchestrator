@@ -10,23 +10,29 @@ All notable changes to PICO are recorded here. The format follows
 
 - The lead records less (issue #43). The prompts no longer ask for `directive` or
   `feedback` interaction events or for optional phases such as `inspection`; `decision`,
-  status, bind, worker/phase outcomes, the integrate bracket and finish stay.
-  The extension's `activity` entries now carry what those events carried: at start the
-  routed `route`, a `prompt_digest` and a 300-character `prompt_excerpt` of the worker
-  contract; on return a 600-character `result_summary` of the worker's final text, its
-  `result_digest` and any reported `commit_sha`. Text is single-line, control characters
-  are removed and secret-like text is withheld; the full text lives in the Pi session
-  transcript. Garden's Conversation view shows these entries beside the lead's decisions.
-- A routed task started with no worker running and no wave declared is recorded as an
-  implicit single-task wave; tasks then run one after another join the same wave until it
-  is integrated (`integrate_begin`/`integrate_end` with `"auto"`, refused with
-  `WAVE_AUTO_AMBIGUOUS` or `WAVE_UNKNOWN` when several or none are open). Concurrent tasks
-  still need `declare_wave` (`WAVE_UNDECLARED`). A run that ends without COMPLETED marks
-  its still-open waves `abandoned` (appended to `reconciled`, kind `wave`); COMPLETED is
-  refused while an integration was begun and never ended (`PARENT_WAVE_INTEGRATING`).
-- A failed Claude step whose retry succeeded is now `completed`: a later start of the same
-  step on the same route allows failed -> completed, recorded in `worker_overrides`
-  (`by` `extension` or `lead`, `reason` `retry_succeeded`) within the existing bounds.
+  status, bind, worker/phase outcomes, the integrate bracket and finish stay. Worker
+  contracts open with a `Goal:` line.
+- The extension's `activity` entries carry what those events carried: at start the routed
+  `route`, a `prompt_digest`, the contract's `goal` (200 characters) and a 300-character
+  `prompt_excerpt` taken after the task tag and goal line; on return a 600-character
+  `result_summary`, its `result_digest` and any reported `commit_sha`. Text is single-line
+  with control characters removed; credential shapes (tokens, JWTs, `password=` style
+  assignments, URLs with credentials, cloud and package-registry keys) are masked in the
+  whole text before it is cut, and an unbroken run left at the cut is dropped. The full
+  text lives in the Pi session transcript. Garden's Conversation view shows these entries.
+- A routed task started with no worker running and no wave declared gets its own implicit
+  single-task wave (never grown). Only an explicit `declare_wave` lets tasks run
+  concurrently (`WAVE_UNDECLARED`, write-scope overlap and the parallel limit are
+  unchanged). `integrate_begin`/`integrate_end` accept `"auto"` for the one open implicit
+  wave and refuse with `WAVE_AUTO_AMBIGUOUS` (several) or `WAVE_UNKNOWN` (none). A run that
+  ends without COMPLETED marks its open waves `abandoned` (`reconciled`, kind `wave`).
+  COMPLETED is refused with `PARENT_WAVE_INTEGRATING` while an integration was begun and not
+  ended, and with `PARENT_WAVE_NOT_INTEGRATED` for a never-integrated wave whose task has a
+  bound worktree (`phase.workspace_bound`); read-only waves do not block it.
+- A failed Claude step whose retry succeeded is now `completed`: after the last failure the
+  same step must have started again on the same route and returned without error. The
+  failure stays in `worker_overrides` (`by` `extension` or `lead`, `reason`
+  `retry_succeeded`) within the existing bounds.
 
 ### Fixed
 
