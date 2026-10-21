@@ -163,6 +163,16 @@
             "minimum": 1,
             "description": "Optional wall-clock limit for this task's child execution, in seconds; overrides the manifest default. Omitted: the manifest default, else no limit."
           },
+          "max_lead_calls": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Optional limit on the lead's model calls for this task's child execution; overrides the manifest default. At the limit the run is stopped IN_PROGRESS (stopped_reason LEAD_CALL_LIMIT) and resumes only with a raised limit. Omitted: the manifest default, else the repository's .pi/autonomy.yaml limits.max_lead_calls, else no limit."
+          },
+          "lead_calls_warn_at": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Optional lead call at which the lead is told once to converge for this task; overrides the manifest default. Must be below the effective max_lead_calls. Omitted: the manifest default, else the repository policy, else 80% of max_lead_calls."
+          },
           "depends_on": {
             "type": "array",
             "items": {
@@ -230,6 +240,16 @@
       "type": "integer",
       "minimum": 1,
       "description": "Optional default wall-clock limit for each child execution, in seconds. A task's own max_duration_seconds overrides it. When a child reaches it, the launcher stops the child and ends the execution as cancelled with EXECUTION_TIME_LIMIT. Omitted: no limit. Unrelated to a check's timeout_seconds."
+    },
+    "max_lead_calls": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Optional default limit on the lead's model calls for each child execution. A task's own max_lead_calls overrides it. At the limit the run is stopped IN_PROGRESS (stopped_reason LEAD_CALL_LIMIT) and resumes only with a raised limit. Omitted: the repository's .pi/autonomy.yaml limits.max_lead_calls, else no limit."
+    },
+    "lead_calls_warn_at": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Optional default lead call at which the lead is told once to converge. A task's own lead_calls_warn_at overrides it. Must be below the effective max_lead_calls."
     },
     "budget": {
       "description": "Optional spend limit across the workspace's child runs. The scheduler launches nothing once it is reached; running children are not stopped. max_cost_usd uses backend-reported cost, which only Claude workers report today, so it is a lower bound.",

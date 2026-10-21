@@ -405,6 +405,9 @@ def run_report(record: dict, *, state: Path | None = None, session_dirs: list[Pa
         "tokens": used,
         "spend_tokens": sum(s for s, _ in spent), "spend_complete": all(c for _, c in spent),
         "calls": {"lead": len(lead_calls) if isinstance(lead_calls, list) else None,
+                  **({"lead_limit": {key: context["lead_call_limit"].get(key) for key in (
+                      "max_lead_calls", "source", "warn_at", "warned_at_call", "calls_at_limit", "stopped", "stopped_reason")}}
+                     if isinstance(context.get("lead_call_limit"), dict) else {}),
                   "orchestration_record": orchestration_record_calls(calls),
                   "workers": {b: v["invocations"] for b, v in used["workers"].items()}},
         "wall_clock_seconds": _duration(record),

@@ -157,7 +157,8 @@ def report(plan: dict, entries: dict, refused: dict, held: set[str] | None = Non
                      "blocked_by": task["blocked_by"], "run_id": entry.get("run_id"),
                      "run_status": entry.get("run_status"), "run_blocker_code": entry.get("run_blocker_code"),
                      "launches": entry.get("launches"), "refusal": refused.get(task["id"]),
-                     "time_limit": workspace_run.time_limit_view(entry)})
+                     "time_limit": workspace_run.time_limit_view(entry),
+                     "lead_call_limit": entry.get("lead_call_limit")})
     counts: dict[str, int] = {}
     for row in rows:
         counts[row["state"]] = counts.get(row["state"], 0) + 1
@@ -313,13 +314,22 @@ def time_limit_text(view: dict | None) -> str:
     return f" (limit {view['max_duration_seconds']}s)"
 
 
+def lead_calls_text(view: dict | None) -> str:
+    """` (lead calls 18/30)`; ` (lead calls 32/30, stopped by LEAD_CALL_LIMIT)` once the run was ended by it."""
+    if not isinstance(view, dict) or type(view.get("max_lead_calls")) is not int:
+        return ""
+    calls = view.get("calls")
+    text = f"lead calls {calls if calls is not None else '?'}/{view['max_lead_calls']}"
+    return f" ({text}, stopped by LEAD_CALL_LIMIT)" if view.get("stopped") else f" ({text})"
+
+
 def render(result: dict) -> str:
     lines = [f"Workspace {result['workspace_id']}: {result['status']} (cap {result['cap']})"]
     for row in result["tasks"]:
         detail = row["run_blocker_code"] or (row["refusal"] or {}).get("code") or ""
         lines.append(f"  {row['id']} [{row['repository']}] {row['state']}"
                      + (f" run={row['run_id']}" if row["run_id"] else "") + (f" {detail}" if detail else "")
-                     + time_limit_text(row.get("time_limit")))
+                     + time_limit_text(row.get("time_limit")) + lead_calls_text(row.get("lead_call_limit")))
     lines.append("  " + ", ".join(f"{k}={v}" for k, v in result["counts"].items()))
     if any(r["state"] == "needs_reconciliation" for r in result["tasks"]):
         lines.append("  Inspect interrupted children, then rerun with --resume-interrupted to continue them.")

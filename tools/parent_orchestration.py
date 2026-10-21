@@ -410,6 +410,61 @@ def empty_context() -> dict:
             "checkpoints": [], "worker_usage": {}, "lead_usage": {}, "lead_calls": [], "spawned_agents": 0}
 
 
+LEAD_LIMIT_SOURCES = ("cli", "task", "manifest", "policy", "env")
+LEAD_LIMIT_STATES = ("set", "reached")
+LEAD_LIMIT_STOP_REASON = "LEAD_CALL_LIMIT"
+
+
+def _lead_limit_event(parent: dict, event: dict) -> None:
+    """Record the lead-call limit and what the lifecycle extension did about it.
+
+    `lead_limit` `set` records the effective limit, its source and the warning threshold; `reached` records the
+    call that used the last allowed call (tools are then limited to status and finish). `lead_call_warning`
+    records the one convergence warning. `lead_call_limit_reached` is the stop: the run stays IN_PROGRESS with
+    `stopped_reason: LEAD_CALL_LIMIT` and a fresh resume checkpoint. Written only by the lifecycle extension,
+    never by the lead's own event payload.
+    """
+    context = parent.setdefault("context", empty_context())
+    kind = event["kind"]
+    calls = len(context.setdefault("lead_calls", []))
+    if kind == "lead_limit":
+        state = event["state"]
+        if state not in LEAD_LIMIT_STATES:
+            raise ParentRunError("invalid lead limit state")
+        if state == "set":
+            maximum, warn_at = event.get("max_lead_calls"), event.get("warn_at")
+            if type(maximum) is not int or maximum < 1 or event.get("source") not in LEAD_LIMIT_SOURCES:
+                raise ParentRunError("invalid lead call limit", error_code="MAX_LEAD_CALLS_INVALID")
+            if warn_at is not None and (type(warn_at) is not int or not 1 <= warn_at < maximum):
+                raise ParentRunError("invalid lead call warning threshold", error_code="LEAD_CALLS_WARN_AT_INVALID")
+            previous = context.get("lead_call_limit") or {}
+            # A resume sets the limit again: the call count carries over, and a raised limit clears the stop.
+            context["lead_call_limit"] = {
+                "max_lead_calls": maximum, "source": event["source"], "warn_at": warn_at,
+                "warned_at_call": previous.get("warned_at_call") if warn_at is not None and previous.get("warn_at") == warn_at else None,
+                "calls_at_limit": previous.get("calls_at_limit") if calls >= maximum else None,
+                "stopped": False, "stopped_reason": None, "calls_at_stop": previous.get("calls_at_stop")}
+            return
+        limit = context.get("lead_call_limit")
+        if limit is None or set(event) - {"kind", "state"}:
+            raise ParentRunError("no lead call limit is set for this run")
+        if limit["calls_at_limit"] is None:
+            limit["calls_at_limit"] = calls
+        return
+    limit = context.get("lead_call_limit")
+    if limit is None or set(event) != {"kind"}:
+        raise ParentRunError("no lead call limit is set for this run")
+    if kind == "lead_call_warning":
+        if limit["warned_at_call"] is None:
+            limit["warned_at_call"] = calls
+        return
+    # lead_call_limit_reached: leave the run resumable, never terminal.
+    limit.update({"stopped": True, "stopped_reason": LEAD_LIMIT_STOP_REASON, "calls_at_stop": calls})
+    if limit["calls_at_limit"] is None:
+        limit["calls_at_limit"] = min(calls, limit["max_lead_calls"])
+    _checkpoint(parent, reason="lead_call_limit", phase=None)
+
+
 def _count(value: Any, field: str) -> int:
     if type(value) is not int or value < 0:
         raise ParentRunError(f"invalid {field}")
@@ -612,6 +667,9 @@ def _record_event_unlocked(run_id: str, event: dict, *, repo_root: Path = ROOT) 
         "interaction": {"kind", "type", "summary", "task_id", "step_id", "subagent_id", "reply_to"},
         "lead_usage": {"kind", "model", "phase", "task_type", "turn_index", "duration_ms", "input_tokens", "output_tokens", "cached_tokens", "cache_write_tokens", "total_tokens", "estimated_cost_usd"},
         "checkpoint": {"kind", "phase", "reason", "workspace_bound"},
+        "lead_limit": {"kind", "state", "max_lead_calls", "source", "warn_at"},
+        "lead_call_warning": {"kind"},
+        "lead_call_limit_reached": {"kind"},
     }
     required = {
         "phase": {"kind", "phase", "status"},
@@ -628,6 +686,9 @@ def _record_event_unlocked(run_id: str, event: dict, *, repo_root: Path = ROOT) 
         "interaction": {"kind", "type", "summary", "task_id", "step_id"},
         "lead_usage": {"kind", "model"},
         "checkpoint": {"kind", "phase", "reason"},
+        "lead_limit": {"kind", "state"},
+        "lead_call_warning": {"kind"},
+        "lead_call_limit_reached": {"kind"},
     }
     if kind not in allowed or set(event) - allowed[kind]:
         raise ParentRunError("unsupported event or unexpected fields")
@@ -920,6 +981,8 @@ def _record_event_unlocked(run_id: str, event: dict, *, repo_root: Path = ROOT) 
         for field in ("input_tokens", "output_tokens", "cached_tokens", "total_tokens"):
             call[field] = event.get(field)
         context["lead_calls"].append(call)
+    elif kind in {"lead_limit", "lead_call_warning", "lead_call_limit_reached"}:
+        _lead_limit_event(parent, event)
     elif kind == "wave":
         _wave_event(parent, event)
         if event["status"] == "integrating":

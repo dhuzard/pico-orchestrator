@@ -319,6 +319,12 @@ reconciles the record against the live process and provenance, and
 `--max-duration SECONDS` (or `max_duration_seconds` on a workspace task, with
 a manifest default) caps a child's wall-clock time: it is stopped and its run
 closed `BLOCKED` with `EXECUTION_TIME_LIMIT`. No limit is set by default.
+`--max-lead-calls N` (or `max_lead_calls` on a workspace task, a manifest default, or
+`limits.max_lead_calls` in `.pi/autonomy.yaml`) bounds the lead's model calls: the lead is
+warned once at 80% (`lead_calls_warn_at`), limited to `status` and `finish` at the limit,
+and then the run is stopped but left `IN_PROGRESS` (`LEAD_CALL_LIMIT`) so that
+`--resume --max-lead-calls <higher N>` can continue it; the same limit is refused with
+`LEAD_CALL_LIMIT_EXHAUSTED`. No limit is set by default.
 
 ### Act from the Garden: validate, request PR, check CI, promote
 

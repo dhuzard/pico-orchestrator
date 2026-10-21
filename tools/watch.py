@@ -217,6 +217,16 @@ def _time_limit(view):
             "elapsed_seconds": elapsed if type(elapsed) in {int, float} else None}
 
 
+def _lead_call_limit(view):
+    """Sanitized lead calls used against the limit, or None when the run has no limit."""
+    if not isinstance(view, dict) or _count(view.get("max_lead_calls")) is None:
+        return None
+    return {"max_lead_calls": view["max_lead_calls"], "calls": _count(view.get("calls")),
+            "source": _match(view.get("source"), SLUG), "reached": view.get("reached") is True,
+            "stopped": view.get("stopped") is True, "warn_at": _count(view.get("warn_at")),
+            "warned": view.get("warned") is True}
+
+
 def _count(value):
     return value if type(value) is int and value >= 0 else None
 
@@ -374,6 +384,7 @@ def workspace_view(state: Path, *, workspace_id: str | None = None, manifest: Pa
             "run_blocker_code": _match(row["run_blocker_code"], CODE),
             "refusal_code": _match((row["refusal"] or {}).get("code"), CODE),
             "time_limit": _time_limit(row.get("time_limit")),
+            "lead_call_limit": _lead_call_limit(row.get("lead_call_limit")),
             "run": run, "links": _merge_links(publication_links(run_record, runs_dir) if run_record else [],
                                               workspace_pr_links(entry, runs_dir)), "tokens": tokens})
     repositories = []

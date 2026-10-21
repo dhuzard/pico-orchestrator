@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 """Read a target repository's `.pi/autonomy.yaml` execution-authority limits.
 
-The parent orchestrator reads four values from it:
+The parent orchestrator reads these values from it:
 
 - `limits.parallel_tasks`: the most routed tasks one wave may run at once
   (`orchestration_record` `declare_wave` rejects larger waves with
   `WAVE_LIMIT_EXCEEDED`);
 - `limits.open_prs`: the most open batch PRs before new batches stack on the
   newest batch branch instead of opening another PR;
+- `limits.max_lead_calls` (optional): the most model calls the lead may make in
+  one run; the lifecycle extension then stops the run (left IN_PROGRESS and
+  resumable only with a raised limit, `stopped_reason: LEAD_CALL_LIMIT`).
+  `limits.lead_calls_warn_at` (optional) is the call at which the lead is told
+  once to converge (default 80% of the limit). Absent means no limit;
 - `pr_granularity`: `batch` (one push and one PR per integrated wave batch) or
   `task` (one PR per task);
 - `issue_reference`: `refs` (PR bodies say `Refs #N`, which never closes the
@@ -69,7 +74,8 @@ def limits(worktree: Path) -> dict:
     if issues:
         raise AutonomyPolicyError(issues[0])
     configured = data.get("limits", {})
-    return {"ok": True, "source": str(RELATIVE_PATH),
+    optional = {name: configured[name] for name in ("max_lead_calls", "lead_calls_warn_at") if name in configured}
+    return {"ok": True, "source": str(RELATIVE_PATH), **optional,
             "parallel_tasks": configured.get("parallel_tasks", DEFAULTS["parallel_tasks"]),
             "open_prs": configured.get("open_prs", DEFAULTS["open_prs"]),
             "pr_granularity": data.get("pr_granularity", DEFAULTS["pr_granularity"]),
