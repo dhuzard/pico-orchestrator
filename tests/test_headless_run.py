@@ -313,6 +313,7 @@ class HeadlessRunTest(HeadlessFixture):
         self.assertEqual((record["status"], record["lease_handoff_error"]), ("interrupted", "RUN_LEASE_LOCK_TIMEOUT"))
         self.assertIsNone(record["pid"])
         self.assertEqual(record["run_id"], crashed["run_id"])
+        self.assertEqual(hr._OWN_CHILDREN, {}, "a stopped child is not left in the registry")
 
     def test_interrupted_process_is_detected_and_resumable(self):
         launched = self.start(behavior="hang", wait=False)

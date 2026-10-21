@@ -527,37 +527,42 @@ def _launch_locked(path: Path, *, worktree: Path, identity: str, common: Path, e
             except (run_lease.LeaseError, OSError):
                 pass
         raise HeadlessError("PI_UNAVAILABLE", f"cannot launch {pi_executable}: {exc}") from exc
-    if continuing:
-        # Hand the lease to the launched process, so its liveness is what keeps the lease live.
-        try:
-            run_lease.acquire(record["run_id"], owner, pid=child.pid, handoff=True)
-        except (run_lease.LeaseError, OSError) as exc:
-            # Never leave a child running under a lease it cannot hold: stop it and say so.
-            code = exc.code if isinstance(exc, run_lease.LeaseError) else "RUN_LEASE_STORAGE_UNAVAILABLE"
+    try:
+        if continuing:
+            # Hand the lease to the launched process, so its liveness is what keeps the lease live.
             try:
-                os.killpg(child.pid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                pass
-            child.wait()
-            log.close()
-            record.update({"status": "interrupted", "pid": None, "lease_handoff_error": code,
-                           "launches": record["launches"] + 1, "outcome": "lease_handoff_failed"})
-            save_record(path, record)
-            raise HeadlessError("RUN_LEASE_HANDOFF_FAILED",
-                                f"the run lease could not be handed to the launched process ({code}); it was stopped") from exc
-    # The limit belongs to this launch: a resume starts a fresh window from now and does not inherit an
-    # earlier launch's limit (the caller passes it again).
-    launched_at = clock()
-    for stale in ("max_duration_seconds", "deadline_at", "deadline_epoch", "stop_reason", "time_limit"):
-        record.pop(stale, None)
-    if max_duration_seconds is not None:
-        record.update({"max_duration_seconds": max_duration_seconds, "deadline_epoch": launched_at + max_duration_seconds,
-                       "deadline_at": _iso(launched_at + max_duration_seconds)})
-    record.update({"status": "launched", "pid": child.pid, "pid_start": run_lease.pid_start(child.pid),
-                   "launches": record["launches"] + 1, "started_at": _now(), "exit_code": None,
-                   "outcome": "resumed" if resume else "launched"})
-    save_record(path, record)
-    return record, child, log, before
+                run_lease.acquire(record["run_id"], owner, pid=child.pid, handoff=True)
+            except (run_lease.LeaseError, OSError) as exc:
+                # Never leave a child running under a lease it cannot hold: stop it and say so.
+                code = exc.code if isinstance(exc, run_lease.LeaseError) else "RUN_LEASE_STORAGE_UNAVAILABLE"
+                try:
+                    os.killpg(child.pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+                child.wait()
+                log.close()
+                record.update({"status": "interrupted", "pid": None, "lease_handoff_error": code,
+                               "launches": record["launches"] + 1, "outcome": "lease_handoff_failed"})
+                save_record(path, record)
+                raise HeadlessError("RUN_LEASE_HANDOFF_FAILED",
+                                    f"the run lease could not be handed to the launched process ({code}); it was stopped") from exc
+        # The limit belongs to this launch: a resume starts a fresh window from now and does not inherit an
+        # earlier launch's limit (the caller passes it again).
+        launched_at = clock()
+        for stale in ("max_duration_seconds", "deadline_at", "deadline_epoch", "stop_reason", "time_limit"):
+            record.pop(stale, None)
+        if max_duration_seconds is not None:
+            record.update({"max_duration_seconds": max_duration_seconds, "deadline_epoch": launched_at + max_duration_seconds,
+                           "deadline_at": _iso(launched_at + max_duration_seconds)})
+        record.update({"status": "launched", "pid": child.pid, "pid_start": run_lease.pid_start(child.pid),
+                       "launches": record["launches"] + 1, "started_at": _now(), "exit_code": None,
+                       "outcome": "resumed" if resume else "launched"})
+        save_record(path, record)
+        return record, child, log, before
+    except BaseException:
+        # Every exit after registration that does not hand the child to start() drops it.
+        _OWN_CHILDREN.pop(child.pid, None)
+        raise
 
 
 def status(*, target: Path, explicit_repo: str, execution_id: str) -> dict:
