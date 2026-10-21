@@ -49,13 +49,13 @@ class FakeGh:
         self.issue_error, self.pr_error = issue_error, pr_error
         self.calls: list[tuple] = []
 
-    def list_issue_summaries(self, limit, *, repo):
+    def list_issue_summaries(self, limit, *, repo, timeout=None):
         self.calls.append(("issues", limit, repo))
         if self.issue_error:
             raise self.issue_error
         return self.issues[:limit]
 
-    def list_open_prs(self, limit, *, repo):
+    def list_open_prs(self, limit, *, repo, timeout=None):
         self.calls.append(("prs", limit, repo))
         if self.pr_error:
             raise self.pr_error
@@ -214,6 +214,122 @@ class IssuesViewTest(IssuesFixture):
         self.assertIsNone(item["updated_at"])
 
 
+class BlockingGh(FakeGh):
+    """A gh that hangs on chosen repositories until released."""
+
+    def __init__(self, hang: set[str], **kwargs):
+        super().__init__(**kwargs)
+        self.hang, self.release, self.entered = hang, threading.Event(), threading.Event()
+
+    def list_issue_summaries(self, limit, *, repo, timeout=None):
+        if repo in self.hang:
+            self.entered.set()
+            self.release.wait(10)
+        return super().list_issue_summaries(limit, repo=repo, timeout=timeout)
+
+
+class IssuesRobustnessTest(IssuesFixture):
+    def second_repo(self, name="web"):
+        other = Path(self.tmp.name) / name
+        other.mkdir()
+        git(other, "init", "-q", "-b", "main")
+        git(other, "remote", "add", "origin", f"https://github.com/acme/{name}.git")
+        return other
+
+    def workspace(self, fake, repos):
+        state = {"repositories": repos}
+        return gi.IssuesSource(gi.workspace_targets(lambda: state), mode="workspace", adapter=fake, clock=self.clock), state
+
+    def test_git_timeout_or_missing_git_fails_only_that_repository(self):
+        other = self.second_repo()
+        real_run = subprocess.run
+        for error in (subprocess.TimeoutExpired(["git"], 10), FileNotFoundError("git")):
+            def run(argv, *args, error=error, **kwargs):
+                if str(self.repo) in argv:
+                    raise error
+                return real_run(argv, *args, **kwargs)
+            with self.subTest(error=type(error).__name__), patch.object(gi.github_integration.subprocess, "run", run):
+                source, _ = self.workspace(FakeGh(), [
+                    {"id": "api", "repository": "acme/app", "resolved_path": str(self.repo)},
+                    {"id": "web", "repository": "acme/web", "resolved_path": str(other)}])
+                api, web = source.view()["repositories"]
+                self.assertEqual((api["available"], api["error_code"], api["issues"]),
+                                 (False, "TARGET_REPOSITORY_UNREADABLE", None))
+                self.assertTrue(web["available"])
+
+    def test_hung_gh_blocks_neither_other_repositories_nor_other_requests(self):
+        other = self.second_repo()
+        fake = BlockingGh({"acme/app"})
+        source, _ = self.workspace(fake, [
+            {"id": "api", "repository": "acme/app", "resolved_path": str(self.repo)},
+            {"id": "web", "repository": "acme/web", "resolved_path": str(other)}])
+        results = []
+        first = threading.Thread(target=lambda: results.append(source.view()))
+        first.start()
+        self.assertTrue(fake.entered.wait(5))
+        try:
+            api, web = source.view()["repositories"]  # returns while the first request is still stuck
+            self.assertEqual((api["error_code"], api["issues"]), ("ISSUES_FETCH_IN_PROGRESS", None))
+            self.assertTrue(web["available"])
+        finally:
+            fake.release.set()
+            first.join(10)
+        self.assertTrue(results[0]["repositories"][0]["available"])
+        # The second request never started its own gh call for the hung repository.
+        self.assertEqual(sum(1 for kind, _, repo in fake.calls if (kind, repo) == ("issues", "acme/app")), 1)
+
+    def test_expired_entry_is_served_stale_while_it_is_refetched(self):
+        fake = BlockingGh(set())
+        source = self.source(fake)
+        source.view()
+        self.clock.now += 61
+        fake.hang = {"acme/app"}
+        first = threading.Thread(target=source.view)
+        first.start()
+        self.assertTrue(fake.entered.wait(5))
+        try:
+            [entry] = source.view()["repositories"]
+            self.assertEqual((entry["available"], entry["cached"]), (True, True))
+        finally:
+            fake.release.set()
+            first.join(10)
+
+    def test_cache_drops_expired_and_unwatched_repositories(self):
+        other = self.second_repo()
+        source, state = self.workspace(FakeGh(), [
+            {"id": "api", "repository": "acme/app", "resolved_path": str(self.repo)},
+            {"id": "web", "repository": "acme/web", "resolved_path": str(other)}])
+        source.view()
+        self.assertEqual(len(source._cache), 2)
+        state["repositories"] = state["repositories"][:1]
+        source.view()
+        self.assertEqual([key[0] for key in source._cache], ["api"])
+        state["repositories"] = []
+        source.view()
+        self.assertEqual(source._cache, {})
+
+    def test_bool_number_is_invalid_and_label_names_are_capped(self):
+        [entry] = self.source(FakeGh(issues=[issue(True)])).view()["repositories"]
+        self.assertEqual((entry["error_code"], entry["issues"]), ("GH_OUTPUT_INVALID", None))
+        [entry] = self.source(FakeGh(issues=[issue(2, labels=[{"name": "x" * 500}])])).view()["repositories"]
+        self.assertEqual(len(entry["issues"][0]["labels"][0]), gi.MAX_LABEL)
+
+    def test_gh_reads_use_the_short_timeout(self):
+        seen = []
+
+        class Recording(FakeGh):
+            def list_issue_summaries(self, limit, *, repo, timeout=None):
+                seen.append(timeout)
+                return super().list_issue_summaries(limit, repo=repo)
+
+            def list_open_prs(self, limit, *, repo, timeout=None):
+                seen.append(timeout)
+                return super().list_open_prs(limit, repo=repo)
+        self.source(Recording()).view()
+        self.assertEqual(seen, [gi.GH_TIMEOUT, gi.GH_TIMEOUT])
+        self.assertLess(gi.GH_TIMEOUT, github_sync.DEFAULT_TIMEOUT_SECONDS)
+
+
 class GithubSyncWrappersTest(unittest.TestCase):
     def run_with(self, stdout):
         proc = subprocess.CompletedProcess(args=["gh"], returncode=0, stdout=stdout, stderr="")
@@ -228,6 +344,14 @@ class GithubSyncWrappersTest(unittest.TestCase):
                                                     "number,title,state,labels,assignees,updatedAt,url",
                                                     "--limit", "51", "--repo", "acme/app"])
         self.assertIs(mock_run.call_args[1]["shell"], False)
+        self.assertEqual(mock_run.call_args[1]["timeout"], github_sync.DEFAULT_TIMEOUT_SECONDS)
+        which, run = self.run_with(json.dumps([issue(3)]))
+        with which, run as mock_run:
+            github_sync.list_issue_summaries(5, repo="acme/app", timeout=10)
+        self.assertEqual(mock_run.call_args[1]["timeout"], 10)
+        which, run = self.run_with(json.dumps([issue(True)]))
+        with which, run, self.assertRaises(github_sync.GhOutputError):
+            github_sync.list_issue_summaries(5, repo="acme/app")
         which, run = self.run_with(json.dumps([{**issue(3), "assignees": "nobody"}]))
         with which, run, self.assertRaises(github_sync.GhOutputError):
             github_sync.list_issue_summaries(5, repo="acme/app")

@@ -340,7 +340,7 @@ def list_issues(state: str = "open", limit: int = 200, *, repo: str | None = Non
     return data
 
 
-def list_issue_summaries(limit: int, *, repo: str) -> list[dict]:
+def list_issue_summaries(limit: int, *, repo: str, timeout: int = DEFAULT_TIMEOUT_SECONDS) -> list[dict]:
     """Open issues with the fields the Garden issues panel shows (read-only).
 
     Fixed argv: gh issue list --state open --json <fixed fields> --limit <n> --repo <owner/name>.
@@ -351,7 +351,7 @@ def list_issue_summaries(limit: int, *, repo: str) -> list[dict]:
     argv = [GH_BINARY, "issue", "list", "--state", "open",
             "--json", "number,title,state,labels,assignees,updatedAt,url",
             "--limit", str(limit), "--repo", validate_repo(repo)]
-    proc = _run(argv)
+    proc = _run(argv, timeout=timeout)
     _require_success(proc, argv)
     data = _parse_json(proc, "gh issue list")
     if not isinstance(data, list):
@@ -361,6 +361,8 @@ def list_issue_summaries(limit: int, *, repo: str) -> list[dict]:
         if not isinstance(issue, dict):
             raise GhOutputError(f"{context}: expected object")
         _validate_issue_shape(issue, context)
+        if type(issue["number"]) is not int:
+            raise GhOutputError(f"{context}: invalid issue number")
         _require_keys(issue, ["assignees", "updatedAt"], context)
         for field in ("labels", "assignees"):
             if not isinstance(issue[field], list) or not all(isinstance(item, dict) for item in issue[field]):
@@ -368,7 +370,7 @@ def list_issue_summaries(limit: int, *, repo: str) -> list[dict]:
     return data
 
 
-def list_open_prs(limit: int, *, repo: str) -> list[dict]:
+def list_open_prs(limit: int, *, repo: str, timeout: int = DEFAULT_TIMEOUT_SECONDS) -> list[dict]:
     """Open PRs with head branch and body, used only to find issue references (read-only).
 
     Fixed argv: gh pr list --state open --json number,headRefName,body,isDraft
@@ -378,7 +380,7 @@ def list_open_prs(limit: int, *, repo: str) -> list[dict]:
         raise ValueError(f"limit must be an integer from 1 to 1000, got {limit!r}")
     argv = [GH_BINARY, "pr", "list", "--state", "open", "--json", "number,headRefName,body,isDraft",
             "--limit", str(limit), "--repo", validate_repo(repo)]
-    proc = _run(argv)
+    proc = _run(argv, timeout=timeout)
     _require_success(proc, argv)
     data = _parse_json(proc, "gh pr list")
     if not isinstance(data, list):

@@ -1829,7 +1829,11 @@ data endpoint (`/api/controls`, `/api/branches`, `/api/runs`,
 CONTROL_TOKEN_INVALID` without it. The page sends the token on every poll; a
 page opened without it shows "Open the URL printed at launch". The static
 page, script and stylesheet are served without the token, since the token
-reaches the page only in the URL fragment. Without `--controls` nothing needs
+reaches the page only in the URL fragment. The page keeps the token in memory
+only and removes it from the address bar, so a reload or a second tab opened
+from the address bar has no token and shows only that message. Open the full
+launch URL printed in the terminal again to recover. The token is deliberately
+not kept in `sessionStorage` or any other browser storage. Without `--controls` nothing needs
 a token, and `/api/controls` stays a read-only panel. A
 malformed or negative `Content-Length` on `POST /api/action` is answered with
 `400 CONTROL_BODY_INVALID`.
@@ -1897,9 +1901,16 @@ wrappers in `tools/github_sync.py`: `list_issue_summaries` (`gh issue list
 51 --repo <identity>`) and `list_open_prs` (`gh pr list --state open --json
 number,headRefName,body,isDraft --limit 101 --repo <identity>`). At most
 `CAP = 50` issues are served, in `gh`'s order (newest first), and `truncated`
-says when more exist. Each repository's result, including a failure, is
-cached for 60 seconds; the page polls every 30 seconds without blocking the
-live run view.
+says when more exist. Each `gh` call has a 10-second timeout (`GH_TIMEOUT`;
+the CLI default is 30). Each repository's result, including a failure, is
+cached for 60 seconds, and each request drops expired entries and
+repositories that are no longer watched. The cache lock is never held while
+`git` or `gh` runs. A repository already being fetched is not fetched again:
+a concurrent request gets its expired entry as `cached: true`, or
+`ISSUES_FETCH_IN_PROGRESS` when none exists yet. Workspace repositories are
+read in parallel (up to 4 at a time), so one hung repository does not delay
+the others. The page polls every 30 seconds without blocking the live run
+view.
 
 **Response.** `{ok: true, mode ("repository"|"workspace"), cap,
 cache_ttl_seconds, reference_rules, repositories[]}`. Each repository is
@@ -1922,7 +1933,9 @@ linked only in the GitHub UI, and mentions such as `Refs #33`, are not seen.
 
 **Errors.** Per repository: `GH_UNAVAILABLE` (no `gh` on PATH),
 `GH_UNAUTHENTICATED`, `GH_RATE_LIMITED`, `GH_TIMEOUT`, `GH_OUTPUT_INVALID`,
-`GH_COMMAND_FAILED`, the identity codes above, or a manifest blocker code.
+`GH_COMMAND_FAILED`, the identity codes above,
+`TARGET_REPOSITORY_UNREADABLE` (`git` is missing or timed out while resolving
+the identity), `ISSUES_FETCH_IN_PROGRESS`, or a manifest blocker code.
 `error` is a fixed sentence per code; `gh`'s own output is never served. A
 failed PR listing leaves the issues available and sets
 `pull_requests.error_code`, with every issue's `references.pull_requests`
@@ -1940,8 +1953,10 @@ queue".
 
 Coverage: `tests/test_garden_issues.py` (fake `gh` adapter, real temporary
 Git checkouts and a real HTTP server) covers the shape, the cap, every `gh`
-failure code, the cache, ambiguous and conflicting identities, workspace
-blockers, references, the token on `/api/issues`, `/api/runs` and
+failure code, the cache and its pruning, a `git` timeout or missing `git`
+on one repository, a hung `gh` that blocks neither other repositories nor
+other requests, ambiguous and conflicting identities, workspace blockers,
+references, the token on `/api/issues`, `/api/runs` and
 `/api/workspace` with controls on and off, and that hostile issue text is
 served verbatim. `tests/garden-issues.test.ts` renders hostile titles and
 labels with a DOM stub that throws on `innerHTML`.

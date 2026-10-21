@@ -41,6 +41,7 @@ import subprocess
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
@@ -52,7 +53,10 @@ import github_sync  # noqa: E402
 CAP = 50
 PR_SCAN_LIMIT = 100
 CACHE_TTL = 60.0
+GH_TIMEOUT = 10  # seconds per read-only gh call; the CLI default is 30
+MAX_PARALLEL = 4
 MAX_TITLE = 512
+MAX_LABEL = 100
 MAX_LABELS = 20
 MAX_ASSIGNEES = 10
 STAMP = re.compile(r"^[0-9T:.Z+-]{1,40}$")
@@ -81,6 +85,8 @@ REASONS = {
     "TARGET_REPOSITORY_UNRESOLVED": "the checkout's GitHub repository cannot be resolved",
     "TARGET_REPOSITORY_CONFLICT": "the checkout's GitHub remotes no longer match the watched repository",
     "WORKSPACE_REPOSITORY_PATH_MISSING": "the repository checkout is missing",
+    "TARGET_REPOSITORY_UNREADABLE": "git could not read the checkout (git missing or timed out)",
+    "ISSUES_FETCH_IN_PROGRESS": "the issues of this repository are still being fetched",
 }
 
 
@@ -127,9 +133,15 @@ def local_pico_branches(checkout: Path) -> list[str] | None:
     return sorted(name for name in proc.stdout.splitlines() if BRANCH.fullmatch(name))
 
 
+def _clip(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
 def _issue(raw: dict, repository: str) -> dict:
-    title = raw["title"] if len(raw["title"]) <= MAX_TITLE else raw["title"][:MAX_TITLE - 1] + "…"
-    labels = [item["name"] for item in raw["labels"] if isinstance(item.get("name"), str)][:MAX_LABELS]
+    if type(raw.get("number")) is not int or raw["number"] < 1:  # a bool is not an issue number
+        raise github_sync.GhOutputError("gh issue list: invalid issue number")
+    title = _clip(raw["title"], MAX_TITLE)
+    labels = [_clip(item["name"], MAX_LABEL) for item in raw["labels"] if isinstance(item.get("name"), str)][:MAX_LABELS]
     assignees = [item["login"] for item in raw["assignees"]
                  if isinstance(item.get("login"), str) and LOGIN.fullmatch(item["login"])][:MAX_ASSIGNEES]
     updated = raw.get("updatedAt")
@@ -155,12 +167,31 @@ class IssuesSource:
         self.targets, self.mode, self.adapter = targets, mode, adapter
         self.clock, self.ttl, self.cap = clock, ttl, cap
         self._cache: dict[tuple, tuple[float, dict]] = {}
+        self._inflight: set[tuple] = set()
+        # Guards only the cache and the in-flight set; it is never held while gh or git runs.
         self._lock = threading.Lock()
 
     def view(self) -> dict:
+        targets = self.targets()
+        seen: set[tuple] = set()
+        if len(targets) > 1:
+            # Repositories are read in parallel, so one slow repository does not delay the others.
+            with ThreadPoolExecutor(max_workers=min(MAX_PARALLEL, len(targets))) as pool:
+                entries = list(pool.map(lambda target: self._entry(target, seen), targets))
+        else:
+            entries = [self._entry(target, seen) for target in targets]
+        self._prune(seen)
         return {"ok": True, "mode": self.mode, "cap": self.cap, "cache_ttl_seconds": self.ttl,
-                "reference_rules": REFERENCE_RULES,
-                "repositories": [self._entry(target) for target in self.targets()]}
+                "reference_rules": REFERENCE_RULES, "repositories": entries}
+
+    def _prune(self, current: set[tuple]) -> None:
+        """Drop expired entries and repositories that are no longer watched, so the cache stays bounded."""
+        now = self.clock()
+        with self._lock:
+            # An expired entry being refetched is kept: concurrent requests serve it as stale meanwhile.
+            for key in [k for k, (at, _) in self._cache.items()
+                        if k not in current or (now - at >= self.ttl and k not in self._inflight)]:
+                del self._cache[key]
 
     @staticmethod
     def _blank(target: Target, repository: str | None) -> dict:
@@ -175,7 +206,7 @@ class IssuesSource:
         entry.update({"error_code": code, "error": REASONS.get(code, "the repository cannot be read")})
         return entry
 
-    def _entry(self, target: Target) -> dict:
+    def _entry(self, target: Target, seen: set[tuple] | None = None) -> dict:
         expected = target.repository if isinstance(target.repository, str) else None
         try:
             expected = github_sync.validate_repo(expected) if expected else None
@@ -189,34 +220,51 @@ class IssuesSource:
             identity = github_integration.resolve_target(target.checkout, target.explicit)
         except github_integration.IntegrationError as exc:
             return self._failed(target, expected, exc.code)
+        except (OSError, subprocess.SubprocessError):
+            # git missing (FileNotFoundError) or hung (TimeoutExpired): fail this repository only.
+            return self._failed(target, expected, "TARGET_REPOSITORY_UNREADABLE")
         if expected is not None and identity.casefold() != expected.casefold():
             return self._failed(target, expected, "TARGET_REPOSITORY_CONFLICT")
         key = (target.id, identity.casefold(), str(target.checkout))
         with self._lock:
+            if seen is not None:
+                seen.add(key)
             cached = self._cache.get(key)
             if cached is not None and self.clock() - cached[0] < self.ttl:
                 return {**cached[1], "cached": True}
+            if key in self._inflight:
+                # Another request is already fetching: never start a second gh call or wait for it.
+                if cached is not None:
+                    return {**cached[1], "cached": True}
+                return self._failed(target, identity, "ISSUES_FETCH_IN_PROGRESS")
+            self._inflight.add(key)
+        try:
             entry = self._fetch(target, identity)
+        except Exception:  # never leave a repository marked in flight
+            entry = self._failed(target, identity, "GH_COMMAND_FAILED")
+            entry["fetched_at"] = _now()
+        with self._lock:
+            self._inflight.discard(key)
             self._cache[key] = (self.clock(), entry)
-            return entry
+        return entry
 
     def _fetch(self, target: Target, identity: str) -> dict:
         entry = self._blank(target, identity)
         entry["fetched_at"] = _now()
         try:
-            raw = self.adapter.list_issue_summaries(self.cap + 1, repo=identity)
+            raw = self.adapter.list_issue_summaries(self.cap + 1, repo=identity, timeout=GH_TIMEOUT)
+            issues = [_issue(item, identity) for item in raw[:self.cap]]
         except (github_sync.GithubSyncError, ValueError) as exc:
             code = gh_error_code(exc)
             entry.update({"error_code": code, "error": REASONS[code]})
             return entry
-        issues = [_issue(item, identity) for item in raw[:self.cap]]
         entry.update({"available": True, "truncated": len(raw) > self.cap, "issues": issues})
 
         branches = local_pico_branches(target.checkout)
         if branches is not None:
             entry["branches"] = {"available": True, "scanned": len(branches)}
         try:
-            prs = self.adapter.list_open_prs(PR_SCAN_LIMIT + 1, repo=identity)
+            prs = self.adapter.list_open_prs(PR_SCAN_LIMIT + 1, repo=identity, timeout=GH_TIMEOUT)
             entry["pull_requests"] = {"available": True, "error_code": None, "scanned": min(len(prs), PR_SCAN_LIMIT),
                                       "truncated": len(prs) > PR_SCAN_LIMIT}
             prs = prs[:PR_SCAN_LIMIT]

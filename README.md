@@ -328,7 +328,9 @@ current CI state. The action runs only after you confirm, and only if nothing
 changed since the preview. The launch URL carries a one-session token, so open
 the Garden from that URL and keep it private. With `--controls` on, the page
 sends the token on every poll, and the runs, workspace and issues data are
-not served without it. Without `--controls` the Garden stays read-only.
+not served without it. The page keeps the token in memory only, so after a
+reload, or in a second tab, it shows "Open the URL printed at launch"; open
+the full launch URL from the terminal again. Without `--controls` the Garden stays read-only.
 
 The buttons call the same commands as the terminal, so the autonomy policy
 still decides. When **Request PR** is refused because `.pi/autonomy.yaml` does
