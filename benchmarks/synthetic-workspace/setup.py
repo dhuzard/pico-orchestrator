@@ -133,8 +133,19 @@ def inside_git(target: Path) -> bool:
         probe = probe.parent
     if not probe.is_dir():
         probe = probe.parent
-    done = subprocess.run(["git", "-C", str(probe), "rev-parse", "--git-dir"], capture_output=True, text=True, check=False)
-    return done.returncode == 0
+    env = {**os.environ, "LC_ALL": "C", "LANG": "C"}
+    try:
+        done = subprocess.run(["git", "-C", str(probe), "rev-parse", "--git-dir"], capture_output=True, text=True,
+                              check=False, env=env)
+    except OSError as exc:
+        raise SetupError(f"cannot check whether the target is inside a Git repository: git is unavailable ({exc})") from exc
+    if done.returncode == 0:
+        return True
+    # Only Git's own "not a git repository" answer (exit 128) means the target is outside every repository.
+    if done.returncode == 128 and "not a git repository" in done.stderr.lower():
+        return False
+    raise SetupError("cannot tell whether the target is inside a Git repository "
+                     f"(git exited {done.returncode}: {done.stderr.strip()[:200]}); refusing to continue")
 
 
 def create(target: Path, *, owner: str = DEFAULT_OWNER, workspace_id: str = DEFAULT_WORKSPACE_ID,
@@ -142,8 +153,11 @@ def create(target: Path, *, owner: str = DEFAULT_OWNER, workspace_id: str = DEFA
     target = target.expanduser().resolve()
     if target == ROOT or ROOT in target.parents:
         raise SetupError("target must be outside the PICO repository")
-    common = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "--path-format=absolute", "--git-common-dir"],
-                            capture_output=True, text=True, check=False)
+    try:
+        common = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                                capture_output=True, text=True, check=False)
+    except OSError as exc:
+        raise SetupError(f"git is unavailable ({exc})") from exc
     if common.returncode == 0 and (Path(common.stdout.strip()) == target or Path(common.stdout.strip()) in target.parents):
         raise SetupError("target must not be inside this checkout's Git directory")
     if inside_git(target):

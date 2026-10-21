@@ -170,9 +170,39 @@ class SessionBindsAndAttribution(unittest.TestCase):
 
     def test_bind_without_task_id_resolves_to_the_sole_phase(self):
         calls = [{"action": "bind_workspace", "step_id": "impl"}]
-        self.assertEqual(bm.session_binds(calls, ["only"]), [("only", "impl")])
-        self.assertEqual(bm.session_binds(calls, ["a", "b"]), [("?", "impl")])
+        self.assertEqual(bm.session_binds(calls, ["only"]), {"resolved": [("only", "impl")], "unresolved": []})
         self.assertIsNone(bm.session_binds(None, ["a"]))
+
+    def test_unattributable_bind_is_unresolved_and_kept_out_of_the_diff(self):
+        calls = [{"action": "bind_workspace", "task_id": "a", "step_id": "impl"},
+                 {"action": "bind_workspace", "step_id": "review"}]
+        found = bm.session_binds(calls, ["a", "b"])
+        self.assertEqual(found, {"resolved": [("a", "impl")], "unresolved": [{"step": "review", "order": 2}]})
+        facts = bm.provenance_facts(make_record("r"), session_bind_keys=found["resolved"])
+        self.assertEqual([f["key"] for f in facts if f["category"] == "bind"], [["a", "impl"]])  # no "?" key
+
+    def test_compare_flags_bind_source_mismatch_and_lists_unresolved_binds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            self.session(base / "b")
+            write_state(base / "b", {"run-1": make_record("run-1")}, {"ta": passed("run-1")})
+            sessions = base / "b" / "executions" / "k" / "sessions" / "20260101_s.jsonl"
+            extra = json.dumps(self.call("u", action="bind_workspace", step_id="review"))
+            sessions.write_text(sessions.read_text(encoding="utf-8") + "\n" + extra, encoding="utf-8")
+            after = make_record("run-2")
+            after["parent_orchestration"]["activity"] = [  # fewer binds, but seen through another source
+                {"tool": "ClaudeWorker", "status": "started", "task_id": "t1", "step_id": "impl"}]
+            write_state(base / "a", {"run-2": after}, {"ta": passed("run-2")})
+            result = bm.compare(bm.workspace_report(base / "b", "ws"), bm.workspace_report(base / "a", "ws"))
+            text = bm.render_compare(result)
+        prov = result["provenance"]
+        self.assertTrue(prov["bind_source_mismatch"])
+        self.assertEqual(prov["bind_sources"], [{"task": "ta", "before": "session", "after": "activity"}])
+        self.assertEqual([m for m in prov["missing"] if m["category"] == "bind"], [])  # no false "missing"
+        self.assertFalse(prov["complete"])
+        self.assertEqual(prov["unresolved_binds"]["before"], [{"task": "ta", "step": "review", "order": 4}])
+        self.assertIn("bind_source_mismatch", text)
+        self.assertIn("Unresolved binds", text)
 
 
 class Durations(unittest.TestCase):
@@ -447,6 +477,45 @@ class SetupGuards(unittest.TestCase):
             with self.assertRaises(self.setup.SetupError, msg=str(target)):
                 self.setup.create(target)
             self.assertFalse(target.exists())
+
+    def fake_git(self, body: str) -> dict:
+        bin_dir = self.base / "fakebin"
+        bin_dir.mkdir(exist_ok=True)
+        script = bin_dir / "git"
+        script.write_text("#!/bin/sh\n" + body + "\n")
+        script.chmod(0o755)
+        return {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"}
+
+    def with_env(self, env: dict, action):
+        old = {k: os.environ.get(k) for k in env}
+        os.environ.update(env)
+        try:
+            return action()
+        finally:
+            for key, value in old.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+    def test_git_errors_other_than_not_a_repository_fail_closed(self):
+        ownership = self.fake_git('echo "fatal: detected dubious ownership in repository at /x" >&2; exit 128')
+        with self.assertRaises(self.setup.SetupError) as raised:
+            self.with_env(ownership, lambda: self.setup.create(self.base / "owned"))
+        self.assertIn("dubious ownership", str(raised.exception))
+        self.assertFalse((self.base / "owned").exists())
+        broken = self.fake_git('echo "fatal: something else" >&2; exit 1')
+        with self.assertRaises(self.setup.SetupError):
+            self.with_env(broken, lambda: self.setup.create(self.base / "broken"))
+        empty = self.base / "emptybin"
+        empty.mkdir()
+        with self.assertRaises(self.setup.SetupError):
+            self.with_env({"PATH": str(empty)}, lambda: self.setup.inside_git(self.base / "nogit"))
+
+    def test_only_git_not_a_repository_answer_means_outside(self):
+        self.assertFalse(self.setup.inside_git(self.base / "not" / "yet" / "there"))
+        said = self.fake_git('echo "fatal: not a git repository (or any of the parent directories): .git" >&2; exit 128')
+        self.assertFalse(self.with_env(said, lambda: self.setup.inside_git(self.base)))
 
     def test_refuses_this_checkouts_common_dir(self):
         common = subprocess.run(["git", "-C", str(REPO_ROOT), "rev-parse", "--path-format=absolute", "--git-common-dir"],

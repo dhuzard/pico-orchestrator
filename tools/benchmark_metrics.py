@@ -204,16 +204,27 @@ def orchestration_record_calls(calls: list[dict] | None) -> dict | None:
             "event_kinds": dict(sorted(event_kinds.items()))}
 
 
-def session_binds(calls: list[dict] | None, phase_ids: list[str]) -> list[tuple[str, str]] | None:
-    """(task, step) of each `bind_workspace` call; a missing task_id means the sole routed task."""
+def session_binds(calls: list[dict] | None, phase_ids: list[str]) -> dict | None:
+    """Binds of the `bind_workspace` calls: `resolved` (task, step) pairs and `unresolved` ones.
+
+    A missing task_id means the sole routed task. With several phases it cannot be attributed: the bind is
+    listed as unresolved (its step and its order among the bind calls) and is never part of the fact diff.
+    """
     if calls is None:
         return None
-    out = set()
+    resolved, unresolved = set(), []
+    order = 0
     for args in calls:
         if args.get("action") == "bind_workspace" and isinstance(args.get("step_id"), str):
+            order += 1
             task = args.get("task_id")
-            out.add((str(task) if task else (phase_ids[0] if len(phase_ids) == 1 else "?"), args["step_id"]))
-    return sorted(out)
+            if task:
+                resolved.add((str(task), args["step_id"]))
+            elif len(phase_ids) == 1:
+                resolved.add((phase_ids[0], args["step_id"]))
+            else:
+                unresolved.append({"step": args["step_id"], "order": order})
+    return {"resolved": sorted(resolved), "unresolved": unresolved}
 
 
 # --- provenance facts ------------------------------------------------------
@@ -279,6 +290,13 @@ def provenance_facts(record: dict, interaction_types: tuple[str, ...] = (),
     return facts
 
 
+def bind_source(parent: dict, session: dict | None) -> str:
+    """Where a run's bind facts come from: `session`, `record` (a `binds` list) or `activity` (ClaudeWorker starts)."""
+    if session is not None:
+        return "session"
+    return "record" if parent.get("binds") else "activity"
+
+
 def diff_facts(before: list[dict], after: list[dict]) -> list[dict]:
     """Facts of `before` whose counterpart is missing from `after`, by semantic identity.
 
@@ -338,6 +356,7 @@ def run_report(record: dict, *, state: Path | None = None, session_dirs: list[Pa
     files = session_files(state, record.get("run_id", ""), session_dirs or []) if state is not None else []
     calls = session_calls(files, record.get("run_id", ""))
     phase_ids = [str(ph.get("id")) for ph in parent.get("phases") or [] if isinstance(ph, dict)]
+    binds = session_binds(calls, phase_ids)
     observed = (entry or {}).get("observed") if isinstance((entry or {}).get("observed"), dict) else {}
     checks = observed.get("checks") if isinstance(observed.get("checks"), list) else None
     validation = observed.get("validation") if isinstance(observed.get("validation"), dict) else {}
@@ -361,7 +380,9 @@ def run_report(record: dict, *, state: Path | None = None, session_dirs: list[Pa
                     "checks_passed": checks_passed,
                     "checks": [{"id": c.get("id"), "status": c.get("status")} for c in checks or [] if isinstance(c, dict)],
                     "verified": status == "COMPLETED" and checks_passed is True},
-        "provenance_facts": provenance_facts(record, session_bind_keys=session_binds(calls, phase_ids)),
+        "bind_source": bind_source(parent, binds),
+        "unresolved_binds": binds["unresolved"] if binds else [],
+        "provenance_facts": provenance_facts(record, session_bind_keys=binds["resolved"] if binds else None),
     }
 
 
@@ -452,14 +473,27 @@ def provenance_completeness(before: dict, after: dict) -> list[dict]:
         return {(r.get("task") or f"#{i}"): r for i, r in enumerate(report["runs"])}
     b, a = keyed(before), keyed(after)
     missing = []
+    mismatched = []
     for task, run in sorted(b.items()):
         counterpart = a.get(task)
         if counterpart is None:
             missing.append({"task": task, "category": "run", "key": [task], "value": {}, "reason": "absent"})
             continue
-        for fact in diff_facts(run["provenance_facts"], counterpart["provenance_facts"]):
+        before_facts, after_facts = run["provenance_facts"], counterpart["provenance_facts"]
+        sources = (run.get("bind_source"), counterpart.get("bind_source"))
+        if sources[0] != sources[1]:
+            # Binds observed through different sources cannot be compared: flag it, never report false "missing".
+            mismatched.append({"task": task, "before": sources[0], "after": sources[1]})
+            before_facts = [f for f in before_facts if f["category"] != "bind"]
+            after_facts = [f for f in after_facts if f["category"] != "bind"]
+        for fact in diff_facts(before_facts, after_facts):
             missing.append({"task": task, **fact})
-    return missing
+    return missing, mismatched
+
+
+def unresolved_binds(report: dict) -> list[dict]:
+    return [{"task": r.get("task") or f"#{i}", **item} for i, r in enumerate(report["runs"])
+            for item in r.get("unresolved_binds") or []]
 
 
 def compare(before: dict, after: dict) -> dict:
@@ -479,9 +513,11 @@ def compare(before: dict, after: dict) -> dict:
                               for n in TOKEN_NAMES.values()}
                           for b in sorted(set(bt["tokens"]["workers"]) | set(at["tokens"]["workers"]))},
     }
-    missing = provenance_completeness(before, after)
+    missing, mismatched = provenance_completeness(before, after)
     return {"before": before, "after": after, "deltas": deltas,
-            "provenance": {"complete": not missing, "missing": missing}}
+            "provenance": {"complete": not missing and not mismatched, "missing": missing,
+                           "bind_source_mismatch": bool(mismatched), "bind_sources": mismatched,
+                           "unresolved_binds": {"before": unresolved_binds(before), "after": unresolved_binds(after)}}}
 
 
 # --- rendering -------------------------------------------------------------
@@ -535,6 +571,16 @@ def render_compare(result: dict) -> str:
                  f"({len(prov['missing'])} BEFORE fact(s) missing from AFTER)")
     for m in prov["missing"]:
         lines.append(f"  {m.get('task')}: {m['category']} {'/'.join(m['key'])} ({m['reason']})")
+    if prov["bind_source_mismatch"]:
+        lines.append("  bind_source_mismatch: binds were observed through different sources, so they are not compared:")
+        for item in prov["bind_sources"]:
+            lines.append(f"    {item['task']}: before={item['before']} after={item['after']}")
+    unresolved = prov["unresolved_binds"]
+    if unresolved["before"] or unresolved["after"]:
+        lines.append("Unresolved binds (bind_workspace without task_id in a run with several phases; not diffed)")
+        for side in ("before", "after"):
+            for item in unresolved[side]:
+                lines.append(f"  {side} {item['task']}: step {item['step']} (bind call #{item['order']})")
     return "\n".join(lines)
 
 
