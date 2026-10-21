@@ -215,6 +215,13 @@ def _context_event(parent: dict, event: dict) -> None:
                                            "tokens_before": tokens_before})
 
 
+def _event_priced(event: dict, cost) -> bool:
+    """An event is fully priced when it carries a cost, and that cost is not zero despite tokens."""
+    if cost is None:
+        return False
+    return not (cost == 0 and any((event.get(field) or 0) > 0 for field in USAGE_COUNTERS if field != "duration_ms"))
+
+
 def _usage_event(parent: dict, event: dict) -> None:
     backend = event.get("backend")
     if backend not in USAGE_BACKENDS:
@@ -236,6 +243,8 @@ def _usage_event(parent: dict, event: dict) -> None:
         if type(cost) not in (int, float) or not math.isfinite(cost) or cost < 0:
             raise ParentRunError("invalid estimated cost")
         usage["estimated_cost_usd"] = round(usage.get("estimated_cost_usd", 0) + cost, 6)
+    # Like total_tokens_complete: false once any event could not be priced.
+    usage["cost_complete"] = usage.get("cost_complete", True) and _event_priced(event, cost)
 
 
 def _wave_event(parent: dict, event: dict) -> None:
@@ -357,7 +366,7 @@ def _record_event_unlocked(run_id: str, event: dict, *, repo_root: Path = ROOT) 
         "spawn": {"kind"},
         "activity": {"kind", "status", "tool", "task_id", "step_id", "subagent_id"},
         "interaction": {"kind", "type", "summary", "task_id", "step_id", "subagent_id", "reply_to"},
-        "lead_usage": {"kind", "model", "phase", "task_type", "turn_index", "duration_ms", "input_tokens", "output_tokens", "cached_tokens", "total_tokens", "estimated_cost_usd"},
+        "lead_usage": {"kind", "model", "phase", "task_type", "turn_index", "duration_ms", "input_tokens", "output_tokens", "cached_tokens", "cache_write_tokens", "total_tokens", "estimated_cost_usd"},
     }
     required = {
         "phase": {"kind", "phase", "status"},
@@ -536,10 +545,11 @@ def _record_event_unlocked(run_id: str, event: dict, *, repo_root: Path = ROOT) 
             lead["mixed_models"] = True
         elif not lead.get("mixed_models"):
             lead["model"] = model
-        for field in ("input_tokens", "output_tokens", "cached_tokens", "total_tokens"):
+        for field in ("input_tokens", "output_tokens", "cached_tokens", "cache_write_tokens", "total_tokens"):
             if event.get(field) is not None:
                 lead[field] = (lead.get(field) or 0) + _count(event[field], field)
         cost = event.get("estimated_cost_usd")
+        lead["cost_complete"] = lead.get("cost_complete", True) and _event_priced(event, cost)
         if cost is not None:
             # Pi's own per-message list-price estimate for the lead; absent when unreported.
             if type(cost) not in (int, float) or not math.isfinite(cost) or cost < 0:

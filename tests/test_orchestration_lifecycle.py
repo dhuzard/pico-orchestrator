@@ -693,6 +693,23 @@ class LifecycleTest(unittest.TestCase):
             po.ParentRun(worktree=self.target, repo_root=self.records).event(
                 {"kind": "lead_usage", "model": "m/x", "estimated_cost_usd": -1})
 
+    def test_cost_complete_flags_track_unpriced_zero_cost_and_cache_writes(self):
+        schema = provenance.load_schema(self.records)
+        parent = po.ParentRun(worktree=self.target, repo_root=self.records)
+        parent.event({"kind": "usage", "backend": "claude-code", "duration_ms": 5})  # AskClaude: no cost
+        parent.event({"kind": "usage", "backend": "pi-subagent", "input_tokens": 5, "cache_write_tokens": 3,
+                      "estimated_cost_usd": 0})
+        parent.event({"kind": "usage", "backend": "pi-subagent", "input_tokens": 5, "estimated_cost_usd": 0.1})
+        parent.event({"kind": "lead_usage", "model": "m/lead", "input_tokens": 4, "cache_write_tokens": 2,
+                      "estimated_cost_usd": 0.2})
+        record = parent.finish("PARTIAL")
+        self.assertEqual(provenance.validate_run_record(record, schema), [])
+        context = record["parent_orchestration"]["context"]
+        self.assertFalse(context["worker_usage"]["claude-code"]["cost_complete"])
+        self.assertFalse(context["worker_usage"]["pi-subagent"]["cost_complete"])  # one zero-cost event with tokens
+        self.assertEqual(context["lead_usage"]["cache_write_tokens"], 2)
+        self.assertTrue(context["lead_usage"]["cost_complete"])
+
     def test_partial_worker_usage_does_not_claim_complete_token_total(self):
         record = {"started_at": "2026-10-14T00:00:00Z"}
         parent = {"context": {"lead_usage": {"input_tokens": 10, "output_tokens": 5},

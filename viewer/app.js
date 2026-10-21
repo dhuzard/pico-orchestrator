@@ -469,7 +469,8 @@ function renderWorkspaceOverview(data) {
     const parts = [];
     if (budget.max_tokens) parts.push(`${short(budget.spent_tokens)} / ${short(budget.max_tokens)} tokens`);
     if (budget.max_cost_usd) parts.push(`${budget.cost_complete === false ? "≥ " : ""}$${budget.spent_cost_usd.toFixed(2)} / $${budget.max_cost_usd.toFixed(2)} reported`);
-    if (budget.cost_complete === false && budget.unpriced?.length) parts.push(`cost excludes ${budget.unpriced.join(", ")}`);
+    if (budget.cost_complete === false && budget.unpriced?.length) parts.push(`cost is a lower bound, excludes ${budget.unpriced.join(", ")}`);
+    if (budget.incomplete) parts.push("in-flight spend unknown: nothing new will launch");
     $("ws-budget").textContent = parts.join(" · ") + (budget.exhausted ? " · exhausted" : "") + " · launch gate: running children can overshoot";
     if (budget.max_tokens) {
       $("ws-budget-bar").style.width = `${Math.min(100, 100 * budget.spent_tokens / budget.max_tokens)}%`;
@@ -781,7 +782,7 @@ function showPreview(action, result, onConfirm) {
   } else if (action === "schedule") {
     content.append(factList([["Will launch", p.dispatch?.join(", ") || "nothing"], ["Will resume", p.resume?.join(", ") || "nothing"],
       ["Interrupted", p.interrupted?.join(", ") || "none"], ["Parallel cap", p.cap], ["Allow mutation", p.allow_mutation ? "yes" : "no"],
-      ["Budget", p.budget ? `${short(p.budget.spent_tokens)} of ${p.budget.max_tokens ? short(p.budget.max_tokens) : "—"} tokens${p.budget.cost_complete === false ? ` · cost excludes ${(p.budget.unpriced || []).join(", ")}` : ""}${p.budget.exhausted ? " · exhausted: nothing new will launch" : ""}` : "none set"]]));
+      ["Budget", p.budget ? `${short(p.budget.spent_tokens)} of ${p.budget.max_tokens ? short(p.budget.max_tokens) : "—"} tokens${p.budget.cost_complete === false ? ` · cost is a lower bound, excludes ${(p.budget.unpriced || []).join(", ")}` : ""}${p.budget.incomplete ? " · in-flight spend unknown: nothing new will launch" : ""}${p.budget.exhausted ? " · exhausted: nothing new will launch" : ""}` : "none set"]]));
     content.append(el("pre", "action-pre", Object.entries(p.mutating_permissions || {}).map(([repo, perms]) => `${repo}: ${perms.length ? perms.join(", ") : "no mutating permissions"}`).join("\n")));
   } else if (action === "set_permission") {
     content.append(factList([["Repository", p.repository], ["Permission", p.permission?.replaceAll("_", " ")], ["New value", p.value ? "allowed" : "denied"], ["File", p.creates_file ? "created from the template" : "edited in place"]]));

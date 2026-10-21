@@ -32,14 +32,30 @@ def _has_tokens(part: dict) -> bool:
     return any((_count(part.get(field)) or 0) > 0 for field in (*COUNTED, "total_tokens"))
 
 
+def _priced(part: dict, cost) -> bool:
+    """Whether a participant's cost is fully known.
+
+    A participant that did anything (invocations or tokens) with no cost, or with a
+    zero cost despite tokens, is unpriced. An explicit per-participant
+    cost_complete=false (some event was unpriced) also makes it so; records that
+    predate the flag are judged from their aggregates.
+    """
+    if part.get("cost_complete") is False:
+        return False
+    active = (_count(part.get("invocations")) or 0) > 0 or _has_tokens(part)
+    if not active:
+        return True
+    return cost is not None and not (cost == 0 and _has_tokens(part))
+
+
 def cost_coverage(context: dict) -> tuple[float | None, list[str]]:
-    """Reported cost of one run's participants and the names of those with tokens but no cost."""
+    """Reported cost of one run's participants and the names of those whose cost is not fully known."""
     lead = context.get("lead_usage") if isinstance(context.get("lead_usage"), dict) else {}
     usage = context.get("worker_usage") if isinstance(context.get("worker_usage"), dict) else {}
     named = [(str(lead.get("model") or "lead"), lead)] + [(str(name), entry) for name, entry in usage.items()
                                                            if isinstance(entry, dict)]
     costs = [_cost(part.get("estimated_cost_usd")) for _, part in named]
-    unpriced = sorted({name for (name, part), cost in zip(named, costs, strict=True) if cost is None and _has_tokens(part)})
+    unpriced = sorted({name for (name, part), cost in zip(named, costs, strict=True) if not _priced(part, cost)})
     known = [cost for cost in costs if cost is not None]
     return (round(sum(known), 6) if known else None), unpriced
 

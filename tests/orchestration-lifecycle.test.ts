@@ -1184,13 +1184,14 @@ test("the lead's own Pi-reported message cost is forwarded only when valid", asy
   await h.handlers.get("before_agent_start")!({ prompt: "PI_ORCHESTRATION_RUN_V1" });
   await h.handlers.get("turn_start")!({ turnIndex: 0 });
   const ended = (timestamp: number, cost: unknown) => h.handlers.get("message_end")!({ message: { role: "assistant",
-    provider: "openai-codex", model: "gpt-6.1-sol", timestamp, usage: { input: 10, output: 2, totalTokens: 12, cost } } });
+    provider: "openai-codex", model: "gpt-6.1-sol", timestamp, usage: { input: 10, output: 2, totalTokens: 12, cacheWrite: 7, cost } } });
   await ended(1, { total: 0.0125 });
   await ended(2, undefined);
   await ended(3, { total: -1 });
   const lead = h.parentCalls("event").filter((call) => call.input?.kind === "lead_usage").map((call) => call.input!);
   assert.equal(lead.length, 3);
   assert.equal(lead[0].estimated_cost_usd, 0.0125);
+  assert.equal(lead[0].cache_write_tokens, 7);
   assert.equal("estimated_cost_usd" in lead[1], false);
   assert.equal("estimated_cost_usd" in lead[2], false);
 });
@@ -1211,7 +1212,7 @@ test("worker usage telemetry is recorded from backend results only", async () =>
   await startRun(h, "/work/examplelab");
   await h.handlers.get("tool_call")!({ toolName: "spawn_subagent", toolCallId: "s1", input: { task: "x" } });
   await h.handlers.get("tool_result")!({ toolName: "spawn_subagent", toolCallId: "s1", input: {}, content: [],
-    details: { subagent_id: "a-1", elapsedMs: 1500, usage: { input: 900, output: 120, cacheRead: 300 } } });
+    details: { subagent_id: "a-1", elapsedMs: 1500, usage: { input: 900, output: 120, cacheRead: 300, cacheWrite: 40 } } });
   const call = { toolName: "AskClaude", toolCallId: "c1", input: { model: "anthropic/claude-opus-5-5", prompt: "x" } };
   await h.handlers.get("tool_call")!(call);
   await h.handlers.get("tool_result")!({ toolName: "AskClaude", toolCallId: "c1", input: {}, content: [],
@@ -1219,7 +1220,7 @@ test("worker usage telemetry is recorded from backend results only", async () =>
   const usage = h.calls.filter((item) => item.input?.kind === "usage").map((item) => item.input);
   assert.deepEqual(usage, [
     { kind: "usage", backend: "pi-subagent", duration_ms: 1500, input_tokens: 900, output_tokens: 120,
-      cached_tokens: 300, total_tokens: null },
+      cached_tokens: 300, total_tokens: null, cache_write_tokens: 40 },
     { kind: "usage", backend: "claude-code", duration_ms: 4200 },
   ]);
 });

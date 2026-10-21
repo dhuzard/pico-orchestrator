@@ -401,7 +401,7 @@ class Controls:
         expected = self._confirm("schedule", dispatch, interrupted if resume else [], allow_mutation,
                                  observed_plan["max_parallel"], mutating, bool(budget and budget["exhausted"]))
         if confirm is None:
-            launchable = bool(dispatch) and not (budget and budget["exhausted"])
+            launchable = bool(dispatch) and not (budget and (budget["exhausted"] or budget["incomplete"]))
             return {"ok": launchable or bool(resume and interrupted), "stage": "preview", "confirm": expected,
                     "preview": {"dispatch": dispatch, "resume": interrupted if resume else [], "budget": budget,
                                 "interrupted": interrupted, "cap": observed_plan["max_parallel"],

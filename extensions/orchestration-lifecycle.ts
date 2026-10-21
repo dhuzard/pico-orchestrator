@@ -841,7 +841,8 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
         await observe({ kind: "usage", backend: "pi-subagent",
           duration_ms: count(details.elapsedMs) ?? (started ? Date.now() - started : null),
           input_tokens: count(usage.input), output_tokens: count(usage.output),
-          cached_tokens: count(usage.cacheRead), total_tokens: count(usage.totalTokens) });
+          cached_tokens: count(usage.cacheRead), total_tokens: count(usage.totalTokens),
+          ...(count(usage.cacheWrite) === null ? {} : { cache_write_tokens: count(usage.cacheWrite) }) });
       }
     }
     if (result.toolName === "AskClaude") {
@@ -1190,6 +1191,7 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
       duration_ms: started === undefined ? null : Math.max(0, Date.now() - started),
       input_tokens: count(message.usage?.input), output_tokens: count(message.usage?.output),
       cached_tokens: count(message.usage?.cacheRead), total_tokens: count(message.usage?.totalTokens),
+      ...(count(message.usage?.cacheWrite) === null ? {} : { cache_write_tokens: count(message.usage?.cacheWrite) }),
       ...(typeof leadCost === "number" && Number.isFinite(leadCost) && leadCost >= 0 ? { estimated_cost_usd: leadCost } : {}) });
   });
 

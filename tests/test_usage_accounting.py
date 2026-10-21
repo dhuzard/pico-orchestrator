@@ -6,6 +6,7 @@ import json
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -45,9 +46,19 @@ class UsageTest(unittest.TestCase):
 
     def test_lead_without_cost_is_named_unpriced_and_tokenless_participants_are_ignored(self):
         tokens = usage.run_tokens(parent({"model": "openai-codex/gpt", "input_tokens": 9, "output_tokens": 1},
-                                         {"claude-code": {"invocations": 1, "duration_ms": 5}}))
+                                         {"claude-code": {"invocations": 0}}))
         self.assertEqual(tokens["unpriced"], ["openai-codex/gpt"])
         self.assertIsNone(tokens["estimated_cost_usd"])
+
+    def test_calls_with_no_counts_zero_cost_and_incomplete_flags_are_unpriced(self):
+        ask = {"invocations": 3, "duration_ms": 900}  # AskClaude records no tokens and no cost
+        self.assertEqual(usage.run_tokens(parent(workers={"claude-code": ask}))["unpriced"], ["claude-code"])
+        zero = {"invocations": 1, "input_tokens": 50, "output_tokens": 5, "estimated_cost_usd": 0}
+        self.assertEqual(usage.run_tokens(parent(workers={"claude-code": zero}))["unpriced"], ["claude-code"])
+        flagged = {"invocations": 2, "input_tokens": 5, "output_tokens": 5, "estimated_cost_usd": 0.4,
+                   "cost_complete": False}
+        self.assertEqual(usage.run_tokens(parent(workers={"claude-code": flagged}))["unpriced"], ["claude-code"])
+        self.assertTrue(usage.run_tokens(parent(workers={"claude-code": {**flagged, "cost_complete": True}}))["cost_complete"])
 
     def test_old_blocks_and_records_without_new_fields_still_sum(self):
         old = {"input_tokens": 10, "output_tokens": 5, "cached_tokens": 2, "total_tokens": None,
@@ -78,7 +89,7 @@ class RenderTest(unittest.TestCase):
         text = ws.render(result)
         self.assertIn("538,446 of 120,000 tokens", text)
         self.assertIn("$3.64 reported cost", text)
-        self.assertIn("cost excludes: openai-codex/gpt-6.1, pi-subagent", text)
+        self.assertIn("lower bound; cost excludes: openai-codex/gpt-6.1, pi-subagent", text)
         self.assertIn("launch gate", text)
         self.assertIn("can still overshoot", text)
 
@@ -88,6 +99,43 @@ class RenderTest(unittest.TestCase):
         text = ws.render({"workspace_id": "w", "status": "OK", "cap": 1, "tasks": [], "counts": {}, "budget": budget})
         self.assertNotIn("cost excludes", text)
         self.assertIn("launch gate", text)
+
+
+class InflightTest(unittest.TestCase):
+    def plan(self, base: Path) -> dict:
+        return {"workspace_id": "w", "budget": {"max_tokens": 100},
+                "repositories": [{"id": "r", "git_common_dir": str(base / "git")}],
+                "tasks": [{"id": "t1", "repository": "r"}]}
+
+    def test_missing_or_unreadable_execution_record_makes_the_budget_incomplete(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            plan = self.plan(base)
+            ids, problems = ws.inflight_usage(plan, {"t1"})
+            self.assertEqual(ids, [])
+            self.assertEqual(len(problems), 1)
+            state = ws.budget_state(plan, {"tasks": {}}, base, running={"t1"})
+            self.assertTrue(state["incomplete"])
+            self.assertIn("t1", state["incomplete_reasons"][0])
+            # Corrupt record: the loader's error is caught, not raised.
+            path = ws.workspace_run.headless_run.execution_path(base / "git", "w--t1")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("{not json")
+            self.assertEqual(len(ws.inflight_usage(plan, {"t1"})[1]), 1)
+
+    def test_found_run_id_is_cached_and_not_rediscovered(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            plan = self.plan(base)
+            path = ws.workspace_run.headless_run.execution_path(base / "git", "w--t1")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({"record_version": ws.workspace_run.headless_run.RECORD_VERSION,
+                                        "session_dir": str(base), "session_id": "s", "run_id": None}))
+            cache: dict = {}
+            with mock.patch.object(ws.workspace_run.headless_run, "discover_run_id", return_value="run-x") as found:
+                self.assertEqual(ws.inflight_usage(plan, {"t1"}, cache), (["run-x"], []))
+                self.assertEqual(ws.inflight_usage(plan, {"t1"}, cache), (["run-x"], []))
+            self.assertEqual(found.call_count, 1)
 
 
 if __name__ == "__main__":
