@@ -36,6 +36,7 @@ class InitProjectTest(unittest.TestCase):
         text = workflow.read_text(encoding="utf-8")
         self.assertIn("github-pr-create", text)
         self.assertIn("Refs #N", text)
+        self.assertIn("issue_reference", text)
         self.assertIn("trace --latest", text)
         self.assertIn("pico/batch-<n>", text)
         self.assertTrue(any("routing.yaml" in action for action in actions))
@@ -45,17 +46,23 @@ class InitProjectTest(unittest.TestCase):
         self.assertEqual(autonomy_policy.limits(self.tmp)["source"], "default")
         init_project.init_project(self.tmp)
         limits = autonomy_policy.limits(self.tmp)
-        self.assertEqual((limits["parallel_tasks"], limits["open_prs"], limits["pr_granularity"]), (3, 2, "batch"))
+        self.assertEqual((limits["parallel_tasks"], limits["open_prs"], limits["pr_granularity"],
+                          limits["issue_reference"]), (3, 2, "batch", "refs"))
         policy = self.tmp / ".pi" / "autonomy.yaml"
-        # Files written before pr_granularity/open_prs existed keep validating with defaults.
+        # Files written before pr_granularity/open_prs/issue_reference existed keep validating with defaults.
         legacy = "\n".join(line for line in policy.read_text(encoding="utf-8").splitlines()
-                           if not line.startswith(("pr_granularity", "  open_prs")))
+                           if not line.startswith(("pr_granularity", "  open_prs", "issue_reference")))
         policy.write_text(legacy.replace("parallel_tasks: 3", "parallel_tasks: 5"), encoding="utf-8")
         limits = autonomy_policy.limits(self.tmp)
-        self.assertEqual((limits["parallel_tasks"], limits["open_prs"], limits["pr_granularity"]), (5, 2, "batch"))
+        self.assertEqual((limits["parallel_tasks"], limits["open_prs"], limits["pr_granularity"],
+                          limits["issue_reference"]), (5, 2, "batch", "refs"))
+        policy.write_text(legacy + "\nissue_reference: closes\n", encoding="utf-8")
+        self.assertEqual(autonomy_policy.limits(self.tmp)["issue_reference"], "closes")
+        for invalid in ("\npr_granularity: per_commit\n", "\nissue_reference: fixes\n"):
+            policy.write_text(legacy + invalid, encoding="utf-8")
+            with self.assertRaises(autonomy_policy.AutonomyPolicyError):
+                autonomy_policy.limits(self.tmp)
         policy.write_text(legacy + "\npr_granularity: per_commit\n", encoding="utf-8")
-        with self.assertRaises(autonomy_policy.AutonomyPolicyError):
-            autonomy_policy.limits(self.tmp)
         result = subprocess.run([sys.executable, str(REPO_ROOT / "tools" / "autonomy_policy.py"), "limits",
                                  "--worktree", str(self.tmp)], capture_output=True, text=True)
         self.assertEqual(result.returncode, 1)

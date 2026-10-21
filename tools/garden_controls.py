@@ -142,7 +142,7 @@ class Controls:
         repositories = []
         for repo in plan["repositories"]:
             item = {"id": repo["id"], "repository": repo["repository"], "base_branch": repo.get("base_branch", "main"),
-                    "source": None, "profile": None, "pr_granularity": None, "permissions": {}, "merge_enabled": None,
+                    "source": None, "profile": None, "pr_granularity": None, "issue_reference": None, "permissions": {}, "merge_enabled": None,
                     "limits": {}, "error_code": None}
             checkout = Path(repo["resolved_path"]) if repo.get("resolved_path") else None
             path = autonomy_policy.policy_path(checkout) if checkout else None
@@ -150,6 +150,7 @@ class Controls:
                 item["error_code"] = repo.get("blocker_code") or "WORKSPACE_REPOSITORY_PATH_MISSING"
             elif not path.is_file():
                 item["source"] = "default (no .pi/autonomy.yaml)"
+                item["issue_reference"] = autonomy_policy.DEFAULTS["issue_reference"]
                 item["permissions"] = {name: False for name in PERMISSIONS}
                 item["merge_enabled"] = False
                 item["limits"] = {k: v for k, v in autonomy_policy.DEFAULTS.items() if isinstance(v, int)}
@@ -164,6 +165,8 @@ class Controls:
                     permissions = policy.get("permissions") or {}
                     item.update({"source": ".pi/autonomy.yaml", "profile": policy.get("profile"),
                                  "pr_granularity": policy.get("pr_granularity", "batch"),
+                                 "issue_reference": policy.get("issue_reference",
+                                                               autonomy_policy.DEFAULTS["issue_reference"]),
                                  "permissions": {name: permissions.get(name) is True for name in PERMISSIONS},
                                  "merge_enabled": (permissions.get("merge") or {}).get("enabled") is True,
                                  "limits": {k: v for k, v in (policy.get("limits") or {}).items() if isinstance(v, int)}})

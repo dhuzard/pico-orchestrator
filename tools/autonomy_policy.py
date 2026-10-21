@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Read a target repository's `.pi/autonomy.yaml` execution-authority limits.
 
-The parent orchestrator reads three values from it:
+The parent orchestrator reads four values from it:
 
 - `limits.parallel_tasks`: the most routed tasks one wave may run at once
   (`orchestration_record` `declare_wave` rejects larger waves with
@@ -9,7 +9,9 @@ The parent orchestrator reads three values from it:
 - `limits.open_prs`: the most open batch PRs before new batches stack on the
   newest batch branch instead of opening another PR;
 - `pr_granularity`: `batch` (one push and one PR per integrated wave batch) or
-  `task` (one PR per task).
+  `task` (one PR per task);
+- `issue_reference`: `refs` (PR bodies say `Refs #N`, which never closes the
+  issue) or `closes` (`Closes #N`, so the issue closes when the PR merges).
 
 A repository without the file gets the defaults below. A file that exists but
 does not validate against `schemas/autonomy.schema.json` fails closed with
@@ -30,7 +32,7 @@ import yaml
 ROOT = Path(__file__).resolve().parent.parent
 SCHEMA_PATH = ROOT / "schemas" / "autonomy.schema.json"
 RELATIVE_PATH = Path(".pi") / "autonomy.yaml"
-DEFAULTS = {"parallel_tasks": 3, "open_prs": 2, "pr_granularity": "batch"}
+DEFAULTS = {"parallel_tasks": 3, "open_prs": 2, "pr_granularity": "batch", "issue_reference": "refs"}
 
 
 class AutonomyPolicyError(Exception):
@@ -70,7 +72,8 @@ def limits(worktree: Path) -> dict:
     return {"ok": True, "source": str(RELATIVE_PATH),
             "parallel_tasks": configured.get("parallel_tasks", DEFAULTS["parallel_tasks"]),
             "open_prs": configured.get("open_prs", DEFAULTS["open_prs"]),
-            "pr_granularity": data.get("pr_granularity", DEFAULTS["pr_granularity"])}
+            "pr_granularity": data.get("pr_granularity", DEFAULTS["pr_granularity"]),
+            "issue_reference": data.get("issue_reference", DEFAULTS["issue_reference"])}
 
 
 def main() -> int:
