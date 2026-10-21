@@ -31,6 +31,14 @@ All notable changes to PICO are recorded here. The format follows
   integrated wave has covered since (`phase.workspace_bound`, checked per task so a missing
   wave record cannot hide it; `phase.bound_epochs` keeps the route epochs that bound one, so
   an escalation does not forget the old route's worktree); read-only tasks do not block it.
+- Only a mutating step starts an implicit wave, and only when its task has no open wave in the
+  current route epoch: a read-only specifier or reviewer never adds one, so after integration
+  the phase keeps pointing at the integrated wave. A task that mutates again after integration
+  starts a new wave.
+- `benchmark_metrics.py --compare` matches waves by their task set and route epoch (raw ids kept
+  as `ids` metadata) and integrate facts by that key, so `wave-1` and `auto-...` are the same
+  wave. Phases with no route, workers or wave (like `inspection`) are listed under
+  "Dropped optional phases" (`provenance.dropped_optional_phases`) instead of as missing facts.
 - A failed Claude step whose retry succeeded is now `completed`: after the last failure the
   same step must have started again on the same route and returned without error. The
   failure stays in `worker_overrides` (`by` `extension` or `lead`, `reason`

@@ -88,14 +88,14 @@ function harness(preflight: Record<string, unknown>, failEvent = false, verifyOk
 }
 
 const CODEX_HIGH = "openai-codex/gpt-6.1-sol";
-function routeFor(id: string, options: { workerMutation?: "allowed" | "forbidden"; specifierEffort?: string;
+function routeFor(id: string, options: { workerMutation?: "allowed" | "forbidden"; specifierMutation?: "allowed"; specifierEffort?: string;
   reviewerEffort?: string; specifierTier?: string } = {}) {
   return {
     toolName: "route_task",
     toolCallId: `route-${id}`,
     details: { result: { ok: true, classification: { base: { id } },
       selected_route: "CODEX_CLAUDE_CODEX", policy_version: 7,
-      execution_plan: { steps: [{ id: "codex_specifier", family: "codex", mutation_permission: "forbidden" },
+      execution_plan: { steps: [{ id: "codex_specifier", family: "codex", mutation_permission: options.specifierMutation ?? "forbidden" },
         { id: "claude_worker", family: "claude", mutation_permission: options.workerMutation ?? "forbidden" },
         { id: "codex_reviewer", family: "codex", mutation_permission: "forbidden" }] },
       capacity_assignments: [
@@ -1787,16 +1787,28 @@ test("the prompts no longer ask for directive, feedback, or optional phase event
   }
 });
 
+/**
+ * Route tasks whose Codex specifier mutates and bind a worktree for each: only a mutating step starts an
+ * implicit wave, so these tests need one. Task text names the worktree, as a mutating Codex contract must.
+ */
+async function routeMutating(h: ReturnType<typeof harness>, ids: string[], extra: { workerMutation?: "allowed" } = {}) {
+  for (const id of ids) {
+    await h.handlers.get("tool_result")!(routeFor(id, { specifierMutation: "allowed", ...extra }));
+    await h.tools.get("orchestration_record").execute("b", { action: "bind_workspace", task_id: id,
+      step_id: "codex_specifier", path: `/tmp/wt-${id}` });
+  }
+}
+const wtTask = (label: string) => `work in /tmp/wt-${label.split(":")[0]}`;
+
 test("gates still hold with implicit waves: concurrency, bind, bracket, and parent checkout", async () => {
   const dir = realpathSync(mkdtempSync(join(tmpdir(), "pico-implicit-gates-")));
   try {
     const h = harness({ ok: true, status: "READY" }, false, true, { executable: fakeClaude(dir) });
     await h.handlers.get("before_agent_start")!({ prompt: "PI_ORCHESTRATION_RUN_V1" }, { cwd: dir, ui: { notify() {} } });
     const record = h.tools.get("orchestration_record");
-    await h.handlers.get("tool_result")!(routeFor("A", { workerMutation: "allowed" }));
-    await h.handlers.get("tool_result")!(routeFor("B", { workerMutation: "allowed" }));
+    await routeMutating(h, ["A", "B"], { workerMutation: "allowed" });
     const waves = () => h.calls.filter((call) => call.input?.kind === "wave");
-    const spawn = (id: string, label: string) => ({ toolName: "spawn_subagent", toolCallId: id, input: { task: "t", label } });
+    const spawn = (id: string, label: string) => ({ toolName: "spawn_subagent", toolCallId: id, input: { task: wtTask(label), label } });
     const done = (id: string) => h.handlers.get("tool_result")!({ toolName: "spawn_subagent", toolCallId: id, content: [],
       details: { subagent_id: `sub-${id}` } });
     // No integration of an unknown wave, and a mutating step is unbound until the lead binds it.
@@ -1836,13 +1848,13 @@ test("a refused implicit wave is diagnosed, records nothing, and never blocks th
   const h = harness({ ok: true, status: "READY" }, false, true,
     { waveEventResult: { ok: false, error_code: "PARENT_WAVE_TRANSITION_INVALID" } });
   await h.handlers.get("before_agent_start")!({ prompt: "PI_ORCHESTRATION_RUN_V1" }, { cwd: "/tmp/target", ui: { notify() {} } });
-  await h.handlers.get("tool_result")!(routeFor("A"));
+  await routeMutating(h, ["A"]);
   const quiet = process.stderr.write;
   process.stderr.write = (() => true) as typeof process.stderr.write;
   try {
     for (const id of ["a1", "a2"]) {
       assert.equal(await h.handlers.get("tool_call")!({ toolName: "spawn_subagent", toolCallId: id,
-        input: { task: "t", label: "A:codex_specifier" } }), undefined);
+        input: { task: wtTask("A"), label: "A:codex_specifier" } }), undefined);
       await h.handlers.get("tool_result")!({ toolName: "spawn_subagent", toolCallId: id, content: [], details: { subagent_id: id } });
     }
   } finally { process.stderr.write = quiet; }
@@ -1898,17 +1910,17 @@ test("resume after an interruption starts a fresh implicit wave without conflict
   const first = harness({ ok: true, status: "READY" }, false, true, { entries });
   await first.handlers.get("session_start")!({ reason: "startup" }, context);
   await first.handlers.get("before_agent_start")!({ prompt: "PI_ORCHESTRATION_RUN_V1" }, context);
-  await first.handlers.get("tool_result")!(routeFor("A"));
+  await routeMutating(first, ["A"]);
   assert.equal(await first.handlers.get("tool_call")!({ toolName: "spawn_subagent", toolCallId: "a1",
-    input: { task: "t", label: "A:codex_specifier" } }), undefined);
+    input: { task: wtTask("A"), label: "A:codex_specifier" } }), undefined);
   // The process dies with the worker in flight; the session is resumed in a new process.
   await first.handlers.get("session_shutdown")!({ reason: "reload" });
   const resumed = harness({ ok: true, status: "READY" }, false, true, { entries });
   await resumed.handlers.get("session_start")!({ reason: "startup" }, context);
   assert.equal((await resumed.tools.get("orchestration_record").execute("s", { action: "status" })).details.ok, true);
-  await resumed.handlers.get("tool_result")!(routeFor("A"));
+  await routeMutating(resumed, ["A"]);
   assert.equal(await resumed.handlers.get("tool_call")!({ toolName: "spawn_subagent", toolCallId: "a2",
-    input: { task: "t", label: "A:codex_specifier" } }), undefined);
+    input: { task: wtTask("A"), label: "A:codex_specifier" } }), undefined);
   const wave = resumed.calls.find((call) => call.input?.kind === "wave");
   assert.deepEqual(wave?.input?.task_ids, ["A"]);
   assert.equal((await resumed.tools.get("orchestration_record").execute("s", { action: "status" })).details.ok, true);
@@ -1922,12 +1934,12 @@ test("resume after an interruption starts a fresh implicit wave without conflict
 
 const done = (h: ReturnType<typeof harness>, id: string, text = "ok") => h.handlers.get("tool_result")!({
   toolName: "spawn_subagent", toolCallId: id, content: [{ type: "text", text }], details: { subagent_id: `sub-${id}` } });
-const spawnCall = (id: string, label: string) => ({ toolName: "spawn_subagent", toolCallId: id, input: { task: "t", label } });
+const spawnCall = (id: string, label: string) => ({ toolName: "spawn_subagent", toolCallId: id, input: { task: wtTask(label), label } });
 
 test("implicit waves are one per task and never let tasks overlap; auto needs exactly one open", async () => {
   const h = harness({ ok: true, status: "READY" });
   await h.handlers.get("before_agent_start")!({ prompt: "PI_ORCHESTRATION_RUN_V1" }, { cwd: "/tmp/target", ui: { notify() {} } });
-  for (const id of ["A", "B"]) await h.handlers.get("tool_result")!(routeFor(id));
+  await routeMutating(h, ["A", "B"]);
   const record = h.tools.get("orchestration_record");
   // The reviewer's interleaving: specifier A, specifier B, then both reviewers at once.
   for (const [id, label] of [["a1", "A:codex_specifier"], ["b1", "B:codex_specifier"]]) {
@@ -1966,11 +1978,12 @@ test("an unintegrated wave of a mutating task refuses COMPLETED; the contract go
     const h = harness({ ok: true, status: "READY" }, false, true, { executable: fakeClaude(dir) });
     await h.handlers.get("before_agent_start")!({ prompt: "PI_ORCHESTRATION_RUN_V1" }, { cwd: dir, ui: { notify() {} } });
     const record = h.tools.get("orchestration_record");
-    await h.handlers.get("tool_result")!(routeFor("A", { workerMutation: "allowed" }));
+    await h.handlers.get("tool_result")!(routeFor("A", { workerMutation: "allowed", specifierMutation: "allowed" }));
     const workspace = join(dir, "wt");
     mkdirSync(workspace);
     await record.execute("b", { action: "bind_workspace", task_id: "A", step_id: "claude_worker", path: workspace });
-    const contract = `[pico-task A:codex_specifier]\nGoal: Find the race in the save path.\nContext: ${"boilerplate ".repeat(40)}`;
+    await record.execute("b", { action: "bind_workspace", task_id: "A", step_id: "codex_specifier", path: workspace });
+    const contract = `[pico-task A:codex_specifier]\nGoal: Find the race in the save path.\nContext: ${"boilerplate ".repeat(40)} ${workspace}`;
     assert.equal(await h.handlers.get("tool_call")!({ toolName: "spawn_subagent", toolCallId: "g1",
       input: { task: contract, label: "A:codex_specifier" } }), undefined);
     await done(h, "g1");
@@ -1996,7 +2009,7 @@ test("an unintegrated wave of a mutating task refuses COMPLETED; the contract go
 test("a declared wave after an implicit one supersedes it; auto then refuses clearly", async () => {
   const h = harness({ ok: true, status: "READY" });
   await h.handlers.get("before_agent_start")!({ prompt: "PI_ORCHESTRATION_RUN_V1" }, { cwd: "/tmp/target", ui: { notify() {} } });
-  for (const id of ["A", "B", "C", "D"]) await h.handlers.get("tool_result")!(routeFor(id));
+  await routeMutating(h, ["A", "B", "C", "D"]);
   const record = h.tools.get("orchestration_record");
   assert.equal(await h.handlers.get("tool_call")!(spawnCall("a1", "A:codex_specifier")), undefined);
   await done(h, "a1");
@@ -2020,4 +2033,35 @@ test("a declared wave after an implicit one supersedes it; auto then refuses cle
   assert.deepEqual(replayed.errors, []);
   assert.deepEqual(replayed.parent.waves.map((wave: any) => wave.status), ["abandoned", "integrated", "integrated"]);
   assert.deepEqual(replayed.parent.reconciled.filter((entry: any) => entry.kind === "wave").map((entry: any) => entry.from_status), ["declared"]);
+});
+
+test("a read-only reviewer after integration adds no wave: one integrated wave, and the phase points at it", async () => {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "pico-no-stray-wave-")));
+  try {
+    const h = harness({ ok: true, status: "READY" }, false, true, { executable: fakeClaude(dir) });
+    await h.handlers.get("before_agent_start")!({ prompt: "PI_ORCHESTRATION_RUN_V1" }, { cwd: dir, ui: { notify() {} } });
+    const record = h.tools.get("orchestration_record");
+    await h.handlers.get("tool_result")!(routeFor("A", { workerMutation: "allowed" }));
+    const workspace = join(dir, "wt");
+    mkdirSync(workspace);
+    await record.execute("b", { action: "bind_workspace", task_id: "A", step_id: "claude_worker", path: workspace });
+    // A read-only specifier first: no wave. The mutating Claude worker starts the task's one wave.
+    assert.equal(await h.handlers.get("tool_call")!(spawnCall("s1", "A:codex_specifier")), undefined);
+    await done(h, "s1");
+    assert.equal(h.calls.filter((call) => call.input?.kind === "wave").length, 0);
+    assert.equal((await claudeWorkerRun(h, "c1", { prompt: "[pico-task A:claude_worker] implement" })).guard, undefined);
+    assert.equal((await record.execute("i", { action: "integrate_begin", wave_id: "auto" })).details.ok, true);
+    assert.equal((await record.execute("i", { action: "integrate_end", wave_id: "auto" })).details.ok, true);
+    // The read-only reviewer after integration: still one wave.
+    assert.equal(await h.handlers.get("tool_call")!(spawnCall("r1", "A:codex_reviewer")), undefined);
+    await done(h, "r1");
+    const replayed = replay(eventsOf(h), null);
+    assert.deepEqual(replayed.errors, []);
+    const { waves, phases } = replayed.parent;
+    assert.deepEqual(waves.map((wave: any) => [wave.task_ids, wave.status]), [[["A"], "integrated"]]);
+    assert.equal(phases[0].wave_id, waves[0].id);
+    // The task mutating again after integration starts a new wave.
+    assert.equal((await claudeWorkerRun(h, "c2", { prompt: "[pico-task A:claude_worker] repair" })).guard, undefined);
+    assert.equal(replay(eventsOf(h), null).parent.waves.length, 2);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });

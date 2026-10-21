@@ -371,6 +371,9 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
   // Implicit single-task waves (one per task) recorded in this process and not yet integrated. They never
   // allow concurrency; "auto" needs exactly one.
   const implicitOpen = new Map<string, string[]>();
+  // Route epoch (escalations seen) of each task, and the epoch each implicit wave was recorded in.
+  const routeEpochs = new Map<string, number>();
+  const implicitEpoch = new Map<string, number>();
   let integrating: string | null = null;
   let batchStart = 0;
   let batchPeak = 0;
@@ -538,7 +541,7 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
   function resetRunState(): void {
     approvals.clear(); pendingRoutes.clear(); workspaces.clear(); snapshots.clear();
     subagentTasks.clear(); inFlight.clear(); claudeCalls.clear(); workerPlans.clear();
-    scopeViolation = null; activeWave = null; integrating = null; implicitOpen.clear(); lastPhase = "routing";
+    scopeViolation = null; activeWave = null; integrating = null; implicitOpen.clear(); routeEpochs.clear(); implicitEpoch.clear(); lastPhase = "routing";
     currentTurn = null; messageStarts.clear();
     batchStart = 0; batchPeak = 0;
     pendingReroutes.clear();
@@ -901,8 +904,12 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
       snapshots.set(call.toolCallId, before);
       // A routed task started while no worker runs and no wave is declared is a single-task wave: record it
       // here so the lead need not. Concurrent work still needs the lead's declare_wave (gate above).
-      if (taskId && approval && inFlight.size === 0 && activeWave === null &&
-          ![...implicitOpen.values()].some((members) => members.includes(taskId))) await recordImplicitWave(taskId);
+      // Only a mutating step starts one, and only when the task has no open wave in its current route epoch:
+      // a read-only step (specifier, reviewer) never adds a wave, so after integration the phase keeps pointing
+      // at the integrated wave. A task that mutates again after integration starts a new one.
+      if (taskId && approval && step?.mode === "full" && inFlight.size === 0 && activeWave === null &&
+          ![...implicitOpen].some(([id, members]) => members.includes(taskId)
+            && implicitEpoch.get(id) === (routeEpochs.get(taskId) ?? 0))) await recordImplicitWave(taskId);
       if (inFlight.size === 0) batchStart = Date.now();
       inFlight.set(call.toolCallId, { taskId, stepId: step?.id ?? null, tool: call.toolName,
         phase: workerPlans.get(call.toolCallId)?.phase });
@@ -1137,6 +1144,7 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
       { kind: "wave", wave_id: id, task_ids: [taskId], status: "declared" });
     if (result.ok === false) { diagnose("telemetry", result); return; }
     implicitOpen.set(id, [taskId]);
+    implicitEpoch.set(id, routeEpochs.get(taskId) ?? 0);
   }
 
   async function declareWave(waveId: string, tasks: { task_id: string; write_scope: string[] }[]) {
@@ -1177,7 +1185,9 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
     }
     activeWave = { id: waveId, tasks: new Map(tasks.map((task) => [task.task_id, task.write_scope])) };
     // An implicit wave whose tasks all joined this wave is superseded; any other stays open and visible.
-    for (const [id, members] of implicitOpen) if (members.every((task) => ids.includes(task))) implicitOpen.delete(id);
+    for (const [id, members] of implicitOpen) {
+      if (members.every((task) => ids.includes(task))) { implicitOpen.delete(id); implicitEpoch.delete(id); }
+    }
     return reply(true, `Wave ${waveId} declared with ${ids.length} task(s) (limit ${limit}). Launch all their ready workers in one tool batch, each attributed "<task_id>:<step_id>".`,
       { wave_id: waveId, task_ids: ids, parallel_tasks: limit });
   }
@@ -1217,6 +1227,7 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
     }
     integrating = null;
     implicitOpen.delete(waveId);
+    implicitEpoch.delete(waveId);
     if (activeWave?.id === waveId) activeWave = null;
     return reply(true, `Wave ${waveId} integrated; the parent checkout snapshot is re-based. Plan the next dependency-ready wave.`,
       { wave_id: waveId, digest: rebased.digest });
@@ -1314,6 +1325,7 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
       if (params.action === "event" && params.event.kind === "escalation" && ok) {
         parentFailure = null; parentBlocked = false;
         pendingReroutes.add(params.event.phase);
+        routeEpochs.set(params.event.phase, (routeEpochs.get(params.event.phase) ?? 0) + 1);
         approvals.delete(params.event.phase);
         for (const key of workspaces.keys()) {
           if (key.startsWith(`${params.event.phase}\u0000`)) workspaces.delete(key);

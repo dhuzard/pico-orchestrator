@@ -330,8 +330,51 @@ class ProvenanceDiff(unittest.TestCase):
         self.assertEqual(found, {
             ("phase", ("t1",), "absent"), ("worker", ("t1", "impl", "0"), "absent"),
             ("worker", ("t2", "impl", "0"), "differs"),
-            ("integrate", ("w1", "begin"), "absent"), ("integrate", ("w1", "end"), "absent"),
+            ("integrate", ("t1,t2", "0", "begin"), "absent"), ("integrate", ("t1,t2", "0", "end"), "absent"),
             ("finish", ("run",), "differs")})
+
+    def test_waves_match_by_task_set_not_id_and_integrate_facts_follow(self):
+        before = make_record("run-a", waves=[{"id": "wave-1", "task_ids": ["t1", "t2"], "status": "integrated"}])
+        after = make_record("run-b", waves=[{"id": "auto-1f2e3d4c-t1", "task_ids": ["t2", "t1"], "status": "integrated"}])
+        for phase in after["parent_orchestration"]["phases"]:
+            phase["wave_id"] = "auto-1f2e3d4c-t1"
+        self.assertEqual(bm.provenance_diff(before, after), [])
+        facts = {(f["category"], tuple(f["key"])): f for f in bm.provenance_facts(after)}
+        self.assertEqual(facts[("wave", ("t1,t2", "0"))]["ids"], ["auto-1f2e3d4c-t1"])  # raw id kept as metadata
+        # A wave that never reached integration is still missing its begin/end, whatever its id.
+        after["parent_orchestration"]["waves"][0]["status"] = "declared"
+        self.assertEqual({(m["category"], tuple(m["key"])) for m in bm.provenance_diff(before, after)},
+                         {("integrate", ("t1,t2", "0", "begin")), ("integrate", ("t1,t2", "0", "end"))})
+        # A different task set is a different wave: its absence is reported.
+        other = make_record("run-c", waves=[{"id": "w9", "task_ids": ["t1"], "status": "integrated"}])
+        self.assertIn(("wave", ("t1,t2", "0")), {(m["category"], tuple(m["key"])) for m in bm.provenance_diff(before, other)})
+
+    def test_two_waves_for_one_task_set_count_once_at_the_furthest_status(self):
+        before = make_record("run-a", waves=[{"id": "w", "task_ids": ["t1"], "status": "integrated"}])
+        after = make_record("run-b", waves=[{"id": "auto-a", "task_ids": ["t1"], "status": "integrated"},
+                                            {"id": "auto-b", "task_ids": ["t1"], "status": "declared"}])
+        self.assertEqual([m for m in bm.provenance_diff(before, after) if m["category"] in {"wave", "integrate"}], [])
+
+    def test_optional_phase_without_route_workers_or_wave_is_dropped_not_missing(self):
+        optional = {"id": "inspection", "status": "completed", "route": None, "blocker_code": None, "workers": []}
+        before = make_record("run-a")
+        before["parent_orchestration"]["phases"].insert(0, optional)
+        after = make_record("run-b")
+        self.assertEqual([(m["category"], m["key"]) for m in bm.provenance_diff(before, after)], [("phase", ["inspection"])])
+        with tempfile.TemporaryDirectory() as tmp:
+            b, a = Path(tmp) / "b", Path(tmp) / "a"
+            write_state(b, {"run-a": before})
+            write_state(a, {"run-b": after})
+            result = bm.compare(bm.runs_report(b, ["run-a"]), bm.runs_report(a, ["run-b"]))
+        prov = result["provenance"]
+        self.assertTrue(prov["complete"])
+        self.assertEqual(prov["missing"], [])
+        self.assertEqual([m["key"] for m in prov["dropped_optional_phases"]], [["inspection"]])
+        self.assertIn("Dropped optional phases", bm.render_compare(result))
+        # A phase that had a worker, a route or a wave is not optional.
+        routed = {"id": "inspection", "status": "completed", "route": "CODEX", "blocker_code": None, "workers": []}
+        before["parent_orchestration"]["phases"][0] = routed
+        self.assertEqual(bm.split_dropped_optional(bm.provenance_facts(before), bm.provenance_diff(before, after))[0], [])
 
     def test_extra_facts_in_after_are_not_missing(self):
         before, after = make_record("run-a"), make_record("run-b")
