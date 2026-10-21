@@ -472,8 +472,11 @@ def _lead_limit_event(parent: dict, event: dict) -> None:
             pinned = os.environ.get("PI_ORCHESTRATION_MAX_LEAD_CALLS")
             if previous and pinned and (pinned != str(maximum) or os.environ.get(
                     "PI_ORCHESTRATION_MAX_LEAD_CALLS_SOURCE", event["source"]) != event["source"]):
-                # The launcher pinned the limit in the environment: a later set that differs is not the extension's
-                # (a forged raise). Keep the recorded limit and record the refusal.
+                # The launcher pinned the limit in the environment: a later set that differs is probably not the
+                # extension's (a forged raise). Keep the recorded limit and record the refusal. This is best-effort
+                # only: the lead's bash inherits the environment and can override the variable. The authoritative
+                # resume check is the launcher's execution record (headless_run._launch_locked); an interactive run
+                # has no launcher record and therefore no exhausted check on resume.
                 previous.setdefault("refused_sets", []).append({"max_lead_calls": maximum, "source": event["source"]})
                 del previous["refused_sets"][:-10]
                 return
