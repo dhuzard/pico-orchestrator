@@ -647,9 +647,21 @@ class ExecutionTimeLimitTest(HeadlessFixture):
         self.assertEqual(record["max_duration_seconds"], finished["max_duration_seconds"])
 
     def test_a_waiting_launcher_enforces_the_limit_itself(self):
-        timer = threading.Timer(0.3, lambda: setattr(self.clock, "now", self.clock.now + 5))
+        # Pass the deadline only once the child has created its parent run: on a
+        # slow runner a fixed delay can fire before that, leaving no run to settle.
+        stop = threading.Event()
+
+        def expire():
+            deadline = time.monotonic() + 20
+            while not stop.is_set() and time.monotonic() < deadline:
+                if list((self.state / "runs").glob("run-*.json")):
+                    self.clock.now += 5
+                    return
+                time.sleep(0.05)
+
+        timer = threading.Thread(target=expire, daemon=True)
         timer.start()
-        self.addCleanup(timer.cancel)
+        self.addCleanup(stop.set)
         started = time.monotonic()
         record = self.start(behavior="hang", max_duration_seconds=1)
         self.assertLess(time.monotonic() - started, 5, "the launcher returned because of the limit, not the child's own end")
