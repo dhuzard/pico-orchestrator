@@ -175,6 +175,47 @@ class RecorderTest(StateTestCase):
         self.assertEqual(refused.exception.error_code, "RESUME_CHECKPOINT_DRIFT")
         self.assertEqual(self.parent(self.run_id)["final_status"], "IN_PROGRESS")
 
+    def test_a_stop_mid_integration_with_an_unchanged_head_refuses_the_resume(self):
+        self.limit(2, "task", 1)
+        self.event({"kind": "phase", "phase": "t1", "status": "in_progress"})
+        self.event({"kind": "wave", "wave_id": "w1", "task_ids": ["t1"], "status": "declared"})
+        self.event({"kind": "wave", "wave_id": "w1", "task_ids": ["t1"], "status": "integrating"})
+        self.calls(4)
+        self.event({"kind": "lead_call_limit_reached"})  # HEAD never moved; a conflicted file is in the tree
+        run_lease.release(self.run_id, self.owner, repo_root=self.records)
+        for attempt in ("owner-b", "owner-c"):
+            with self.assertRaises(po.ParentRunError) as refused:
+                po.resume(self.run_id, worktree=self.target, owner_id=attempt, pid=os.getpid(),
+                          explicit_repo="Examplecorp/examplelab", repo_root=self.records)
+            self.assertEqual(refused.exception.error_code, "RESUME_MID_INTEGRATION")
+            self.assertIsNone(run_lease.status(self.run_id, repo_root=self.records)["lease"], "the lease is released again")
+        self.assertEqual(self.parent(self.run_id)["final_status"], "IN_PROGRESS")
+        # The way out: finishing the run abandons the open wave (the work of `pico exec cancel`).
+        po.finish(self.run_id, "BLOCKED", blocker_code="EXECUTION_CANCELLED", owner_id="owner-c", repo_root=self.records)
+        self.assertEqual(self.parent(self.run_id)["waves"][0]["status"], "abandoned")
+
+    def test_a_crash_while_integrating_is_refused_too(self):
+        self.event({"kind": "phase", "phase": "t1", "status": "in_progress"})
+        self.event({"kind": "wave", "wave_id": "w1", "task_ids": ["t1"], "status": "declared"})
+        self.event({"kind": "wave", "wave_id": "w1", "task_ids": ["t1"], "status": "integrating"})
+        run_lease.release(self.run_id, self.owner, repo_root=self.records)
+        with self.assertRaises(po.ParentRunError) as refused:
+            po.resume(self.run_id, worktree=self.target, owner_id="owner-b", pid=os.getpid(),
+                      explicit_repo="Examplecorp/examplelab", repo_root=self.records)
+        self.assertIn(refused.exception.error_code, {"RESUME_MID_INTEGRATION", "RESUME_CHECKPOINT_DRIFT"})
+
+    def test_a_forged_raise_of_the_limit_is_refused_when_the_launcher_pinned_it(self):
+        with unittest.mock.patch.dict(os.environ, {"PI_ORCHESTRATION_MAX_LEAD_CALLS": "5",
+                                                   "PI_ORCHESTRATION_MAX_LEAD_CALLS_SOURCE": "cli"}):
+            self.limit(5, "cli", 4)
+            self.event({"kind": "lead_limit", "state": "set", "max_lead_calls": 9999, "source": "cli"})
+            self.event({"kind": "lead_limit", "state": "set", "max_lead_calls": 5, "source": "task"})
+            self.event({"kind": "lead_limit", "state": "set", "max_lead_calls": 5, "source": "cli"})  # the same pin: accepted
+        recorded = self.parent(self.run_id)["context"]["lead_call_limit"]
+        self.assertEqual((recorded["max_lead_calls"], recorded["source"]), (5, "cli"))
+        self.assertEqual(recorded["refused_sets"], [{"max_lead_calls": 9999, "source": "cli"},
+                                                    {"max_lead_calls": 5, "source": "task"}])
+
     def test_the_extensions_own_count_wins_over_lost_telemetry_and_survives_a_resume(self):
         self.limit(5, "cli", 4)
         self.calls(3)  # three lead_usage rows were recorded; the extension counted seven calls
@@ -341,6 +382,19 @@ class LeadLimitExecutionTest(HeadlessFixture):
         with self.assertRaises(hr.HeadlessError) as refused:
             self.start(behavior="leadlimit", resume=True)
         self.assertEqual(refused.exception.code, "LEAD_CALL_LIMIT_EXHAUSTED")
+        self.assertEqual(self.status()["launches"], 1)
+
+    def test_a_forged_raise_in_the_run_record_cannot_lift_the_exhausted_limit(self):
+        first = self.stopped()
+        owner = first["lease_owner"]
+        po.record_event(first["run_id"], {"kind": "lead_limit", "state": "set", "max_lead_calls": 9999, "source": "cli"},
+                        owner_id=owner)
+        forged = provenance.get_run(hr.ROOT, first["run_id"])["parent_orchestration"]["context"]["lead_call_limit"]
+        self.assertEqual(forged["max_lead_calls"], 9999, "the forgery landed in the run record")
+        for attempt in (None, 6):
+            with self.assertRaises(hr.HeadlessError) as refused:
+                self.start(behavior="leadlimit", resume=True, max_lead_calls=attempt)
+            self.assertEqual(refused.exception.code, "LEAD_CALL_LIMIT_EXHAUSTED")
         self.assertEqual(self.status()["launches"], 1)
 
     def test_a_run_that_was_never_limited_resumes_unlimited(self):

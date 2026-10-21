@@ -531,7 +531,11 @@ def _launch_locked(path: Path, *, worktree: Path, identity: str, common: Path, e
             save_record(path, record)
             return record
         run = record.get("run") or {}
-        exhausted = run.get("lead_call_limit") or {}
+        exhausted = dict(run.get("lead_call_limit") or {})
+        # The launcher's own record of the previous launch's limit is authoritative: the run record's limit can be
+        # rewritten by anything holding the run's owner id, this execution record cannot.
+        if type(record.get("max_lead_calls")) is int:
+            exhausted["max_lead_calls"] = record["max_lead_calls"]
         if (resume and run.get("status") == "IN_PROGRESS" and type(exhausted.get("calls")) is int
                 and type(exhausted.get("max_lead_calls")) is int and exhausted["calls"] >= exhausted["max_lead_calls"]
                 and (max_lead_calls is None or max_lead_calls <= exhausted["calls"])):

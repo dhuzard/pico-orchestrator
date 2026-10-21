@@ -369,7 +369,8 @@ def resume(run_id: str, *, worktree: Path, owner_id: str, pid: int | None = None
                     held.release()  # finished between the status read and the lease
                     return status(run_id, repo_root=repo_root)
                 verdict = _verify_checkpoint_unlocked(run_id, worktree, owner_id, repo_root)
-            if verdict["check"]["status"] != "verified":
+                mid_integration = _mid_integration(_parent(provenance.get_run(repo_root, run_id)))
+            if verdict["check"]["status"] != "verified" or mid_integration:
                 held.release()
             lease = held.lease
     except run_lease.LeaseError as exc:
@@ -383,6 +384,12 @@ def resume(run_id: str, *, worktree: Path, owner_id: str, pid: int | None = None
         raise ParentRunError(detail, error_code=check["reason_code"],
                              details={"expected": verdict["checkpoint"], "actual": verdict["live"],
                                       "mismatches": check["mismatches"], "run_status": "IN_PROGRESS"})
+    if mid_integration:
+        # HEAD may be unchanged while the tree holds a half-applied merge, so the checkpoint cannot prove it clean.
+        raise ParentRunError(
+            "a wave was mid-integration when the run stopped; the checkout may hold a half-applied merge. "
+            "Cancel the execution (`pico exec cancel`, which abandons the open wave) and start a new run",
+            error_code="RESUME_MID_INTEGRATION", details={"run_status": "IN_PROGRESS"})
     return {**current, "lease": lease, "checkpoint": verdict["checkpoint"]}
 
 
@@ -425,6 +432,12 @@ def lead_call_count(context: dict, event: dict | None = None) -> int:
     return max(seen)
 
 
+def _mid_integration(parent: dict) -> bool:
+    """The run stopped (or crashed) with a current wave integrating, or a lead-call stop recorded that it did."""
+    limit = (parent.get("context") or {}).get("lead_call_limit") or {}
+    return bool(limit.get("mid_integration")) or _integrating(parent)
+
+
 def _integrating(parent: dict) -> bool:
     phases = parent.get("phases") or []
     return any(wave.get("status") == "integrating" and _wave_is_current(phases, wave)
@@ -456,12 +469,22 @@ def _lead_limit_event(parent: dict, event: dict) -> None:
             if warn_at is not None and (type(warn_at) is not int or not 1 <= warn_at < maximum):
                 raise ParentRunError("invalid lead call warning threshold", error_code="LEAD_CALLS_WARN_AT_INVALID")
             previous = context.get("lead_call_limit") or {}
+            pinned = os.environ.get("PI_ORCHESTRATION_MAX_LEAD_CALLS")
+            if previous and pinned and (pinned != str(maximum) or os.environ.get(
+                    "PI_ORCHESTRATION_MAX_LEAD_CALLS_SOURCE", event["source"]) != event["source"]):
+                # The launcher pinned the limit in the environment: a later set that differs is not the extension's
+                # (a forged raise). Keep the recorded limit and record the refusal.
+                previous.setdefault("refused_sets", []).append({"max_lead_calls": maximum, "source": event["source"]})
+                del previous["refused_sets"][:-10]
+                return
             # A resume sets the limit again: the call count carries over, and a raised limit clears the stop.
             context["lead_call_limit"] = {
                 "max_lead_calls": maximum, "source": event["source"], "warn_at": warn_at,
                 "warned_at_call": previous.get("warned_at_call") if warn_at is not None and previous.get("warn_at") == warn_at else None,
                 "calls_at_limit": previous.get("calls_at_limit") if calls >= maximum else None,
-                "calls_seen": calls, "stopped": False, "stopped_reason": None, "mid_integration": False,
+                "calls_seen": calls, "stopped": False, "stopped_reason": None,
+                "mid_integration": bool(previous.get("mid_integration")),
+                **({"refused_sets": previous["refused_sets"]} if previous.get("refused_sets") else {}),
                 "calls_at_stop": previous.get("calls_at_stop")}
             return
         limit = context.get("lead_call_limit")

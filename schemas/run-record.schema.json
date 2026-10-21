@@ -910,6 +910,7 @@
                 "calls_seen": { "type": "integer", "minimum": 0, "description": "The lifecycle extension's own lead call count from its limit events; the run's count is the larger of this and the recorded lead_calls." },
                 "stopped": { "type": "boolean" },
                 "mid_integration": { "type": "boolean", "description": "The stop came while a wave was integrating: the pre-integration checkpoint was kept, so a resume reports drift and needs reconciliation." },
+                "refused_sets": { "type": "array", "maxItems": 10, "description": "Later limit settings that differed from the limit the launcher pinned and were refused (a forged raise).", "items": { "type": "object", "additionalProperties": false, "required": ["max_lead_calls", "source"], "properties": { "max_lead_calls": { "type": "integer" }, "source": { "type": "string" } } } },
                 "stopped_reason": { "enum": ["LEAD_CALL_LIMIT", null] },
                 "calls_at_stop": { "type": ["integer", "null"], "minimum": 0 }
               }

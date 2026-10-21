@@ -1839,11 +1839,11 @@ is blocked with a `LEAD_CALL_LIMIT` reason that says so. The lead may finish wit
 of 2 further calls and its chosen outcome is recorded as given (a non-COMPLETED finish is
 reconciled as usual, abandoning open work). If the lead has not finished by then, the extension
 stops the run without finishing it: it records any worker still in flight as `blocked`
-(`LEAD_CALL_LIMIT`), aborts worker handles and waits (bounded, 5 s) for them to settle, records `lead_call_limit_reached` (the recorder
+(`LEAD_CALL_LIMIT`), aborts worker handles and waits (bounded, 5 s) for them to settle (ClaudeWorker runs only: a Pi `spawn_subagent` has no abort handle here, so a subagent is not waited for), records `lead_call_limit_reached` (the recorder
 writes a fresh resume checkpoint with reason `lead_call_limit` and `stopped_reason:
 LEAD_CALL_LIMIT`, under the owner-checked write), releases the run lease through the owner
 path, and aborts the agent. The run stays `IN_PROGRESS`, the session marker stays active and
-later tool calls are refused. If a wave is `integrating` at the stop, the pre-integration checkpoint is kept and `mid_integration: true` recorded, so a resume reports drift (#40) and needs reconciliation. The headless execution ends `interrupted` with
+later tool calls are refused. If a wave is `integrating` at the stop, the pre-integration checkpoint is kept and `mid_integration: true` recorded, so a resume cannot proceed. `resume` itself refuses with `RESUME_MID_INTEGRATION` whenever `mid_integration` is recorded or any current wave is still `integrating` (a conflicted or half-merged tree can sit under an unchanged HEAD, which the checkpoint cannot show); the lease is released again and the run stays `IN_PROGRESS`. **The way out:** `pico exec cancel` (which finishes the run and, through #42, abandons the open wave), inspect or clean the checkout, then start a new run. The headless execution ends `interrupted` with
 `stop_reason: LEAD_CALL_LIMIT`. If the checkpoint cannot be written the run is not left
 resumable; it stays closed and the normal settle ends it.
 
@@ -1851,7 +1851,7 @@ resumable; it stays closed and the normal settle ends it.
 start --resume --max-lead-calls N` (or `--resume-interrupted` with a higher task/manifest
 limit, or a higher policy limit). The new limit must exceed the calls already made; the same,
 a lower, or no effective limit is refused before anything launches with `LEAD_CALL_LIMIT_EXHAUSTED`.
-The usual resume rules apply (lease claim, checkpoint verification; drift refuses), the new
+The check uses the limit in the launcher's own execution record (`max_lead_calls`), not the run record's, because the run record's limit can be rewritten by anything holding the run's owner id; when the launcher pinned the limit in the environment, the recorder also refuses a later `lead_limit set` that differs (recorded in `refused_sets`). The usual resume rules apply (lease claim, checkpoint verification; drift refuses), the new
 limit and source are recorded and the call count does not reset. Because the run is not terminal,
 a repeat `start` without `--resume` reports `resume_required`. If the wall-clock limit also
 fires (`EXECUTION_TIME_LIMIT`), the run is finished `BLOCKED` with that code as before and is
