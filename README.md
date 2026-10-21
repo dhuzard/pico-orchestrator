@@ -340,6 +340,9 @@ child runs, and optionally `max_cost_usd`). Once it is reached the scheduler
 launches nothing new and marks the remaining tasks **held by budget**; running
 children continue. The Garden shows spend against the budget. Reported cost
 comes only from Claude workers today, so the cost limit is a lower bound.
+A direct `pico workspace launch` is refused the same way
+(`WORKSPACE_BUDGET_EXHAUSTED`) unless you pass `--ignore-budget`, which is
+recorded as `budget_override` in the workspace record.
 
 **Schedule now…** previews which tasks will launch, the parallel cap and each
 repository's mutating permissions, and starts the scheduler in the background

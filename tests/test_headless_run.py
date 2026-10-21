@@ -244,6 +244,20 @@ class HeadlessRunTest(unittest.TestCase):
         self.assertEqual(self.status()["launches"], 1)
         self.assertNotIn("lease_takeovers", provenance.get_run(hr.ROOT, crashed["run_id"])["parent_orchestration"])
 
+    def test_budget_refusal_before_spawn_never_takes_or_leaks_a_lease(self):
+        crashed = self.start(behavior="crash")
+        before = run_lease.status(crashed["run_id"], repo_root=hr.ROOT)
+
+        def refuse():
+            raise hr.HeadlessError("WORKSPACE_BUDGET_EXHAUSTED", "budget spent")
+        with self.assertRaises(hr.HeadlessError) as refused:
+            self.start(behavior="finish", resume=True, takeover=True, before_spawn=refuse)
+        self.assertEqual(refused.exception.code, "WORKSPACE_BUDGET_EXHAUSTED")
+        after = run_lease.status(crashed["run_id"], repo_root=hr.ROOT)
+        self.assertEqual((after["state"], after["lease"]), (before["state"], before["lease"]))
+        self.assertNotIn("lease_takeovers", provenance.get_run(hr.ROOT, crashed["run_id"])["parent_orchestration"])
+        self.assertEqual(self.status()["launches"], 1)
+
     def test_failed_lease_handoff_stops_the_child_visibly(self):
         crashed = self.start(behavior="crash")
         real = run_lease.acquire

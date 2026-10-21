@@ -38,6 +38,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import atomic_io  # noqa: E402
 import headless_run  # noqa: E402
+import usage  # noqa: E402
 import workspace_plan  # noqa: E402
 
 RECORD_VERSION = 1
@@ -227,9 +228,31 @@ def _entry(record: dict, task: dict, repo: dict, execution: dict, inputs: dict |
     return entry
 
 
+def budget_state(plan: dict, record: dict | None = None, runs_dir: Path | None = None) -> dict | None:
+    """Spend against the manifest's budget, from the workspace's recorded child runs."""
+    budget = plan.get("budget")
+    if not budget:
+        return None
+    if record is None:
+        record = load_workspace(workspace_record_path(plan["workspace_id"])) or {}
+    used = usage.workspace_usage(runs_dir or headless_run.state_root() / "runs", record)
+    cost = used.get("estimated_cost_usd") or 0.0
+    reasons = []
+    if budget.get("max_tokens") is not None and used["spent_tokens"] >= budget["max_tokens"]:
+        reasons.append("tokens")
+    if budget.get("max_cost_usd") is not None and cost >= budget["max_cost_usd"]:
+        reasons.append("cost")
+    return {"max_tokens": budget.get("max_tokens"), "spent_tokens": used["spent_tokens"],
+            "max_cost_usd": budget.get("max_cost_usd"), "spent_cost_usd": round(cost, 6),
+            "runs": used["runs"], "exhausted": bool(reasons), "reasons": reasons}
+
+
 def launch(*, manifest: Path, task_id: str, allow_mutation: bool = False, resume: bool = False, wait: bool = True,
            access_check=headless_run.workspace_plan.gh_access, pi_executable: str = "pi",
-           takeover_stale_lease: bool = False) -> dict:
+           ignore_budget: bool = False, budget_checked: bool = False, takeover_stale_lease: bool = False) -> dict:
+    """ignore_budget is the explicit user override (recorded); budget_checked is for a caller that already
+    gated the budget itself (the scheduler) and skips the check without recording anything.
+    takeover_stale_lease, with resume, explicitly recovers a stale run lease (recorded in provenance)."""
     plan = _plan(manifest, access_check=access_check)
     task, repo = _task(plan, task_id)
     if task["kind"] == "qualification":
@@ -248,6 +271,25 @@ def launch(*, manifest: Path, task_id: str, allow_mutation: bool = False, resume
     if head != repo["pinned_commit"]:
         raise WorkspaceRunError("WORKSPACE_PIN_MISMATCH",
                                 f"checkout HEAD {head or 'unknown'} is not the pinned commit; check it out first")
+    budget_override: dict | None = None
+
+    def budget_gate() -> None:
+        # Runs only when a child would really start or resume, never for a repeat launch that is a no-op.
+        nonlocal budget_override
+        if budget_checked:
+            return
+        spend = budget_state(plan)
+        if spend is None or not spend["exhausted"]:
+            return
+        if not ignore_budget:
+            raise WorkspaceRunError(
+                "WORKSPACE_BUDGET_EXHAUSTED",
+                f"workspace budget exhausted ({', '.join(spend['reasons'])}): spent {spend['spent_tokens']} tokens"
+                f" of {spend['max_tokens']}, ${spend['spent_cost_usd']} of {spend['max_cost_usd']}; raise the manifest"
+                " budget, or pass --ignore-budget (ignore_budget=True) to override explicitly")
+        budget_override = {"at": _now(), **{k: spend[k] for k in (
+            "reasons", "spent_tokens", "max_tokens", "spent_cost_usd", "max_cost_usd")}}
+
     with locked_workspace(plan["workspace_id"]):
         prior = load_workspace(workspace_record_path(plan["workspace_id"]))
         saved_inputs = ((prior or {}).get("tasks") or {}).get(task_id, {}).get("inputs")
@@ -267,12 +309,14 @@ def launch(*, manifest: Path, task_id: str, allow_mutation: bool = False, resume
                                        execution_id=execution_id(plan["workspace_id"], task_id),
                                        objective=objective, allow_mutation=allow_mutation,
                                        resume=resume, wait=wait, pi_executable=pi_executable,
-                                       takeover=takeover_stale_lease)
+                                       before_spawn=budget_gate, takeover=takeover_stale_lease)
     except headless_run.HeadlessError as exc:
         raise WorkspaceRunError(exc.code, exc.detail) from exc
     with locked_workspace(plan["workspace_id"]):
         path, record = _workspace(plan, manifest)
         entry = _entry(record, task, repo, execution, inputs)
+        if budget_override is not None and execution.get("outcome") in {"launched", "resumed"}:
+            entry["budget_override"] = budget_override
         save_workspace(path, record)
     return {"workspace_id": plan["workspace_id"], "task": entry, "workspace_record": str(path)}
 
@@ -337,6 +381,8 @@ def main(argv: list[str] | None = None) -> int:
             p.add_argument("--takeover-stale-lease", action="store_true",
                            help="with --resume: explicitly recover a stale run lease (recorded in provenance)")
             p.add_argument("--no-wait", action="store_true")
+            p.add_argument("--ignore-budget", action="store_true",
+                           help="launch although the workspace budget is exhausted; recorded as budget_override")
             p.add_argument("--pi", default=os.environ.get("PI_EXECUTABLE", "pi"), help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     access = None if args.no_access_check else headless_run.workspace_plan.gh_access
@@ -344,7 +390,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "launch":
             result = launch(manifest=args.manifest, task_id=args.task, allow_mutation=args.allow_mutation,
                             resume=args.resume, wait=not args.no_wait, access_check=access, pi_executable=args.pi,
-                            takeover_stale_lease=args.takeover_stale_lease)
+                            ignore_budget=args.ignore_budget, takeover_stale_lease=args.takeover_stale_lease)
             ok = result["task"]["execution_status"] == "launched" or result["task"]["run_status"] in {"COMPLETED", "PARTIAL"}
         elif args.command == "status":
             result = status(manifest=args.manifest, task_id=args.task, access_check=access)

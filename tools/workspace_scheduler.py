@@ -46,7 +46,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import usage  # noqa: E402
 import workspace_plan  # noqa: E402
 import workspace_run  # noqa: E402
 
@@ -127,22 +126,8 @@ def dependents_closure(tasks: list[dict], roots: set[str]) -> set[str]:
 
 
 def budget_state(plan: dict, record: dict | None = None, runs_dir: Path | None = None) -> dict | None:
-    """Spend against the manifest's budget, from the workspace's recorded child runs."""
-    budget = plan.get("budget")
-    if not budget:
-        return None
-    if record is None:
-        record = workspace_run.load_workspace(workspace_run.workspace_record_path(plan["workspace_id"])) or {}
-    used = usage.workspace_usage(runs_dir or workspace_run.headless_run.state_root() / "runs", record)
-    cost = used.get("estimated_cost_usd") or 0.0
-    reasons = []
-    if budget.get("max_tokens") is not None and used["spent_tokens"] >= budget["max_tokens"]:
-        reasons.append("tokens")
-    if budget.get("max_cost_usd") is not None and cost >= budget["max_cost_usd"]:
-        reasons.append("cost")
-    return {"max_tokens": budget.get("max_tokens"), "spent_tokens": used["spent_tokens"],
-            "max_cost_usd": budget.get("max_cost_usd"), "spent_cost_usd": round(cost, 6),
-            "runs": used["runs"], "exhausted": bool(reasons), "reasons": reasons}
+    """Spend against the manifest's budget (computation lives in workspace_run.budget_state)."""
+    return workspace_run.budget_state(plan, record, runs_dir)
 
 
 def report(plan: dict, entries: dict, refused: dict, held: set[str] | None = None) -> dict:
@@ -251,6 +236,7 @@ def run(manifest: Path, *, max_parallel: int | None = None, allow_mutation: bool
                         owned[tid] = pool.submit(workspace_run.launch, manifest=manifest, task_id=tid,
                                                  allow_mutation=allow_mutation, resume=resume, wait=True,
                                                  access_check=None, pi_executable=pi_executable,
+                                                 budget_checked=True,  # gated above
                                                  takeover_stale_lease=resume)
                     running.add(tid)
                     busy.add(repo_of[tid])

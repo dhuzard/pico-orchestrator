@@ -321,7 +321,7 @@ def claim_run_lease(run_id: str, owner: str, *, takeover: bool) -> dict:
 
 def start(*, target: Path, explicit_repo: str, execution_id: str, objective: str, allow_mutation: bool = False,
           resume: bool = False, pi_executable: str = "pi", python: str = sys.executable,
-          wait: bool = True, takeover: bool = False) -> dict:
+          wait: bool = True, before_spawn=None, takeover: bool = False) -> dict:
     if takeover and not resume:
         raise HeadlessError("TAKEOVER_REQUIRES_RESUME", "--takeover-stale-lease applies only to --resume")
     if not objective.strip() or len(objective) > 20000:
@@ -335,7 +335,8 @@ def start(*, target: Path, explicit_repo: str, execution_id: str, objective: str
     with locked_record(path):
         launched = _launch_locked(path, worktree=worktree, identity=identity, common=common,
                                   execution_id=execution_id, objective=objective, allow_mutation=allow_mutation,
-                                  resume=resume, pi_executable=pi_executable, python=python, takeover=takeover)
+                                  resume=resume, pi_executable=pi_executable, python=python,
+                                  before_spawn=before_spawn, takeover=takeover)
     if isinstance(launched, dict):
         return launched
     record, child, log, before = launched
@@ -362,7 +363,8 @@ def start(*, target: Path, explicit_repo: str, execution_id: str, objective: str
 
 
 def _launch_locked(path: Path, *, worktree: Path, identity: str, common: Path, execution_id: str, objective: str,
-                   allow_mutation: bool, resume: bool, pi_executable: str, python: str, takeover: bool = False):
+                   allow_mutation: bool, resume: bool, pi_executable: str, python: str, before_spawn=None,
+                   takeover: bool = False):
     """Return the settled record, or (record, child, log, checkout_before) for a new launch. Caller holds the lock."""
     record = load_record(path)
     if record is not None:
@@ -392,6 +394,9 @@ def _launch_locked(path: Path, *, worktree: Path, identity: str, common: Path, e
             return record
     elif resume:
         raise HeadlessError("EXECUTION_UNKNOWN", "nothing to resume for this execution id")
+
+    if before_spawn is not None:
+        before_spawn()  # a child will start or resume: callers may still refuse here
 
     granted = mutation_permitted(worktree)
     if granted and not allow_mutation:
