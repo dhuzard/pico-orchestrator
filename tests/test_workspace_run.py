@@ -255,6 +255,14 @@ class WorkspaceRunTest(unittest.TestCase):
                 time.sleep(0.1)
             self.assertEqual(running, {"a1"})
             self.assertEqual(state["spent_tokens"], 3000)
+            # A record whose pid now belongs to another process (pid reuse) is not a running child.
+            record_path = hr.execution_path(Path(next(r for r in plan["repositories"] if r["id"] == "alpha")["git_common_dir"]),
+                                           "ws--a1")
+            record = json.loads(record_path.read_text())
+            if record.get("pid_start") is not None:
+                record_path.write_text(json.dumps({**record, "pid_start": "1"}))
+                self.assertEqual(wr.running_tasks(plan, exclude={"b1"})[0], set())
+                record_path.write_text(json.dumps(record))
             with self.assertRaises(wr.WorkspaceRunError) as ctx:
                 self.launch(manifest, "b1")
             self.assertEqual(ctx.exception.code, "WORKSPACE_BUDGET_EXHAUSTED")

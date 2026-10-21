@@ -259,6 +259,20 @@ class HeadlessRunTest(unittest.TestCase):
         self.assertNotIn("lease_takeovers", provenance.get_run(hr.ROOT, crashed["run_id"])["parent_orchestration"])
         self.assertEqual(self.status()["launches"], 1)
 
+    def test_execution_liveness_rejects_a_reused_pid(self):
+        launched = self.start(behavior="hang", wait=False)
+        try:
+            self.assertEqual(launched["pid_start"], run_lease.pid_start(launched["pid"]))
+            self.assertTrue(hr.execution_alive(launched))
+            if launched["pid_start"] is not None:
+                # Same pid, different start time: another process now owns the pid.
+                self.assertFalse(hr.execution_alive({**launched, "pid_start": "1"}))
+            # Records written before the start time was kept still use the plain pid probe.
+            self.assertTrue(hr.execution_alive({**launched, "pid_start": None}))
+        finally:
+            hr.cancel(target=self.target, explicit_repo="acme/target", execution_id="exec-1", grace=1)
+        self.assertFalse(hr.execution_alive(launched))
+
     def test_failed_lease_handoff_stops_the_child_visibly(self):
         crashed = self.start(behavior="crash")
         real = run_lease.acquire

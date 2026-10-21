@@ -177,6 +177,20 @@ def pid_alive(pid: int | None) -> bool:
     return True
 
 
+def execution_alive(record: dict) -> bool:
+    """The execution's child is still the process it launched: alive, and not a reused pid.
+
+    Records launched by this version carry the child's `pid_start` (start time
+    from /proc); a live pid with a different start time is another process.
+    Older records, and hosts without /proc, fall back to the plain pid probe.
+    """
+    pid = record.get("pid")
+    if not pid_alive(pid):
+        return False
+    recorded, current = record.get("pid_start"), run_lease.pid_start(pid)
+    return recorded is None or current is None or recorded == current
+
+
 def discover_run_id(session_dir: Path, session_id: str) -> str | None:
     """The lifecycle extension stores the parent run id in a custom session entry."""
     run_id = None
@@ -469,8 +483,9 @@ def _launch_locked(path: Path, *, worktree: Path, identity: str, common: Path, e
             save_record(path, record)
             raise HeadlessError("RUN_LEASE_HANDOFF_FAILED",
                                 f"the run lease could not be handed to the launched process ({code}); it was stopped") from exc
-    record.update({"status": "launched", "pid": child.pid, "launches": record["launches"] + 1,
-                   "started_at": _now(), "exit_code": None, "outcome": "resumed" if resume else "launched"})
+    record.update({"status": "launched", "pid": child.pid, "pid_start": run_lease.pid_start(child.pid),
+                   "launches": record["launches"] + 1, "started_at": _now(), "exit_code": None,
+                   "outcome": "resumed" if resume else "launched"})
     save_record(path, record)
     return record, child, log, before
 

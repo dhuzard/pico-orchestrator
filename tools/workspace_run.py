@@ -304,7 +304,7 @@ def running_tasks(plan: dict, exclude=(), workspace: dict | None = None) -> tupl
         except (headless_run.HeadlessError, OSError, ValueError) as exc:
             problems.append(f"{tid}: execution record {path} is unreadable ({getattr(exc, 'code', type(exc).__name__)})")
             continue
-        if record and record.get("status") in {"launching", "launched"} and headless_run.pid_alive(record.get("pid")):
+        if record and record.get("status") in {"launching", "launched"} and headless_run.execution_alive(record):
             running.add(tid)
     return running, problems
 
