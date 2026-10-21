@@ -325,17 +325,25 @@ def diff_facts(before: list[dict], after: list[dict]) -> list[dict]:
     return sorted(missing, key=lambda f: (f["category"], f["key"], f["reason"]))
 
 
+# Phases a lead recorded only as bookkeeping. Anything else, such as `routing`, can carry a blocker or an outcome.
+OPTIONAL_PHASE_IDS = frozenset({"inspection"})
+
+
 def split_dropped_optional(before_facts: list[dict], missing: list[dict]) -> tuple[list[dict], list[dict]]:
     """Separate phases that carried no route, no worker and no wave (like `inspection`) from the missing facts.
 
-    They are real facts of the BEFORE run, so they stay listed, but as dropped optional phases rather than
-    lost evidence: nothing was routed, run or outcome-bearing in them.
+    Only phases on the allow-list `OPTIONAL_PHASE_IDS` count, and only when they were `completed` with no
+    blocker code, route, worker, wave or escalation. They stay listed as dropped optional phases rather than
+    lost evidence; every other phase (a blocked `routing` phase, say) stays missing.
     """
     with_workers = {f["key"][0] for f in before_facts if f["category"] == "worker" and f["key"][0] != "override"}
     dropped, lost = [], []
     for fact in missing:
-        optional = (fact["category"] == "phase" and fact["reason"] == "absent" and not fact["value"].get("route")
-                    and not fact["value"].get("in_wave") and fact["key"][0] not in with_workers)
+        value = fact["value"]
+        optional = (fact["category"] == "phase" and fact["reason"] == "absent" and fact["key"][0] in OPTIONAL_PHASE_IDS
+                    and value.get("status") == "completed" and not value.get("blocker_code")
+                    and not value.get("route") and not value.get("in_wave") and not value.get("escalations")
+                    and fact["key"][0] not in with_workers)
         (dropped if optional else lost).append(fact)
     return dropped, lost
 

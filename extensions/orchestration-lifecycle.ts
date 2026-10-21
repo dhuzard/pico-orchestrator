@@ -910,9 +910,14 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
       if (taskId && approval && step?.mode === "full" && inFlight.size === 0 && activeWave === null &&
           ![...implicitOpen].some(([id, members]) => members.includes(taskId)
             && implicitEpoch.get(id) === (routeEpochs.get(taskId) ?? 0))) await recordImplicitWave(taskId);
+      // A mutating step that starts in an already bound worktree re-marks the task as unintegrated, so work done
+      // after an earlier integration (no new bind) can never leave COMPLETED passing without integration.
+      if (runId && taskId && approval && step?.mode === "full") {
+        await observe({ kind: "checkpoint", phase: approval.phase, reason: "worker_approval", workspace_bound: true });
+      }
       if (inFlight.size === 0) batchStart = Date.now();
       inFlight.set(call.toolCallId, { taskId, stepId: step?.id ?? null, tool: call.toolName,
-        phase: workerPlans.get(call.toolCallId)?.phase });
+        phase: workerPlans.get(call.toolCallId)?.phase ?? (call.toolName === "spawn_subagent" && step ? approval?.phase : undefined) });
       // The activity entry carries what a lead directive event used to: task, step, route, and a digest of
       // the worker contract (never its text).
       const fields = call.input as Record<string, unknown>;
@@ -928,6 +933,12 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
       batchPeak = Math.max(batchPeak, inFlight.size);
       workerStarts.set(call.toolCallId, Date.now());
       const plan = workerPlans.get(call.toolCallId);
+      // A routed Codex step: the validated model and reasoning effort are recorded here, so the record names
+      // which model ran even when the lead records nothing. The lead's own worker event still wins.
+      if (call.toolName === "spawn_subagent" && approval && step?.model) {
+        await observe({ kind: "worker", phase: approval.phase, step_id: step.id, status: "in_progress", model: step.model,
+          ...(step.effort ? { reasoning_effort: step.effort } : {}) });
+      }
       // Observational: the lead may record the worker itself; the tool_result handler records its terminal status.
       if (plan) await observe({ kind: "worker", phase: plan.phase, step_id: plan.stepId, status: "in_progress",
         model: plan.canonical, backend: "claude-code", backend_model: plan.backendModel, reasoning_effort: plan.effort });
@@ -1029,6 +1040,11 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
       } else {
         if (result.toolName === "spawn_subagent" && typeof details.subagent_id === "string" && !result.isError) {
           runSubagents.add(details.subagent_id);
+        }
+        // The worker's own terminal status, like ClaudeWorker's: it never overrides one the lead recorded.
+        if (worker?.phase && worker.stepId && result.toolName === "spawn_subagent") {
+          await observe({ kind: "worker", phase: worker.phase, step_id: worker.stepId, only_if_open: true,
+            ...(result.isError ? { status: "failed", blocker_code: "WORKER_FAILED" } : { status: "completed" }) });
         }
         const usage = (details.usage ?? {}) as Json;
         await observe({ kind: "usage", backend: "pi-subagent",

@@ -371,6 +371,22 @@ class ProvenanceDiff(unittest.TestCase):
         self.assertEqual(prov["missing"], [])
         self.assertEqual([m["key"] for m in prov["dropped_optional_phases"]], [["inspection"]])
         self.assertIn("Dropped optional phases", bm.render_compare(result))
+        # Not on the allow-list, or not a plain completed phase: it stays missing, never "dropped".
+        for phase in ({"id": "routing", "status": "blocked", "route": None, "blocker_code": "WORKER_SCOPE_VIOLATION", "workers": []},
+                      {"id": "inspection", "status": "blocked", "route": None, "blocker_code": "X_BLOCKED", "workers": []},
+                      {"id": "inspection", "status": "completed", "route": None, "blocker_code": None, "workers": [],
+                       "escalations": [{"from_route": "CODEX", "to_route": "CLAUDE_CODEX", "reason": "AMBIGUITY"}]},
+                      {"id": "scratch", "status": "completed", "route": None, "blocker_code": None, "workers": []}):
+            before["parent_orchestration"]["phases"][0] = copy.deepcopy(phase)
+            gone, lost = bm.split_dropped_optional(bm.provenance_facts(before), bm.provenance_diff(before, after))
+            self.assertEqual((gone, [m["key"] for m in lost]), ([], [[phase["id"]]]), phase)
+            with tempfile.TemporaryDirectory() as tmp:
+                b, a = Path(tmp) / "b", Path(tmp) / "a"
+                write_state(b, {"run-a": before})
+                write_state(a, {"run-b": after})
+                prov = bm.compare(bm.runs_report(b, ["run-a"]), bm.runs_report(a, ["run-b"]))["provenance"]
+            self.assertFalse(prov["complete"], phase)
+            self.assertEqual(prov["dropped_optional_phases"], [])
         # A phase that had a worker, a route or a wave is not optional.
         routed = {"id": "inspection", "status": "completed", "route": "CODEX", "blocker_code": None, "workers": []}
         before["parent_orchestration"]["phases"][0] = routed

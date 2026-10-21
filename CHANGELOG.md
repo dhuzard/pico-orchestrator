@@ -37,8 +37,17 @@ All notable changes to PICO are recorded here. The format follows
   starts a new wave.
 - `benchmark_metrics.py --compare` matches waves by their task set and route epoch (raw ids kept
   as `ids` metadata) and integrate facts by that key, so `wave-1` and `auto-...` are the same
-  wave. Phases with no route, workers or wave (like `inspection`) are listed under
-  "Dropped optional phases" (`provenance.dropped_optional_phases`) instead of as missing facts.
+  wave. Optional phases (like `inspection`) are listed under
+  "Dropped optional phases" (`provenance.dropped_optional_phases`) instead of as missing facts, but only
+  for the allow-listed `inspection` phase when it was `completed` with no blocker, route, worker, wave or
+  escalation; every other phase (a blocked `routing` phase, say) stays missing.
+- A mutating worker that starts in an already bound worktree re-marks its task unintegrated
+  (`workspace_bound`), so work done after an earlier integration whose new wave write was refused
+  still refuses COMPLETED with `PARENT_WAVE_NOT_INTEGRATED`.
+- The extension records a routed Codex step's `model` and `reasoning_effort` when its subagent
+  starts, and its terminal status (`only_if_open`, like ClaudeWorker's) when it returns, so the
+  record names the reviewing model even when the lead records no worker event. The lead's own
+  event still wins.
 - A failed Claude step whose retry succeeded is now `completed`: after the last failure the
   same step must have started again on the same route and returned without error. The
   failure stays in `worker_overrides` (`by` `extension` or `lead`, `reason`

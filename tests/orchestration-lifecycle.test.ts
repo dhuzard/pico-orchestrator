@@ -2065,3 +2065,56 @@ test("a read-only reviewer after integration adds no wave: one integrated wave, 
     assert.equal(replay(eventsOf(h), null).parent.waves.length, 2);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+test("a Codex step with no lead worker event still records its model, effort and terminal status", async () => {
+  const h = harness({ ok: true, status: "READY" });
+  await h.handlers.get("before_agent_start")!({ prompt: "PI_ORCHESTRATION_RUN_V1" }, { cwd: "/tmp/target", ui: { notify() {} } });
+  await h.handlers.get("tool_result")!(routeFor("A"));
+  const run = async (id: string, step: string, fail = false) => {
+    assert.equal(await h.handlers.get("tool_call")!({ toolName: "spawn_subagent", toolCallId: id,
+      input: { task: "review", label: `A:${step}` } }), undefined);
+    await h.handlers.get("tool_result")!({ toolName: "spawn_subagent", toolCallId: id, isError: fail,
+      content: [{ type: "text", text: "done" }], details: { subagent_id: `s-${id}`, elapsedMs: 3 } });
+  };
+  await run("r1", "codex_reviewer");
+  await run("s1", "codex_specifier", true);
+  const replayed = replay(eventsOf(h), null);
+  assert.deepEqual(replayed.errors, []);
+  const workers = Object.fromEntries(replayed.parent.phases[0].workers.map((worker: any) => [worker.step_id, worker]));
+  assert.deepEqual([workers.codex_reviewer.model, workers.codex_reviewer.reasoning_effort, workers.codex_reviewer.status],
+    [CODEX_HIGH, "high", "completed"]);
+  assert.deepEqual([workers.codex_specifier.status, workers.codex_specifier.blocker_code], ["failed", "WORKER_FAILED"]);
+  // The lead's judgment still wins: it restates the model and overrides the completed worker.
+  const lead = { kind: "worker", phase: "A", step_id: "codex_reviewer", status: "failed", blocker_code: "REVIEW_REJECTED", model: CODEX_HIGH };
+  const judged = replay([...eventsOf(h), lead], null);
+  assert.deepEqual(judged.errors, []);
+  assert.equal(judged.parent.phases[0].workers.find((worker: any) => worker.step_id === "codex_reviewer").status, "failed");
+});
+
+test("work after an integration with its wave write refused still refuses COMPLETED", async () => {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "pico-regress-")));
+  try {
+    const h = harness({ ok: true, status: "READY" }, false, true, { executable: fakeClaude(dir) });
+    await h.handlers.get("before_agent_start")!({ prompt: "PI_ORCHESTRATION_RUN_V1" }, { cwd: dir, ui: { notify() {} } });
+    const record = h.tools.get("orchestration_record");
+    await h.handlers.get("tool_result")!(routeFor("A", { workerMutation: "allowed" }));
+    const workspace = join(dir, "wt");
+    mkdirSync(workspace);
+    await record.execute("b", { action: "bind_workspace", task_id: "A", step_id: "claude_worker", path: workspace });
+    assert.equal((await claudeWorkerRun(h, "c1", { prompt: "[pico-task A:claude_worker] implement" })).guard, undefined);
+    await record.execute("i", { action: "integrate_begin", wave_id: "auto" });
+    await record.execute("i", { action: "integrate_end", wave_id: "auto" });
+    // The same bound worktree mutates again; the recorder refuses that second implicit-wave write.
+    assert.equal((await claudeWorkerRun(h, "c2", { prompt: "[pico-task A:claude_worker] repair" })).guard, undefined);
+    const waveDeclarations = eventsOf(h).filter((event: any) => event.kind === "wave" && event.status === "declared");
+    assert.equal(waveDeclarations.length, 2);
+    const events = eventsOf(h).filter((event) => event !== waveDeclarations[1]);
+    for (const step of ["codex_specifier", "codex_reviewer"]) {
+      events.push({ kind: "worker", phase: "A", step_id: step, status: "completed", model: CODEX_HIGH });
+    }
+    events.push({ kind: "phase", phase: "A", status: "completed", route: "CODEX_CLAUDE_CODEX" });
+    const refused = replay(events, "COMPLETED");
+    // (Re-running a completed step is a refused, non-blocking telemetry write; the finish is what matters.)
+    assert.deepEqual(refused.errors.map((error) => error[1]), ["PARENT_WORKER_TRANSITION_INVALID", "PARENT_WAVE_NOT_INTEGRATED"]);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
