@@ -400,11 +400,13 @@ class Controls:
             except workspace_run.headless_run.HeadlessError:
                 granted = ["unreadable policy"]
             mutating[repo["id"]] = granted
-        budget = workspace_scheduler.budget_state(observed_plan, record)
+        running, running_problems = workspace_run.running_tasks(observed_plan, workspace=record)
+        budget = workspace_scheduler.budget_state(observed_plan, record, running=running,
+                                                  extra_problems=running_problems)
         expected = self._confirm("schedule", dispatch, interrupted if resume else [], allow_mutation,
                                  observed_plan["max_parallel"], mutating, bool(budget and budget["exhausted"]))
         if confirm is None:
-            launchable = bool(dispatch) and not (budget and budget["exhausted"])
+            launchable = bool(dispatch) and not (budget and (budget["exhausted"] or budget["incomplete"]))
             return {"ok": launchable or bool(resume and interrupted), "stage": "preview", "confirm": expected,
                     "preview": {"dispatch": dispatch, "resume": interrupted if resume else [], "budget": budget,
                                 "interrupted": interrupted, "cap": observed_plan["max_parallel"],

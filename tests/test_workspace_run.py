@@ -216,6 +216,150 @@ class WorkspaceRunTest(unittest.TestCase):
         self.assertEqual(overall["tasks"]["g1"]["execution_status"], "cancelled")
         self.assertNotIn("b1", overall["tasks"])
 
+    def budget_manifest(self, budget):
+        path = self.manifest()
+        data = yaml.safe_load(path.read_text())
+        if budget is not None:
+            data["budget"] = budget
+        path.write_text(yaml.safe_dump(data))
+        return path
+
+    def test_direct_launch_is_refused_when_budget_exhausted(self):
+        os.environ["FAKE_PI_USAGE"] = "600,500"
+        manifest = self.budget_manifest({"max_tokens": 1000})
+        self.launch(manifest, "a1")  # the first child spends past the limit
+        with self.assertRaises(wr.WorkspaceRunError) as ctx:
+            self.launch(manifest, "b1")
+        self.assertEqual(ctx.exception.code, "WORKSPACE_BUDGET_EXHAUSTED")
+        self.assertIn("--ignore-budget", ctx.exception.detail)
+        self.assertIn("1000", ctx.exception.detail)
+        self.assertNotIn("b1", wr.status(manifest=manifest, access_check=None)["tasks"])
+
+    def test_direct_launch_counts_the_spend_of_a_running_child(self):
+        os.environ["FAKE_PI_USAGE"] = "3000,0"
+        os.environ["FAKE_PI_BEHAVIOR"] = "hang"
+        manifest = self.budget_manifest({"max_tokens": 2000})
+        self.launch(manifest, "a1", wait=False)  # still running: the workspace record has no run id for it
+        try:
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                plan = wr._plan(manifest, access_check=None)
+                running, _ = wr.running_tasks(plan, exclude={"b1"})
+                state = wr.budget_state(plan, running=running)
+                if state["spent_tokens"] >= 3000:
+                    break
+                time.sleep(0.1)
+            self.assertEqual(running, {"a1"})
+            self.assertEqual(state["spent_tokens"], 3000)
+            with self.assertRaises(wr.WorkspaceRunError) as ctx:
+                self.launch(manifest, "b1")
+            self.assertEqual(ctx.exception.code, "WORKSPACE_BUDGET_EXHAUSTED")
+        finally:
+            wr.cancel(manifest=manifest, task_id="a1")
+
+    def exec_path(self, manifest, task):
+        repo = {"a1": "alpha", "b1": "beta", "g1": "gamma"}[task]
+        repos = {r["id"]: r for r in wr._plan(manifest, access_check=None)["repositories"]}
+        return hr.execution_path(Path(repos[repo]["git_common_dir"]), f"ws--{task}")
+
+    def test_corrupt_record_of_a_finished_task_does_not_block_launch(self):
+        manifest = self.budget_manifest({"max_tokens": 1000000})
+        self.launch(manifest, "a1")
+        self.exec_path(manifest, "a1").write_text("{not json")
+        self.assertEqual(self.launch(manifest, "b1")["task"]["run_status"], "PARTIAL")
+
+    def test_corrupt_record_of_a_possibly_running_task_refuses_with_path_and_remedy(self):
+        manifest = self.budget_manifest({"max_tokens": 1000000})
+        broken = self.exec_path(manifest, "g1")
+        broken.parent.mkdir(parents=True, exist_ok=True)
+        broken.write_text("{not json")  # g1 has no finished entry: it might be running
+        with self.assertRaises(wr.WorkspaceRunError) as ctx:
+            self.launch(manifest, "a1")
+        self.assertEqual(ctx.exception.code, "WORKSPACE_BUDGET_UNKNOWN")
+        self.assertIn(str(broken), ctx.exception.detail)
+        self.assertIn("repair or delete", ctx.exception.detail)
+        self.assertEqual(self.launch(manifest, "a1", ignore_budget=True)["task"]["run_status"], "PARTIAL")
+
+    def test_garden_budget_matches_the_direct_launch_gate(self):
+        import watch
+        manifest = self.budget_manifest({"max_tokens": 1000000})
+        broken = self.exec_path(manifest, "g1")
+        broken.parent.mkdir(parents=True, exist_ok=True)
+        broken.write_text("{not json")
+        plan = wr._plan(manifest, access_check=None)
+        state = watch._budget(plan, {"tasks": {}}, self.state / "runs")
+        self.assertTrue(state["incomplete"])
+        self.assertIn(str(broken), state["incomplete_reasons"][0])
+
+    def test_repeat_launch_is_a_noop_even_when_budget_is_exhausted(self):
+        os.environ["FAKE_PI_USAGE"] = "600,500"
+        manifest = self.budget_manifest({"max_tokens": 1000})
+        first = self.launch(manifest, "a1")
+        for kwargs in ({}, {"ignore_budget": True}, {"resume": True}):
+            again = self.launch(manifest, "a1", **kwargs)
+            self.assertEqual(again["task"]["outcome"], "already_finished")
+            self.assertEqual(again["task"]["launches"], 1)
+            self.assertEqual(again["task"]["run_id"], first["task"]["run_id"])
+            self.assertNotIn("budget_override", again["task"])
+
+    def test_resume_of_interrupted_task_is_gated(self):
+        os.environ["FAKE_PI_USAGE"] = "600,500"
+        plain = self.manifest()
+        self.launch(plain, "a1")
+        os.environ["FAKE_PI_BEHAVIOR"] = "crash"
+        self.assertEqual(self.launch(plain, "b1")["task"]["execution_status"], "interrupted")
+        os.environ["FAKE_PI_BEHAVIOR"] = "finish"
+        manifest = self.budget_manifest({"max_tokens": 1000})
+        with self.assertRaises(wr.WorkspaceRunError) as ctx:
+            self.launch(manifest, "b1", resume=True)
+        self.assertEqual(ctx.exception.code, "WORKSPACE_BUDGET_EXHAUSTED")
+        resumed = self.launch(manifest, "b1", resume=True, ignore_budget=True)
+        self.assertEqual(resumed["task"]["outcome"], "resumed")
+        self.assertIn("budget_override", resumed["task"])
+
+    def test_budget_checked_skips_the_gate_and_records_no_override(self):
+        os.environ["FAKE_PI_USAGE"] = "600,500"
+        manifest = self.budget_manifest({"max_tokens": 1000})
+        self.launch(manifest, "a1")
+        result = self.launch(manifest, "b1", budget_checked=True)
+        self.assertEqual(result["task"]["outcome"], "launched")
+        self.assertNotIn("budget_override", result["task"])
+
+    def test_ignore_budget_launches_and_records_the_override(self):
+        os.environ["FAKE_PI_USAGE"] = "600,500"
+        manifest = self.budget_manifest({"max_tokens": 1000})
+        first = self.launch(manifest, "a1")
+        self.assertNotIn("budget_override", first["task"])
+        result = self.launch(manifest, "b1", ignore_budget=True)
+        override = result["task"]["budget_override"]
+        self.assertEqual(override["reasons"], ["tokens"])
+        self.assertEqual(override["max_tokens"], 1000)
+        self.assertTrue(override["at"])
+        record = wr.load_workspace(wr.workspace_record_path("ws"))
+        self.assertIn("budget_override", record["tasks"]["b1"])
+
+    def test_launch_allowed_without_budget_or_under_budget(self):
+        plain = self.launch(self.manifest(), "a1")
+        self.assertNotIn("budget_override", plain["task"])
+        roomy = self.launch(self.budget_manifest({"max_tokens": 1000000}), "b1")
+        self.assertNotIn("budget_override", roomy["task"])
+
+    def test_cli_ignore_budget(self):
+        os.environ["FAKE_PI_USAGE"] = "600,500"
+        manifest = self.budget_manifest({"max_tokens": 1000})
+        self.launch(manifest, "a1")
+        def run(args):
+            out = io.StringIO()
+            with redirect_stdout(out):
+                rc = wr.main(args)
+            return rc, json.loads(out.getvalue())
+        base = ["launch", str(manifest), "--task", "b1", "--no-access-check", "--pi", str(self.pi)]
+        rc, data = run(base)
+        self.assertEqual((rc, data["error_code"]), (1, "WORKSPACE_BUDGET_EXHAUSTED"))
+        rc, data = run(base + ["--ignore-budget"])
+        self.assertEqual(rc, 0, data)
+        self.assertIn("budget_override", data["task"])
+
     def test_cli(self):
         manifest = self.manifest()
         def run(args):

@@ -17,7 +17,7 @@ import github_integration
 import workspace_plan
 import workspace_run
 import garden_controls  # noqa: E402
-from usage import TOKEN_FIELDS, run_tokens, sum_tokens  # noqa: E402,F401
+from usage import TOKEN_FIELDS, cost_coverage, run_tokens, sum_tokens  # noqa: E402,F401
 import workspace_scheduler
 
 RUN_ID = re.compile(r"^run-[A-Za-z0-9-]+$")
@@ -129,8 +129,19 @@ def public_run(record: dict, directory: Path | None = None) -> dict:
         "metrics": {key: metrics.get(key) for key in (
             "wall_clock_ms", "total_tokens", "lead_input_tokens", "lead_output_tokens",
             "worker_input_tokens", "worker_output_tokens", "parallel_speedup",
-            "estimated_cost_usd", "lead_model")},
+            "estimated_cost_usd", "lead_model")} | _cost_flags(context),
     }
+
+
+def _budget(plan: dict, record: dict, runs_dir: Path) -> dict | None:
+    """Same figure a direct launch would gate on: running children's spend included, failing closed."""
+    running, problems = workspace_scheduler.workspace_run.running_tasks(plan, workspace=record)
+    return workspace_scheduler.budget_state(plan, record, runs_dir, running=running, extra_problems=problems)
+
+
+def _cost_flags(context: dict) -> dict:
+    unpriced = cost_coverage(context)[1]
+    return {"cost_complete": not unpriced, "unpriced": unpriced}
 
 
 def load_runs(directory: Path, repository: str | None) -> list[dict]:
@@ -364,7 +375,7 @@ def workspace_view(state: Path, *, workspace_id: str | None = None, manifest: Pa
             "waves": [_ids(wave) for wave in plan.get("waves") or []],
             "status": report["status"], "counts": report["counts"], "repositories": repositories,
             "tokens": sum_tokens([part for parts in tokens_by_repo.values() for part in parts]),
-            "budget": workspace_scheduler.budget_state(plan, record, runs_dir) if source == "manifest" else None,
+            "budget": _budget(plan, record, runs_dir) if source == "manifest" else None,
             "sessions": sessions}
 
 

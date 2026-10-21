@@ -6,8 +6,33 @@ All notable changes to PICO are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- `pico workspace launch` now refuses with `WORKSPACE_BUDGET_EXHAUSTED` when the
+  workspace budget is exhausted (it previously spent past it; only the
+  scheduler and the Garden checked). `--ignore-budget` overrides explicitly and
+  is recorded as `budget_override`. Found by the scientific-evidence-pilot run.
+  Refs #6.
+
 ### Added
 
+- Usage accounting: Claude cache writes are recorded as `cache_write_tokens`
+  and counted in budgeted spend (cache reads are not); the lead's Pi-reported
+  cost is forwarded as optional `estimated_cost_usd`; usage blocks carry
+  `cost_complete` and `unpriced`, shown by the scheduler and the Garden; the
+  scheduler counts the spend of children that are still running, and holds
+  new launches when that spend cannot be resolved. Per-participant
+  `cost_complete` is false for calls with no cost or a zero cost despite
+  tokens. Records written before this change stay valid and readable.
+
+### Compatibility
+
+- Run records written by this version can contain `lead_usage.estimated_cost_usd`,
+  `lead_usage.cache_write_tokens`, `lead_usage.cost_complete`,
+  `worker_usage.*.cache_write_tokens` and `worker_usage.*.cost_complete`.
+  Older PICO versions validate these closed objects with
+  `additionalProperties: false` and will reject such records. The record
+  version is not bumped.
 - `CONTRIBUTING.md` with the development checks, the rules for routing and
   policy changes, pull request expectations and the licensing stance.
 - `CODE_OF_CONDUCT.md` (Contributor Covenant 2.1).
