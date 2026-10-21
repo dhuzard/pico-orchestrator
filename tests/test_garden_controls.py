@@ -310,6 +310,9 @@ class GardenControlsTest(unittest.TestCase):
 
     def test_garden_toggle_does_not_authorize_publication_until_it_reaches_the_base(self):
         self.validated_a1()
+        alpha = self.repos["alpha"][0]
+        git("-C", str(alpha), "config", "user.name", "t")  # CI runners have no global identity
+        git("-C", str(alpha), "config", "user.email", "t@example.com")
         for permission in ("push_branch", "create_pr"):
             _, preview = self.act(action="set_permission", repository="alpha", permission=permission, value=True)
             self.assertIn("no effect on publication until it is committed and pushed", preview["preview"]["note"])
