@@ -11,12 +11,22 @@ All notable changes to PICO are recorded here. The format follows
 - The lead records less (issue #43). The prompts no longer ask for `directive` or
   `feedback` interaction events or for optional phases such as `inspection`; `decision`,
   status, bind, worker/phase outcomes, the integrate bracket and finish stay.
-  The extension's `activity` entry at worker start now also carries the task's
-  `route` and a SHA-256 `prompt_digest` of the worker contract (never its text), so
-  nothing a directive carried is lost. A routed task started with no worker running
-  and no wave declared is recorded as an implicit single-task wave (named `"auto"` in
-  `integrate_begin`/`integrate_end`); concurrent tasks still need `declare_wave`
-  (`WAVE_UNDECLARED`). A refused implicit-wave write is diagnosed and never blocks.
+  The extension's `activity` entries now carry what those events carried: at start the
+  routed `route`, a `prompt_digest` and a 300-character `prompt_excerpt` of the worker
+  contract; on return a 600-character `result_summary` of the worker's final text, its
+  `result_digest` and any reported `commit_sha`. Text is single-line, control characters
+  are removed and secret-like text is withheld; the full text lives in the Pi session
+  transcript. Garden's Conversation view shows these entries beside the lead's decisions.
+- A routed task started with no worker running and no wave declared is recorded as an
+  implicit single-task wave; tasks then run one after another join the same wave until it
+  is integrated (`integrate_begin`/`integrate_end` with `"auto"`, refused with
+  `WAVE_AUTO_AMBIGUOUS` or `WAVE_UNKNOWN` when several or none are open). Concurrent tasks
+  still need `declare_wave` (`WAVE_UNDECLARED`). A run that ends without COMPLETED marks
+  its still-open waves `abandoned` (appended to `reconciled`, kind `wave`); COMPLETED is
+  refused while an integration was begun and never ended (`PARENT_WAVE_INTEGRATING`).
+- A failed Claude step whose retry succeeded is now `completed`: a later start of the same
+  step on the same route allows failed -> completed, recorded in `worker_overrides`
+  (`by` `extension` or `lead`, `reason` `retry_succeeded`) within the existing bounds.
 
 ### Fixed
 

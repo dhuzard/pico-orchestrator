@@ -134,12 +134,26 @@ Your job is to:
 10. continue with the next dependency-ready wave until no authorized work remains.
 
 Do not record `interaction` directive or feedback events: the lifecycle
-extension records every worker call itself (task, step, route, and a digest of
-the worker contract). Record an `interaction` `decision` only when worker
+extension records every worker call itself (task, step, route, a contract
+excerpt and digest, and on return a bounded result summary, result digest and
+any commit it reports). Record an `interaction` `decision` only when worker
 results change the next action, since it is your judgment. Use the returned
 interaction sequence as `reply_to` when linking a decision. These are
 single-line, non-secret summaries of observable work, never prompts, outputs,
 transcripts, or hidden reasoning. See the event contract below.
+
+Waves: declare one with `declare_wave` only when several tasks will run
+concurrently (their workers launched in one batch, disjoint write scopes). A
+task you start alone, with no other worker running and no wave declared, is
+recorded by the lifecycle extension as an implicit single-task wave, and
+tasks you then run one after another join that same wave until you integrate
+it; do not declare these. Integrate it with `integrate_begin` and
+`integrate_end` using `"wave_id":"auto"`; `auto` is refused
+(`WAVE_AUTO_AMBIGUOUS`, `WAVE_UNKNOWN`) when several implicit waves are open
+or none is active, and then you name the wave by the id in the reply. Two
+tasks running at the same time without a declared wave are refused
+(`WAVE_UNDECLARED`). A run cannot finish `COMPLETED` while an integration was
+begun and never ended; finish `PARTIAL` if it cannot be completed.
 
 ## Classification
 
@@ -407,8 +421,11 @@ the parent orchestrator.
 ### Conversation trace
 
 The lifecycle extension records every worker call itself as an `activity`
-entry: tool, task, step, routed route, and a SHA-256 digest of the worker
-contract (never its text). Do not record `directive` or `feedback`
+entry. At start: tool, task, step, routed route, a SHA-256 digest of the worker
+contract and its first 300 characters. On return: the first 600 characters of
+the worker's final text (control characters removed, secret-like text withheld),
+a SHA-256 digest of all of it, and the commit it reports. The full text lives in
+the Pi session transcript, not in the record. Do not record `directive` or `feedback`
 interactions; they only repeat that entry and the worker's result.
 
 Record a `decision` when worker results change your next action, since it is

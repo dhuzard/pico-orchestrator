@@ -47,6 +47,7 @@ CODE_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,99}$")
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 MODEL_RE = re.compile(r"^[A-Za-z0-9_.:/-]{1,128}$")
 VERSION_RE = re.compile(r"^(?:>=)?[0-9]+\.[0-9]+\.[0-9]+$")
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 COMMIT_RE = re.compile(r"^[0-9a-f]{7,64}$")
 REFERENCE_RE = re.compile(r"^checkpoints/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/[0-9]{4}\.json$")
 REASONING_EFFORTS = {"low", "medium", "high"}
@@ -59,7 +60,15 @@ USAGE_BACKENDS = {"claude-code", "pi-subagent"}
 USAGE_COUNTERS = ("duration_ms", "input_tokens", "output_tokens", "cached_tokens", "cache_write_tokens", "total_tokens")
 # A wave groups routed tasks with disjoint write scopes that run concurrently;
 # it is integrated into the parent checkout only after all its workers return.
-WAVE_STATUSES = ("declared", "integrating", "integrated")
+WAVE_STATUSES = ("declared", "integrating", "integrated", "abandoned")
+# Statuses an event may set; "abandoned" is written only by `_reconcile_open` when a run ends without COMPLETED.
+WAVE_EVENT_STATUSES = WAVE_STATUSES[:3]
+WAVE_OPEN_STATUSES = {"declared", "integrating"}
+ACTIVITY_EXCERPT_CHARS = 300
+ACTIVITY_SUMMARY_CHARS = 600
+CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]+")
+COMMIT_RE = re.compile(r"^[0-9a-f]{7,40}$")
+DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 LOCK_WAIT_SECONDS = 5
 # Resume checkpoint (audit A10): the parent checkout's path, branch and HEAD at
 # the last phase boundary or worker approval, compared with the live checkout
@@ -156,6 +165,26 @@ def _safe(value: str | None, pattern: re.Pattern, field: str) -> str | None:
     if not isinstance(value, str) or not pattern.fullmatch(value) or provenance._contains_secret_like_content(value):
         raise ParentRunError(f"invalid {field}")
     return value
+
+
+def _retry_started(parent: dict, phase: dict, step_id: str) -> bool:
+    """True when the step was started again, on its current route, after its last recorded failure."""
+    route = (phase.get("escalations") or [{}])[-1].get("to_route") or phase["route"]
+    last_failed = -1
+    last_started = -1
+    for index, entry in enumerate(parent.get("activity") or []):
+        if entry.get("task_id") != phase["id"] or entry.get("step_id") != step_id:
+            continue
+        if entry["status"] == "failed":
+            last_failed = index
+        elif entry["status"] == "started" and entry.get("route") in (None, route):
+            last_started = index
+    return last_failed >= 0 and last_started > last_failed
+
+
+def _bounded_text(value: str, limit: int) -> str:
+    text = " ".join(CONTROL_RE.sub(" ", ANSI_RE.sub("", value)).split())[:limit].strip()
+    return "[withheld: secret-like content]" if provenance._contains_secret_like_content(text) else text
 
 
 def _parent(record: dict) -> dict:
@@ -427,7 +456,7 @@ def _wave_event(parent: dict, event: dict) -> None:
     for task_id in task_ids:
         _safe(task_id, ID_RE, "wave task id")
     status = event.get("status")
-    if status not in WAVE_STATUSES:
+    if status not in WAVE_EVENT_STATUSES:
         raise ParentRunError("invalid wave status", error_code="PARENT_WAVE_STATUS_INVALID")
     waves = parent.setdefault("waves", [])
     wave = next((item for item in waves if item["id"] == wave_id), None)
@@ -436,11 +465,14 @@ def _wave_event(parent: dict, event: dict) -> None:
             raise ParentRunError("wave was never declared", error_code="PARENT_WAVE_TRANSITION_INVALID")
         wave = {"id": wave_id, "task_ids": list(task_ids), "status": status}
         waves.append(wave)
-    elif wave["task_ids"] != task_ids:
+    elif wave["task_ids"] != task_ids and not (
+            # A still-declared wave may grow: an implicit single-task wave takes the next task that starts alone.
+            wave["status"] == "declared" and status == "declared" and task_ids[:len(wave["task_ids"])] == wave["task_ids"]):
         raise ParentRunError("wave tasks conflict with prior event", error_code="PARENT_EVENT_CONFLICT")
-    elif WAVE_STATUSES.index(status) < WAVE_STATUSES.index(wave["status"]):
+    elif wave["status"] == "abandoned" or WAVE_STATUSES.index(status) < WAVE_STATUSES.index(wave["status"]):
         raise ParentRunError("wave cannot move backwards", error_code="PARENT_WAVE_TRANSITION_INVALID")
     wave["status"] = status
+    wave["task_ids"] = list(task_ids)
     for task_id in task_ids:
         _phase(parent, task_id)["wave_id"] = wave_id
 
@@ -534,7 +566,8 @@ def _record_event_unlocked(run_id: str, event: dict, *, repo_root: Path = ROOT) 
         "wave": {"kind", "wave_id", "task_ids", "status"},
         "concurrency": {"kind", "peak_workers", "active_ms"},
         "spawn": {"kind"},
-        "activity": {"kind", "status", "tool", "task_id", "step_id", "subagent_id", "route", "prompt_digest"},
+        "activity": {"kind", "status", "tool", "task_id", "step_id", "subagent_id", "route", "prompt_digest",
+                     "prompt_excerpt", "result_summary", "result_digest", "commit_sha"},
         "interaction": {"kind", "type", "summary", "task_id", "step_id", "subagent_id", "reply_to"},
         "lead_usage": {"kind", "model", "phase", "task_type", "turn_index", "duration_ms", "input_tokens", "output_tokens", "cached_tokens", "cache_write_tokens", "total_tokens", "estimated_cost_usd"},
         "checkpoint": {"kind", "phase", "reason"},
@@ -647,12 +680,31 @@ def _record_event_unlocked(run_id: str, event: dict, *, repo_root: Path = ROOT) 
         values = {key: _safe(event[key], pattern, key) for key, pattern in (
             ("model", MODEL_RE), ("backend", MODEL_RE), ("backend_model", MODEL_RE), ("blocker_code", CODE_RE),
             ("installed_backend_version", VERSION_RE), ("required_backend_version", VERSION_RE)) if key in event}
-        if event.get("only_if_open") is True and prior not in {"not_started", "in_progress"}:
+        if prior == "failed" and event["status"] == "in_progress" and _retry_started(parent, phase, step_id):
+            # The retry's own launch record: the failure stands (and stays visible) until the retry completes.
+            return parent
+        retried = prior == "failed" and event["status"] == "completed" and _retry_started(parent, phase, step_id)
+        if event.get("only_if_open") is True and prior not in {"not_started", "in_progress"} and not retried:
             # The lifecycle's automatic record of a worker's raw result: never overrides a recorded status.
             return parent
         terminal = {"completed", "blocked", "failed"}
         override = None
-        if prior in terminal:
+        if retried:
+            # A later start of the same step after its failure: the retry's success replaces the failure. The
+            # failure stays in `worker_overrides`, recorded by the lead or by the extension's automatic record.
+            history = [item for item in parent.get("worker_overrides") or []
+                       if (item["phase_id"], item["step_id"], item["route_epoch"]) == (phase["id"], step_id, epoch)]
+            if (len(history) >= MAX_OVERRIDES_PER_WORKER
+                    or len(parent.get("worker_overrides") or []) >= MAX_WORKER_OVERRIDES):
+                raise ParentRunError("too many overrides recorded for this worker or run",
+                                     error_code="PARENT_WORKER_OVERRIDE_LIMIT")
+            override = {"phase_id": phase["id"], "step_id": step_id, "route_epoch": epoch,
+                        "from_status": prior, "from_blocker_code": worker.get("blocker_code"),
+                        "to_status": "completed", "blocker_code": None, "phase_status": phase["status"],
+                        "by": "extension" if event.get("only_if_open") is True else "lead",
+                        "reason": "retry_succeeded", "at": _now()}
+            worker["blocker_code"] = None
+        elif prior in terminal:
             # The lead's judgment wins over an earlier record, but never silently: each override is
             # appended to `worker_overrides` with what it replaced. Allowed: completed -> failed/blocked
             # and failed -> blocked (each with a blocker code), and a failed/blocked worker restated with
@@ -726,6 +778,23 @@ def _record_event_unlocked(run_id: str, event: dict, *, repo_root: Path = ROOT) 
             if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
                 raise ParentRunError("invalid activity prompt digest")
             entry["prompt_digest"] = digest
+        # Bounded text, set by the extension from what it observes: the start of the worker contract and the
+        # start of the worker's result. Sanitised here, never rejected: control characters are dropped,
+        # whitespace is collapsed, and secret-like text is replaced by a marker. The full text lives only in
+        # the Pi session transcript.
+        for field, limit in (("prompt_excerpt", ACTIVITY_EXCERPT_CHARS), ("result_summary", ACTIVITY_SUMMARY_CHARS)):
+            if event.get(field) is not None:
+                if not isinstance(event[field], str):
+                    raise ParentRunError(f"invalid activity {field}")
+                entry[field] = _bounded_text(event[field], limit)
+        if event.get("result_digest") is not None:
+            if not isinstance(event["result_digest"], str) or not DIGEST_RE.fullmatch(event["result_digest"]):
+                raise ParentRunError("invalid activity result digest")
+            entry["result_digest"] = event["result_digest"]
+        if event.get("commit_sha") is not None:
+            if not isinstance(event["commit_sha"], str) or not COMMIT_RE.fullmatch(event["commit_sha"]):
+                raise ParentRunError("invalid activity commit sha")
+            entry["commit_sha"] = event["commit_sha"]
         parent.setdefault("activity", []).append(entry)
         parent["activity"] = parent["activity"][-500:]
     elif kind == "interaction":
@@ -865,6 +934,14 @@ def _finish_unlocked(run_id: str, status: str, *, blocker_code: str | None = Non
             raise ParentRunError("unfinished: " + "; ".join(unfinished[:12]) +
                                  ". Record each as completed, blocked or failed, then finish again",
                                  error_code="PARENT_COMPLETION_INCOMPLETE")
+        # An integration begun and never ended leaves the parent checkout in an unknown state. A wave that was
+        # only declared (read-only work, nothing to merge) stays as recorded.
+        integrating = [wave["id"] for wave in parent.get("waves") or []
+                       if wave["status"] == "integrating" and _wave_is_current(phases, wave)]
+        if integrating:
+            raise ParentRunError("wave integration was begun and never ended: " + ", ".join(integrating[:12]) +
+                                 ". Record integrate_end, or finish as PARTIAL",
+                                 error_code="PARENT_WAVE_INTEGRATING")
         missing = _missing_reviews(phases)
         if missing:
             raise ParentRunError("mandatory independent review not completed for phase " + ", ".join(missing[:12]) +
@@ -877,6 +954,11 @@ def _finish_unlocked(run_id: str, status: str, *, blocker_code: str | None = Non
     return provenance.finish_run(repo_root, run_id, outcome=status.lower(),
                                  parent_orchestration=parent,
                                  orchestration_metrics=delegation_metrics(record, parent))
+
+
+def _wave_is_current(phases: list[dict], wave: dict) -> bool:
+    """A wave no later wave has superseded: some task of it still names it as its wave."""
+    return any(phase.get("wave_id") == wave["id"] for phase in phases if phase["id"] in wave["task_ids"])
 
 
 def _reconcile_open(parent: dict, status: str) -> None:
@@ -905,6 +987,11 @@ def _reconcile_open(parent: dict, status: str) -> None:
                                 "route_epoch": epoch, "from_status": worker["status"],
                                 "to": RECONCILED_STATUS, "reason": reason, "at": at})
                 worker["status"] = RECONCILED_STATUS
+    for wave in parent.get("waves") or []:
+        if wave["status"] in WAVE_OPEN_STATUSES:
+            entries.append({"kind": "wave", "wave_id": wave["id"], "from_status": wave["status"],
+                            "to": RECONCILED_STATUS, "reason": reason, "at": at})
+            wave["status"] = RECONCILED_STATUS
     if not entries:
         del parent["reconciled"]
 

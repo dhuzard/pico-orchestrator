@@ -400,8 +400,20 @@ The parent runs independent tasks in waves. Each task declares a write scope
 | `integrate_end {wave_id}` | Re-bases the parent-checkout snapshot after the parent's merges and closes the wave. | `INTEGRATION_NOT_STARTED`, `WORKER_SCOPE_UNVERIFIABLE` |
 
 A routed task started while no worker runs and no wave is declared is recorded by the lifecycle extension as an
-implicit single-task wave (`auto-<hex>-<task>`); `integrate_begin` and `integrate_end` accept `"auto"` for it.
-The extension never infers the integrate bracket: `integrated` would assert a merge it did not observe.
+implicit single-task wave (`auto-<hex>-<task>`). While that wave is not integrated and no worker runs, the next task
+that starts alone joins it (the `wave` event may grow a still-`declared` wave by appending task ids). `integrate_begin`
+and `integrate_end` accept `"auto"` for it; `auto` fails with `WAVE_AUTO_AMBIGUOUS` when several implicit waves are
+open and `WAVE_UNKNOWN` when none is active. A declared wave replaces the active one for the gate; an implicit wave it
+does not cover stays open and visible. At a non-COMPLETED finish every `declared` or `integrating` wave becomes
+`abandoned` (`reconciled`, kind `wave`); COMPLETED is refused with `PARENT_WAVE_INTEGRATING` while a current wave is
+`integrating`. The extension never infers the integrate bracket: `integrated` would assert a merge it did not observe.
+
+Worker `activity` entries replace the lead's directive and feedback events. At start they carry `route`,
+`prompt_digest` and `prompt_excerpt` (first 300 characters of the contract); on return `result_summary` (first 600
+characters of the final text), `result_digest` and `commit_sha` when the result reports one. Text is single-line,
+control characters are removed and secret-like text is replaced by a marker. The full text lives only in the Pi session
+transcript. A failed step started again on the same route may become `completed`: the failure is kept in
+`worker_overrides` with `reason: "retry_succeeded"` and `by: "extension"` or `"lead"`.
 
 Scope overlap is conservative: an entry's scope is its literal directory
 prefix up to the first glob segment, and two entries overlap when one prefix

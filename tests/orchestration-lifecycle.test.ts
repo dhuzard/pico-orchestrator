@@ -1670,7 +1670,8 @@ async function twoTaskRun(mode: "legacy" | "lean") {
         } else {
           const input = { task: `${step} for ${task}`, label: `${task}:${step}` };
           assert.equal(await h.handlers.get("tool_call")!({ toolName: tool, toolCallId: id, input }), undefined);
-          await h.handlers.get("tool_result")!({ toolName: tool, toolCallId: id, content: [],
+          await h.handlers.get("tool_result")!({ toolName: tool, toolCallId: id,
+            content: [{ type: "text", text: `${step} of ${task} committed at 244fea7; 80 passes, one skip` }],
             details: { subagent_id: `sub-${id}`, elapsedMs: 5 } });
         }
         if (mode === "legacy") await interaction("feedback", task, step, `${step} returned`);
@@ -1700,7 +1701,27 @@ function facts(parent: any) {
       phase.workers.map((worker: any) => `${worker.step_id}=${worker.status}`).join(",")),
     checkpoint: parent.checkpoint.reason,
     final: parent.final_status,
+    // What the old directive and feedback events carried, now from activity: the contract start at launch
+    // and the result summary, digest and commit at return, for every worker call.
+    contracts: parent.activity.filter((entry: any) => entry.status === "started")
+      .map((entry: any) => `${entry.task_id}:${entry.step_id}:${entry.prompt_excerpt ? "excerpt" : "MISSING"}:${entry.prompt_digest ? "digest" : "MISSING"}`).sort(),
+    results: parent.activity.filter((entry: any) => entry.status === "finished" || entry.status === "failed")
+      .map((entry: any) => `${entry.task_id}:${entry.step_id}:${entry.result_summary ? "summary" : "MISSING"}:${entry.result_digest ? "digest" : "MISSING"}`).sort(),
+    decisions: parent.interactions.filter((entry: any) => entry.type === "decision").map((entry: any) => entry.summary),
   };
+}
+
+/**
+ * The record calls a lead must make for the two-task run, derived from what the prompt requires rather than
+ * from the script: a status check, then per task a bind (the only mutating step), the reviewer's outcome
+ * (mandatory review), the phase outcome and the integrate bracket, then one decision and finish. The
+ * previous prompt additionally required an inspection phase pair, a declared wave per task, and a directive
+ * and a feedback for each step.
+ */
+function requiredLeadCalls(requires: { inspectionPhase: boolean; singleTaskWave: boolean; directiveFeedback: boolean }) {
+  const tasks = 2, steps = 3;
+  const perTask = 1 + (requires.singleTaskWave ? 1 : 0) + (requires.directiveFeedback ? 2 * steps : 0) + 1 + 1 + 2;
+  return 1 + (requires.inspectionPhase ? 2 : 0) + tasks * perTask + 1 + 1;
 }
 
 test("a two-task run needs fewer lead record calls and loses no recorded fact", async () => {
@@ -1708,6 +1729,16 @@ test("a two-task run needs fewer lead record calls and loses no recorded fact", 
   const after = await twoTaskRun("lean");
   // Exact counts: legacy = status 1 + inspection 2 + per task (bind 1, wave 1, directive+feedback 6, reviewer 1,
   // phase 1, integrate 2) x 2 + decision 1 + finish 1; lean drops inspection, waves and directive/feedback.
+  const promptText = readFileSync(join(import.meta.dirname, "..", "prompts", "orchestrate.md"), "utf8");
+  // What the current prompt requires: the derived total is asserted against the script and against the prompt.
+  assert.match(promptText, /Do not record `interaction` directive or feedback events/);
+  assert.match(promptText, /do not record optional phases such as `inspection`/);
+  assert.match(promptText, /Declare the wave when more than one task will run concurrently/);
+  for (const required of ['{"action":"status"}', "bind_workspace", "integrate_begin", "integrate_end"]) {
+    assert.ok(promptText.includes(required), required);
+  }
+  assert.equal(before.leadRecordCalls, requiredLeadCalls({ inspectionPhase: true, singleTaskWave: true, directiveFeedback: true }));
+  assert.equal(after.leadRecordCalls, requiredLeadCalls({ inspectionPhase: false, singleTaskWave: false, directiveFeedback: false }));
   assert.equal(before.leadRecordCalls, 29);
   assert.equal(after.leadRecordCalls, 13);
   for (const run of [before, after]) {
@@ -1730,6 +1761,19 @@ test("a two-task run needs fewer lead record calls and loses no recorded fact", 
       && entry.step_id === item.step_id), `${item.type} ${item.task_id}:${item.step_id}`);
   }
   assert.deepEqual(parent.interactions.map((entry: any) => entry.type), ["decision"]);
+  // Auditability: every worker return keeps its meaning without a feedback event. Before this change the
+  // activity entry held no result at all, so these assertions fail on the pre-PR behaviour.
+  const returns = parent.activity.filter((entry: any) => entry.status === "finished");
+  assert.equal(returns.length, 6);
+  for (const entry of returns) {
+    assert.ok(entry.result_summary.length > 0 && entry.result_summary.length <= 600);
+    if (entry.tool === "spawn_subagent") assert.match(entry.result_summary, /committed at 244fea7; 80 passes, one skip/);
+    assert.match(entry.result_digest, /^[0-9a-f]{64}$/);
+  }
+  assert.deepEqual(returns.filter((entry: any) => entry.tool === "spawn_subagent").map((entry: any) => entry.commit_sha),
+    ["244fea7", "244fea7", "244fea7", "244fea7"]);
+  for (const entry of started) assert.ok(entry.prompt_excerpt.length > 0 && entry.prompt_excerpt.length <= 300);
+ 
   assert.equal(parent.waves.length, 2);
   assert.ok(parent.waves.every((wave: any) => wave.id.startsWith("auto-") && wave.status === "integrated"));
 });
@@ -1830,13 +1874,18 @@ test("worker failure and integration conflict with auto-recorded events leave th
     await record.execute("p", { action: "event", event: { kind: "phase", phase: "A", status: "partial" } });
     assert.equal((await record.execute("f", { action: "finish", status: "PARTIAL" })).details.ok, true);
     const replayed = replay(eventsOf(h), "PARTIAL");
-    // The only refusal is the recorder declining the retry's automatic "completed" over the earlier terminal
-    // "failed": telemetry-grade, so it never blocks the run (the lead can record its own judgment).
-    assert.deepEqual(replayed.errors.map((error) => error[1]), ["PARENT_WORKER_TRANSITION_INVALID"]);
+    // The retry's automatic "completed" replaces the earlier "failed"; the failure stays in worker_overrides.
+    assert.deepEqual(replayed.errors, []);
     assert.equal(replayed.final, "partial");
     const parent = replayed.parent;
     assert.deepEqual(parent.activity.filter((entry: any) => entry.status === "failed").map((entry: any) => entry.step_id), ["claude_worker"]);
-    assert.deepEqual(parent.waves.map((wave: any) => wave.status), ["integrating"]);
+    const claude = parent.phases[0].workers.find((worker: any) => worker.step_id === "claude_worker");
+    assert.deepEqual([claude.status, claude.blocker_code], ["completed", null]);
+    assert.deepEqual(parent.worker_overrides.map((o: any) => [o.from_status, o.to_status, o.by, o.reason, o.from_blocker_code]),
+      [["failed", "completed", "extension", "retry_succeeded", "MODEL_INVOCATION_FAILED"]]);
+    // The abandoned integration is reconciled, not left open.
+    assert.deepEqual(parent.waves.map((wave: any) => wave.status), ["abandoned"]);
+    assert.deepEqual(parent.reconciled.filter((entry: any) => entry.kind === "wave").map((entry: any) => entry.from_status), ["integrating"]);
     const open = parent.phases.flatMap((phase: any) => [phase, ...phase.workers]).filter((item: any) => ["not_started", "in_progress"].includes(item.status));
     assert.deepEqual(open, []);
   } finally { rmSync(dir, { recursive: true, force: true }); }
@@ -1867,4 +1916,62 @@ test("resume after an interruption starts a fresh implicit wave without conflict
   const replayed = replay([...eventsOf(first), ...eventsOf(resumed)], null);
   assert.deepEqual(replayed.errors, []);
   assert.equal(replayed.parent.waves.length, 2);
+  // The orphan of the interrupted process is superseded by the resumed wave and, with no COMPLETED, reconciled.
+  assert.equal(replay([...eventsOf(first), ...eventsOf(resumed)], "PARTIAL").parent.waves.every((wave: any) => wave.status === "abandoned"), true);
+});
+
+const done = (h: ReturnType<typeof harness>, id: string, text = "ok") => h.handlers.get("tool_result")!({
+  toolName: "spawn_subagent", toolCallId: id, content: [{ type: "text", text }], details: { subagent_id: `sub-${id}` } });
+const spawnCall = (id: string, label: string) => ({ toolName: "spawn_subagent", toolCallId: id, input: { task: "t", label } });
+
+test("tasks run in turn share one implicit wave: no dangling wave, and auto integrates all of it", async () => {
+  const h = harness({ ok: true, status: "READY" });
+  await h.handlers.get("before_agent_start")!({ prompt: "PI_ORCHESTRATION_RUN_V1" }, { cwd: "/tmp/target", ui: { notify() {} } });
+  for (const id of ["A", "B"]) await h.handlers.get("tool_result")!(routeFor(id));
+  const record = h.tools.get("orchestration_record");
+  // The reviewer's interleaving: specifier A, specifier B, reviewer A, then integrate.
+  for (const [id, label] of [["a1", "A:codex_specifier"], ["b1", "B:codex_specifier"], ["a2", "A:codex_reviewer"]]) {
+    assert.equal(await h.handlers.get("tool_call")!(spawnCall(id, label)), undefined);
+    await done(h, id);
+  }
+  assert.equal((await record.execute("i", { action: "integrate_begin", wave_id: "auto" })).details.ok, true);
+  assert.equal((await record.execute("i", { action: "integrate_end", wave_id: "auto" })).details.ok, true);
+  const replayed = replay(eventsOf(h), null);
+  assert.deepEqual(replayed.errors, []);
+  const waves = replayed.parent.waves;
+  assert.deepEqual(waves.map((wave: any) => [wave.task_ids, wave.status]), [[["A", "B"], "integrated"]]);
+  assert.deepEqual(replayed.parent.phases.map((phase: any) => phase.wave_id), [waves[0].id, waves[0].id]);
+  // Integrated: the next task starts a new wave rather than reopening it.
+  assert.equal(await h.handlers.get("tool_call")!(spawnCall("a3", "A:codex_reviewer")), undefined);
+  assert.equal(replay(eventsOf(h), null).parent.waves.length, 2);
+});
+
+test("a declared wave after an implicit one supersedes it; auto then refuses clearly", async () => {
+  const h = harness({ ok: true, status: "READY" });
+  await h.handlers.get("before_agent_start")!({ prompt: "PI_ORCHESTRATION_RUN_V1" }, { cwd: "/tmp/target", ui: { notify() {} } });
+  for (const id of ["A", "B", "C", "D"]) await h.handlers.get("tool_result")!(routeFor(id));
+  const record = h.tools.get("orchestration_record");
+  assert.equal(await h.handlers.get("tool_call")!(spawnCall("a1", "A:codex_specifier")), undefined);
+  await done(h, "a1");
+  // Not integrated and not part of the next wave: it stays open and visible.
+  assert.equal((await record.execute("w", { action: "declare_wave", wave_id: "w2", tasks: [
+    { task_id: "B", write_scope: ["b/**"] }, { task_id: "C", write_scope: ["c/**"] }] })).details.ok, true);
+  assert.match((await record.execute("i", { action: "integrate_begin", wave_id: "auto" })).content[0].text, /WAVE_UNKNOWN/);
+  assert.equal((await record.execute("i", { action: "integrate_begin", wave_id: "w2" })).details.ok, true);
+  assert.equal((await record.execute("i", { action: "integrate_end", wave_id: "w2" })).details.ok, true);
+  // A new implicit wave while the earlier one is still open: two are open, so auto names none of them.
+  assert.equal(await h.handlers.get("tool_call")!(spawnCall("d1", "D:codex_specifier")), undefined);
+  await done(h, "d1");
+  const ambiguous = await record.execute("i", { action: "integrate_begin", wave_id: "auto" });
+  assert.equal(ambiguous.details.ok, false);
+  assert.match(ambiguous.content[0].text, /WAVE_AUTO_AMBIGUOUS/);
+  assert.equal(h.calls.filter((call) => call.input?.status === "integrating").length, 1, "a refused auto records nothing more");
+  // The wave is still reachable by its id, and the dangling one is reconciled when the run is not COMPLETED.
+  const dId = h.calls.filter((call) => call.input?.kind === "wave").at(-1)!.input!.wave_id as string;
+  assert.equal((await record.execute("i", { action: "integrate_begin", wave_id: dId })).details.ok, true);
+  assert.equal((await record.execute("i", { action: "integrate_end", wave_id: dId })).details.ok, true);
+  const replayed = replay(eventsOf(h), "PARTIAL");
+  assert.deepEqual(replayed.errors, []);
+  assert.deepEqual(replayed.parent.waves.map((wave: any) => wave.status), ["abandoned", "integrated", "integrated"]);
+  assert.deepEqual(replayed.parent.reconciled.filter((entry: any) => entry.kind === "wave").map((entry: any) => entry.from_status), ["declared"]);
 });

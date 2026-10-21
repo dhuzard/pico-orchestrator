@@ -57,6 +57,18 @@ const EFFORT = Type.Union(REASONING_EFFORTS.map((effort) => Type.Literal(effort)
 const DEFAULT_PARALLEL_TASKS = 3;
 const TAG_ID = "[A-Za-z0-9][A-Za-z0-9_.-]{0,127}";
 const LABEL_TAG = new RegExp(`^(${TAG_ID}):(${TAG_ID})$`);
+const EXCERPT_CHARS = 300;
+const SUMMARY_CHARS = 600;
+/** Bounded, single-line, control-free text for the record; the recorder bounds and screens it again. */
+function boundedText(value: string, limit: number): string {
+  return value.replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, "").replace(/[\u0000-\u001f\u007f-\u009f]+/g, " ").replace(/\s+/g, " ").trim().slice(0, limit);
+}
+/** The commit a worker result reports ("commit abc1234", "at 244fea7", or a bare 40-hex id), if any. */
+function reportedCommit(text: string): string | undefined {
+  const keyed = /\b(?:commit(?:ted)?|sha|HEAD)\b[^0-9a-f]{0,12}([0-9a-f]{7,40})\b/i.exec(text)
+    ?? /\b(?:at|as)\s+([0-9a-f]{7,40})\b(?=[\s;,.)]|$)/i.exec(text) ?? /\b([0-9a-f]{40})\b/.exec(text);
+  return keyed ? keyed[1].toLowerCase() : undefined;
+}
 const PROMPT_TAG = new RegExp(`^\\s*\\[pico-task (${TAG_ID}):(${TAG_ID})\\]`);
 const ESCALATION = Type.Union(["FAILED_ATTEMPTS", "REVIEW_FINDINGS", "AMBIGUITY", "ARCHITECTURE",
   "SECURITY_SENSITIVE", "SEMANTIC_RISK", "CONTEXT_BUDGET"].map((reason) => Type.Literal(reason)));
@@ -344,6 +356,8 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
   let currentTurn: number | null = null;
   const messageStarts = new Map<number, number>();
   let activeWave: { id: string; tasks: Map<string, string[]>; implicit?: boolean } | null = null;
+  // Implicit single-task waves recorded in this process and not yet integrated; "auto" needs exactly one.
+  const implicitOpen = new Map<string, string[]>();
   let integrating: string | null = null;
   let batchStart = 0;
   let batchPeak = 0;
@@ -511,7 +525,7 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
   function resetRunState(): void {
     approvals.clear(); pendingRoutes.clear(); workspaces.clear(); snapshots.clear();
     subagentTasks.clear(); inFlight.clear(); claudeCalls.clear(); workerPlans.clear();
-    scopeViolation = null; activeWave = null; integrating = null; lastPhase = "routing";
+    scopeViolation = null; activeWave = null; integrating = null; implicitOpen.clear(); lastPhase = "routing";
     currentTurn = null; messageStarts.clear();
     batchStart = 0; batchPeak = 0;
     pendingReroutes.clear();
@@ -887,7 +901,8 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
       if (runId) await observe({ kind: "activity", status: "started", tool: call.toolName,
         task_id: taskId, step_id: step?.id ?? null,
         ...(approval ? { route: approval.route } : {}),
-        ...(contract ? { prompt_digest: createHash("sha256").update(contract).digest("hex") } : {}) });
+        ...(contract ? { prompt_digest: createHash("sha256").update(contract).digest("hex"),
+                         prompt_excerpt: boundedText(contract, EXCERPT_CHARS) } : {}) });
       batchPeak = Math.max(batchPeak, inFlight.size);
       workerStarts.set(call.toolCallId, Date.now());
       const plan = workerPlans.get(call.toolCallId);
@@ -932,8 +947,17 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
       }
     }
     await workerFinished(result.toolCallId);
-    if (runId && worker) await observe({ kind: "activity", status: result.isError ? "failed" : "finished",
-      tool: worker.tool, task_id: worker.taskId, step_id: worker.stepId });
+    if (runId && worker) {
+      // What the worker returned, bounded: the first part of its final text, a digest of all of it, and the
+      // commit it reports. This replaces the lead's feedback events; the full text stays in the Pi transcript.
+      const text = result.content.filter((item) => item.type === "text").map((item) => item.text).join("\n");
+      const commit = reportedCommit(text);
+      await observe({ kind: "activity", status: result.isError ? "failed" : "finished",
+        tool: worker.tool, task_id: worker.taskId, step_id: worker.stepId,
+        ...(text ? { result_summary: boundedText(text, SUMMARY_CHARS),
+                     result_digest: createHash("sha256").update(text).digest("hex") } : {}),
+        ...(commit ? { commit_sha: commit } : {}) });
+    }
     const before = snapshots.get(result.toolCallId);
     snapshots.delete(result.toolCallId);
     if (runId && before) {
@@ -1090,12 +1114,17 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
    */
   async function recordImplicitWave(taskId: string): Promise<void> {
     if (!runId || parentBlocked) return;
+    // An implicit wave that is not yet integrated is never replaced: while no worker runs it takes the next task
+    // that starts alone, so one wave covers the tasks the lead ran one after another.
+    const current = activeWave?.implicit === true ? activeWave : null;
     // Unique across processes (a resumed run has no counter), so a repeated task never reuses an integrated wave.
-    const id = `auto-${randomBytes(4).toString("hex")}-${taskId}`.slice(0, 128);
+    const id = current?.id ?? `auto-${randomBytes(4).toString("hex")}-${taskId}`.slice(0, 128);
+    const taskIds = [...(current ? current.tasks.keys() : []), taskId];
     const result = await command(PARENT, ["event", runId, ...ownerArgs()],
-      { kind: "wave", wave_id: id, task_ids: [taskId], status: "declared" });
+      { kind: "wave", wave_id: id, task_ids: taskIds, status: "declared" });
     if (result.ok === false) { diagnose("telemetry", result); return; }
-    activeWave = { id, tasks: new Map([[taskId, []]]), implicit: true };
+    activeWave = { id, tasks: new Map(taskIds.map((task) => [task, [] as string[]])), implicit: true };
+    implicitOpen.set(id, taskIds);
   }
 
   async function declareWave(waveId: string, tasks: { task_id: string; write_scope: string[] }[]) {
@@ -1135,13 +1164,24 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
       return reply(false, "BLOCKED: parent provenance update failed; see diagnostic log.", parentFailure ?? {});
     }
     activeWave = { id: waveId, tasks: new Map(tasks.map((task) => [task.task_id, task.write_scope])) };
+    // An implicit wave whose tasks all joined this wave is superseded; any other stays open and visible.
+    for (const [id, members] of implicitOpen) if (members.every((task) => ids.includes(task))) implicitOpen.delete(id);
     return reply(true, `Wave ${waveId} declared with ${ids.length} task(s) (limit ${limit}). Launch all their ready workers in one tool batch, each attributed "<task_id>:<step_id>".`,
       { wave_id: waveId, task_ids: ids, parallel_tasks: limit });
   }
 
   async function integration(action: "integrate_begin" | "integrate_end", requestedWaveId: string) {
     // The lead names an implicitly recorded single-task wave as "auto".
-    const waveId = requestedWaveId === "auto" && activeWave?.implicit ? activeWave.id : requestedWaveId;
+    let waveId = requestedWaveId;
+    if (requestedWaveId === "auto") {
+      if (implicitOpen.size > 1) {
+        return reply(false, `BLOCKED: WAVE_AUTO_AMBIGUOUS: ${implicitOpen.size} implicit waves are open (${[...implicitOpen.keys()].join(", ")}); name the one to integrate by its id.`);
+      }
+      if (!activeWave?.implicit || !implicitOpen.has(activeWave.id)) {
+        return reply(false, `BLOCKED: WAVE_UNKNOWN: "auto" names the open implicit wave, and none is active${activeWave ? ` (the active wave is ${activeWave.id})` : ""}.`);
+      }
+      waveId = activeWave.id;
+    }
     if (action === "integrate_begin") {
       if (!activeWave || activeWave.id !== waveId) return reply(false, `BLOCKED: WAVE_UNKNOWN: ${waveId} is not the declared wave.`);
       if (integrating) return reply(true, `Wave ${waveId} is already integrating.`);
@@ -1163,6 +1203,7 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
       return reply(false, "BLOCKED: parent provenance update failed; see diagnostic log.", parentFailure ?? {});
     }
     integrating = null;
+    implicitOpen.delete(waveId);
     activeWave = null;
     return reply(true, `Wave ${waveId} integrated; the parent checkout snapshot is re-based. Plan the next dependency-ready wave.`,
       { wave_id: waveId, digest: rebased.digest });
@@ -1171,7 +1212,7 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
   pi.registerTool({
     name: "orchestration_record",
     label: "Record parent orchestration outcome",
-    description: "Parent only: record phases, workers, child runs, mutation counts, concise numbered interaction summaries, or final status; bind mutating steps to prepared worktrees; declare waves; and bracket integration. Interaction events describe directives, feedback, and decisions with task/step ids and optional reply_to. Never include prompts, raw outputs, transcripts, or issue bodies.",
+    description: "Parent only: record phases, workers, child runs, mutation counts, concise numbered interaction summaries, or final status; bind mutating steps to prepared worktrees; declare waves; and bracket integration. Do not record directive or feedback interactions: the extension records each worker call itself, with task, step, route, a contract excerpt and digest, and a bounded result summary, digest and commit (the full text stays in the Pi session transcript). Record a decision interaction only for your own judgment, with task/step ids and optional reply_to. Never include prompts, raw outputs, transcripts, or issue bodies.",
     parameters: Type.Union([
       Type.Object({ action: Type.Literal("status") }, { additionalProperties: false }),
       Type.Object({ action: Type.Literal("bind_workspace"), task_id: Type.Optional(Type.String()),

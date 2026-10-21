@@ -66,7 +66,7 @@
         "worker_overrides": {
           "type": "array",
           "maxItems": 200,
-          "description": "Each time the lead replaced a terminal worker record (completed -> failed/blocked, failed -> blocked, or a failed/blocked worker restated with a different blocker code). The earlier status and blocker code are kept here; the worker holds the current ones.",
+          "description": "Each time a terminal worker record was replaced: by the lead (completed -> failed/blocked, failed -> blocked, or a failed/blocked worker restated with a different blocker code), or failed -> completed when a later start of the same step succeeded (by lead or extension, reason retry_succeeded). The earlier status and blocker code are kept here; the worker holds the current ones.",
           "items": {
             "type": "object",
             "additionalProperties": false,
@@ -85,10 +85,11 @@
                   "required_backend_version": {"type": "string"}
                 }
               },
-              "to_status": {"enum": ["failed", "blocked"]},
-              "blocker_code": {"type": "string"},
+              "to_status": {"enum": ["completed", "failed", "blocked"]},
+              "blocker_code": {"type": ["string", "null"]},
               "phase_status": {"type": "string", "description": "Status of the worker's phase when the override was recorded; a terminal value flags a phase outcome recorded before the override."},
-              "by": {"const": "lead"},
+              "by": {"enum": ["lead", "extension"]},
+              "reason": {"const": "retry_succeeded", "description": "Present when a retry of a failed step succeeded: the failure is replaced by completed, by the lead or by the extension's automatic record."},
               "at": {"type": "string"}
             }
           }
@@ -99,13 +100,14 @@
           "items": {
             "type": "object",
             "additionalProperties": false,
-            "required": ["kind", "phase_id", "from_status", "to", "reason", "at"],
+            "required": ["kind", "from_status", "to", "reason", "at"],
             "properties": {
-              "kind": {"enum": ["phase", "worker"]},
+              "kind": {"enum": ["phase", "worker", "wave"]},
+              "wave_id": {"type": "string", "description": "Id of a reconciled wave (kind wave): declared or integrating when the run ended without COMPLETED."},
               "phase_id": {"type": "string"},
               "step_id": {"type": "string"},
               "route_epoch": {"type": "integer", "minimum": 0, "description": "Route epoch of a reconciled worker."},
-              "from_status": {"enum": ["not_started", "in_progress"]},
+              "from_status": {"enum": ["not_started", "in_progress", "declared", "integrating"]},
               "to": {"const": "abandoned"},
               "reason": {"type": "string", "maxLength": 120},
               "at": {"type": "string"}
@@ -602,7 +604,8 @@
                 "enum": [
                   "declared",
                   "integrating",
-                  "integrated"
+                  "integrated",
+                  "abandoned"
                 ]
               }
             }
@@ -670,7 +673,27 @@
               "prompt_digest": {
                 "type": "string",
                 "pattern": "^[0-9a-f]{64}$",
-                "description": "SHA-256 of the worker contract; the contract itself is never recorded."
+                "description": "SHA-256 of the worker contract."
+              },
+              "prompt_excerpt": {
+                "type": "string",
+                "maxLength": 300,
+                "description": "First 300 characters of the worker contract, control characters removed, secret-like text withheld. The full text lives in the Pi session transcript."
+              },
+              "result_summary": {
+                "type": "string",
+                "maxLength": 600,
+                "description": "First 600 characters of the worker's final text, control characters removed, secret-like text withheld. The full text lives in the Pi session transcript."
+              },
+              "result_digest": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$",
+                "description": "SHA-256 of the worker's full final text."
+              },
+              "commit_sha": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{7,40}$",
+                "description": "Commit the worker's result reported, when it named one."
               }
             }
           }

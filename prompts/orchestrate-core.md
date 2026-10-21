@@ -138,12 +138,26 @@ Your job is to:
 10. continue with the next dependency-ready wave until no authorized work remains.
 
 Do not record `interaction` directive or feedback events: the lifecycle
-extension records every worker call itself (task, step, route, and a digest of
-the worker contract). Record an `interaction` `decision` only when worker
+extension records every worker call itself (task, step, route, a contract
+excerpt and digest, and on return a bounded result summary, result digest and
+any commit it reports). Record an `interaction` `decision` only when worker
 results change the next action, since it is your judgment. Use the returned
 interaction sequence as `reply_to` when linking a decision. These are
 single-line, non-secret summaries of observable work, never prompts, outputs,
 transcripts, or hidden reasoning. See the full reference for the event fields.
+
+Waves: declare one with `declare_wave` only when several tasks will run
+concurrently (their workers launched in one batch, disjoint write scopes). A
+task you start alone, with no other worker running and no wave declared, is
+recorded by the lifecycle extension as an implicit single-task wave, and
+tasks you then run one after another join that same wave until you integrate
+it; do not declare these. Integrate it with `integrate_begin` and
+`integrate_end` using `"wave_id":"auto"`; `auto` is refused
+(`WAVE_AUTO_AMBIGUOUS`, `WAVE_UNKNOWN`) when several implicit waves are open
+or none is active, and then you name the wave by the id in the reply. Two
+tasks running at the same time without a declared wave are refused
+(`WAVE_UNDECLARED`). A run cannot finish `COMPLETED` while an integration was
+begun and never ended; finish `PARTIAL` if it cannot be completed.
 
 ## Classification
 
