@@ -544,9 +544,11 @@ must be authorized, or the gate refuses with `PUBLICATION_BODY_INVALID`:
   `Closes #N` line, so a batch PR can close every issue it resolves.
 
 Closed issues must be in the PR's own repository. `issue_reference` is read
-from `.pi/autonomy.yaml` at the base branch's current commit **as the GitHub
-API reports it**, through the authenticated `gh` adapter
-(`github_sync.branch_head`: `gh api -X GET repos/<repo>/git/ref/heads/<base>`;
+from `.pi/autonomy.yaml` at the **default branch's** current commit **as the
+GitHub API reports it** (never the caller's `--base`; see below), through the
+authenticated `gh` adapter (`github_sync.default_branch`: `gh api -X GET
+repos/<repo>`; `github_sync.branch_head`: `gh api -X GET
+repos/<repo>/git/ref/heads/<default>`;
 `github_sync.policy_file_at`: `gh api -X GET
 repos/<repo>/contents/.pi/autonomy.yaml?ref=<sha>`, both fixed argv with
 shape validation, pinned to `--hostname github.com` and run without
@@ -556,23 +558,106 @@ config, so a forged `refs/heads/<base>` or `refs/remotes/...`, a `git
 replace`, or a `core.sshCommand`, `remote.<name>.uploadpack` or
 `include.path` that serves a fake remote cannot authorize closing, and
 neither can an uncommitted edit or a policy committed on the `pico/` branch.
-A base branch or policy that GitHub does not have means `refs`. GitHub
+A default branch or policy that GitHub does not have means `refs`. GitHub
 reports a symlink at `.pi/autonomy.yaml` as `type: symlink` (or, for a
 symlink to a file in the repository, as that file under another `path`);
-both are refused with `AUTONOMY_POLICY_PATH_UNSAFE`, as is a symlinked or
-locally modified policy in the checkout. Base branch names are limited to
+both are refused with `AUTONOMY_POLICY_PATH_UNSAFE`, as is a symlinked `.pi`
+or policy in the checkout (a dirty copy is ignored, see below). Base branch names are limited to
 `[A-Za-z0-9._-]` segments separated by `/` (`PUBLICATION_REF_INVALID`). The
 policy is consulted only when the body would close an issue the caller did
-not name. The dry-run plan records `base_commit`, `issue_reference`,
-`closes_issues`, the policy blob SHA (`issue_policy_blob`, when consulted)
-and the body hash, so the reviewed `plan_hash` binds all of them. Because
-`base_commit` is in the plan, any merge to the base branch between the dry
-run and the apply makes the apply fail with `GITHUB_STATE_CONFLICT`, even
-for a PR that only says `Refs #N`; review a fresh dry run and apply again. A
-workspace task without `closes_issue` reads the same GitHub base commit to
-choose its body, and `workspace_contracts publish` returns that choice as
-`issue_reference_decision` (`closes`, `source: task | repository`,
-`base_commit`, `policy_blob`).
+not name. The dry-run plan records `base_commit`, `policy_branch`,
+`policy_commit`, `policy_blob`, `issue_reference`, `closes_issues` and the body
+hash, so the reviewed `plan_hash` binds all of them. Any merge to the base or
+the default branch between the dry run and the apply makes the apply fail
+with `GITHUB_STATE_CONFLICT`, even for a PR that only says `Refs #N`; review a
+fresh dry run and apply again. A workspace task without `closes_issue` reads
+the same default-branch policy to choose its body, and `workspace_contracts
+publish` returns that choice as `issue_reference_decision` (`closes`,
+`source: task | repository`, `policy_branch`, `policy_commit`,
+`policy_blob`).
+
+**Publication permissions (`push_branch`, `create_pr`) come from the same
+default-branch policy** (issue #39). `github_integration.publish` asks the API
+for the repository's default branch (`repos/<repo>` `default_branch`; the
+response must name the same repository), reads that branch's head commit and
+its `.pi/autonomy.yaml` once, and that one blob decides both `issue_reference`
+and whether the PR may be pushed and opened. Neither the working tree nor the
+caller's `--base` is authority. `--base` only chooses where the PR points: a
+worker's `pico/` branch reaches GitHub through a single grant and could carry
+any policy, so a policy read at the caller-named base would let that branch
+authorize itself (and close issues). A worker can also edit its tracked copy,
+commit a grant on its `pico/` branch (which reaches the integrated branch when
+the lead integrates), or symlink `.pi`; none of that matters. Order of checks,
+before any local ref is inspected:
+
+1. A symlinked `.pi` or `.pi/autonomy.yaml` in the checkout is refused with
+   `AUTONOMY_POLICY_PATH_UNSAFE` (cheap defence in depth). A modified, deleted
+   or untracked copy is not refused: it has no authority, and refusing it
+   would break a Garden toggle or `init_project`'s uncommitted policy.
+2. The default-branch policy is read; a symlink, a `type`/`path` mismatch, a
+   directory or an unreadable file is `AUTONOMY_POLICY_PATH_UNSAFE` or
+   `AUTONOMY_POLICY_INVALID`, and a schema-invalid policy is
+   `AUTONOMY_POLICY_INVALID` (a one-shot grant never overrides these).
+3. A missing default branch or policy, or a policy that does not set both
+   permissions to `true`, is `PUBLICATION_NOT_AUTHORIZED`, unless an in-process
+   one-shot grant covers the withheld permissions (unchanged: Garden-confirmed,
+   never from the command line).
+
+The plan records `policy_branch`, `policy_commit`, `policy_blob` (always,
+replacing the earlier `issue_policy_blob`), `publication_permissions` (the two
+booleans the policy evaluated to, so a grant shows `false`/`false` next to
+`authorization: one_shot_grant`), `base_commit` and `authorization`; all are in
+the hashed plan. A merge that changes the default branch between the dry run
+and the apply changes `policy_commit` and so yields `GITHUB_STATE_CONFLICT`; a
+change that withdraws the permissions is `PUBLICATION_NOT_AUTHORIZED` at apply
+time.
+
+*Root of trust.* The repository's default branch on GitHub is now the root of
+trust for publication. Whoever can push to it, merge into it, or change which
+branch is the default (a repository admin) controls `push_branch`,
+`create_pr` and `issue_reference` for every publication. Protect the default
+branch: require pull request review and disallow direct pushes (and restrict
+who can change the default branch or edit branch protection). PICO cannot
+verify these settings; they are the operator's responsibility.
+
+*Drift.* A checkout whose `.pi/autonomy.yaml` (committed or dirty) differs from
+the authorizing policy is reported but not refused: `publish` returns
+`policy_drift`, the sorted permission names that differ. It is informational,
+not part of the plan hash, and can never grant more than the authorizing
+policy. Refusing on drift (a candidate `AUTONOMY_POLICY_DRIFT`) was rejected:
+it would block publishing the very PR that proposes a policy change.
+
+Who else reads autonomy permissions (issue #39 audit):
+
+| Reader | Effect | Source |
+| --- | --- | --- |
+| `github_integration.publish` (push, draft PR); reached by `--publish`, `workspace_contracts.publish` and the Garden `publish` action | GitHub write | default-branch policy on GitHub (changed) |
+| `backlog github-pr-create` | opened a PR for any base and head with no permission check, dry run or plan hash | **removed**; PRs are opened only by `publish`, and `github-pr-link` links the result. Removal was smaller and safer than rebuilding a second gated path |
+| Garden one-shot grant | in-process override for one reviewed plan | unchanged; covers only the two permissions the policy withholds |
+| `github_integration.execute`, `backlog github-push` | GitHub write | see "Not enforced" below |
+| `headless_run.mutation_permitted` | decides whether `start` needs `--allow-mutation` for a local run | working tree, left: it can only add a prompt for the operator, it authorizes no GitHub write |
+| `autonomy_policy.limits` (`parallel_tasks`, `open_prs`, `pr_granularity`) | local scheduling | working tree, left |
+| Garden permissions panel | display and `set_permission`/`commit_policy` | checkout, left; its preview and panel say that publication ignores it until the change is committed and pushed to the default branch |
+
+**Not enforced today (follow-up: #58).** `create_github_issues`,
+`comment_on_issue` and `comment_on_pr` in `.pi/autonomy.yaml` are **not**
+enforced by `github_integration.execute` or `backlog github-push`. Those paths
+rely on the parent's dry run and plan hash (and `--allow-destructive` for
+closes) alone; a policy that sets these permissions to `false` does not stop
+them. Do not treat those three flags as a control until #58 lands.
+
+**Trust boundary summary.** Publication authority rests on the default branch
+on GitHub (see "Root of trust" above) and on the Garden session token for
+one-shot grants. Agent-side tool denylists do not fully stop a same-user
+process (S1, #59): a process running as the user can read the token or call
+`gh` directly, so they are not a substitute for branch protection.
+
+**Garden one-shot grant trust (follow-up: #59).** The grant trusts whoever
+holds the Garden session token. `pico watch` prints the token, so a process
+running as the same user, including a lead running bash outside a sandbox,
+can obtain it and confirm a grant. That is inside the same-user trust boundary
+tracked with worker isolation (S1); the token does not defend against a
+same-user process.
 
 The trust boundary stops at the push. The branch push itself still runs
 through local git (`git push` with the checkout's remote and config), so a
@@ -1098,10 +1183,8 @@ python3 tools/backlog.py update ORCH-001 --status in_progress
 # Orchestrate implementation/review in Pi, store run provenance, validate, then:
 python3 tools/backlog.py update ORCH-001 --status review
 
-# If a branch has already been pushed by a human/CI-safe process, create or link
-# a PR without closing the issue automatically.
-python3 tools/backlog.py github-pr-create ORCH-001 --base main --head feature/export-workflow
-# or: python3 tools/backlog.py github-pr-link ORCH-001 17
+# Open the PR with the gated publication path, then link it (no automatic closing).
+python3 tools/backlog.py github-pr-link ORCH-001 17
 
 # Only after deterministic acceptance criteria are satisfied:
 python3 tools/backlog.py update ORCH-001 --status completed
@@ -1643,7 +1726,6 @@ python3 tools/backlog.py github-sync <id>
 python3 tools/backlog.py github-push <id>
 python3 tools/backlog.py github-pull <issue-number>
 python3 tools/backlog.py github-pr-sync <id>
-python3 tools/backlog.py github-pr-create <id> --base <base-branch> --head <already-pushed-head-branch>
 python3 tools/backlog.py github-pr-link <id> <pr-number>
 ```
 
@@ -2013,12 +2095,13 @@ the validated commit (`WORKSPACE_HEAD_CHANGED`). Every upstream implementation
 task must already have a PR, unless it is `merged`
 (`WORKSPACE_UPSTREAM_UNPUBLISHED`). The body (`Refs #<issue>`, or
 `Closes #<issue>` when the task sets `closes_issue: true` or omits it in a
-repository whose `.pi/autonomy.yaml` on GitHub's base branch sets
+repository whose `.pi/autonomy.yaml` on GitHub's default branch sets
 `issue_reference: closes`; validated
 commit, check results, contracts, `Depends on: owner/repo#N` lines, no
 objective or transcript, secret-scanned) goes to
 `github_integration.publish` unchanged: autonomy `push_branch` and
-`create_pr` are required (`PUBLICATION_NOT_AUTHORIZED`), the run is a dry run
+`create_pr` are required on the default branch's policy on GitHub
+(`PUBLICATION_NOT_AUTHORIZED`), the run is a dry run
 until `--apply` with the reviewed `--plan-hash`, the push is non-force, and the
 PR is a draft. The PR number and publication run id are recorded.
 
@@ -2191,7 +2274,7 @@ HMAC confirmation and are audited:
 **One-shot publication grant.** `github_integration.publish(..., grant=...)`
 accepts `{"one_shot": true, "granted_by": "<name>"}` from in-process callers
 only; there is no command-line flag, so `--publish` behaves exactly as before.
-A grant covers only the permissions the policy withholds (`push_branch`,
+A grant covers only the permissions the default-branch policy withholds (`push_branch`,
 `create_pr`), never an unreadable or invalid policy (`AUTONOMY_POLICY_INVALID`
 still blocks). The publication record's new optional `authorization` field
 (`source: policy | one_shot_grant`, `granted_by`, `granted`) and the plan hash
@@ -2415,12 +2498,10 @@ choke point (`_run`):
   signal that must not silently drive workflow state. A remote-closed/
   local-not-completed mismatch is reported as a `discrepancy`, not
   auto-repaired.
-- `github_pr_create_task(id, base, head)` — creates a PR only for a backlog
-  item in `review` or `completed` with a mapped GitHub issue, using an
-  explicit already-pushed head branch and a generated body containing
-  `Refs #N` (not closing keywords, whatever `issue_reference` says). It never
-  pushes, checks out, merges, or
-  marks a PR ready.
+- There is no `github-pr-create` (removed in the #39 fix): it called
+  `gh pr create` with any base and head and no permission check, dry run or
+  plan hash. PRs are opened by `github_integration --publish`, and
+  `github_pr_link_task` links the result.
 - `github_pr_link_task(id, pr)` — records an existing PR mapping and PR sync
   baseline under the same `review`/`completed` plus mapped-issue guard,
   without editing remote PR metadata.

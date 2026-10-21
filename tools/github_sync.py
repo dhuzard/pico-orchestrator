@@ -173,13 +173,14 @@ def _validate_pr_patch_argv(argv: list[str]) -> None:
 _OWNER_REPO = r"([A-Za-z0-9][A-Za-z0-9_.-]*)/([A-Za-z0-9][A-Za-z0-9_.-]*)"
 _BRANCH = r"[A-Za-z0-9][A-Za-z0-9._-]*(?:/[A-Za-z0-9][A-Za-z0-9._-]*)*"
 _GET_BRANCH_RE = re.compile(rf"repos/{_OWNER_REPO}/git/ref/heads/({_BRANCH})")
+_GET_REPO_RE = re.compile(rf"repos/{_OWNER_REPO}")
 _GET_POLICY_RE = re.compile(rf"repos/{_OWNER_REPO}/contents/\.pi/autonomy\.yaml\?ref=([0-9a-f]{{40,64}})")
 POLICY_PATH = ".pi/autonomy.yaml"
 GITHUB_HOSTNAME = "github.com"
 
 
 def _validate_get_argv(argv: list[str]) -> None:
-    """Accept only `gh api -X GET <branch ref | policy contents endpoint> --hostname github.com`."""
+    """Accept only `gh api -X GET <repository | branch ref | policy contents endpoint> --hostname github.com`."""
     def reject(reason: str) -> None:
         raise GithubSyncError(f"internal error: gh api argv rejected ({reason}): {argv!r}")
 
@@ -187,14 +188,14 @@ def _validate_get_argv(argv: list[str]) -> None:
         reject("unexpected length")
     if argv[5:] != ["--hostname", GITHUB_HOSTNAME]:
         reject("the host must be pinned with --hostname github.com")
-    match = _GET_BRANCH_RE.fullmatch(argv[4]) or _GET_POLICY_RE.fullmatch(argv[4])
+    match = _GET_BRANCH_RE.fullmatch(argv[4]) or _GET_POLICY_RE.fullmatch(argv[4]) or _GET_REPO_RE.fullmatch(argv[4])
     if not match:
-        reject("endpoint must be a branch ref or the .pi/autonomy.yaml contents at a commit")
+        reject("endpoint must be the repository, a branch ref or the .pi/autonomy.yaml contents at a commit")
     try:
         validate_repo(f"{match.group(1)}/{match.group(2)}")
     except ValueError:
         reject("invalid owner/repo")
-    if ".." in match.group(3):
+    if match.lastindex >= 3 and ".." in match.group(3):
         reject("invalid branch")
 
 
@@ -212,6 +213,27 @@ def _get_or_none(argv: list[str], context: str) -> Any:
         return None
     _require_success(proc, argv)
     return _parse_json(proc, context)
+
+
+def default_branch(*, repo: str) -> str:
+    """The repository's default branch name as GitHub reports it (`gh api -X GET repos/<repo>`).
+
+    The authorizing autonomy policy lives on this branch, never on a branch a
+    caller names. A response for another repository (a rename or transfer
+    redirect) or an invalid branch name is refused.
+    """
+    argv = [GH_BINARY, "api", "-X", "GET", f"repos/{validate_repo(repo)}", "--hostname", GITHUB_HOSTNAME]
+    data = _get_or_none(argv, "gh api repos")
+    if data is None:
+        raise GhOutputError("gh api repos: repository not found")
+    name = data.get("default_branch") if isinstance(data, dict) else None
+    if not isinstance(data, dict) or not isinstance(data.get("full_name"), str) \
+            or data["full_name"].casefold() != repo.casefold() or not isinstance(name, str):
+        raise GhOutputError("gh api repos: unexpected repository shape")
+    try:
+        return validate_branch(name)
+    except ValueError as exc:
+        raise GhOutputError("gh api repos: unexpected default branch name") from exc
 
 
 def branch_head(branch: str, *, repo: str) -> str | None:
