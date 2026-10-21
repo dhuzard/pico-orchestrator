@@ -1,0 +1,75 @@
+{
+  "runs": {
+    "lib-slugify": {
+      "facts": [
+        {
+          "category": "phase",
+          "key": [
+            "lib-slugify"
+          ],
+          "value": {
+            "blocker_code": "REPEATED_INEFFECTIVE_ACTION",
+            "escalations": 0,
+            "in_wave": false,
+            "route": "CLAUDE_CODEX",
+            "status": "blocked"
+          }
+        },
+        {
+          "category": "worker",
+          "key": [
+            "lib-slugify",
+            "claude_worker",
+            "0"
+          ],
+          "value": {
+            "backend": "claude-code",
+            "backend_model": "claude-sonnet-5-5",
+            "blocker_code": "REPEATED_INEFFECTIVE_ACTION",
+            "model": "claude-sonnet-5-5",
+            "status": "blocked"
+          }
+        },
+        {
+          "category": "worker",
+          "key": [
+            "override",
+            "lib-slugify",
+            "claude_worker",
+            "0",
+            "failed",
+            "blocked"
+          ],
+          "value": {
+            "blocker_code": "REPEATED_INEFFECTIVE_ACTION"
+          }
+        },
+        {
+          "category": "finish",
+          "key": [
+            "run"
+          ],
+          "value": {
+            "blocker_code": "REPEATED_INEFFECTIVE_ACTION",
+            "final_status": "PARTIAL",
+            "outcome": "partial"
+          }
+        }
+      ],
+      "lead_calls": 0,
+      "lead_limit": null,
+      "open_items": [],
+      "spend_tokens": 0
+    }
+  },
+  "scenario": "retry-gate",
+  "workspace": {
+    "lib-slugify": {
+      "execution_status": "exited",
+      "launches": 1,
+      "run_blocker_code": "REPEATED_INEFFECTIVE_ACTION",
+      "run_status": "PARTIAL",
+      "state": "partial"
+    }
+  }
+}

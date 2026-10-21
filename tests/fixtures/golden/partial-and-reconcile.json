@@ -1,0 +1,250 @@
+{
+  "runs": {
+    "lib-slugify": {
+      "facts": [
+        {
+          "category": "phase",
+          "key": [
+            "lib-slugify"
+          ],
+          "value": {
+            "blocker_code": null,
+            "escalations": 0,
+            "in_wave": true,
+            "route": "CLAUDE_CODEX",
+            "status": "completed"
+          }
+        },
+        {
+          "category": "worker",
+          "key": [
+            "lib-slugify",
+            "claude_worker",
+            "0"
+          ],
+          "value": {
+            "backend": "claude-code",
+            "backend_model": "claude-sonnet-5-5",
+            "blocker_code": null,
+            "model": "claude-sonnet-5-5",
+            "status": "completed"
+          }
+        },
+        {
+          "category": "worker",
+          "key": [
+            "lib-slugify",
+            "codex_reviewer",
+            "0"
+          ],
+          "value": {
+            "backend": "codex",
+            "backend_model": "gpt-6.1-sol",
+            "blocker_code": null,
+            "model": "gpt-6.1-sol",
+            "status": "completed"
+          }
+        },
+        {
+          "category": "wave",
+          "key": [
+            "lib-slugify",
+            "0"
+          ],
+          "value": {
+            "task_ids": [
+              "lib-slugify"
+            ]
+          }
+        },
+        {
+          "category": "integrate",
+          "key": [
+            "lib-slugify",
+            "0",
+            "begin"
+          ],
+          "value": {}
+        },
+        {
+          "category": "integrate",
+          "key": [
+            "lib-slugify",
+            "0",
+            "end"
+          ],
+          "value": {}
+        },
+        {
+          "category": "bind",
+          "key": [
+            "lib-slugify",
+            "claude_worker"
+          ],
+          "value": {}
+        },
+        {
+          "category": "finish",
+          "key": [
+            "run"
+          ],
+          "value": {
+            "blocker_code": null,
+            "final_status": "COMPLETED",
+            "outcome": "completed"
+          }
+        }
+      ],
+      "lead_calls": 0,
+      "lead_limit": null,
+      "open_items": [],
+      "spend_tokens": 0
+    },
+    "lib-stopwords": {
+      "facts": [
+        {
+          "category": "phase",
+          "key": [
+            "lib-stopwords"
+          ],
+          "value": {
+            "blocker_code": "APPROVED_INPUTS_UNAVAILABLE",
+            "escalations": 0,
+            "in_wave": true,
+            "route": "CLAUDE_CODEX",
+            "status": "blocked"
+          }
+        },
+        {
+          "category": "worker",
+          "key": [
+            "lib-stopwords",
+            "claude_worker",
+            "0"
+          ],
+          "value": {
+            "backend": "claude-code",
+            "backend_model": "claude-sonnet-5-5",
+            "blocker_code": "APPROVED_INPUTS_UNAVAILABLE",
+            "model": "claude-sonnet-5-5",
+            "status": "blocked"
+          }
+        },
+        {
+          "category": "worker",
+          "key": [
+            "lib-stopwords",
+            "codex_reviewer",
+            "0"
+          ],
+          "value": {
+            "backend": "codex",
+            "backend_model": "gpt-6.1-sol",
+            "blocker_code": null,
+            "model": "gpt-6.1-sol",
+            "status": "abandoned"
+          }
+        },
+        {
+          "category": "phase",
+          "key": [
+            "follow-up"
+          ],
+          "value": {
+            "blocker_code": null,
+            "escalations": 0,
+            "in_wave": false,
+            "route": null,
+            "status": "abandoned"
+          }
+        },
+        {
+          "category": "wave",
+          "key": [
+            "lib-stopwords",
+            "0"
+          ],
+          "value": {
+            "task_ids": [
+              "lib-stopwords"
+            ]
+          }
+        },
+        {
+          "category": "finish",
+          "key": [
+            "reconciled",
+            "worker",
+            "lib-stopwords",
+            "codex_reviewer",
+            "0"
+          ],
+          "value": {
+            "from_status": "in_progress",
+            "to": "abandoned"
+          }
+        },
+        {
+          "category": "finish",
+          "key": [
+            "reconciled",
+            "phase",
+            "follow-up",
+            "None",
+            "None"
+          ],
+          "value": {
+            "from_status": "not_started",
+            "to": "abandoned"
+          }
+        },
+        {
+          "category": "finish",
+          "key": [
+            "reconciled",
+            "wave",
+            "None",
+            "None",
+            "None"
+          ],
+          "value": {
+            "from_status": "declared",
+            "to": "abandoned"
+          }
+        },
+        {
+          "category": "finish",
+          "key": [
+            "run"
+          ],
+          "value": {
+            "blocker_code": "APPROVED_INPUTS_UNAVAILABLE",
+            "final_status": "PARTIAL",
+            "outcome": "partial"
+          }
+        }
+      ],
+      "lead_calls": 0,
+      "lead_limit": null,
+      "open_items": [],
+      "spend_tokens": 0
+    }
+  },
+  "scenario": "partial-and-reconcile",
+  "workspace": {
+    "lib-slugify": {
+      "execution_status": "exited",
+      "launches": 1,
+      "run_blocker_code": null,
+      "run_status": "COMPLETED",
+      "state": "ready_for_downstream"
+    },
+    "lib-stopwords": {
+      "execution_status": "exited",
+      "launches": 1,
+      "run_blocker_code": "APPROVED_INPUTS_UNAVAILABLE",
+      "run_status": "PARTIAL",
+      "state": "partial"
+    }
+  }
+}
