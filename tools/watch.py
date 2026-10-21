@@ -133,6 +133,12 @@ def public_run(record: dict, directory: Path | None = None) -> dict:
     }
 
 
+def _budget(plan: dict, record: dict, runs_dir: Path) -> dict | None:
+    """Same figure a direct launch would gate on: running children's spend included, failing closed."""
+    running, problems = workspace_scheduler.workspace_run.running_tasks(plan, workspace=record)
+    return workspace_scheduler.budget_state(plan, record, runs_dir, running=running, extra_problems=problems)
+
+
 def _cost_flags(context: dict) -> dict:
     unpriced = cost_coverage(context)[1]
     return {"cost_complete": not unpriced, "unpriced": unpriced}
@@ -369,7 +375,7 @@ def workspace_view(state: Path, *, workspace_id: str | None = None, manifest: Pa
             "waves": [_ids(wave) for wave in plan.get("waves") or []],
             "status": report["status"], "counts": report["counts"], "repositories": repositories,
             "tokens": sum_tokens([part for parts in tokens_by_repo.values() for part in parts]),
-            "budget": workspace_scheduler.budget_state(plan, record, runs_dir) if source == "manifest" else None,
+            "budget": _budget(plan, record, runs_dir) if source == "manifest" else None,
             "sessions": sessions}
 
 

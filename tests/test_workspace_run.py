@@ -257,6 +257,40 @@ class WorkspaceRunTest(unittest.TestCase):
         finally:
             wr.cancel(manifest=manifest, task_id="a1")
 
+    def exec_path(self, manifest, task):
+        repo = {"a1": "alpha", "b1": "beta", "g1": "gamma"}[task]
+        repos = {r["id"]: r for r in wr._plan(manifest, access_check=None)["repositories"]}
+        return hr.execution_path(Path(repos[repo]["git_common_dir"]), f"ws--{task}")
+
+    def test_corrupt_record_of_a_finished_task_does_not_block_launch(self):
+        manifest = self.budget_manifest({"max_tokens": 1000000})
+        self.launch(manifest, "a1")
+        self.exec_path(manifest, "a1").write_text("{not json")
+        self.assertEqual(self.launch(manifest, "b1")["task"]["run_status"], "PARTIAL")
+
+    def test_corrupt_record_of_a_possibly_running_task_refuses_with_path_and_remedy(self):
+        manifest = self.budget_manifest({"max_tokens": 1000000})
+        broken = self.exec_path(manifest, "g1")
+        broken.parent.mkdir(parents=True, exist_ok=True)
+        broken.write_text("{not json")  # g1 has no finished entry: it might be running
+        with self.assertRaises(wr.WorkspaceRunError) as ctx:
+            self.launch(manifest, "a1")
+        self.assertEqual(ctx.exception.code, "WORKSPACE_BUDGET_UNKNOWN")
+        self.assertIn(str(broken), ctx.exception.detail)
+        self.assertIn("repair or delete", ctx.exception.detail)
+        self.assertEqual(self.launch(manifest, "a1", ignore_budget=True)["task"]["run_status"], "PARTIAL")
+
+    def test_garden_budget_matches_the_direct_launch_gate(self):
+        import watch
+        manifest = self.budget_manifest({"max_tokens": 1000000})
+        broken = self.exec_path(manifest, "g1")
+        broken.parent.mkdir(parents=True, exist_ok=True)
+        broken.write_text("{not json")
+        plan = wr._plan(manifest, access_check=None)
+        state = watch._budget(plan, {"tasks": {}}, self.state / "runs")
+        self.assertTrue(state["incomplete"])
+        self.assertIn(str(broken), state["incomplete_reasons"][0])
+
     def test_repeat_launch_is_a_noop_even_when_budget_is_exhausted(self):
         os.environ["FAKE_PI_USAGE"] = "600,500"
         manifest = self.budget_manifest({"max_tokens": 1000})

@@ -271,21 +271,38 @@ def inflight_usage(plan: dict, task_ids, cache: dict | None = None) -> tuple[lis
     return found, problems
 
 
-def running_tasks(plan: dict, exclude=()) -> tuple[set[str], list[str]]:
-    """Tasks (other than `exclude`) whose child process is alive, from their execution records."""
+def _finished(entry) -> bool:
+    """A workspace entry that already links a finished run: that child is not running, whatever its record says."""
+    if not isinstance(entry, dict):
+        return False
+    return entry.get("execution_status") == "cancelled" or (
+        entry.get("execution_status") == "exited" and entry.get("run_status") not in (None, "IN_PROGRESS"))
+
+
+def running_tasks(plan: dict, exclude=(), workspace: dict | None = None) -> tuple[set[str], list[str]]:
+    """Tasks (other than `exclude`) whose child process is alive, from their execution records.
+
+    Tasks whose workspace entry already links a finished run are skipped, so a stale or corrupt
+    record of a long-finished task never blocks anything. An unreadable record of a task that could
+    be running is reported with its path.
+    """
     repos = {r["id"]: r for r in plan["repositories"]}
+    if workspace is None:
+        workspace = load_workspace(workspace_record_path(plan["workspace_id"])) or {}
+    entries = workspace.get("tasks") if isinstance(workspace.get("tasks"), dict) else {}
     running: set[str] = set()
     problems: list[str] = []
     for task in plan["tasks"]:
         tid = task["id"]
         repo = repos.get(task["repository"])
-        if tid in exclude or task.get("kind") == "qualification" or not repo or not repo.get("git_common_dir"):
+        if (tid in exclude or task.get("kind") == "qualification" or not repo or not repo.get("git_common_dir")
+                or _finished(entries.get(tid))):
             continue
+        path = headless_run.execution_path(Path(repo["git_common_dir"]), execution_id(plan["workspace_id"], tid))
         try:
-            record = headless_run.load_record(headless_run.execution_path(
-                Path(repo["git_common_dir"]), execution_id(plan["workspace_id"], tid)))
+            record = headless_run.load_record(path)
         except (headless_run.HeadlessError, OSError, ValueError) as exc:
-            problems.append(f"{tid}: execution record unreadable ({getattr(exc, 'code', type(exc).__name__)})")
+            problems.append(f"{tid}: execution record {path} is unreadable ({getattr(exc, 'code', type(exc).__name__)})")
             continue
         if record and record.get("status") in {"launching", "launched"} and headless_run.pid_alive(record.get("pid")):
             running.add(tid)
@@ -363,7 +380,8 @@ def launch(*, manifest: Path, task_id: str, allow_mutation: bool = False, resume
                 raise WorkspaceRunError(
                     "WORKSPACE_BUDGET_UNKNOWN",
                     "in-flight spend of running children cannot be resolved (" + "; ".join(spend["incomplete_reasons"])
-                    + "); pass --ignore-budget (ignore_budget=True) to override explicitly")
+                    + "). If that task is not running, repair or delete the execution record named above; "
+                    "otherwise pass --ignore-budget (ignore_budget=True) to override explicitly")
             budget_override = {"at": _now(), "reasons": ["unknown_in_flight_spend"], **{k: spend[k] for k in (
                 "spent_tokens", "max_tokens", "spent_cost_usd", "max_cost_usd")}}
             return
