@@ -234,9 +234,40 @@ class WorkspaceRunTest(unittest.TestCase):
         self.assertIn("--ignore-budget", ctx.exception.detail)
         self.assertIn("1000", ctx.exception.detail)
         self.assertNotIn("b1", wr.status(manifest=manifest, access_check=None)["tasks"])
+
+    def test_repeat_launch_is_a_noop_even_when_budget_is_exhausted(self):
+        os.environ["FAKE_PI_USAGE"] = "600,500"
+        manifest = self.budget_manifest({"max_tokens": 1000})
+        first = self.launch(manifest, "a1")
+        for kwargs in ({}, {"ignore_budget": True}, {"resume": True}):
+            again = self.launch(manifest, "a1", **kwargs)
+            self.assertEqual(again["task"]["outcome"], "already_finished")
+            self.assertEqual(again["task"]["launches"], 1)
+            self.assertEqual(again["task"]["run_id"], first["task"]["run_id"])
+            self.assertNotIn("budget_override", again["task"])
+
+    def test_resume_of_interrupted_task_is_gated(self):
+        os.environ["FAKE_PI_USAGE"] = "600,500"
+        plain = self.manifest()
+        self.launch(plain, "a1")
+        os.environ["FAKE_PI_BEHAVIOR"] = "crash"
+        self.assertEqual(self.launch(plain, "b1")["task"]["execution_status"], "interrupted")
+        os.environ["FAKE_PI_BEHAVIOR"] = "finish"
+        manifest = self.budget_manifest({"max_tokens": 1000})
         with self.assertRaises(wr.WorkspaceRunError) as ctx:
-            self.launch(manifest, "a1", resume=True)
+            self.launch(manifest, "b1", resume=True)
         self.assertEqual(ctx.exception.code, "WORKSPACE_BUDGET_EXHAUSTED")
+        resumed = self.launch(manifest, "b1", resume=True, ignore_budget=True)
+        self.assertEqual(resumed["task"]["outcome"], "resumed")
+        self.assertIn("budget_override", resumed["task"])
+
+    def test_budget_checked_skips_the_gate_and_records_no_override(self):
+        os.environ["FAKE_PI_USAGE"] = "600,500"
+        manifest = self.budget_manifest({"max_tokens": 1000})
+        self.launch(manifest, "a1")
+        result = self.launch(manifest, "b1", budget_checked=True)
+        self.assertEqual(result["task"]["outcome"], "launched")
+        self.assertNotIn("budget_override", result["task"])
 
     def test_ignore_budget_launches_and_records_the_override(self):
         os.environ["FAKE_PI_USAGE"] = "600,500"

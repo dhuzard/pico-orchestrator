@@ -1886,7 +1886,13 @@ whose message gives spent against limit. `--ignore-budget` (`ignore_budget=True`
 in `workspace_run.launch`) overrides it explicitly; the override is never
 silent, because the task entry in the workspace record gains
 `budget_override` (UTC time, exhausted limits and the spend at launch). The
-scheduler has already gated its own dispatch and passes `ignore_budget=True`.
+check runs only when a child would actually start or resume: a repeat launch
+that is a no-op (such as `already_finished`) is never refused and records no
+override. It runs outside the workspace lock, so two simultaneous direct
+launches can both pass it; this is accepted because spend is only known after
+runs finish. The scheduler has already gated its own dispatch and passes the
+internal `budget_checked=True`, which skips the check and records nothing
+(`ignore_budget` is reserved for explicit user overrides).
 The spend computation is `workspace_run.budget_state`
 (`workspace_scheduler.budget_state` remains as an alias).
 

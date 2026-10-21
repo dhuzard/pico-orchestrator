@@ -234,7 +234,7 @@ def run(manifest: Path, *, max_parallel: int | None = None, allow_mutation: bool
                         owned[tid] = pool.submit(workspace_run.launch, manifest=manifest, task_id=tid,
                                                  allow_mutation=allow_mutation, resume=resume, wait=True,
                                                  access_check=None, pi_executable=pi_executable,
-                                                 ignore_budget=True)  # gated above
+                                                 budget_checked=True)  # gated above
                     running.add(tid)
                     busy.add(repo_of[tid])
                     _record_session(plan["workspace_id"], manifest, plan, session)
