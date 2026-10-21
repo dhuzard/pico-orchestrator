@@ -126,7 +126,7 @@ def git(*args: str) -> str:
     return subprocess.run(["git", *args], check=True, capture_output=True, text=True).stdout.strip()
 
 
-class HeadlessRunTest(unittest.TestCase):
+class HeadlessFixture(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         base = Path(self._tmp.name)
@@ -163,6 +163,8 @@ class HeadlessRunTest(unittest.TestCase):
     def status(self, execution_id="exec-1"):
         return hr.status(target=self.target, explicit_repo="acme/target", execution_id=execution_id)
 
+
+class HeadlessRunTest(HeadlessFixture):
     def test_finished_run_is_recorded_and_target_untouched(self):
         before = session_scope.snapshot(str(self.target))["digest"]
         record = self.start()
@@ -522,6 +524,205 @@ class HeadlessRunTest(unittest.TestCase):
         rc, data = run(["status", "--target", str(self.target), "--repo", "acme/target", "--execution-id", "nope"])
         self.assertEqual(rc, 1)
         self.assertEqual(data["error_code"], "EXECUTION_UNKNOWN")
+
+
+class FakeClock:
+    """Injectable wall clock: tests move time explicitly instead of sleeping."""
+
+    def __init__(self, now: float = 1_000_000.0):
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
+
+
+class ExecutionTimeLimitTest(HeadlessFixture):
+    """Wall-clock limit per execution, with a fake child (`hang`) and a fake clock."""
+
+    def setUp(self):
+        super().setUp()
+        self.clock = FakeClock()
+        patch = unittest.mock.patch.object(hr, "clock", self.clock)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def launch_hanging(self, execution_id="exec-1", **kwargs):
+        launched = self.start(execution_id=execution_id, behavior="hang", wait=False, **kwargs)
+        deadline = time.monotonic() + 5
+        while hr.discover_run_id(Path(launched["session_dir"]), launched["session_id"]) is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.addCleanup(self.reap, launched["pid"])
+        return launched
+
+    @staticmethod
+    def reap(pid):
+        try:
+            os.killpg(pid, 9)
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            os.waitpid(pid, 0)
+        except ChildProcessError:
+            pass
+
+    def test_no_limit_means_no_deadline_and_no_stop(self):
+        launched = self.launch_hanging()
+        for key in ("max_duration_seconds", "deadline_at", "deadline_epoch"):
+            self.assertNotIn(key, launched)
+        self.clock.now += 10 ** 7
+        record = self.status()
+        self.assertEqual((record["status"], record["outcome"]), ("launched", "launched"))
+        self.assertNotIn("stop_reason", record)
+        self.assertTrue(hr.execution_alive(record))
+
+    def test_limit_is_recorded_at_launch(self):
+        launched = self.launch_hanging(max_duration_seconds=90)
+        self.assertEqual(launched["max_duration_seconds"], 90)
+        self.assertEqual(launched["deadline_epoch"], self.clock.now + 90)
+        self.assertRegex(launched["deadline_at"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+        self.assertEqual(hr.time_limit_remaining(launched), 90)
+
+    def test_under_the_limit_the_child_keeps_running(self):
+        launched = self.launch_hanging(max_duration_seconds=100)
+        self.clock.now += 99.9
+        record = self.status()
+        self.assertEqual(record["status"], "launched")
+        self.assertTrue(hr.pid_alive(launched["pid"]))
+        self.assertEqual(record["run"]["status"], "IN_PROGRESS")
+
+    def test_at_the_limit_the_child_is_cancelled_with_a_distinct_reason(self):
+        launched = self.launch_hanging(max_duration_seconds=100)
+        self.clock.now += 100
+        record = self.status()
+        self.assertEqual((record["status"], record["outcome"]), ("cancelled", "time_limit"))
+        self.assertEqual(record["stop_reason"], "EXECUTION_TIME_LIMIT")
+        self.assertEqual(record["time_limit"]["max_duration_seconds"], 100)
+        self.assertEqual(record["time_limit"]["elapsed_seconds"], 100.0)
+        self.assertIsNone(record["pid"])
+        self.assertFalse(hr.execution_alive(launched))
+        # The parent run is not left in progress: BLOCKED with the limit's code, not the operator cancel's.
+        self.assertEqual(record["run"]["status"], "BLOCKED")
+        self.assertEqual(record["run"]["blocker_code"], "EXECUTION_TIME_LIMIT")
+        # Stopped is final for this execution id until an explicit new launch.
+        again = self.status()
+        self.assertEqual((again["status"], again["stop_reason"]), ("cancelled", "EXECUTION_TIME_LIMIT"))
+
+    def test_over_the_limit_is_enforced_the_same_way(self):
+        self.launch_hanging(max_duration_seconds=5)
+        self.clock.now += 3600
+        record = self.status()
+        self.assertEqual(record["stop_reason"], "EXECUTION_TIME_LIMIT")
+        self.assertEqual(record["time_limit"]["elapsed_seconds"], 3600.0)
+
+    def test_a_reused_pid_is_never_signalled_at_the_deadline(self):
+        launched = self.launch_hanging(max_duration_seconds=10)
+        if launched["pid_start"] is None:
+            self.skipTest("no /proc: pid start time unavailable")
+        path = hr.execution_path(session_scope.common_dir(self.target), "exec-1")
+        record = json.loads(path.read_text())
+        path.write_text(json.dumps({**record, "pid_start": "1"}))
+        self.clock.now += 11
+        with unittest.mock.patch.object(hr.os, "killpg") as killpg:
+            observed = self.status()
+        killpg.assert_not_called()
+        self.assertNotEqual(observed["status"], "cancelled")
+        self.assertEqual(observed["child_gone_reason"], "PID_REUSED")
+        self.assertNotIn("stop_reason", observed)
+        self.assertTrue(hr.pid_alive(launched["pid"]), "the process holding the pid was left alone")
+
+    def test_a_child_that_ended_before_the_deadline_keeps_its_own_outcome(self):
+        finished = self.start(behavior="finish", max_duration_seconds=100)
+        self.clock.now += 1000
+        record = self.status()
+        self.assertEqual((record["status"], record["run"]["status"]), ("exited", "PARTIAL"))
+        self.assertNotIn("stop_reason", record)
+        self.assertEqual(record["max_duration_seconds"], finished["max_duration_seconds"])
+
+    def test_a_waiting_launcher_enforces_the_limit_itself(self):
+        timer = threading.Timer(0.3, lambda: setattr(self.clock, "now", self.clock.now + 5))
+        timer.start()
+        self.addCleanup(timer.cancel)
+        started = time.monotonic()
+        record = self.start(behavior="hang", max_duration_seconds=1)
+        self.assertLess(time.monotonic() - started, 5, "the launcher returned because of the limit, not the child's own end")
+        self.assertEqual((record["status"], record["outcome"]), ("cancelled", "time_limit"))
+        self.assertEqual(record["stop_reason"], "EXECUTION_TIME_LIMIT")
+        self.assertEqual(record["run"]["status"], "BLOCKED")
+        self.assertEqual(record["run"]["blocker_code"], "EXECUTION_TIME_LIMIT")
+        self.assertIsNone(record["pid"])
+
+    def test_invalid_limits_are_refused_before_anything_launches(self):
+        for bad in (0, -5, True, "60", 1.5):
+            with self.assertRaises(hr.HeadlessError) as refused:
+                self.start(behavior="hang", wait=False, max_duration_seconds=bad)
+            self.assertEqual(refused.exception.code, "MAX_DURATION_INVALID")
+        self.assertEqual(list((self.state / "executions").rglob("*.json")), [])
+
+    def test_resume_after_a_crash_gets_a_fresh_window_from_its_own_argument(self):
+        crashed = self.start(behavior="crash", max_duration_seconds=50)
+        self.assertEqual(crashed["status"], "interrupted")
+        self.clock.now += 500  # long past the first launch's deadline
+        resumed = self.start(behavior="hang", wait=False, resume=True, takeover=True, max_duration_seconds=70)
+        self.addCleanup(self.reap, resumed["pid"])
+        self.assertEqual(resumed["deadline_epoch"], self.clock.now + 70)
+        self.assertEqual(resumed["run_id"], crashed["run_id"])
+        self.assertEqual(self.status()["status"], "launched")
+        self.clock.now += 70
+        stopped = self.status()
+        self.assertEqual(stopped["stop_reason"], "EXECUTION_TIME_LIMIT")
+        # A resume without --max-duration does not inherit the earlier limit.
+        other = self.start(execution_id="exec-2", behavior="crash", max_duration_seconds=50)
+        self.assertEqual(other["status"], "interrupted")
+        again = self.start(execution_id="exec-2", behavior="hang", wait=False, resume=True, takeover=True)
+        self.addCleanup(self.reap, again["pid"])
+        self.assertNotIn("deadline_epoch", again)
+        self.assertNotIn("max_duration_seconds", again)
+
+    def test_resume_after_a_time_limit_stop_needs_a_new_execution(self):
+        self.launch_hanging(max_duration_seconds=10)
+        self.clock.now += 10
+        stopped = self.status()
+        self.assertEqual(stopped["stop_reason"], "EXECUTION_TIME_LIMIT")
+        # The parent run was settled BLOCKED, so neither a repeat start nor a resume resurrects it.
+        for resume in (False, True):
+            result = self.start(behavior="finish", resume=resume, takeover=resume, max_duration_seconds=10)
+            self.assertEqual(result["outcome"], "already_finished")
+            self.assertEqual(result["launches"], 1)
+            self.assertEqual(result["stop_reason"], "EXECUTION_TIME_LIMIT")
+        # An explicit new launch (a new execution id, hence a new run) starts its own window.
+        fresh = self.start(execution_id="exec-new", behavior="hang", wait=False, max_duration_seconds=10)
+        self.addCleanup(self.reap, fresh["pid"])
+        self.assertEqual(fresh["deadline_epoch"], self.clock.now + 10)
+
+    def test_cancel_after_a_time_limit_stop_keeps_the_outcome(self):
+        self.launch_hanging(max_duration_seconds=10)
+        self.clock.now += 10
+        self.status()
+        cancelled = hr.cancel(target=self.target, explicit_repo="acme/target", execution_id="exec-1", grace=1)
+        self.assertEqual((cancelled["status"], cancelled["outcome"]), ("cancelled", "time_limit"))
+        self.assertEqual(cancelled["run"]["blocker_code"], "EXECUTION_TIME_LIMIT")
+
+    def test_cli_max_duration(self):
+        def run(args):
+            out = io.StringIO()
+            with redirect_stdout(out):
+                rc = hr.main(args)
+            return rc, json.loads(out.getvalue())
+        base = ["--target", str(self.target), "--repo", "acme/target"]
+        os.environ["FAKE_PI_BEHAVIOR"] = "hang"
+        rc, data = run(["start", *base, "--pi", str(self.pi), "--execution-id", "cli-1", "--objective", "inspect",
+                        "--no-wait", "--max-duration", "120"])
+        self.assertEqual(rc, 0)
+        self.addCleanup(self.reap, data["pid"])
+        self.assertEqual(data["max_duration_seconds"], 120)
+        self.assertEqual(data["deadline_epoch"], self.clock.now + 120)
+        rc, data = run(["start", *base, "--pi", str(self.pi), "--execution-id", "cli-2", "--objective", "inspect",
+                        "--no-wait", "--max-duration", "0"])
+        self.assertEqual((rc, data["error_code"]), (1, "MAX_DURATION_INVALID"))
+        self.clock.now += 120
+        rc, data = run(["status", *base, "--execution-id", "cli-1"])
+        self.assertEqual(data["stop_reason"], "EXECUTION_TIME_LIMIT")
+        self.assertEqual(rc, 0)
 
 
 if __name__ == "__main__":

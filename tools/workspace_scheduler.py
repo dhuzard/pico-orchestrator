@@ -156,7 +156,8 @@ def report(plan: dict, entries: dict, refused: dict, held: set[str] | None = Non
         rows.append({"id": task["id"], "repository": task["repository"], "wave": task["wave"], "state": state,
                      "blocked_by": task["blocked_by"], "run_id": entry.get("run_id"),
                      "run_status": entry.get("run_status"), "run_blocker_code": entry.get("run_blocker_code"),
-                     "launches": entry.get("launches"), "refusal": refused.get(task["id"])})
+                     "launches": entry.get("launches"), "refusal": refused.get(task["id"]),
+                     "time_limit": workspace_run.time_limit_view(entry)})
     counts: dict[str, int] = {}
     for row in rows:
         counts[row["state"]] = counts.get(row["state"], 0) + 1
@@ -300,12 +301,25 @@ def budget_lines(b: dict) -> list[str]:
     return lines
 
 
+def time_limit_text(view: dict | None) -> str:
+    """` (limit 600s, 412s left)` for a running child, ` (stopped after 601.2s of a 600s limit)` for a stopped one."""
+    if not view:
+        return ""
+    if view.get("stop_reason"):
+        elapsed = view.get("elapsed_seconds")
+        return f" (stopped after {elapsed if elapsed is not None else '?'}s of a {view['max_duration_seconds']}s limit)"
+    if view.get("remaining_seconds") is not None:
+        return f" (limit {view['max_duration_seconds']}s, {view['remaining_seconds']}s left)"
+    return f" (limit {view['max_duration_seconds']}s)"
+
+
 def render(result: dict) -> str:
     lines = [f"Workspace {result['workspace_id']}: {result['status']} (cap {result['cap']})"]
     for row in result["tasks"]:
         detail = row["run_blocker_code"] or (row["refusal"] or {}).get("code") or ""
         lines.append(f"  {row['id']} [{row['repository']}] {row['state']}"
-                     + (f" run={row['run_id']}" if row["run_id"] else "") + (f" {detail}" if detail else ""))
+                     + (f" run={row['run_id']}" if row["run_id"] else "") + (f" {detail}" if detail else "")
+                     + time_limit_text(row.get("time_limit")))
     lines.append("  " + ", ".join(f"{k}={v}" for k, v in result["counts"].items()))
     if any(r["state"] == "needs_reconciliation" for r in result["tasks"]):
         lines.append("  Inspect interrupted children, then rerun with --resume-interrupted to continue them.")

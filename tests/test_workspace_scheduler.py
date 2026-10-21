@@ -8,7 +8,9 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
+import unittest.mock
 from contextlib import redirect_stdout
 from pathlib import Path
 
@@ -31,7 +33,7 @@ def ok_access(repository: str) -> dict:
     return {"status": "ok", "blocker_code": None, "detail": None, "private": True}
 
 
-class SchedulerTest(unittest.TestCase):
+class SchedulerFixture(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.base = Path(self._tmp.name)
@@ -94,6 +96,8 @@ class SchedulerTest(unittest.TestCase):
     def one_per_repo(self):
         return [{"id": f"{n[0]}1", "repository": n, "title": f"{n} task"} for n in NAMES]
 
+
+class SchedulerTest(SchedulerFixture):
     def test_concurrency_cap_is_respected_and_all_complete(self):
         before = {n: session_scope.snapshot(str(p))["digest"] for n, (p, _) in self.repos.items()}
         result = self.schedule(self.manifest(self.one_per_repo(), max_parallel=4), max_parallel=2)
@@ -295,6 +299,79 @@ class SchedulerTest(unittest.TestCase):
         with redirect_stdout(out):
             rc = ws.main([str(bad), "--no-access-check"])
         self.assertEqual(rc, 2)
+
+
+
+class SchedulerTimeLimitTest(unittest.TestCase):
+    """The scheduler render shows the limit and the time left; its loop observes and enforces the deadline."""
+
+    ENTRY = {"execution_status": "launched", "run_status": "IN_PROGRESS", "max_duration_seconds": 600,
+             "deadline_epoch": 1000.0 + 600}
+
+    def view(self, entry, now):
+        return wr.time_limit_view(entry, now)
+
+    def test_running_child_shows_limit_and_remaining_time(self):
+        view = self.view(self.ENTRY, 1000.0 + 188.6)
+        self.assertEqual((view["max_duration_seconds"], view["remaining_seconds"]), (600, 411))
+        self.assertEqual(ws.time_limit_text(view), " (limit 600s, 411s left)")
+
+    def test_overdue_child_shows_zero_left(self):
+        self.assertEqual(ws.time_limit_text(self.view(self.ENTRY, 5000.0)), " (limit 600s, 0s left)")
+
+    def test_stopped_child_shows_the_reason_and_elapsed_time(self):
+        entry = {**self.ENTRY, "execution_status": "cancelled", "stop_reason": "EXECUTION_TIME_LIMIT",
+                 "time_limit": {"max_duration_seconds": 600, "elapsed_seconds": 601.2}}
+        self.assertEqual(ws.time_limit_text(self.view(entry, 5000.0)), " (stopped after 601.2s of a 600s limit)")
+
+    def test_no_limit_renders_nothing(self):
+        self.assertIsNone(self.view({"execution_status": "launched"}, 1.0))
+        self.assertEqual(ws.time_limit_text(None), "")
+        self.assertIsNone(self.view({"execution_status": "launched", "max_duration_seconds": True}, 1.0))
+
+    def test_render_appends_the_limit_to_the_task_line(self):
+        plan = {"tasks": [{"id": "t1", "repository": "alpha", "wave": 0, "readiness": "planned", "blocked_by": [],
+                           "dispatchable": False, "depends_on": [], "blocks": []}], "blockers": []}
+        entry = {**self.ENTRY, "run_id": "run-x", "launches": 1}
+        report = ws.report(plan, {"t1": entry}, {})
+        text = ws.render({"workspace_id": "w", "status": report["status"], "cap": 1, "counts": report["counts"],
+                          "tasks": report["tasks"]})
+        self.assertRegex(text, r"t1 \[alpha\] running run=run-x \(limit 600s, \d+s left\)")
+
+
+class SchedulerEnforcesTimeLimitTest(SchedulerFixture):
+    def test_scheduler_observes_a_child_past_its_deadline_and_it_ends_cancelled(self):
+        import headless_run
+        clock = [3_000_000.0]
+        with unittest.mock.patch.object(headless_run, "clock", lambda: clock[0]):
+            os.environ["FAKE_PI_BEHAVIOR"] = "hang"
+            manifest = self.manifest([{"id": "a1", "repository": "alpha", "title": "Alpha", "max_duration_seconds": 30}])
+            launched = wr.launch(manifest=manifest, task_id="a1", access_check=None, pi_executable=str(self.pi), wait=False)
+            record = headless_run.load_record(headless_run.execution_path(
+                session_scope.common_dir(self.repos["alpha"][0]), launched["task"]["execution_id"]))
+            self.addCleanup(self._kill, record["pid"])
+            deadline = time.monotonic() + 5  # let the child create its parent run before the deadline passes
+            while headless_run.discover_run_id(Path(record["session_dir"]), record["session_id"]) is None \
+                    and time.monotonic() < deadline:
+                time.sleep(0.05)
+            clock[0] += 31
+            result = ws.run(manifest, access_check=None, pi_executable=str(self.pi), poll_seconds=0.1)
+        row = result["tasks"][0]
+        self.assertEqual((row["state"], row["run_blocker_code"]), ("cancelled", "EXECUTION_TIME_LIMIT"))
+        self.assertEqual(row["time_limit"]["stop_reason"], "EXECUTION_TIME_LIMIT")
+        self.assertEqual(result["status"], "ATTENTION")
+        self.assertIn("stopped after 31.0s of a 30s limit", ws.render(result))
+
+    @staticmethod
+    def _kill(pid):
+        try:
+            os.killpg(pid, 9)
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            os.waitpid(pid, 0)
+        except ChildProcessError:
+            pass
 
 
 if __name__ == "__main__":

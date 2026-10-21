@@ -205,6 +205,18 @@ def _match(value, pattern: re.Pattern):
     return value if isinstance(value, str) and pattern.fullmatch(value) else None
 
 
+def _time_limit(view):
+    """Sanitized limit of a task's current launch: text for Garden, never executed or rendered as markup."""
+    if not isinstance(view, dict):
+        return None
+    elapsed = view.get("elapsed_seconds")
+    return {"max_duration_seconds": _count(view.get("max_duration_seconds")),
+            "deadline_at": _match(view.get("deadline_at"), STAMP),
+            "remaining_seconds": _count(view.get("remaining_seconds")),
+            "stop_reason": _match(view.get("stop_reason"), CODE),
+            "elapsed_seconds": elapsed if type(elapsed) in {int, float} else None}
+
+
 def _count(value):
     return value if type(value) is int and value >= 0 else None
 
@@ -361,6 +373,7 @@ def workspace_view(state: Path, *, workspace_id: str | None = None, manifest: Pa
             "run_id": _match(row["run_id"], RUN_ID), "run_status": _match(row["run_status"], CODE),
             "run_blocker_code": _match(row["run_blocker_code"], CODE),
             "refusal_code": _match((row["refusal"] or {}).get("code"), CODE),
+            "time_limit": _time_limit(row.get("time_limit")),
             "run": run, "links": _merge_links(publication_links(run_record, runs_dir) if run_record else [],
                                               workspace_pr_links(entry, runs_dir)), "tokens": tokens})
     repositories = []

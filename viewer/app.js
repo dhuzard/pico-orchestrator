@@ -481,6 +481,10 @@ function renderWorkspaceOverview(data) {
     }
   }
 }
+function duration(seconds) {
+  const s = Math.max(0, Math.round(seconds)), h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
+  return h ? `${h}h ${m}m` : m ? `${m}m ${s % 60}s` : `${s}s`;
+}
 function workspaceTaskCard(task) {
   const tone = wsTone(task.state);
   const card = el("article", `ws-task ${tone}`);
@@ -499,6 +503,13 @@ function workspaceTaskCard(task) {
   if (task.blocks?.length) facts.append(el("p", "ws-chip quiet", `Unblocks ${task.blocks.join(", ")}`));
   const blocker = task.refusal_code || task.run_blocker_code || task.run?.blocker_code;
   if (blocker) facts.append(el("p", "ws-chip failed", blocker));
+  const limit = task.time_limit;
+  if (limit?.max_duration_seconds) {
+    const text = limit.stop_reason ? `Stopped by the ${duration(limit.max_duration_seconds)} time limit${limit.elapsed_seconds != null ? ` after ${duration(limit.elapsed_seconds)}` : ""}`
+      : limit.remaining_seconds != null ? `Time limit ${duration(limit.max_duration_seconds)} · ${duration(limit.remaining_seconds)} left`
+      : `Time limit ${duration(limit.max_duration_seconds)}`;
+    facts.append(el("p", limit.stop_reason ? "ws-chip failed" : "ws-chip", text));
+  }
   if (task.run_id) {
     const line = el("p", "ws-run");
     const status = task.run?.status ? cap(task.run.status.toLowerCase()) : "record unavailable";

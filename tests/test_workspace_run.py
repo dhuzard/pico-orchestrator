@@ -9,6 +9,7 @@ import sys
 import tempfile
 import time
 import unittest
+import unittest.mock
 from contextlib import redirect_stdout
 from pathlib import Path
 
@@ -29,7 +30,7 @@ def ok_access(repository: str) -> dict:
     return {"status": "ok", "blocker_code": None, "detail": None, "private": True}
 
 
-class WorkspaceRunTest(unittest.TestCase):
+class WorkspaceRunFixture(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.base = Path(self._tmp.name)
@@ -78,6 +79,8 @@ class WorkspaceRunTest(unittest.TestCase):
     def snapshots(self):
         return {n: session_scope.snapshot(str(p))["digest"] for n, (p, _) in self.repos.items()}
 
+
+class WorkspaceRunTest(WorkspaceRunFixture):
     def test_three_children_run_isolated_and_are_linked(self):
         manifest = self.manifest()
         before = self.snapshots()
@@ -389,6 +392,113 @@ class WorkspaceRunTest(unittest.TestCase):
         rc, data = run(["launch", str(manifest), "--task", "nope", "--no-access-check", "--pi", str(self.pi)])
         self.assertEqual(rc, 1)
         self.assertEqual(data["error_code"], "WORKSPACE_TASK_UNKNOWN")
+
+
+
+class WorkspaceTimeLimitTest(WorkspaceRunFixture):
+    """Manifest default, per-task override and enforcement through the workspace status path."""
+
+    def setUp(self):
+        super().setUp()
+        self.clock = [2_000_000.0]
+        patch = unittest.mock.patch.object(hr, "clock", lambda: self.clock[0])
+        patch.start()
+        self.addCleanup(patch.stop)
+        os.environ["FAKE_PI_BEHAVIOR"] = "hang"
+
+    def limited_manifest(self, default=None, overrides=None):
+        path = self.manifest()
+        data = yaml.safe_load(path.read_text())
+        if default is not None:
+            data["max_duration_seconds"] = default
+        for task in data["tasks"]:
+            if task["id"] in (overrides or {}):
+                task["max_duration_seconds"] = overrides[task["id"]]
+        path.write_text(yaml.safe_dump(data))
+        return path
+
+    def reap_all(self, *results):
+        for result in results:
+            record = hr.load_record(hr.execution_path(
+                Path(session_scope.common_dir(self.repos[result["task"]["repository"]][0])), result["task"]["execution_id"]))
+            self.addCleanup(self.kill, record["pid"])
+            # Let the child create its parent run, so the stop has a run to settle.
+            deadline = time.monotonic() + 5
+            while hr.discover_run_id(Path(record["session_dir"]), record["session_id"]) is None and time.monotonic() < deadline:
+                time.sleep(0.05)
+
+    @staticmethod
+    def kill(pid):
+        try:
+            os.killpg(pid, 9)
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            os.waitpid(pid, 0)
+        except ChildProcessError:
+            pass
+
+    def test_no_limit_in_the_manifest_leaves_the_child_unlimited(self):
+        manifest = self.limited_manifest()
+        a1 = self.launch(manifest, "a1", wait=False)
+        self.reap_all(a1)
+        self.assertNotIn("max_duration_seconds", a1["task"])
+        self.assertNotIn("deadline_epoch", a1["task"])
+        self.clock[0] += 10 ** 7
+        status = wr.status(manifest=manifest)["tasks"]["a1"]
+        self.assertEqual(status["execution_status"], "launched")
+        self.assertIsNone(wr.time_limit_view(status))
+
+    def test_manifest_default_applies_and_a_task_overrides_it(self):
+        manifest = self.limited_manifest(default=300, overrides={"b1": 45})
+        a1 = self.launch(manifest, "a1", wait=False)
+        b1 = self.launch(manifest, "b1", wait=False)
+        self.reap_all(a1, b1)
+        self.assertEqual(a1["task"]["max_duration_seconds"], 300)
+        self.assertEqual(b1["task"]["max_duration_seconds"], 45)
+        self.assertEqual(b1["task"]["deadline_epoch"], self.clock[0] + 45)
+        self.assertEqual(wr.time_limit_view(b1["task"])["remaining_seconds"], 45)
+
+    def test_a_task_limit_applies_without_a_manifest_default(self):
+        manifest = self.limited_manifest(overrides={"g1": 20})
+        g1 = self.launch(manifest, "g1", wait=False)
+        self.reap_all(g1)
+        self.assertEqual(g1["task"]["max_duration_seconds"], 20)
+
+    def test_invalid_limits_violate_the_manifest_schema(self):
+        for bad in (0, "10", 1.5):
+            manifest = self.limited_manifest(default=bad)
+            with self.assertRaises(wr.WorkspaceRunError):
+                self.launch(manifest, "a1", wait=False)
+            manifest = self.limited_manifest(overrides={"a1": bad})
+            with self.assertRaises(wr.WorkspaceRunError):
+                self.launch(manifest, "a1", wait=False)
+
+    def test_status_stops_the_child_at_its_deadline_and_the_run_is_not_left_open(self):
+        manifest = self.limited_manifest(overrides={"a1": 60})
+        a1 = self.launch(manifest, "a1", wait=False)
+        self.reap_all(a1)
+        self.clock[0] += 59
+        self.assertEqual(wr.status(manifest=manifest, task_id="a1")["tasks"]["a1"]["execution_status"], "launched")
+        self.clock[0] += 1
+        entry = wr.status(manifest=manifest, task_id="a1")["tasks"]["a1"]
+        self.assertEqual((entry["execution_status"], entry["outcome"]), ("cancelled", "time_limit"))
+        self.assertEqual(entry["stop_reason"], "EXECUTION_TIME_LIMIT")
+        self.assertEqual((entry["run_status"], entry["run_blocker_code"]), ("BLOCKED", "EXECUTION_TIME_LIMIT"))
+        view = wr.time_limit_view(entry)
+        self.assertEqual((view["stop_reason"], view["elapsed_seconds"], view["remaining_seconds"]),
+                         ("EXECUTION_TIME_LIMIT", 60.0, None))
+
+    def test_relaunch_after_a_time_limit_stop_does_not_restart_the_child(self):
+        manifest = self.limited_manifest(overrides={"a1": 5})
+        self.reap_all(self.launch(manifest, "a1", wait=False))
+        self.clock[0] += 5
+        wr.status(manifest=manifest, task_id="a1")
+        for resume in (False, True):
+            again = self.launch(manifest, "a1", wait=False, resume=resume, takeover_stale_lease=resume)
+            self.assertEqual(again["task"]["outcome"], "already_finished")
+            self.assertEqual(again["task"]["stop_reason"], "EXECUTION_TIME_LIMIT")
+            self.assertEqual(again["task"]["launches"], 1)
 
 
 if __name__ == "__main__":

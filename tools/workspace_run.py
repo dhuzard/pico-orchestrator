@@ -219,6 +219,12 @@ def _entry(record: dict, task: dict, repo: dict, execution: dict, inputs: dict |
                   "launches": execution.get("launches"), "run_id": execution.get("run_id"),
                   "run_status": run.get("status"), "run_blocker_code": run.get("blocker_code"),
                   "trace_path": run.get("trace_path"), "last_seen": _now()})
+    # Time limit of the current launch (absent keys clear a previous launch's values).
+    for key in ("max_duration_seconds", "deadline_at", "deadline_epoch", "stop_reason", "time_limit"):
+        if execution.get(key) is not None:
+            entry[key] = execution[key]
+        else:
+            entry.pop(key, None)
     if execution.get("checkout"):
         cleanup = execution["checkout"]
         entry["checkout"] = {"restored": cleanup["restored"], "branch": cleanup["branch_after"],
@@ -226,6 +232,28 @@ def _entry(record: dict, task: dict, repo: dict, execution: dict, inputs: dict |
                              "kept_worktrees": len(cleanup["kept_worktrees"]), "left_reason": cleanup["left_reason"]}
     record["tasks"][task["id"]] = entry
     return entry
+
+
+def time_limit_view(entry: dict | None, now: float | None = None) -> dict | None:
+    """The limit of a task's current launch as plain numbers: None when it has none.
+
+    `remaining_seconds` is set only while the child is running; a child stopped by the limit carries
+    `stop_reason` and the elapsed time recorded when it was stopped.
+    """
+    entry = entry or {}
+    limit = entry.get("max_duration_seconds")
+    if type(limit) is not int or limit < 1:
+        return None
+    view = {"max_duration_seconds": limit, "deadline_at": entry.get("deadline_at"), "remaining_seconds": None,
+            "stop_reason": None, "elapsed_seconds": None}
+    if entry.get("execution_status") == "launched":
+        remaining = headless_run.time_limit_remaining(entry, now)
+        view["remaining_seconds"] = None if remaining is None else int(remaining)
+    stopped = entry.get("time_limit")
+    if entry.get("stop_reason") == headless_run.TIME_LIMIT_CODE and isinstance(stopped, dict):
+        view["stop_reason"] = headless_run.TIME_LIMIT_CODE
+        view["elapsed_seconds"] = stopped.get("elapsed_seconds")
+    return view
 
 
 def inflight_usage(plan: dict, task_ids, cache: dict | None = None) -> tuple[list[str], list[str]]:
@@ -364,6 +392,8 @@ def launch(*, manifest: Path, task_id: str, allow_mutation: bool = False, resume
         raise WorkspaceRunError("WORKSPACE_PIN_MISMATCH",
                                 f"checkout HEAD {head or 'unknown'} is not the pinned commit; check it out first")
     budget_override: dict | None = None
+    # A task's own limit overrides the manifest default; neither set means no limit.
+    max_duration = task.get("max_duration_seconds") or plan.get("max_duration_seconds")
 
     def budget_gate() -> None:
         # Runs only when a child would really start or resume, never for a repeat launch that is a no-op.
@@ -414,7 +444,8 @@ def launch(*, manifest: Path, task_id: str, allow_mutation: bool = False, resume
                                        execution_id=execution_id(plan["workspace_id"], task_id),
                                        objective=objective, allow_mutation=allow_mutation,
                                        resume=resume, wait=wait, pi_executable=pi_executable,
-                                       before_spawn=budget_gate, takeover=takeover_stale_lease)
+                                       before_spawn=budget_gate, takeover=takeover_stale_lease,
+                                       max_duration_seconds=max_duration)
     except headless_run.HeadlessError as exc:
         raise WorkspaceRunError(exc.code, exc.detail) from exc
     with locked_workspace(plan["workspace_id"]):
