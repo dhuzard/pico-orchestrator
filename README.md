@@ -316,6 +316,9 @@ is `BLOCKED`; a process that dies with the run still open is `interrupted` and
 can be relaunched into the same parent run with `--resume`. `pico exec status`
 reconciles the record against the live process and provenance, and
 `pico exec cancel` stops the process and closes the run as `EXECUTION_CANCELLED`.
+`--max-duration SECONDS` (or `max_duration_seconds` on a workspace task, with
+a manifest default) caps a child's wall-clock time: it is stopped and its run
+closed `BLOCKED` with `EXECUTION_TIME_LIMIT`. No limit is set by default.
 
 ### Act from the Garden: validate, request PR, check CI, promote
 

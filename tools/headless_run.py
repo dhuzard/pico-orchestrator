@@ -60,6 +60,8 @@ MUTATING_PERMISSIONS = ("create_worktrees", "commit", "push_branch", "create_pr"
 TERMINATE_GRACE_SECONDS = 10
 LEASE_OWNER_ENV = "PI_ORCHESTRATION_LEASE_OWNER"
 LEASE_TAKEOVER_REASON = "HEADLESS_RESUME_TAKEOVER"
+TIME_LIMIT_CODE = "EXECUTION_TIME_LIMIT"
+WAIT_POLL_SECONDS = 1.0
 # A resumed session must not carry the run marker: the lifecycle answers the
 # marker by settling the restored run and starting a new one. Without it,
 # session_start restores the IN_PROGRESS run and the agent continues it.
@@ -79,6 +81,24 @@ class HeadlessError(Exception):
 
 def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def clock() -> float:
+    """Wall-clock seconds since the epoch. Module-level so tests can substitute a fake clock."""
+    return time.time()
+
+
+def _iso(epoch: float) -> str:
+    return datetime.fromtimestamp(epoch, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def validate_max_duration(value) -> int | None:
+    """None means no limit; otherwise a positive integer number of seconds."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise HeadlessError("MAX_DURATION_INVALID", "max_duration_seconds must be a positive integer")
+    return value
 
 
 def state_root() -> Path:
@@ -158,9 +178,17 @@ def mutation_permitted(worktree: Path) -> list[str]:
     return [name for name in MUTATING_PERMISSIONS if permissions.get(name) is True]
 
 
+# Children this process launched and is waiting for, by pid. Their liveness is read through the Popen
+# object: reaping them behind its back with waitpid would make Popen.wait() report exit status 0.
+_OWN_CHILDREN: dict[int, subprocess.Popen] = {}
+
+
 def pid_alive(pid: int | None) -> bool:
     if not isinstance(pid, int) or pid <= 0:
         return False
+    own = _OWN_CHILDREN.get(pid)
+    if own is not None:
+        return own.poll() is None
     try:
         # Reap our own exited child so a zombie never reads as alive.
         reaped, _ = os.waitpid(pid, os.WNOHANG)
@@ -339,7 +367,9 @@ def claim_run_lease(run_id: str, owner: str, *, takeover: bool) -> dict:
 
 def start(*, target: Path, explicit_repo: str, execution_id: str, objective: str, allow_mutation: bool = False,
           resume: bool = False, pi_executable: str = "pi", python: str = sys.executable,
-          wait: bool = True, before_spawn=None, takeover: bool = False) -> dict:
+          wait: bool = True, before_spawn=None, takeover: bool = False,
+          max_duration_seconds: int | None = None) -> dict:
+    max_duration_seconds = validate_max_duration(max_duration_seconds)
     if takeover and not resume:
         raise HeadlessError("TAKEOVER_REQUIRES_RESUME", "--takeover-stale-lease applies only to --resume")
     if not objective.strip() or len(objective) > 20000:
@@ -354,16 +384,19 @@ def start(*, target: Path, explicit_repo: str, execution_id: str, objective: str
         launched = _launch_locked(path, worktree=worktree, identity=identity, common=common,
                                   execution_id=execution_id, objective=objective, allow_mutation=allow_mutation,
                                   resume=resume, pi_executable=pi_executable, python=python,
-                                  before_spawn=before_spawn, takeover=takeover)
+                                  before_spawn=before_spawn, takeover=takeover,
+                                  max_duration_seconds=max_duration_seconds)
     if isinstance(launched, dict):
         return launched
     record, child, log, before = launched
     if not wait:
+        _OWN_CHILDREN.pop(child.pid, None)
         log.close()
         return record
     try:
-        exit_code = child.wait()
+        exit_code = _wait_for_child(child, path, record)
     finally:
+        _OWN_CHILDREN.pop(child.pid, None)
         log.close()
     with locked_record(path):
         current = load_record(path) or {}
@@ -374,15 +407,38 @@ def start(*, target: Path, explicit_repo: str, execution_id: str, objective: str
         record["checkout"] = restore_checkout(worktree, before)
         refresh(record)  # downgrades to "interrupted" when the run is still open
         if current.get("status") == "cancelled":
-            # A cancel recorded while the child ran stays the outcome of this execution.
-            record["status"] = record["outcome"] = "cancelled"
+            # A cancel (or time-limit stop) recorded while the child ran stays the outcome of this execution.
+            record["status"] = "cancelled"
+            record["outcome"] = current.get("outcome") or "cancelled"
+            for key in ("stop_reason", "time_limit"):
+                if key in current:
+                    record[key] = current[key]
         save_record(path, record)
     return record
 
 
+def _wait_for_child(child, path: Path, record: dict) -> int:
+    """Wait for the child. Without a limit this is a plain wait; with one, the wait is sliced so the
+    launcher enforces the deadline itself (the same stop path `status` uses for children nobody waits on)."""
+    if record.get("deadline_epoch") is None:
+        return child.wait()
+    while True:
+        remaining = time_limit_remaining(record)
+        try:
+            return child.wait(timeout=min(WAIT_POLL_SECONDS, max(0.05, remaining or 0)))
+        except subprocess.TimeoutExpired:
+            pass
+        if time_limit_remaining(record) == 0:
+            with locked_record(path):
+                current = load_record(path)
+                if current is not None:
+                    enforce_time_limit(current)
+                    save_record(path, current)
+
+
 def _launch_locked(path: Path, *, worktree: Path, identity: str, common: Path, execution_id: str, objective: str,
                    allow_mutation: bool, resume: bool, pi_executable: str, python: str, before_spawn=None,
-                   takeover: bool = False):
+                   takeover: bool = False, max_duration_seconds: int | None = None):
     """Return the settled record, or (record, child, log, checkout_before) for a new launch. Caller holds the lock."""
     record = load_record(path)
     if record is not None:
@@ -392,6 +448,7 @@ def _launch_locked(path: Path, *, worktree: Path, identity: str, common: Path, e
             raise HeadlessError("EXECUTION_OBJECTIVE_MISMATCH",
                                 "execution id has a different recorded objective; use a new task id for changed instructions")
         refresh(record)
+        enforce_time_limit(record)  # a repeat start past the deadline stops the child rather than report it running
         if record["status"] == "launched":
             record["outcome"] = "already_running"
             save_record(path, record)
@@ -459,6 +516,7 @@ def _launch_locked(path: Path, *, worktree: Path, identity: str, common: Path, e
     try:
         child = subprocess.Popen(argv, cwd=str(worktree), env=env, shell=False, stdin=subprocess.DEVNULL,
                                  stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+        _OWN_CHILDREN[child.pid] = child
     except OSError as exc:
         log.close()
         record["status"] = "created" if record["launches"] == 0 else "interrupted"
@@ -469,29 +527,42 @@ def _launch_locked(path: Path, *, worktree: Path, identity: str, common: Path, e
             except (run_lease.LeaseError, OSError):
                 pass
         raise HeadlessError("PI_UNAVAILABLE", f"cannot launch {pi_executable}: {exc}") from exc
-    if continuing:
-        # Hand the lease to the launched process, so its liveness is what keeps the lease live.
-        try:
-            run_lease.acquire(record["run_id"], owner, pid=child.pid, handoff=True)
-        except (run_lease.LeaseError, OSError) as exc:
-            # Never leave a child running under a lease it cannot hold: stop it and say so.
-            code = exc.code if isinstance(exc, run_lease.LeaseError) else "RUN_LEASE_STORAGE_UNAVAILABLE"
+    try:
+        if continuing:
+            # Hand the lease to the launched process, so its liveness is what keeps the lease live.
             try:
-                os.killpg(child.pid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                pass
-            child.wait()
-            log.close()
-            record.update({"status": "interrupted", "pid": None, "lease_handoff_error": code,
-                           "launches": record["launches"] + 1, "outcome": "lease_handoff_failed"})
-            save_record(path, record)
-            raise HeadlessError("RUN_LEASE_HANDOFF_FAILED",
-                                f"the run lease could not be handed to the launched process ({code}); it was stopped") from exc
-    record.update({"status": "launched", "pid": child.pid, "pid_start": run_lease.pid_start(child.pid),
-                   "launches": record["launches"] + 1, "started_at": _now(), "exit_code": None,
-                   "outcome": "resumed" if resume else "launched"})
-    save_record(path, record)
-    return record, child, log, before
+                run_lease.acquire(record["run_id"], owner, pid=child.pid, handoff=True)
+            except (run_lease.LeaseError, OSError) as exc:
+                # Never leave a child running under a lease it cannot hold: stop it and say so.
+                code = exc.code if isinstance(exc, run_lease.LeaseError) else "RUN_LEASE_STORAGE_UNAVAILABLE"
+                try:
+                    os.killpg(child.pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+                child.wait()
+                log.close()
+                record.update({"status": "interrupted", "pid": None, "lease_handoff_error": code,
+                               "launches": record["launches"] + 1, "outcome": "lease_handoff_failed"})
+                save_record(path, record)
+                raise HeadlessError("RUN_LEASE_HANDOFF_FAILED",
+                                    f"the run lease could not be handed to the launched process ({code}); it was stopped") from exc
+        # The limit belongs to this launch: a resume starts a fresh window from now and does not inherit an
+        # earlier launch's limit (the caller passes it again).
+        launched_at = clock()
+        for stale in ("max_duration_seconds", "deadline_at", "deadline_epoch", "stop_reason", "time_limit"):
+            record.pop(stale, None)
+        if max_duration_seconds is not None:
+            record.update({"max_duration_seconds": max_duration_seconds, "deadline_epoch": launched_at + max_duration_seconds,
+                           "deadline_at": _iso(launched_at + max_duration_seconds)})
+        record.update({"status": "launched", "pid": child.pid, "pid_start": run_lease.pid_start(child.pid),
+                       "launches": record["launches"] + 1, "started_at": _now(), "exit_code": None,
+                       "outcome": "resumed" if resume else "launched"})
+        save_record(path, record)
+        return record, child, log, before
+    except BaseException:
+        # Every exit after registration that does not hand the child to start() drops it.
+        _OWN_CHILDREN.pop(child.pid, None)
+        raise
 
 
 def status(*, target: Path, explicit_repo: str, execution_id: str) -> dict:
@@ -506,17 +577,62 @@ def status(*, target: Path, explicit_repo: str, execution_id: str) -> dict:
         if record["target_repository"].casefold() != identity.casefold():
             raise HeadlessError("EXECUTION_TARGET_MISMATCH", "execution id belongs to another repository")
         refresh(record)
+        enforce_time_limit(record)
         save_record(path, record)
         return record
 
 
-def _finish_cancelled(record: dict) -> None:
+def time_limit_remaining(record: dict, now: float | None = None) -> float | None:
+    """Seconds left of an execution's limit (0 when over), or None when it has no limit."""
+    deadline = record.get("deadline_epoch")
+    if not isinstance(deadline, (int, float)) or isinstance(deadline, bool):
+        return None
+    if now is None:
+        elapsed = boot_elapsed(record)
+        if elapsed is not None:
+            return max(0.0, record["max_duration_seconds"] - elapsed)
+    return max(0.0, deadline - (clock() if now is None else now))
+
+
+def boot_elapsed(record: dict) -> float | None:
+    """Seconds since the child started, from /proc, or None where that is unavailable.
+
+    The child's start time (`pid_start`, clock ticks since boot) and /proc/uptime share one boot-time
+    clock, so a wall-clock jump (NTP step, WSL2 resuming after host sleep) neither stops a child early
+    nor lets it run late. Without /proc, enforcement falls back to the wall clock (`deadline_epoch`).
+    """
+    start = record.get("pid_start")
+    if not isinstance(start, str) or not start.isdigit():
+        return None
+    try:
+        uptime = float(Path("/proc/uptime").read_text().split()[0])
+        return uptime - int(start) / os.sysconf("SC_CLK_TCK")
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def enforce_time_limit(record: dict, grace: float = TERMINATE_GRACE_SECONDS) -> bool:
+    """Stop a still-running child whose deadline has passed. Caller holds the record lock.
+
+    Only a child that is still the launched process is stopped (`execution_alive`, so a reused pid is
+    never signalled). A child that already ended on its own is left to `refresh`'s normal outcome.
+    Returns True when the execution was stopped by the limit.
+    """
+    if record.get("status") != "launched" or time_limit_remaining(record) != 0:
+        return False
+    if not execution_alive(record):
+        return False
+    _stop_locked(record, grace, TIME_LIMIT_CODE)
+    return True
+
+
+def _finish_cancelled(record: dict, code: str = "EXECUTION_CANCELLED") -> None:
     """Close the run as this execution's lease owner. Another owner's run is never closed from here."""
     run_id = record.get("run_id")
     if not run_id:
         return
     try:
-        parent_orchestration.finish(run_id, "BLOCKED", blocker_code="EXECUTION_CANCELLED",
+        parent_orchestration.finish(run_id, "BLOCKED", blocker_code=code,
                                     owner_id=record.get("lease_owner"))
     except parent_orchestration.ParentRunError as exc:
         if exc.error_code.startswith("RUN_LEASE_"):
@@ -538,38 +654,59 @@ def cancel(*, target: Path, explicit_repo: str, execution_id: str, grace: float 
         if record["target_repository"].casefold() != identity.casefold():
             raise HeadlessError("EXECUTION_TARGET_MISMATCH", "execution id belongs to another repository")
         refresh(record)
-        if record.get("run_id") is None:
-            record["run_id"] = discover_run_id(Path(record["session_dir"]), record["session_id"])
-        # Close the run before signalling, so a graceful Pi shutdown that settles
-        # the parent finds it already terminal with the cancellation code.
-        _finish_cancelled(record)
-        pid = record.get("pid")
-        # Signal only the process this execution launched: the pid and its start time must both match.
-        child = {"pid": pid, "pid_start": record.get("pid_start")}
-        if record["status"] == "launched" and execution_alive(child):
-            try:
-                os.killpg(pid, signal.SIGTERM)
-            except (ProcessLookupError, PermissionError):
-                pass
-            deadline = time.monotonic() + grace
-            while execution_alive(child) and time.monotonic() < deadline:
-                time.sleep(0.05)
-            if execution_alive(child):
-                try:
-                    os.killpg(pid, signal.SIGKILL)
-                except (ProcessLookupError, PermissionError):
-                    pass
-        record["pid"] = None
-        if record.get("run_id") is None:
-            # The process may have created its run between discovery and the signal.
-            record["run_id"] = discover_run_id(Path(record["session_dir"]), record["session_id"])
-            _finish_cancelled(record)
-        record["status"] = "cancelled"
-        record["outcome"] = "cancelled"
-        refresh(record)
-        record["status"] = "cancelled"
+        _stop_locked(record, grace, "EXECUTION_CANCELLED")
         save_record(path, record)
         return record
+
+
+def _stop_locked(record: dict, grace: float, code: str) -> None:
+    """Close the parent run BLOCKED with `code`, stop the child if it is still ours, and record the outcome.
+
+    The caller holds the record lock and has refreshed the record. `code` is EXECUTION_CANCELLED for an
+    operator cancel and EXECUTION_TIME_LIMIT for the wall-clock limit; both end as status `cancelled`.
+    """
+    limit_stop = code == TIME_LIMIT_CODE
+    elapsed = None
+    if limit_stop and record.get("deadline_epoch") is not None:
+        elapsed = boot_elapsed(record)
+        if elapsed is None:
+            elapsed = clock() - (record["deadline_epoch"] - record["max_duration_seconds"])
+        elapsed = round(elapsed, 3)
+    if record.get("run_id") is None:
+        record["run_id"] = discover_run_id(Path(record["session_dir"]), record["session_id"])
+    # Close the run before signalling, so a graceful Pi shutdown that settles
+    # the parent finds it already terminal with the stop code.
+    _finish_cancelled(record, code)
+    pid = record.get("pid")
+    # Signal only the process this execution launched: the pid and its start time must both match.
+    child = {"pid": pid, "pid_start": record.get("pid_start")}
+    if record["status"] == "launched" and execution_alive(child):
+        try:
+            os.killpg(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+        deadline = time.monotonic() + grace
+        while execution_alive(child) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        if execution_alive(child):
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+    record["pid"] = None
+    if record.get("run_id") is None:
+        # The process may have created its run between discovery and the signal.
+        record["run_id"] = discover_run_id(Path(record["session_dir"]), record["session_id"])
+        _finish_cancelled(record, code)
+    record["status"] = "cancelled"
+    limit_stop = limit_stop or record.get("stop_reason") == TIME_LIMIT_CODE  # a later cancel keeps the earlier outcome
+    record["outcome"] = "time_limit" if limit_stop else "cancelled"
+    if code == TIME_LIMIT_CODE:
+        record["stop_reason"] = TIME_LIMIT_CODE
+        record["time_limit"] = {"max_duration_seconds": record["max_duration_seconds"], "elapsed_seconds": elapsed,
+                                "deadline_at": record.get("deadline_at"), "stopped_at": _now()}
+    refresh(record)
+    record["status"] = "cancelled"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -588,13 +725,16 @@ def main(argv: list[str] | None = None) -> int:
             p.add_argument("--takeover-stale-lease", action="store_true",
                            help="with --resume: explicitly recover a stale run lease (recorded in provenance)")
             p.add_argument("--no-wait", action="store_true", help="return after launching instead of waiting for exit")
+            p.add_argument("--max-duration", type=int, default=None, metavar="SECONDS",
+                           help="stop the child after this many wall-clock seconds (EXECUTION_TIME_LIMIT); default: no limit")
             p.add_argument("--pi", default=os.environ.get("PI_EXECUTABLE", "pi"), help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     try:
         if args.command == "start":
             record = start(target=args.target, explicit_repo=args.repo, execution_id=args.execution_id,
                            objective=args.objective, allow_mutation=args.allow_mutation, resume=args.resume,
-                           pi_executable=args.pi, wait=not args.no_wait, takeover=args.takeover_stale_lease)
+                           pi_executable=args.pi, wait=not args.no_wait, takeover=args.takeover_stale_lease,
+                           max_duration_seconds=args.max_duration)
         elif args.command == "status":
             record = status(target=args.target, explicit_repo=args.repo, execution_id=args.execution_id)
         else:
