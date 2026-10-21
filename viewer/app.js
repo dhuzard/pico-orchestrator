@@ -10,7 +10,7 @@ function selectedRun() { return state.runs.find((run) => run.id === state.select
 function setStatus() {
   const node = $("connection");
   node.classList.toggle("offline", !state.healthy);
-  node.lastChild.textContent = state.paused ? " Paused" : state.healthy ? " Live updates" : " Connection lost";
+  node.lastChild.textContent = state.paused ? " Paused" : state.healthy ? " Live updates" : state.tokenRequired ? " Open the URL printed at launch" : " Connection lost";
 }
 function renderPicker(repository) {
   const picker = $("run-select");
@@ -409,7 +409,7 @@ function prAnchor(link) {
   return anchor;
 }
 async function refreshWorkspace() {
-  const response = await fetch("/api/workspace", { cache: "no-store" });
+  const response = await fetch("/api/workspace", { cache: "no-store", headers: tokenHeaders() });
   const data = await response.json().catch(() => ({ ok: false, error_code: `HTTP_${response.status}`, error: "The workspace endpoint did not answer." }));
   state.workspace = data;
 }
@@ -836,15 +836,34 @@ $("workspace-mode").addEventListener("click", () => { history.replaceState(null,
 $("runs-mode").addEventListener("click", () => { location.hash = "runs"; });
 window.addEventListener("hashchange", () => { applyMode(); render(state.label); window.scrollTo({ top: 0 }); });
 
+// Issues change slowly and the server caches gh for a minute, so they are polled every 30 seconds.
+const issueState = { fetchedAt: 0 };
+async function refreshIssues(force = false) {
+  if (!force && Date.now() - issueState.fetchedAt < 30000) return;
+  issueState.fetchedAt = Date.now();
+  let data;
+  try {
+    const response = await fetch("/api/issues", { cache: "no-store", headers: tokenHeaders() });
+    data = await response.json().catch(() => ({ ok: false, error_code: `HTTP_${response.status}`, error: "The issues endpoint did not answer." }));
+  } catch { data = { ok: false, error_code: "CONNECTION_LOST", error: "The Garden server did not answer." }; }
+  // Without a target repository (pico watch --all, or a workspace id without a manifest) the panel stays hidden.
+  $("issues-panel").hidden = data.error_code === "ISSUES_TARGET_NONE";
+  $("issues-state").textContent = data.ok ? `${data.mode === "workspace" ? "per repository" : "this repository"} · read-only` : "unavailable";
+  globalThis.PicoIssues.render($("issues-list"), data);
+}
+
 async function refresh() {
   if (state.paused) return;
   try {
-    const response = await fetch("/api/runs", { cache: "no-store" });
+    const response = await fetch("/api/runs", { cache: "no-store", headers: tokenHeaders() });
+    // With controls on, every data endpoint needs the session token from the launch URL.
+    state.tokenRequired = response.status === 403;
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const data = await response.json();
     state.runs = data.runs || []; state.healthy = true;
     state.workspaceMode = Boolean(data.workspace_mode); state.workspaceId = data.workspace || null;
     if (state.workspaceMode) { await refreshWorkspace(); await refreshControls(); }
+    refreshIssues();  // not awaited: a slow gh call must not hold up the live run view
     applyMode();
     state.label = state.workspaceMode ? `Child runs of workspace ${state.workspaceId || ""}` : data.repository;
     render(state.label);

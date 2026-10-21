@@ -17,6 +17,7 @@ import github_integration
 import workspace_plan
 import workspace_run
 import garden_controls  # noqa: E402
+import garden_issues  # noqa: E402
 import run_lease  # noqa: E402
 from usage import TOKEN_FIELDS, cost_coverage, run_tokens, sum_tokens  # noqa: E402,F401
 import workspace_scheduler
@@ -30,6 +31,7 @@ STAMP = re.compile(r"^[0-9T:.Z+-]{1,40}$")
 SESSION_ID = re.compile(r"^[0-9TZ:-]{1,40}-[0-9]{1,10}$")
 ASSETS = {"/": ("index.html", "text/html; charset=utf-8"),
           "/app.js": ("app.js", "text/javascript; charset=utf-8"),
+          "/issues.js": ("issues.js", "text/javascript; charset=utf-8"),
           "/style.css": ("style.css", "text/css; charset=utf-8")}
 
 
@@ -436,8 +438,13 @@ class WorkspaceSource:
         return [task["run_id"] for repo in view["repositories"] for task in repo["tasks"] if task["run_id"]]
 
 
+# With --controls on, every data endpoint needs the session token; the static
+# page, script and stylesheet do not (the token arrives in the URL fragment).
+TOKEN_ENDPOINTS = frozenset({"/api/controls", "/api/branches", "/api/runs", "/api/workspace", "/api/issues"})
+
+
 def make_handler(directory: Path, repository: str | None, workspace: WorkspaceSource | None = None,
-                 controls=None, port: int | None = None):
+                 controls=None, port: int | None = None, issues: garden_issues.IssuesSource | None = None):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, format, *args):
             if not self.path.startswith("/api/"):
@@ -494,7 +501,7 @@ def make_handler(directory: Path, repository: str | None, workspace: WorkspaceSo
             self._send(payload)
 
         def _token_ok(self) -> bool:
-            # With controls on, the panels and branch list need the session token too.
+            # With controls on, every data endpoint needs the session token too (TOKEN_ENDPOINTS).
             if controls is None:
                 return True
             try:
@@ -509,7 +516,7 @@ def make_handler(directory: Path, repository: str | None, workspace: WorkspaceSo
                 return
             parts = urlsplit(self.path)
             path = parts.path
-            if path in {"/api/controls", "/api/branches"} and not self._token_ok():
+            if path in TOKEN_ENDPOINTS and not self._token_ok():
                 return
             if path == "/api/controls":
                 if workspace is None or workspace.manifest is None:
@@ -546,6 +553,15 @@ def make_handler(directory: Path, repository: str | None, workspace: WorkspaceSo
                     body = {"repository": None, "workspace_mode": True, "workspace": workspace.workspace_id,
                             "runs": load_runs_by_id(directory, workspace.run_ids())}
                 payload = self._json(200, body)
+            elif path == "/api/issues":
+                if issues is None:
+                    payload = self._json(404, {"ok": False, "error_code": "ISSUES_TARGET_NONE",
+                                               "error": "issues need pico watch on one repository or a workspace manifest"})
+                else:
+                    try:
+                        payload = self._json(200, issues.view())
+                    except WorkspaceViewError as exc:
+                        payload = self._json(exc.http_status, {"ok": False, "error_code": exc.code, "error": exc.detail})
             elif path == "/api/workspace":
                 if workspace is None:
                     payload = self._json(404, {"ok": False, "error_code": "WORKSPACE_MODE_OFF",
@@ -612,16 +628,23 @@ def main() -> None:
             repository = github_integration.resolve_target(Path(args.target).resolve(), args.repo)
         except github_integration.IntegrationError as exc:
             parser.error(f"{exc}; use --repo owner/repository or --all")
+    issues = None
+    if workspace is not None and workspace.manifest is not None:
+        issues = garden_issues.IssuesSource(garden_issues.workspace_targets(workspace.plan), mode="workspace")
+    elif repository is not None:
+        issues = garden_issues.IssuesSource(
+            garden_issues.repository_targets(Path(args.target).resolve(), args.repo, repository), mode="repository")
     controls = None
     if args.controls:
         if workspace is None or workspace.manifest is None:
             parser.error("--controls needs --workspace <manifest path>")
         # The contract tools resolve state through the environment; align it with this viewer.
         os.environ["PI_ORCHESTRATOR_STATE_DIR"] = str(state)
-    server = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(directory, repository, workspace))
+    server = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(directory, repository, workspace, issues=issues))
     if args.controls:
         controls = garden_controls.Controls(workspace.manifest, server.server_port)
-        server.RequestHandlerClass = make_handler(directory, repository, workspace, controls, server.server_port)
+        server.RequestHandlerClass = make_handler(directory, repository, workspace, controls, server.server_port,
+                                                  issues=issues)
     label = f"workspace {workspace.workspace_id}" if workspace else repository or "all repositories"
     if controls:
         print(f"Pico watch: http://127.0.0.1:{server.server_port}/#token={controls.token}  ({label}, controls on)", flush=True)
