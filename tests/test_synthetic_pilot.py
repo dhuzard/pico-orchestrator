@@ -312,7 +312,17 @@ class TimeLimitTest(SyntheticPilot):
 
 class LeadCallLimitTest(SyntheticPilot):
     def test_lead_call_limit(self):
-        """Warning, then a resumable stop; the same limit cannot resume, a raised one continues the same run."""
+        """The recorder, launcher and scheduler side of the lead-call limit (#47).
+
+        SCRIPTED, not asserted as behavior: the fake lead itself sends the warning at call 3, "reached" at
+        call 4 and the stop, so those numbers are inputs. The extension's own enforcement (counting calls,
+        warning, restricting tools) is covered by tests/orchestration-lifecycle.test.ts. PRODUCTION code
+        asserted here: the launcher hands the limit and its source to the child, the recorder stores the
+        stop and leaves the run IN_PROGRESS with a fresh checkpoint, the launcher marks the execution
+        interrupted with stop_reason LEAD_CALL_LIMIT, a resume with the same limit is refused
+        (LEAD_CALL_LIMIT_EXHAUSTED, by launcher and scheduler), and a raised limit continues the same run
+        with the recorder keeping the earlier calls.
+        """
         self.edit_manifest(tasks={"lib-slugify": {"max_lead_calls": 4, "lead_calls_warn_at": 3}})
         self.script({"lib-slugify": [[{"op": "lead_limit"}, {"op": "lead_calls", "n": 4}, {"op": "lead_stop"}],
                                      [{"op": "lead_limit"}, {"op": "lead_calls", "n": 2}, *implement()]]})
@@ -320,11 +330,11 @@ class LeadCallLimitTest(SyntheticPilot):
         run_id = stopped["run_id"]
         self.assertEqual((stopped["execution_status"], stopped["stop_reason"], stopped["run_status"]),
                          ("interrupted", "LEAD_CALL_LIMIT", "IN_PROGRESS"))
-        self.assertEqual((stopped["lead_call_limit"]["calls"], stopped["lead_call_limit"]["stopped"]), (4, True))
         parent = self.parent_record("lib-slugify")
         limit = parent["context"]["lead_call_limit"]
-        self.assertEqual((limit["max_lead_calls"], limit["source"], limit["warn_at"], limit["warned_at_call"], limit["calls_at_limit"]),
-                         (4, "task", 3, 3, 4))
+        # Recorder storage of what the launcher configured and of the stop event.
+        self.assertEqual((limit["max_lead_calls"], limit["source"], limit["warn_at"], limit["stopped"], limit["stopped_reason"]),
+                         (4, "task", 3, True, "LEAD_CALL_LIMIT"))
         self.assertIsNone(self.lease("lib-slugify")["lease"], "the lease is released at the stop")
         self.assertEqual(parent["checkpoint"]["reason"], "lead_call_limit")
 
@@ -340,7 +350,8 @@ class LeadCallLimitTest(SyntheticPilot):
         resumed = self.launch("lib-slugify", resume=True)["task"]
         self.assertEqual((resumed["run_id"], resumed["run_status"], resumed["launches"]), (run_id, "COMPLETED", 2))
         parent = self.parent_record("lib-slugify")
-        self.assertEqual(len(parent["context"]["lead_calls"]), 6, "four calls before the stop and two after: the count carries over")
+        # The calls of the first launch (scripted: 4) are still in the recorder after the resume (scripted: 2 more).
+        self.assertEqual(len(parent["context"]["lead_calls"]), 6)
         recorded = parent["context"]["lead_call_limit"]
         self.assertEqual((recorded["max_lead_calls"], recorded["stopped"], recorded["calls_at_stop"]), (10, False, 4))
         self.assert_golden(self.snapshot("lead-call-limit", ["lib-slugify"]))

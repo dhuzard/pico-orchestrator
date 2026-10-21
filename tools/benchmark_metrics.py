@@ -309,19 +309,37 @@ def bind_source(parent: dict, session: dict | None) -> str:
 
 
 def diff_facts(before: list[dict], after: list[dict]) -> list[dict]:
-    """Facts of `before` whose counterpart is missing from `after`, by semantic identity.
+    """Facts of `before` whose counterpart is missing from `after`, by semantic identity and multiplicity.
 
-    `absent`: no fact with that category and key in `after`. `differs`: the key exists but a value
-    differs. Order never matters; facts present only in `after` are not reported.
+    `absent`: no fact with that category and key in `after`. `differs`: the key exists but none of its
+    values equals this fact's value. `count`: the value exists in `after` but fewer times than in `before`
+    (a duplicated fact on the other side, or one lost out of several with the same key and value; the entry
+    carries `expected` and `found`). Order never matters; facts present only in `after` are not reported.
     """
-    index = {(f["category"], tuple(f["key"])): f["value"] for f in after}
-    missing = []
+    def ident(fact: dict) -> tuple:
+        return (fact["category"], tuple(fact["key"]))
+
+    def value_id(fact: dict) -> str:
+        return json.dumps(fact["value"], sort_keys=True, default=str)
+
+    values: dict[tuple, list] = {}
+    counts: dict[tuple, int] = {}
+    for fact in after:
+        values.setdefault(ident(fact), []).append(fact["value"])
+        counts[(ident(fact), value_id(fact))] = counts.get((ident(fact), value_id(fact)), 0) + 1
+    expected: dict[tuple, int] = {}
     for fact in before:
-        ident = (fact["category"], tuple(fact["key"]))
-        if ident not in index:
+        expected[(ident(fact), value_id(fact))] = expected.get((ident(fact), value_id(fact)), 0) + 1
+    missing, counted = [], set()
+    for fact in before:
+        found = counts.get((ident(fact), value_id(fact)), 0)
+        if ident(fact) not in values:
             missing.append({**fact, "reason": "absent"})
-        elif index[ident] != fact["value"]:
-            missing.append({**fact, "reason": "differs", "after": index[ident]})
+        elif found == 0:
+            missing.append({**fact, "reason": "differs", "after": values[ident(fact)][0]})
+        elif found < expected[(ident(fact), value_id(fact))] and (ident(fact), value_id(fact)) not in counted:
+            counted.add((ident(fact), value_id(fact)))
+            missing.append({**fact, "reason": "count", "expected": expected[(ident(fact), value_id(fact))], "found": found})
     return sorted(missing, key=lambda f: (f["category"], f["key"], f["reason"]))
 
 

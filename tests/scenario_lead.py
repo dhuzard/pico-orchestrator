@@ -34,6 +34,7 @@ import time
 
 ERROR_MARKER = "fake-scenario-error"
 SIGNAL_TIMEOUT_SECONDS = 30
+HANG_SECONDS = 30
 
 
 def die(message: str, code: int = 9):
@@ -141,6 +142,9 @@ class Lead:
         self.event(event)
 
     def op_lead_calls(self, op):
+        # SCRIPTED: this stands in for the lifecycle extension, which in production counts the lead's calls and
+        # emits the warning and "reached" events (tests/orchestration-lifecycle.test.ts covers that). The numbers
+        # a scenario then reads back (warning at N, reached at the limit) are echoes of this script, not findings.
         maximum = int(os.environ.get("PI_ORCHESTRATION_MAX_LEAD_CALLS", "0"))
         warn_at = int(os.environ.get("PI_ORCHESTRATION_LEAD_CALLS_WARN_AT", "0"))
         for _ in range(op["n"]):
@@ -152,13 +156,16 @@ class Lead:
                 self.event({"kind": "lead_limit", "state": "reached", "calls": self.calls})
 
     def op_lead_stop(self, op):
-        """The extension's resumable stop at the limit: record it, release the lease, end without an outcome."""
+        """SCRIPTED stand-in for the extension's resumable stop: record it, release the lease, end without an outcome."""
         self.event({"kind": "lead_call_limit_reached", "calls": self.calls})
         self.answer([os.path.join(self.tools, "run_lease.py"), "release", self.run_id, "--owner", self.owner])
         sys.exit(0)
 
     def op_hang(self, op):
-        time.sleep(120)  # the test stops this process; the bound only protects against a forgotten child
+        # The test (or the launcher's time limit) stops this process. If it is still here after the bound, the
+        # stop did not work: say so plainly instead of letting the scenario drift on.
+        time.sleep(HANG_SECONDS)
+        die(f"the hanging child was still running after {HANG_SECONDS}s: the time limit (or the test) did not stop it")
 
     def op_crash(self, op):
         sys.exit(3)
