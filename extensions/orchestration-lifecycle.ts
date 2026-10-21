@@ -527,7 +527,8 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
 
   pi.on("before_agent_start", async (trigger, ctx) => {
     compactionFailed = false;
-    if (!trigger.prompt.includes(MARKER)) return;
+    // Pi >= 1.3 only carries `prompt` on runs started by a user prompt.
+    if (!("prompt" in trigger) || !trigger.prompt.includes(MARKER)) return;
     if (parentBlocked && !runId) {
       const code = String(parentFailure?.error_code ?? "PARENT_PROVENANCE_UNAVAILABLE");
       return { message: { customType: "orchestration-blocker", display: true,
@@ -829,6 +830,7 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
             duration_ms: count(details.elapsed_ms) ?? (started ? Date.now() - started : null),
             input_tokens: count(usage.input_tokens), output_tokens: count(usage.output_tokens),
             cached_tokens: count(usage.cached_tokens), total_tokens: count(usage.total_tokens),
+            ...(count(usage.cache_write_tokens) === null ? {} : { cache_write_tokens: count(usage.cache_write_tokens) }),
             ...(typeof cost === "number" && Number.isFinite(cost) && cost >= 0 ? { estimated_cost_usd: cost } : {}) });
         }
       } else {
@@ -839,7 +841,8 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
         await observe({ kind: "usage", backend: "pi-subagent",
           duration_ms: count(details.elapsedMs) ?? (started ? Date.now() - started : null),
           input_tokens: count(usage.input), output_tokens: count(usage.output),
-          cached_tokens: count(usage.cacheRead), total_tokens: count(usage.totalTokens) });
+          cached_tokens: count(usage.cacheRead), total_tokens: count(usage.totalTokens),
+          ...(count(usage.cacheWrite) === null ? {} : { cache_write_tokens: count(usage.cacheWrite) }) });
       }
     }
     if (result.toolName === "AskClaude") {
@@ -1182,11 +1185,14 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
     const started = messageStarts.get(message.timestamp);
     messageStarts.delete(message.timestamp);
     const approval = approvals.size === 1 ? approvals.get(lastPhase) : undefined;
+    const leadCost = (message.usage as { cost?: { total?: unknown } } | undefined)?.cost?.total; // Pi's per-message estimate
     await observe({ kind: "lead_usage", model, phase: lastPhase,
       task_type: approval?.taskType ?? null, turn_index: currentTurn,
       duration_ms: started === undefined ? null : Math.max(0, Date.now() - started),
       input_tokens: count(message.usage?.input), output_tokens: count(message.usage?.output),
-      cached_tokens: count(message.usage?.cacheRead), total_tokens: count(message.usage?.totalTokens) });
+      cached_tokens: count(message.usage?.cacheRead), total_tokens: count(message.usage?.totalTokens),
+      ...(count(message.usage?.cacheWrite) === null ? {} : { cache_write_tokens: count(message.usage?.cacheWrite) }),
+      ...(typeof leadCost === "number" && Number.isFinite(leadCost) && leadCost >= 0 ? { estimated_cost_usd: leadCost } : {}) });
   });
 
   pi.on("session_compact", async (event) => {

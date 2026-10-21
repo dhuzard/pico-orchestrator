@@ -12,7 +12,7 @@ import { spawn } from "node:child_process";
 export type ClaudeWorkerPlan = { executable: string; cwd: string; backendModel: string;
   effort: string; mode: "read" | "full" };
 export type ClaudeWorkerUsage = { input_tokens: number | null; output_tokens: number | null;
-  cached_tokens: number | null; cost_usd: number | null };
+  cached_tokens: number | null; cache_write_tokens: number | null; cost_usd: number | null };
 export type ClaudeWorkerOutcome = { ok: boolean; text: string; exitCode: number | null;
   error: "TIMEOUT" | "ABORTED" | "OUTPUT_LIMIT" | "SPAWN_FAILED" | "MALFORMED_OUTPUT" | "BACKEND_ERROR"
     | "CONFIG_INVALID" | null;
@@ -189,7 +189,8 @@ export function parseClaudeResult(stdout: string): { result: Record<string, unkn
   const usage = (record.usage && typeof record.usage === "object" ? record.usage : {}) as Record<string, unknown>;
   const cost = record.total_cost_usd;
   return { result: record, usage: { input_tokens: count(usage.input_tokens), output_tokens: count(usage.output_tokens),
-    cached_tokens: count(usage.cache_read_input_tokens),
+    // Cache reads are cheap and never budgeted; cache writes (cache_creation) are billed input.
+    cached_tokens: count(usage.cache_read_input_tokens), cache_write_tokens: count(usage.cache_creation_input_tokens),
     cost_usd: typeof cost === "number" && Number.isFinite(cost) && cost >= 0 ? cost : null } };
 }
 
@@ -197,7 +198,7 @@ export function parseClaudeResult(stdout: string): { result: Record<string, unkn
 export function runClaudeWorker(plan: ClaudeWorkerPlan, prompt: string, signal?: AbortSignal,
                                 timeoutMs = workerTimeoutMs()): Promise<ClaudeWorkerOutcome> {
   const started = Date.now();
-  const empty: ClaudeWorkerUsage = { input_tokens: null, output_tokens: null, cached_tokens: null, cost_usd: null };
+  const empty: ClaudeWorkerUsage = { input_tokens: null, output_tokens: null, cached_tokens: null, cache_write_tokens: null, cost_usd: null };
   let prepared: { env: Record<string, string>; dropped: string[]; sandbox: boolean };
   try {
     prepared = { ...buildWorkerEnv(), sandbox: workerSandboxEnabled() };

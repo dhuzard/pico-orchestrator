@@ -243,6 +243,25 @@ class SchedulerTest(unittest.TestCase):
         self.assertEqual(third["budget"]["reasons"], ["cost"])
         self.assertEqual(sorted(third["session"]["dispatched"]), ["d1", "g1"])
 
+    def test_in_flight_spend_holds_the_next_task_while_a_child_is_still_running(self):
+        # alpha's child reports 3000 tokens at once and keeps running; beta's child spends nothing and
+        # exits first. The workspace record has no run id for alpha yet, but its spend must gate gamma.
+        os.environ["FAKE_PI_USAGE_alpha"] = "3000,0"
+        os.environ["FAKE_PI_USAGE_beta"] = ""
+        os.environ["FAKE_PI_SLEEP_alpha"] = "4"
+        os.environ["FAKE_PI_SLEEP_beta"] = "1.2"
+        tasks = [{"id": "a1", "repository": "alpha", "title": "a"}, {"id": "b1", "repository": "beta", "title": "b"},
+                 {"id": "g1", "repository": "gamma", "title": "g"}]
+        data = yaml.safe_load(self.manifest(tasks, max_parallel=2).read_text())
+        data["budget"] = {"max_tokens": 2000}
+        path = self.base / "workspace.yaml"
+        path.write_text(yaml.safe_dump(data))
+        result = self.schedule(path)
+        self.assertEqual(sorted(result["session"]["dispatched"]), ["a1", "b1"])
+        self.assertEqual(result["session"]["held_by_budget"], ["g1"])
+        self.assertEqual(self.states(result)["g1"], "held_by_budget")
+        self.assertTrue(result["budget"]["exhausted"])
+
     def test_second_task_in_a_repository_launches_after_a_child_moved_the_checkout(self):
         # Real leads left the parent checkout on pico/batch-<n> with worktrees behind; the launcher
         # then refused the next task in that repository (WORKSPACE_PIN_MISMATCH).

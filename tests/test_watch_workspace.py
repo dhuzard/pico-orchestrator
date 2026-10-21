@@ -187,7 +187,9 @@ class WorkspaceViewTest(unittest.TestCase):
         view = self.view(manifest=self.manifest)
         tasks = self.tasks(view)
         self.assertEqual(tasks["api-1"]["tokens"], {"input_tokens": 400, "output_tokens": 60, "cached_tokens": None,
-                                                     "total_tokens": 460, "estimated_cost_usd": 0.25})
+                                                     "cache_write_tokens": None, "total_tokens": 460,
+                                                     "estimated_cost_usd": 0.25, "cost_complete": False,
+                                                     "unpriced": ["lead-model"]})  # the lead reported no cost
         self.assertIsNone(tasks["web-3"]["tokens"]["total_tokens"])  # a worker total was not reported
         repos = {r["id"]: r["tokens"] for r in view["repositories"]}
         self.assertEqual(repos["api"]["input_tokens"], 400 + 40)
@@ -198,7 +200,8 @@ class WorkspaceViewTest(unittest.TestCase):
         self.assertEqual(repos["web"]["input_tokens"], 57)
         self.assertFalse(repos["web"]["total_complete"])
         self.assertEqual(repos["docs"], {"runs": 0, "input_tokens": None, "output_tokens": None, "cached_tokens": None,
-                                         "total_tokens": None, "estimated_cost_usd": None, "total_complete": False})
+                                         "cache_write_tokens": None, "total_tokens": None, "estimated_cost_usd": None,
+                                         "total_complete": False, "cost_complete": True, "unpriced": []})
         total = view["tokens"]
         for field in ("input_tokens", "output_tokens"):
             self.assertEqual(total[field], sum(r[field] or 0 for r in repos.values()))
