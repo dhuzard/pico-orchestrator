@@ -26,6 +26,7 @@ import session_scope  # noqa: E402
 
 LEASE_CLI = ROOT / "tools" / "run_lease.py"
 PARENT_CLI = ROOT / "tools" / "parent_orchestration.py"
+REPO = "Examplecorp/examplelab"
 
 
 def git(cwd: Path, *args: str) -> str:
@@ -50,7 +51,7 @@ class StateTestCase(unittest.TestCase):
         self.target = base / "target"
         self.target.mkdir()
         git(self.target, "init", "-q", "-b", "main")
-        git(self.target, "remote", "add", "origin", "git@github.com:Examplecorp/examplelab.git")
+        git(self.target, "remote", "add", "origin", f"git@github.com:{REPO}.git")
         (self.target / "README.md").write_text("# target\n")
         git(self.target, "add", "README.md")
         self.commit("init")
@@ -69,13 +70,24 @@ class StateTestCase(unittest.TestCase):
         return git(self.target, "rev-parse", "HEAD")
 
     def start_run(self, owner: str | None = None) -> str:
-        started = po.start(worktree=self.target, explicit_repo="Examplecorp/examplelab", repo_root=self.records,
+        started = po.start(worktree=self.target, explicit_repo=REPO, repo_root=self.records,
                            owner_id=owner, pid=os.getpid() if owner else None)
         self.assertEqual(started["status"], "IN_PROGRESS", started)
         return started["run_id"]
 
     def parent(self, run_id: str) -> dict:
         return provenance.get_run(self.records, run_id)["parent_orchestration"]
+
+    def rewrite_lease(self, run_id: str, **fields) -> dict:
+        """Simulate what time or another machine did to a lease file."""
+        path = run_lease.lease_path(run_id, self.records)
+        lease = json.loads(path.read_text())
+        lease.update(fields)
+        path.write_text(json.dumps(lease))
+        return lease
+
+    def expire(self, run_id: str) -> dict:
+        return self.rewrite_lease(run_id, heartbeat_at="2026-01-01T00:00:00Z", expires_at="2026-01-01T00:05:00Z")
 
 
 class RunLeaseTest(StateTestCase):
@@ -84,18 +96,22 @@ class RunLeaseTest(StateTestCase):
     def acquire(self, owner: str, **kwargs):
         return run_lease.acquire(self.RUN, owner, repo_root=self.records, **kwargs)
 
-    def test_lease_records_owner_pid_host_heartbeat_and_expiry_in_state_not_target(self):
+    def test_lease_records_owner_process_machine_heartbeat_and_expiry_in_state_not_target(self):
         result = self.acquire("owner-a", pid=os.getpid(), ttl_seconds=60, now=1_000_000.0)
         lease = result["lease"]
         self.assertEqual(result["acquired"], "new")
         self.assertEqual((lease["owner_id"], lease["pid"], lease["host"]), ("owner-a", os.getpid(), run_lease.host_name()))
+        self.assertEqual(lease["host_id"], run_lease.host_id())
+        self.assertEqual(lease["pid_start"], run_lease.pid_start(os.getpid()))
+        if Path("/proc/self/stat").exists():
+            self.assertIsNotNone(lease["pid_start"])
+            self.assertIsNotNone(lease["host_id"])
         self.assertEqual(lease["acquired_at"], lease["heartbeat_at"])
         self.assertEqual(run_lease._epoch(lease["expires_at"]) - run_lease._epoch(lease["heartbeat_at"]), 60)
         path = run_lease.lease_path(self.RUN, self.records)
         self.assertEqual(path, self.records / "provenance" / "leases" / f"{self.RUN}.json")
         self.assertEqual(json.loads(path.read_text()), lease)
         self.assertFalse(any(self.target.rglob("*.lock")))
-        # With a state directory, leases sit beside the runs there.
         with unittest.mock.patch.dict(os.environ, {provenance.STATE_ENV: str(Path(self._tmp.name) / "state")}):
             self.assertEqual(run_lease.lease_dir(self.records), Path(self._tmp.name) / "state" / "leases")
 
@@ -107,19 +123,51 @@ class RunLeaseTest(StateTestCase):
         self.assertLess(time.monotonic() - started, 1.0, "acquire must not wait for the holder")
         self.assertEqual(held.exception.code, "RUN_LEASE_HELD")
         self.assertEqual(held.exception.lease["owner_id"], "owner-a")
-        self.assertEqual(run_lease.status(self.RUN, repo_root=self.records)["lease"]["owner_id"], "owner-a")
-        # A live lease is never taken over either.
         with self.assertRaises(run_lease.LeaseError) as refused:
             run_lease.takeover(self.RUN, "owner-b", reason="OPERATOR_RECOVERY", repo_root=self.records)
         self.assertEqual(refused.exception.code, "RUN_LEASE_HELD")
 
-    def test_same_owner_renews_and_hands_over_to_a_new_pid(self):
+    def test_same_owner_renews_only_from_the_same_process_or_an_explicit_handoff(self):
         first = self.acquire("owner-a", pid=os.getpid(), now=1_000_000.0)["lease"]
-        renewed = self.acquire("owner-a", pid=os.getppid(), now=1_000_030.0)
+        renewed = self.acquire("owner-a", pid=os.getpid(), now=1_000_030.0)
         self.assertEqual(renewed["acquired"], "renewed")
-        self.assertEqual(renewed["lease"]["pid"], os.getppid())
         self.assertEqual(renewed["lease"]["acquired_at"], first["acquired_at"])
-        self.assertGreater(run_lease._epoch(renewed["lease"]["expires_at"]), run_lease._epoch(first["expires_at"]))
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        self.addCleanup(child.kill)
+        # An owner id collision from another process is refused.
+        with self.assertRaises(run_lease.LeaseError) as mismatch:
+            self.acquire("owner-a", pid=child.pid)
+        self.assertEqual(mismatch.exception.code, "RUN_LEASE_PID_MISMATCH")
+        # Even claiming a hand-off, a process that is neither the holder nor its child cannot take it.
+        with self.assertRaises(run_lease.LeaseError) as unrelated:
+            self.acquire("owner-a", pid=os.getppid(), handoff=True, caller_pid=dead_pid())
+        self.assertEqual(unrelated.exception.code, "RUN_LEASE_PID_MISMATCH")
+        # The launcher (the current holder) hands it to the process it started.
+        handed = self.acquire("owner-a", pid=child.pid, handoff=True)
+        self.assertEqual((handed["lease"]["pid"], handed["lease"]["pid_start"]),
+                         (child.pid, run_lease.pid_start(child.pid)))
+        with self.assertRaises(run_lease.LeaseError) as stale_pid:
+            run_lease.heartbeat(self.RUN, "owner-a", pid=os.getpid(), repo_root=self.records)
+        self.assertEqual(stale_pid.exception.code, "RUN_LEASE_PID_MISMATCH")
+
+    def test_a_child_claims_its_launchers_lease_through_the_handoff(self):
+        self.acquire("owner-a", pid=os.getpid())
+        state = Path(self._tmp.name) / "state"
+        env = {**os.environ, provenance.STATE_ENV: str(state)}
+        run_lease.acquire(self.RUN, "owner-a", pid=os.getpid(), repo_root=self.records)
+        shutil.copytree(run_lease.lease_dir(self.records), state / "leases")
+        # The child process asks for itself, as the lifecycle in a launched Pi does.
+        script = (f"import json, os, subprocess, sys; out = subprocess.run([sys.executable, {str(LEASE_CLI)!r}, "
+                  f"'acquire', {self.RUN!r}, '--owner', 'owner-a', '--pid', str(os.getpid()), '--handoff'], "
+                  "capture_output=True, text=True); print(out.stdout)")
+        claimed = json.loads(subprocess.run([sys.executable, "-c", script], env=env, capture_output=True,
+                                            text=True, check=True).stdout)
+        self.assertTrue(claimed["ok"], claimed)
+        self.assertEqual(claimed["acquired"], "renewed")
+        script_without = script.replace(", '--handoff'", "")
+        refused = json.loads(subprocess.run([sys.executable, "-c", script_without], env=env, capture_output=True,
+                                            text=True, check=True).stdout)
+        self.assertEqual(refused["error_code"], "RUN_LEASE_PID_MISMATCH")
 
     def test_concurrent_acquire_from_separate_processes_has_exactly_one_winner(self):
         state = Path(self._tmp.name) / "state"
@@ -162,30 +210,41 @@ class RunLeaseTest(StateTestCase):
             return exc.code
 
     def test_expired_heartbeat_is_stale_and_reported_not_recovered(self):
-        self.acquire("owner-a", pid=os.getpid(), ttl_seconds=30, now=1_000_000.0)
-        view = run_lease.status(self.RUN, repo_root=self.records, now=1_000_029.0)
-        self.assertEqual(view["state"], "live")
+        self.acquire("owner-a", pid=dead_pid(), ttl_seconds=30, now=1_000_000.0)
+        self.rewrite_lease(self.RUN, host="another-host")  # isolate the expiry from the pid probe
+        self.assertEqual(run_lease.status(self.RUN, repo_root=self.records, now=1_000_029.0)["state"], "live")
         view = run_lease.status(self.RUN, repo_root=self.records, now=1_000_030.0)
         self.assertEqual((view["state"], view["stale_reason"]), ("stale", "HEARTBEAT_EXPIRED"))
         with self.assertRaises(run_lease.LeaseError) as stale:
             self.acquire("owner-b", pid=os.getpid(), now=1_000_031.0)
         self.assertEqual(stale.exception.code, "RUN_LEASE_STALE")
-        self.assertEqual(stale.exception.stale_reason, "HEARTBEAT_EXPIRED")
-        self.assertEqual(run_lease.status(self.RUN, repo_root=self.records)["lease"]["owner_id"], "owner-a")
 
-    def test_dead_pid_on_this_host_is_stale_but_not_on_another_host(self):
-        pid = dead_pid()
-        self.acquire("owner-a", pid=pid)
+    def test_dead_or_reused_pid_on_this_machine_is_stale(self):
+        self.acquire("owner-a", pid=dead_pid())
         view = run_lease.status(self.RUN, repo_root=self.records)
-        self.assertEqual((view["state"], view["stale_reason"]), ("stale", "OWNER_PROCESS_DEAD"))
-        path = run_lease.lease_path(self.RUN, self.records)
-        lease = json.loads(path.read_text())
-        lease["host"] = "another-host"
-        path.write_text(json.dumps(lease))
-        # A pid on another host cannot be probed: only the heartbeat expiry decides.
-        self.assertEqual(run_lease.status(self.RUN, repo_root=self.records)["state"], "live")
+        self.assertEqual((view["state"], view["stale_reason"], view["holder_alive"]),
+                         ("stale", "OWNER_PROCESS_DEAD", False))
+        if run_lease.pid_start(os.getpid()) is not None:
+            # The pid is alive, but it is not the process that took the lease (pid reuse).
+            self.rewrite_lease(self.RUN, pid=os.getpid(), pid_start="1")
+            self.assertEqual(run_lease.status(self.RUN, repo_root=self.records)["stale_reason"], "OWNER_PROCESS_DEAD")
 
-    def test_unreadable_lease_is_stale_and_only_takeover_recovers_it(self):
+    def test_pids_are_never_judged_across_machines_or_containers_sharing_a_hostname(self):
+        self.acquire("owner-a", pid=dead_pid())
+        self.rewrite_lease(self.RUN, host="another-host")
+        self.assertEqual(run_lease.status(self.RUN, repo_root=self.records)["state"], "live")
+        self.rewrite_lease(self.RUN, host=run_lease.host_name(), host_id="0000000000000000")
+        view = run_lease.status(self.RUN, repo_root=self.records)
+        self.assertEqual((view["state"], view["holder_alive"]), ("live", None))
+        with unittest.mock.patch.object(run_lease, "_read_text", return_value=None), \
+                unittest.mock.patch("os.readlink", side_effect=OSError):
+            run_lease.host_id.cache_clear()
+            try:
+                self.assertIsNone(run_lease.host_id(), "without machine keys only the hostname identifies a host")
+            finally:
+                run_lease.host_id.cache_clear()
+
+    def test_unreadable_or_implausible_lease_is_stale(self):
         path = run_lease.lease_path(self.RUN, self.records)
         path.parent.mkdir(parents=True)
         path.write_text("{not json")
@@ -194,6 +253,15 @@ class RunLeaseTest(StateTestCase):
         with self.assertRaises(run_lease.LeaseError) as stale:
             self.acquire("owner-b")
         self.assertEqual(stale.exception.code, "RUN_LEASE_STALE")
+        path.unlink()
+        now = time.time()
+        self.acquire("owner-a", pid=os.getpid())
+        for fields in ({"expires_at": run_lease._iso(now + 3 * 24 * 3600)},  # beyond heartbeat + max TTL
+                       {"heartbeat_at": run_lease._iso(now + 3600), "expires_at": run_lease._iso(now + 3900)},
+                       {"expires_at": "not a time"}):
+            with self.subTest(fields=fields):
+                self.rewrite_lease(self.RUN, **{"heartbeat_at": run_lease._iso(now), **fields})
+                self.assertEqual(run_lease.status(self.RUN, repo_root=self.records)["stale_reason"], "LEASE_UNREADABLE")
 
     def test_heartbeat_extends_only_the_owners_lease(self):
         self.acquire("owner-a", pid=os.getpid(), ttl_seconds=30, now=1_000_000.0)
@@ -216,7 +284,7 @@ class RunLeaseTest(StateTestCase):
         self.assertTrue(run_lease.release(self.RUN, "owner-a", repo_root=self.records)["released"])
         self.assertEqual(run_lease.status(self.RUN, repo_root=self.records)["state"], "free")
         self.assertFalse(run_lease.release(self.RUN, "owner-a", repo_root=self.records)["released"])
-        self.assertEqual(self.acquire("owner-b", pid=os.getpid())["acquired"], "new")
+        self.assertFalse(hasattr(run_lease, "release_for_outcome"), "no owner-blind release exists")
 
     def test_invalid_inputs_fail_closed(self):
         for kwargs in ({"owner_id": "../escape"}, {"owner_id": ""}, {"owner_id": "o", "pid": 0},
@@ -243,18 +311,32 @@ class TakeoverTest(StateTestCase):
         result = run_lease.takeover(run_id, "recovery-owner", reason="OPERATOR_RECOVERY", pid=os.getpid(),
                                     repo_root=self.records)
         self.assertEqual(result["acquired"], "takeover")
-        self.assertEqual(result["lease"]["owner_id"], "recovery-owner")
         recorded = self.parent(run_id)["lease_takeovers"]
         self.assertEqual(len(recorded), 1)
-        self.assertEqual(recorded[0]["previous_owner_id"], "crashed-owner")
-        self.assertEqual(recorded[0]["owner_id"], "recovery-owner")
-        self.assertEqual(recorded[0]["reason"], "OPERATOR_RECOVERY")
-        self.assertEqual(recorded[0]["stale_reason"], "OWNER_PROCESS_DEAD")
+        self.assertEqual((recorded[0]["previous_owner_id"], recorded[0]["owner_id"], recorded[0]["reason"],
+                          recorded[0]["stale_reason"], recorded[0]["forced"]),
+                         ("crashed-owner", "recovery-owner", "OPERATOR_RECOVERY", "OWNER_PROCESS_DEAD", False))
+        self.assertEqual(self.parent(run_id)["owner_id"], "recovery-owner")
         self.assertEqual(result["lease"]["takeovers"], recorded)
-        # The new lease is live: a third owner is refused.
         with self.assertRaises(run_lease.LeaseError) as held:
             run_lease.acquire(run_id, "third-owner", repo_root=self.records)
         self.assertEqual(held.exception.code, "RUN_LEASE_HELD")
+
+    def test_expired_lease_of_a_running_holder_needs_a_separate_force_reason(self):
+        run_id = self.start_run(owner="sleeper")  # this test process is the running holder
+        self.expire(run_id)
+        view = run_lease.status(run_id, repo_root=self.records)
+        self.assertEqual((view["state"], view["stale_reason"], view["holder_alive"]),
+                         ("stale", "HEARTBEAT_EXPIRED", True))
+        with self.assertRaises(run_lease.LeaseError) as alive:
+            run_lease.takeover(run_id, "recovery", reason="OPERATOR_RECOVERY", repo_root=self.records)
+        self.assertEqual(alive.exception.code, "RUN_LEASE_HOLDER_ALIVE")
+        self.assertEqual(run_lease.status(run_id, repo_root=self.records)["lease"]["owner_id"], "sleeper")
+        forced = run_lease.takeover(run_id, "recovery", reason="OPERATOR_RECOVERY", force_reason="HOLDER_HUNG",
+                                    repo_root=self.records)
+        entry = forced["takeover"]
+        self.assertEqual((entry["forced"], entry["force_reason"]), (True, "HOLDER_HUNG"))
+        self.assertEqual(self.parent(run_id)["lease_takeovers"][-1], entry)
 
     def test_takeover_without_provenance_is_refused_and_leaves_the_lease(self):
         run_lease.acquire("run-missing", "crashed-owner", pid=dead_pid(), repo_root=self.records)
@@ -281,6 +363,65 @@ class TakeoverTest(StateTestCase):
         self.assertEqual(invalid.exception.code, "RUN_LEASE_INVALID")
 
 
+class OwnedWriteTest(StateTestCase):
+    """Writes to a run are checked against its lease (review finding 1)."""
+
+    EVENT = {"kind": "phase", "phase": "S1", "status": "in_progress"}
+
+    def test_sleep_then_wake_cannot_finish_or_free_the_new_owners_run(self):
+        # A owns the run, then sleeps past its TTL; B (another machine's view) takes over.
+        run_id = self.start_run(owner="owner-a")
+        self.expire(run_id)
+        self.rewrite_lease(run_id, host_id="another-machine")
+        run_lease.takeover(run_id, "owner-b", reason="OPERATOR_RECOVERY", pid=os.getpid(), repo_root=self.records)
+        before = provenance.run_path(self.records, run_id).read_bytes()
+        # A wakes up and shuts down: settle, finish and events are all refused.
+        for write in (lambda: po.settle(run_id, owner_id="owner-a", repo_root=self.records),
+                      lambda: po.finish(run_id, "BLOCKED", owner_id="owner-a", repo_root=self.records),
+                      lambda: po.record_event(run_id, self.EVENT, owner_id="owner-a", repo_root=self.records)):
+            with self.assertRaises(po.ParentRunError) as refused:
+                write()
+            self.assertEqual(refused.exception.error_code, "RUN_LEASE_LOST")
+        self.assertEqual(provenance.run_path(self.records, run_id).read_bytes(), before)
+        view = run_lease.status(run_id, repo_root=self.records)
+        self.assertEqual((view["state"], view["lease"]["owner_id"]), ("live", "owner-b"))
+        # B keeps working and finishing releases B's own lease.
+        po.record_event(run_id, self.EVENT, owner_id="owner-b", repo_root=self.records)
+        po.finish(run_id, "PARTIAL", owner_id="owner-b", repo_root=self.records)
+        self.assertEqual(run_lease.status(run_id, repo_root=self.records)["state"], "free")
+
+    def test_a_caller_without_the_lease_cannot_write_an_owned_run(self):
+        run_id = self.start_run(owner="owner-a")
+        for owner in (None, "owner-b"):
+            with self.subTest(owner=owner), self.assertRaises(po.ParentRunError) as refused:
+                po.finish(run_id, "BLOCKED", owner_id=owner, repo_root=self.records)
+            self.assertEqual(refused.exception.error_code, "RUN_LEASE_LOST")
+        self.assertEqual(run_lease.status(run_id, repo_root=self.records)["lease"]["owner_id"], "owner-a")
+        self.assertEqual(self.parent(run_id)["final_status"], "IN_PROGRESS")
+
+    def test_recorded_owner_may_write_while_the_lease_is_free_and_nobody_else(self):
+        run_id = self.start_run(owner="owner-a")
+        run_lease.release(run_id, "owner-a", repo_root=self.records)
+        with self.assertRaises(po.ParentRunError) as refused:
+            po.record_event(run_id, self.EVENT, owner_id="owner-b", repo_root=self.records)
+        self.assertEqual(refused.exception.error_code, "RUN_LEASE_NOT_HELD")
+        po.record_event(run_id, self.EVENT, owner_id="owner-a", repo_root=self.records)
+        # Stale but never taken over: the owner can still record its explicit outcome.
+        run_lease.acquire(run_id, "owner-a", pid=os.getpid(), repo_root=self.records)
+        self.expire(run_id)
+        po.finish(run_id, "PARTIAL", owner_id="owner-a", repo_root=self.records)
+        self.assertEqual(run_lease.status(run_id, repo_root=self.records)["state"], "free")
+
+    def test_cli_requires_an_owner_for_every_write(self):
+        for command in (["start", "--worktree", str(self.target)], ["event", "run-x"], ["finish", "run-x", "PARTIAL"],
+                        ["settle", "run-x"]):
+            with self.subTest(command=command[0]):
+                result = subprocess.run([sys.executable, str(PARENT_CLI), *command], capture_output=True, text=True,
+                                        input="{}")
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("--owner", result.stderr)
+
+
 class LeaseCliTest(StateTestCase):
     def cli(self, *args: str) -> tuple[int, dict]:
         env = {**os.environ, provenance.STATE_ENV: str(Path(self._tmp.name) / "state")}
@@ -301,8 +442,7 @@ class LeaseCliTest(StateTestCase):
         self.assertEqual((code, taken["error_code"]), (1, "RUN_LEASE_HELD"))
         code, released = self.cli("release", "run-cli", "--owner", "owner-a")
         self.assertEqual((code, released["released"]), (0, True))
-        code, status = self.cli("status", "run-cli")
-        self.assertEqual(status["state"], "free")
+        self.assertEqual(self.cli("status", "run-cli")[1]["state"], "free")
 
     def test_cli_default_pid_is_the_calling_process(self):
         code, acquired = self.cli("acquire", "run-cli", "--owner", "owner-a")
@@ -312,43 +452,51 @@ class LeaseCliTest(StateTestCase):
 class ResumeCheckpointTest(StateTestCase):
     def test_start_and_boundaries_record_the_checkout(self):
         run_id = self.start_run(owner="owner-a")
-        checkpoint = self.parent(run_id)["checkpoint"]
+        parent = self.parent(run_id)
+        checkpoint = parent["checkpoint"]
+        self.assertEqual(parent["owner_id"], "owner-a")
         self.assertEqual(checkpoint["worktree"], str(self.target.resolve()))
         self.assertEqual(checkpoint["branch"], "main")
         self.assertEqual(checkpoint["head"], git(self.target, "rev-parse", "HEAD"))
         self.assertEqual((checkpoint["phase"], checkpoint["reason"], checkpoint["sequence"]), ("start", "run_start", 1))
-        self.assertEqual(run_lease.status(run_id, repo_root=self.records)["lease"]["owner_id"], "owner-a")
+        own = {"owner_id": "owner-a", "repo_root": self.records}
         head = self.commit("phase work")
-        po.record_event(run_id, {"kind": "phase", "phase": "S1", "status": "in_progress"}, repo_root=self.records)
+        po.record_event(run_id, {"kind": "phase", "phase": "S1", "status": "in_progress"}, **own)
         checkpoint = self.parent(run_id)["checkpoint"]
         self.assertEqual((checkpoint["phase"], checkpoint["head"], checkpoint["reason"]), ("S1", head, "phase_boundary"))
         before = provenance.run_path(self.records, run_id).read_bytes()
-        po.record_event(run_id, {"kind": "phase", "phase": "S1", "status": "in_progress"}, repo_root=self.records)
+        po.record_event(run_id, {"kind": "phase", "phase": "S1", "status": "in_progress"}, **own)
         self.assertEqual(provenance.run_path(self.records, run_id).read_bytes(), before)
         git(self.target, "switch", "-q", "-c", "integration")
-        po.record_event(run_id, {"kind": "checkpoint", "phase": "S1", "reason": "worker_approval"},
-                        repo_root=self.records)
+        po.record_event(run_id, {"kind": "checkpoint", "phase": "S1", "reason": "worker_approval"}, **own)
         checkpoint = self.parent(run_id)["checkpoint"]
         self.assertEqual((checkpoint["branch"], checkpoint["reason"]), ("integration", "worker_approval"))
         with self.assertRaises(po.ParentRunError):
-            po.record_event(run_id, {"kind": "checkpoint", "phase": "S1", "reason": "rebase"}, repo_root=self.records)
+            po.record_event(run_id, {"kind": "checkpoint", "phase": "S1", "reason": "rebase"}, **own)
         head = self.commit("integrated")
-        po.record_event(run_id, {"kind": "mutation", "code": 1}, repo_root=self.records)
+        po.record_event(run_id, {"kind": "mutation", "code": 1}, **own)
         self.assertEqual(self.parent(run_id)["checkpoint"]["head"], head)
 
-    def resume(self, run_id: str, owner: str = "owner-b", pid: int | None = None):
-        return po.resume(run_id, worktree=self.target, owner_id=owner, pid=pid or os.getpid(),
-                         explicit_repo="Examplecorp/examplelab", repo_root=self.records)
+    def resume(self, run_id: str, owner: str = "owner-b", worktree: Path | None = None):
+        return po.resume(run_id, worktree=worktree or self.target, owner_id=owner, pid=os.getpid(),
+                         explicit_repo=REPO, repo_root=self.records)
 
-    def test_verified_resume_takes_the_lease_and_records_the_check(self):
+    def crashed_run(self) -> str:
+        """An owned run whose owner process died: its lease is stale, then recovered by takeover."""
         run_id = self.start_run(owner="crashed")
         run_lease.release(run_id, "crashed", repo_root=self.records)
+        return run_id
+
+    def test_verified_resume_takes_the_lease_and_ownership(self):
+        run_id = self.crashed_run()
+        run_lease.acquire(run_id, "owner-b", pid=os.getpid(), repo_root=self.records)  # e.g. after a takeover
         resumed = self.resume(run_id)
         self.assertEqual(resumed["status"], "IN_PROGRESS")
         self.assertEqual(resumed["lease"]["owner_id"], "owner-b")
-        self.assertEqual(resumed["checkpoint"]["head"], git(self.target, "rev-parse", "HEAD"))
-        checks = self.parent(run_id)["resume_checks"]
-        self.assertEqual([(check["status"], check["owner_id"]) for check in checks], [("verified", "owner-b")])
+        parent = self.parent(run_id)
+        self.assertEqual(parent["owner_id"], "owner-b")
+        self.assertEqual([(check["status"], check["owner_id"]) for check in parent["resume_checks"]],
+                         [("verified", "owner-b")])
 
     def test_live_lease_blocks_resume_before_any_record_change(self):
         run_id = self.start_run(owner="owner-a")
@@ -360,8 +508,8 @@ class ResumeCheckpointTest(StateTestCase):
         self.assertEqual(provenance.run_path(self.records, run_id).read_bytes(), before)
 
     def test_stale_lease_blocks_resume_until_an_explicit_takeover(self):
-        run_id = self.start_run(owner="crashed", )
-        run_lease.heartbeat(run_id, "crashed", pid=dead_pid(), repo_root=self.records)
+        run_id = self.start_run(owner="crashed")
+        self.rewrite_lease(run_id, pid=dead_pid(), pid_start=None)
         with self.assertRaises(po.ParentRunError) as stale:
             self.resume(run_id)
         self.assertEqual(stale.exception.error_code, "RUN_LEASE_STALE")
@@ -370,66 +518,98 @@ class ResumeCheckpointTest(StateTestCase):
         self.assertEqual(self.resume(run_id)["status"], "IN_PROGRESS")
         self.assertEqual(len(self.parent(run_id)["lease_takeovers"]), 1)
 
-    def test_changed_head_blocks_the_resumed_run_with_expected_and_actual(self):
-        run_id = self.start_run(owner="crashed")
+    def assert_refused_in_progress(self, run_id: str, code: str) -> dict:
+        parent = self.parent(run_id)
+        self.assertEqual((parent["final_status"], parent["blocker_code"]), ("IN_PROGRESS", None),
+                         "a checkpoint failure never closes the run")
+        self.assertEqual(parent["resume_checks"][-1]["reason_code"], code)
+        self.assertEqual(run_lease.status(run_id, repo_root=self.records)["state"], "free",
+                         "the lease taken for the refused resume is released")
+        return parent
+
+    def test_changed_head_refuses_resume_and_leaves_the_run_for_an_operator(self):
+        run_id = self.crashed_run()
         expected = git(self.target, "rev-parse", "HEAD")
-        run_lease.release(run_id, "crashed", repo_root=self.records)
         actual = self.commit("moved while nobody owned the run")
         with self.assertRaises(po.ParentRunError) as drift:
             self.resume(run_id)
         self.assertEqual(drift.exception.error_code, "RESUME_CHECKPOINT_DRIFT")
         self.assertEqual(drift.exception.details["mismatches"],
                          [{"field": "head", "expected": expected, "actual": actual}])
-        record = provenance.get_run(self.records, run_id)
-        parent = record["parent_orchestration"]
-        self.assertEqual((parent["final_status"], parent["blocker_code"]), ("BLOCKED", "RESUME_CHECKPOINT_DRIFT"))
-        self.assertEqual(parent["resume_checks"][-1]["status"], "drift")
-        # Never silently re-based: the checkpoint still names the expected revision.
-        self.assertEqual(parent["checkpoint"]["head"], expected)
-        self.assertEqual(run_lease.status(run_id, repo_root=self.records)["state"], "free")
-        # The blocked run can no longer be resumed or written to.
-        self.assertEqual(self.resume(run_id, owner="owner-c")["status"], "BLOCKED")
-        with self.assertRaises(po.ParentRunError):
-            po.record_event(run_id, {"kind": "phase", "phase": "S1", "status": "in_progress"}, repo_root=self.records)
+        parent = self.assert_refused_in_progress(run_id, "RESUME_CHECKPOINT_DRIFT")
+        self.assertEqual(parent["checkpoint"]["head"], expected, "never silently re-based")
+        self.assertEqual(parent["owner_id"], "crashed", "a refused resume does not take ownership")
+        # The operator restores the checkout; the same resume then verifies.
+        git(self.target, "reset", "-q", "--hard", expected)
+        self.assertEqual(self.resume(run_id)["status"], "IN_PROGRESS")
 
     def test_switched_branch_and_moved_worktree_are_drift(self):
-        run_id = self.start_run(owner="crashed")
-        run_lease.release(run_id, "crashed", repo_root=self.records)
+        run_id = self.crashed_run()
         git(self.target, "switch", "-q", "-c", "elsewhere")
         with self.assertRaises(po.ParentRunError) as drift:
             self.resume(run_id)
         self.assertEqual([item["field"] for item in drift.exception.details["mismatches"]], ["branch"])
-        run_id = self.start_run(owner="crashed-2")
-        run_lease.release(run_id, "crashed-2", repo_root=self.records)
+        git(self.target, "switch", "-q", "main")
         linked = Path(self._tmp.name) / "linked"
         git(self.target, "worktree", "add", "-q", str(linked))
         with self.assertRaises(po.ParentRunError) as moved:
-            po.resume(run_id, worktree=linked, owner_id="owner-b", pid=os.getpid(),
-                      explicit_repo="Examplecorp/examplelab", repo_root=self.records)
+            self.resume(run_id, worktree=linked)
         self.assertEqual(moved.exception.error_code, "RESUME_CHECKPOINT_DRIFT")
         self.assertIn("worktree", [item["field"] for item in moved.exception.details["mismatches"]])
+        self.assert_refused_in_progress(run_id, "RESUME_CHECKPOINT_DRIFT")
 
-    def test_legacy_record_without_checkpoint_loads_but_cannot_resume(self):
+    def test_interrupted_integration_is_drift_against_the_pre_integration_checkpoint(self):
+        run_id = self.start_run(owner="crashed")
+        own = {"owner_id": "crashed", "repo_root": self.records}
+        po.record_event(run_id, {"kind": "wave", "wave_id": "w1", "task_ids": ["S1"], "status": "declared"}, **own)
+        before = git(self.target, "rev-parse", "HEAD")
+        po.record_event(run_id, {"kind": "wave", "wave_id": "w1", "task_ids": ["S1"], "status": "integrating"}, **own)
+        checkpoint = self.parent(run_id)["checkpoint"]
+        self.assertEqual((checkpoint["reason"], checkpoint["head"]), ("integration_started", before))
+        merged = self.commit("half of the wave merged, then the process died")
+        run_lease.release(run_id, "crashed", repo_root=self.records)
+        with self.assertRaises(po.ParentRunError) as drift:
+            self.resume(run_id)
+        self.assertEqual(drift.exception.error_code, "RESUME_CHECKPOINT_DRIFT")
+        self.assertEqual(drift.exception.details["expected"]["head"], before)
+        self.assertEqual(drift.exception.details["actual"]["head"], merged)
+        self.assertEqual(drift.exception.details["expected"]["reason"], "integration_started")
+        self.assert_refused_in_progress(run_id, "RESUME_CHECKPOINT_DRIFT")
+
+    def test_legacy_record_without_checkpoint_loads_but_its_resume_is_refused(self):
         run_id = self.start_run()
         path = provenance.run_path(self.records, run_id)
         record = json.loads(path.read_text())
         del record["parent_orchestration"]["checkpoint"]
+        del record["parent_orchestration"]["owner_id"]
         path.write_text(json.dumps(record))
-        # Older records still load, report status and accept events (no checkpoint is invented).
         self.assertEqual(po.status(run_id, repo_root=self.records)["status"], "IN_PROGRESS")
         po.record_event(run_id, {"kind": "phase", "phase": "S1", "status": "in_progress"}, repo_root=self.records)
         self.assertNotIn("checkpoint", self.parent(run_id))
         with self.assertRaises(po.ParentRunError) as missing:
             self.resume(run_id)
         self.assertEqual(missing.exception.error_code, "RESUME_CHECKPOINT_MISSING")
-        parent = self.parent(run_id)
-        self.assertEqual((parent["final_status"], parent["blocker_code"]), ("BLOCKED", "RESUME_CHECKPOINT_MISSING"))
-        self.assertEqual(parent["resume_checks"][-1]["status"], "unverified")
+        self.assertEqual(self.assert_refused_in_progress(run_id, "RESUME_CHECKPOINT_MISSING")["resume_checks"][-1]["status"],
+                         "unverified")
+        # An operator closes it explicitly: take the free lease, then record the outcome.
+        run_lease.acquire(run_id, "operator", pid=os.getpid(), repo_root=self.records)
+        po.finish(run_id, "BLOCKED", blocker_code="RESUME_CHECKPOINT_MISSING", owner_id="operator",
+                  repo_root=self.records)
+        self.assertEqual(self.parent(run_id)["final_status"], "BLOCKED")
+
+    def test_run_finished_between_status_and_lease_is_not_resumed(self):
+        run_id = self.crashed_run()
+        in_progress = po.status(run_id, repo_root=self.records)
+        po.finish(run_id, "PARTIAL", owner_id="crashed", repo_root=self.records)
+        with unittest.mock.patch.object(po, "status", side_effect=[in_progress, po.status(run_id, repo_root=self.records)]):
+            result = self.resume(run_id)
+        self.assertEqual(result["status"], "PARTIAL")
         self.assertEqual(run_lease.status(run_id, repo_root=self.records)["state"], "free")
+        self.assertNotIn("resume_checks", self.parent(run_id))
 
     def test_explicit_outcome_releases_the_lease(self):
-        for finisher in (lambda run_id: po.finish(run_id, "PARTIAL", repo_root=self.records),
-                         lambda run_id: po.settle(run_id, repo_root=self.records)):
+        for finisher in (lambda run_id: po.finish(run_id, "PARTIAL", owner_id="owner-a", repo_root=self.records),
+                         lambda run_id: po.settle(run_id, owner_id="owner-a", repo_root=self.records)):
             run_id = self.start_run(owner="owner-a")
             self.assertEqual(run_lease.status(run_id, repo_root=self.records)["state"], "live")
             finisher(run_id)
@@ -439,20 +619,18 @@ class ResumeCheckpointTest(StateTestCase):
         state = Path(self._tmp.name) / "state"
         env = {**os.environ, provenance.STATE_ENV: str(state)}
         started = json.loads(subprocess.run(
-            [sys.executable, str(PARENT_CLI), "start", "--worktree", str(self.target), "--repo",
-             "Examplecorp/examplelab", "--owner", "crashed", "--pid", str(dead_pid())],
-            env=env, capture_output=True, text=True, check=True).stdout)
+            [sys.executable, str(PARENT_CLI), "start", "--worktree", str(self.target), "--repo", REPO,
+             "--owner", "crashed", "--pid", str(dead_pid())], env=env, capture_output=True, text=True, check=True).stdout)
         run_id = started["run_id"]
         subprocess.run([sys.executable, str(LEASE_CLI), "takeover", run_id, "--owner", "recovery",
                         "--reason", "OPERATOR_RECOVERY", "--pid", str(dead_pid())], env=env, check=True,
                        capture_output=True)
-        # The recovery owner died too; release its lease so both resumers race on a free lease.
         subprocess.run([sys.executable, str(LEASE_CLI), "release", run_id, "--owner", "recovery"], env=env,
                        check=True, capture_output=True)
         children = [subprocess.Popen([sys.executable, str(PARENT_CLI), "resume", run_id, "--worktree",
-                                      str(self.target), "--repo", "Examplecorp/examplelab",
-                                      "--owner", f"pi-{index}", "--pid", str(os.getpid())],
-                                     env=env, stdout=subprocess.PIPE, text=True) for index in range(2)]
+                                      str(self.target), "--repo", REPO, "--owner", f"pi-{index}",
+                                      "--pid", str(os.getpid())], env=env, stdout=subprocess.PIPE, text=True)
+                    for index in range(2)]
         results = [json.loads(child.communicate(timeout=60)[0]) for child in children]
         accepted = [result for result in results if result.get("status") == "IN_PROGRESS"]
         refused = [result for result in results if result.get("ok") is False]
@@ -466,34 +644,44 @@ class ResumeCheckpointTest(StateTestCase):
         state = Path(self._tmp.name) / "state"
         env = {**os.environ, provenance.STATE_ENV: str(state)}
         started = json.loads(subprocess.run(
-            [sys.executable, str(PARENT_CLI), "start", "--worktree", str(self.target), "--repo",
-             "Examplecorp/examplelab"], env=env, capture_output=True, text=True, check=True).stdout)
+            [sys.executable, str(PARENT_CLI), "start", "--worktree", str(self.target), "--repo", REPO,
+             "--owner", "pi-x", "--pid", str(os.getpid())], env=env, capture_output=True, text=True, check=True).stdout)
         self.commit("drift")
         result = subprocess.run([sys.executable, str(PARENT_CLI), "resume", started["run_id"], "--worktree",
-                                 str(self.target), "--repo", "Examplecorp/examplelab", "--owner", "pi-x"],
+                                 str(self.target), "--repo", REPO, "--owner", "pi-x", "--pid", str(os.getpid())],
                                 env=env, capture_output=True, text=True)
         payload = json.loads(result.stdout)
         self.assertEqual((result.returncode, payload["error_code"]), (1, "RESUME_CHECKPOINT_DRIFT"))
         self.assertEqual(payload["details"]["mismatches"][0]["field"], "head")
         self.assertEqual(payload["details"]["actual"]["head"], git(self.target, "rev-parse", "HEAD"))
+        self.assertEqual(payload["details"]["run_status"], "IN_PROGRESS")
 
 
 class WorkerIsolationTest(StateTestCase):
     def test_lease_and_checkpoint_never_touch_the_target_or_widen_worker_scope(self):
         before = session_scope.snapshot(str(self.target))
         run_id = self.start_run(owner="owner-a")
-        po.record_event(run_id, {"kind": "phase", "phase": "S1", "status": "in_progress"}, repo_root=self.records)
-        po.record_event(run_id, {"kind": "checkpoint", "phase": "S1", "reason": "worker_approval"},
-                        repo_root=self.records)
+        own = {"owner_id": "owner-a", "repo_root": self.records}
+        po.record_event(run_id, {"kind": "phase", "phase": "S1", "status": "in_progress"}, **own)
+        po.record_event(run_id, {"kind": "checkpoint", "phase": "S1", "reason": "worker_approval"}, **own)
         run_lease.heartbeat(run_id, "owner-a", repo_root=self.records)
-        po.finish(run_id, "PARTIAL", repo_root=self.records)
+        po.finish(run_id, "PARTIAL", **own)
         self.assertEqual(session_scope.snapshot(str(self.target)), before)
-        # The parent checkout is still not a valid worker workspace; a linked worktree still is.
         self.assertEqual(session_scope.worktree(str(self.target), str(self.target))["blocker_code"],
                          "WORKER_WORKSPACE_INVALID")
         linked = Path(self._tmp.name) / "wt-s1"
         git(self.target, "worktree", "add", "-q", "-b", "pico/s1", str(linked))
         self.assertTrue(session_scope.worktree(str(self.target), str(linked))["ok"])
+
+    def test_in_process_scope_owns_its_run(self):
+        with po.ParentRun(worktree=self.target, explicit_repo=REPO, repo_root=self.records) as scope:
+            scope.event({"kind": "phase", "phase": "S1", "status": "completed"})
+            self.assertEqual(run_lease.status(scope.run_id, repo_root=self.records)["lease"]["owner_id"],
+                             scope.owner_id)
+            with self.assertRaises(po.ParentRunError):
+                po.finish(scope.run_id, "BLOCKED", repo_root=self.records)
+        self.assertEqual(self.parent(scope.run_id)["final_status"], "BLOCKED")
+        self.assertEqual(run_lease.status(scope.run_id, repo_root=self.records)["state"], "free")
 
 
 class StatusSurfaceTest(StateTestCase):
@@ -501,11 +689,10 @@ class StatusSurfaceTest(StateTestCase):
         import watch
         run_id = self.start_run(owner="owner-a")
         runs = provenance.runs_dir(self.records)
-        visible = watch.load_runs(runs, "Examplecorp/examplelab")[0]
-        self.assertEqual(visible["lease"]["owner_id"], "owner-a")
-        self.assertEqual(visible["lease"]["state"], "live")
-        po.finish(run_id, "PARTIAL", repo_root=self.records)
-        self.assertIsNone(watch.load_runs(runs, "Examplecorp/examplelab")[0]["lease"])
+        visible = watch.load_runs(runs, REPO)[0]
+        self.assertEqual((visible["lease"]["owner_id"], visible["lease"]["state"]), ("owner-a", "live"))
+        po.finish(run_id, "PARTIAL", owner_id="owner-a", repo_root=self.records)
+        self.assertIsNone(watch.load_runs(runs, REPO)[0]["lease"])
 
 
 if __name__ == "__main__":

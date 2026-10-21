@@ -121,16 +121,17 @@ def _repository_slug(repository: str | None) -> str:
     return repository.replace("/", "__") if repository else "_unresolved"
 
 
-def start(run_id: str, cwd: Path, *, repo_root: Path = ROOT) -> dict:
+def start(run_id: str, cwd: Path, *, owner_id: str | None = None, repo_root: Path = ROOT) -> dict:
     parent_orchestration.record_event(run_id, {"kind": "context", "starting_commit": _commit(cwd)},
-                                      repo_root=repo_root)
+                                      owner_id=owner_id, repo_root=repo_root)
     return {"ok": True}
 
 
-def checkpoint(run_id: str, payload: dict, *, repo_root: Path = ROOT) -> dict:
+def checkpoint(run_id: str, payload: dict, *, owner_id: str | None = None, repo_root: Path = ROOT) -> dict:
     # Sequence selection, file publication, and the parent link are one
-    # operation; concurrent checkpoints must not pick the same sequence.
-    with parent_orchestration._run_lock(repo_root, run_id):
+    # operation; concurrent checkpoints must not pick the same sequence. Only
+    # the run's owner may write (lease lock, owner check, then run lock).
+    with parent_orchestration._owned(run_id, owner_id, repo_root):
         return _checkpoint_unlocked(run_id, payload, repo_root=repo_root)
 
 
@@ -187,8 +188,10 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("policy")
     p_start = sub.add_parser("start")
     p_start.add_argument("run_id")
+    p_start.add_argument("--owner", required=True)
     p_checkpoint = sub.add_parser("checkpoint")
     p_checkpoint.add_argument("run_id")
+    p_checkpoint.add_argument("--owner", required=True)
     args = parser.parse_args(argv)
     try:
         if args.command == "policy":
@@ -198,9 +201,9 @@ def main(argv: list[str] | None = None) -> int:
             if not isinstance(payload, dict) or not isinstance(payload.get("cwd"), str):
                 raise ContextBudgetError("CONTEXT_INPUT_INVALID", "payload requires cwd")
             if args.command == "start":
-                result = start(args.run_id, Path(payload["cwd"]))
+                result = start(args.run_id, Path(payload["cwd"]), owner_id=args.owner)
             else:
-                result = checkpoint(args.run_id, payload)
+                result = checkpoint(args.run_id, payload, owner_id=args.owner)
     except ContextBudgetError as exc:
         print(json.dumps({"ok": False, "blocker_code": exc.code, "error": str(exc)}))
         return 1

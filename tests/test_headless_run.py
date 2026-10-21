@@ -27,6 +27,7 @@ sys.path.insert(0, str(REPO_ROOT / "tools"))
 
 import headless_run as hr  # noqa: E402
 import provenance  # noqa: E402
+import run_lease  # noqa: E402
 import session_scope  # noqa: E402
 
 FAKE_PI = r'''#!/usr/bin/env python3
@@ -51,14 +52,19 @@ def pcmd(*a):
     return json.loads(out.stdout)
 existing = glob.glob(os.path.join(sdir, f"*_{sid}.jsonl"))
 run_id = None
-owner = os.environ.get("PI_ORCHESTRATION_LEASE_OWNER") or f"fake-{os.getpid()}"
+# Like the lifecycle: read the launcher's owner once, never pass it on, hand off explicitly.
+owner = os.environ.pop("PI_ORCHESTRATION_LEASE_OWNER", None) or f"fake-{os.getpid()}"
+handoff = ["--handoff"] if owner.startswith("headless-") else []
 marker = "PI_ORCHESTRATION_RUN_V1" in prompt
 if existing and marker:
     # Real lifecycle: before_agent_start settles the restored run and starts anew.
     for line in open(existing[0]):
         e = json.loads(line)
         if e.get("type") == "custom" and e.get("customType") == "pi-orchestration-parent-v1":
-            pcmd("settle", e["data"]["run_id"])
+            # Restore (lease + checkpoint), then settle as the restored run's owner.
+            pcmd("resume", e["data"]["run_id"], "--worktree", os.getcwd(), "--repo", os.environ["PI_TARGET_REPOSITORY"],
+                 "--owner", owner, "--pid", str(os.getpid()), *handoff)
+            pcmd("settle", e["data"]["run_id"], "--owner", owner)
     existing = []
     os.remove(glob.glob(os.path.join(sdir, f"*_{sid}.jsonl"))[0])
 if existing:
@@ -68,7 +74,7 @@ if existing:
             run_id = e["data"]["run_id"]
     # Real lifecycle restore: verify identity, take the run lease, verify the resume checkpoint.
     st = pcmd("resume", run_id, "--worktree", os.getcwd(), "--repo", os.environ["PI_TARGET_REPOSITORY"],
-              "--owner", owner, "--pid", str(os.getpid()))
+              "--owner", owner, "--pid", str(os.getpid()), *handoff)
     if st.get("status") != "IN_PROGRESS":
         print(json.dumps({"type": "fake", "run_id": run_id, "resume_refused": st}))
         sys.exit(4)
@@ -97,14 +103,15 @@ if usage:
              "total_tokens": int(numbers[0]) + int(numbers[1])}
     if len(numbers) > 2:
         event["estimated_cost_usd"] = float(numbers[2])
-    subprocess.run([sys.executable, parent, "event", run_id], input=json.dumps(event), capture_output=True, text=True)
+    subprocess.run([sys.executable, parent, "event", run_id, "--owner", owner], input=json.dumps(event),
+                   capture_output=True, text=True)
 if behavior == "slow":
     time.sleep(float(os.environ.get("FAKE_PI_SLEEP", "0.4")))
     behavior = "finish"
 if behavior == "finish":
-    pcmd("finish", run_id, "PARTIAL")
+    pcmd("finish", run_id, "PARTIAL", "--owner", owner)
 elif behavior == "settle":
-    pcmd("settle", run_id)
+    pcmd("settle", run_id, "--owner", owner)
 elif behavior == "crash":
     note("end")
     sys.exit(3)
@@ -222,6 +229,37 @@ class HeadlessRunTest(unittest.TestCase):
         final = self.start(behavior="finish", resume=True)
         self.assertEqual(final["outcome"], "already_finished")
         self.assertEqual(final["launches"], 2)
+
+    def test_takeover_never_displaces_a_running_holder(self):
+        crashed = self.start(behavior="crash")
+        path = run_lease.lease_path(crashed["run_id"], hr.ROOT)
+        lease = json.loads(path.read_text())
+        # Pretend the holder is a live process on this machine whose heartbeat expired.
+        lease.update({"pid": os.getpid(), "pid_start": run_lease.pid_start(os.getpid()),
+                      "heartbeat_at": "2026-01-01T00:00:00Z", "expires_at": "2026-01-01T00:05:00Z"})
+        path.write_text(json.dumps(lease))
+        with self.assertRaises(hr.HeadlessError) as alive:
+            self.start(behavior="finish", resume=True, takeover=True)
+        self.assertEqual(alive.exception.code, "RUN_LEASE_HOLDER_ALIVE")
+        self.assertEqual(self.status()["launches"], 1)
+        self.assertNotIn("lease_takeovers", provenance.get_run(hr.ROOT, crashed["run_id"])["parent_orchestration"])
+
+    def test_failed_lease_handoff_stops_the_child_visibly(self):
+        crashed = self.start(behavior="crash")
+        real = run_lease.acquire
+
+        def refuse_handoff(*args, **kwargs):
+            if kwargs.get("handoff"):
+                raise run_lease.LeaseError("RUN_LEASE_LOCK_TIMEOUT", "busy")
+            return real(*args, **kwargs)
+        with unittest.mock.patch.object(hr.run_lease, "acquire", side_effect=refuse_handoff):
+            with self.assertRaises(hr.HeadlessError) as failed:
+                self.start(behavior="hang", resume=True, takeover=True, wait=False)
+        self.assertEqual(failed.exception.code, "RUN_LEASE_HANDOFF_FAILED")
+        record = self.status()
+        self.assertEqual((record["status"], record["lease_handoff_error"]), ("interrupted", "RUN_LEASE_LOCK_TIMEOUT"))
+        self.assertIsNone(record["pid"])
+        self.assertEqual(record["run_id"], crashed["run_id"])
 
     def test_interrupted_process_is_detected_and_resumable(self):
         launched = self.start(behavior="hang", wait=False)

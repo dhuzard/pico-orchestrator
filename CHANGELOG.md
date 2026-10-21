@@ -10,15 +10,19 @@ All notable changes to PICO are recorded here. The format follows
 
 - Single-owner run lease (`tools/run_lease.py`: `acquire`, `heartbeat`,
   `release`, `status`, `takeover`). A second process that resumes a run with
-  a live lease fails with `RUN_LEASE_HELD`; a stale lease is recovered only by
-  an explicit takeover recorded in the run's provenance. New and resumed runs
-  take the lease, the lifecycle renews it, and every explicit outcome releases
-  it. Garden and `pico exec status` show the holder (audit A3, mitigated).
+  a live lease fails with `RUN_LEASE_HELD`. A stale lease is recovered only by
+  an explicit takeover recorded in the run's provenance, and a holder still
+  running on the same machine needs a separate force reason. Every write to a
+  run (`event`, `finish`, `settle`) now requires `--owner` and is refused
+  unless the caller holds the lease or is the recorded owner of a free lease.
+  The lifecycle detaches and aborts running workers when its lease is lost or
+  cannot be renewed in time. Garden and `pico exec status` show the holder
+  (audit A3, mitigated).
 - Verified resume checkpoint: the parent checkout's worktree, branch, HEAD and
-  phase are recorded at each boundary and worker approval, and a resume whose
-  checkout moved is blocked with `RESUME_CHECKPOINT_DRIFT` instead of being
-  re-based (audit A10, mitigated). `pico exec start --resume` now needs
-  `--takeover-stale-lease` to continue a crashed launch.
+  phase are recorded at each boundary, at worker approval and before
+  integration. A resume whose checkout moved is refused with
+  `RESUME_CHECKPOINT_DRIFT` instead of being re-based, and the run stays
+  `IN_PROGRESS` for an operator (audit A10, mitigated).
 - `CONTRIBUTING.md` with the development checks, the rules for routing and
   policy changes, pull request expectations and the licensing stance.
 - `CODE_OF_CONDUCT.md` (Contributor Covenant 2.1).
@@ -51,6 +55,15 @@ All notable changes to PICO are recorded here. The format follows
 
 ### Changed
 
+- `pico exec start --resume` needs `--takeover-stale-lease` to continue a
+  crashed launch; the scheduler's `--resume-interrupted` implies it but never
+  displaces a running holder.
+- `tools/parent_orchestration.py start|event|finish|settle` and
+  `tools/context_budget.py start|checkpoint` require `--owner`.
+- An `IN_PROGRESS` run recorded before this release has no resume checkpoint:
+  its resume is refused with `RESUME_CHECKPOINT_MISSING` and it stays
+  `IN_PROGRESS`. Close it explicitly with `run_lease.py acquire` followed by
+  `parent_orchestration.py finish --owner`, or start a new run.
 - State files are written through one atomic writer (unique temp file, fsync).
   It refuses to write through symlinks, including a symlinked user model
   config.

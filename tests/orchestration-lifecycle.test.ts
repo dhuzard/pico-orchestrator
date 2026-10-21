@@ -5,7 +5,8 @@ import { join } from "node:path";
 import { test } from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Value } from "typebox/value";
-import { createOrchestrationLifecycle, leaseOwner, runJson, scopesOverlap } from "../extensions/orchestration-lifecycle.ts";
+import { createOrchestrationLifecycle, leaseOwner, leaseProcessState, runJson, scopesOverlap } from "../extensions/orchestration-lifecycle.ts";
+import { hostname } from "node:os";
 import { classifyClaudeInvocationError, resolveClaudeBackendModel } from "../extensions/claude-backend-adapter.ts";
 import { buildWorkerEnv, claudeWorkerArgs, describeDenials, inGitDirectory, WORKER_ENV_CREDENTIALS, WORKER_ENV_NAMES,
   WORKER_SANDBOX_SETTINGS, WorkerConfigError, workerSandboxEnabled } from "../extensions/claude-worker.ts";
@@ -18,7 +19,8 @@ function harness(preflight: Record<string, unknown>, failEvent = false, verifyOk
                    completionError?: string; limits?: Record<string, unknown>; executable?: string;
                    routeConflict?: boolean; reroutePhases?: string[];
                    escalationWorkerConflict?: boolean; resumeResult?: Record<string, unknown>;
-                   heartbeatResult?: Record<string, unknown> } = {}) {
+                   heartbeatResult?: Record<string, unknown>; eventResult?: Record<string, unknown>;
+                   clock?: () => number } = {}) {
   const handlers = new Map<string, Handler>();
   const tools = new Map<string, any>();
   const calls: { script: string; args: string[]; input?: Record<string, unknown> }[] = [];
@@ -54,6 +56,7 @@ function harness(preflight: Record<string, unknown>, failEvent = false, verifyOk
       reroute_phases: options.reroutePhases ?? [] };
     if (args[0] === "settle" && options.settleFails) return { ok: false, error_code: "PARENT_STORAGE_UNAVAILABLE" };
     if (args[0] === "event" && failEvent) return { ok: false };
+    if (args[0] === "event" && options.eventResult) return options.eventResult;
     if (args[0] === "event" && options.routeConflict && !escalated && input?.kind === "phase" && input.route === "CLAUDE_CODEX")
       return { ok: false, error_code: "PARENT_EVENT_CONFLICT" };
     if (args[0] === "event" && options.escalationWorkerConflict && input?.kind === "escalation")
@@ -74,7 +77,7 @@ function harness(preflight: Record<string, unknown>, failEvent = false, verifyOk
     appendEntry(customType: string, data: unknown) { entries.push({ type: "custom", customType, data }); },
     getActiveTools() { return ["route_task", "spawn_subagent", "ClaudeWorker", "orchestration_record"]; },
   } as unknown as ExtensionAPI;
-  createOrchestrationLifecycle(command)(pi);
+  createOrchestrationLifecycle(command, options.clock)(pi);
   const parentCalls = (operation: string) =>
     calls.filter((call) => call.script.endsWith("parent_orchestration.py") && call.args[0] === operation);
   const leaseCalls = (operation: string) =>
@@ -1289,13 +1292,50 @@ function restoredSession(overrides: Record<string, unknown> = {}) {
   return { h, context, entries };
 }
 
-test("lease owner is the launcher's when handed down, else stable per host, process and session", () => {
-  assert.equal(leaseOwner("s", { PI_ORCHESTRATION_LEASE_OWNER: "headless-abc-123" }, 7, "box"), "headless-abc-123");
-  assert.equal(leaseOwner("session-a", {}, 42, "my host"), "pi-my-host-42-session-a");
-  assert.equal(leaseOwner("session-a", {}, 42, "my host"), leaseOwner("session-a", {}, 42, "my host"));
-  assert.notEqual(leaseOwner("session-a", {}, 42, "box"), leaseOwner("session-a", {}, 43, "box"));
-  // An unsafe handed-down owner is ignored rather than passed to the lease tool.
-  assert.match(leaseOwner(null, { PI_ORCHESTRATION_LEASE_OWNER: "../x" }, 1, "box"), /^pi-box-1-nosession$/);
+const thisOwner = (sessionId: string | null) => {
+  const state = leaseProcessState();
+  return leaseOwner(sessionId, state.launcherOwner, process.pid, hostname(), state.nonce);
+};
+
+test("lease owner is the launcher's when handed down, else unique per host, process nonce and session", () => {
+  assert.equal(leaseOwner("s", "headless-abc-123", 7, "box", "n1"), "headless-abc-123");
+  assert.equal(leaseOwner("session-a", null, 42, "my host", "a1b2"), "pi-my-host-42-a1b2-session-a");
+  // Same pid and session in another process (pid reuse, shared namespace) still differs by nonce.
+  assert.notEqual(leaseOwner("session-a", null, 42, "box", "n1"), leaseOwner("session-a", null, 42, "box", "n2"));
+  assert.notEqual(leaseOwner("session-a", null, 42, "box", "n1"), leaseOwner("session-a", null, 43, "box", "n1"));
+  assert.match(leaseOwner(null, "../x", 1, "box", "n1"), /^pi-box-1-n1-nosession$/);
+});
+
+test("the handed-down owner is read once, removed from the environment, and survives a reload", () => {
+  const state = leaseProcessState();
+  const nonce = state.nonce;
+  const env: NodeJS.ProcessEnv = { PI_ORCHESTRATION_LEASE_OWNER: "headless-abc-123" };
+  try {
+    assert.equal(leaseProcessState(env).launcherOwner, "headless-abc-123");
+    assert.equal("PI_ORCHESTRATION_LEASE_OWNER" in env, false, "nested processes must not inherit the owner");
+    // A reloaded extension instance sees the same process identity.
+    assert.equal(leaseProcessState({}).launcherOwner, "headless-abc-123");
+    assert.equal(leaseProcessState({}).nonce, nonce);
+  } finally {
+    state.launcherOwner = null;
+  }
+});
+
+test("a launched process resumes its launcher's lease only through the explicit hand-off", async () => {
+  const state = leaseProcessState();
+  state.launcherOwner = "headless-abc-123";
+  try {
+    const { h, context } = restoredSession();
+    await h.handlers.get("session_start")!({ reason: "startup" }, context);
+    const resume = h.parentCalls("resume")[0].args;
+    assert.equal(resume[resume.indexOf("--owner") + 1], "headless-abc-123");
+    assert.ok(resume.includes("--handoff"));
+  } finally {
+    state.launcherOwner = null;
+  }
+  const { h, context } = restoredSession();
+  await h.handlers.get("session_start")!({ reason: "startup" }, context);
+  assert.equal(h.parentCalls("resume")[0].args.includes("--handoff"), false);
 });
 
 test("a new run and a resumed run both take the lease as this process", async () => {
@@ -1310,7 +1350,7 @@ test("a new run and a resumed run both take the lease as this process", async ()
   const resume = h.parentCalls("resume")[0].args;
   assert.equal(resume[1], "parent-test");
   assert.equal(resume[resume.indexOf("--worktree") + 1], process.cwd());
-  assert.equal(resume[resume.indexOf("--owner") + 1], leaseOwner("session-a"));
+  assert.equal(resume[resume.indexOf("--owner") + 1], thisOwner("session-a"));
   const status = await h.tools.get("orchestration_record").execute("status", { action: "status" });
   assert.equal(status.details.active, true);
 });
@@ -1392,4 +1432,70 @@ test("worker approval and workspace binding record a resume checkpoint", async (
     task_id: "S1", step_id: "codex_worker", path: "/tmp/target-wt" });
   assert.equal(bound.details.ok, true);
   assert.equal(checkpoints().length, 2);
+});
+
+test("every write to the run names this process as its owner", async () => {
+  const h = harness({ ok: true });
+  await h.handlers.get("before_agent_start")!({ prompt: "PI_ORCHESTRATION_RUN_V1" });
+  const tool = h.tools.get("orchestration_record");
+  await tool.execute("e", { action: "event", event: { kind: "phase", phase: "S1", status: "in_progress" } });
+  await tool.execute("f", { action: "finish", status: "PARTIAL" });
+  await h.handlers.get("before_agent_start")!({ prompt: "PI_ORCHESTRATION_RUN_V1" });
+  await h.handlers.get("session_shutdown")!({ reason: "quit" });
+  const writes = h.calls.filter((call) => ["event", "finish", "settle"].includes(call.args[0])
+    || (call.script.endsWith("context_budget.py") && call.args[0] === "start"));
+  assert.ok(writes.length >= 4);
+  for (const call of writes) assert.equal(call.args[call.args.indexOf("--owner") + 1], thisOwner(null), call.args.join(" "));
+});
+
+test("a write refused because another owner holds the lease detaches without settling", async () => {
+  const h = harness({ ok: true }, false, true, { eventResult: { ok: false, error_code: "RUN_LEASE_LOST" } });
+  await h.handlers.get("before_agent_start")!({ prompt: "PI_ORCHESTRATION_RUN_V1" });
+  const tool = h.tools.get("orchestration_record");
+  await h.handlers.get("tool_result")!(routed);
+  const status = await tool.execute("s", { action: "status" });
+  assert.equal(status.details.active, false);
+  assert.match(status.content[0].text, /RUN_LEASE_LOST/);
+  await h.handlers.get("session_shutdown")!({ reason: "quit" });
+  assert.equal(h.parentCalls("settle").length, 0);
+});
+
+test("renewals failing past the lease lifetime detach the process and abort running workers", async () => {
+  let now = 1_000_000;
+  const h = harness({ ok: true }, false, true,
+    { heartbeatResult: { ok: false, error_code: "RUN_LEASE_LOCK_TIMEOUT" }, clock: () => now });
+  let aborted = 0;
+  const ctx = { cwd: "/tmp/target", ui: { notify() {} }, abort() { aborted += 1; }, getContextUsage: () => undefined };
+  await h.handlers.get("before_agent_start")!({ prompt: "PI_ORCHESTRATION_RUN_V1" }, ctx);
+  // Transient failures inside the lease lifetime keep the run.
+  now += 120_000;
+  await h.handlers.get("turn_end")!({}, ctx);
+  assert.equal((await h.tools.get("orchestration_record").execute("s", { action: "status" })).details.active, true);
+  // An exploration worker is running when the lease can no longer be trusted.
+  assert.equal(await h.handlers.get("tool_call")!({ toolName: "spawn_subagent", toolCallId: "w1",
+    input: { task: "explore" } }, ctx), undefined);
+  now += 121_000; // 241 s without a successful renewal: past TTL (300 s) minus the 60 s margin
+  const next = await h.handlers.get("tool_call")!({ toolName: "spawn_subagent", toolCallId: "w2",
+    input: { task: "explore more" } }, ctx);
+  assert.equal(next.block, true);
+  assert.equal(aborted, 1, "the running worker is aborted, not only new tool calls");
+  const status = await h.tools.get("orchestration_record").execute("s", { action: "status" });
+  assert.equal(status.details.active, false);
+  assert.match(status.content[0].text, /RUN_LEASE_SELF_EXPIRED/);
+  await h.handlers.get("session_shutdown")!({ reason: "quit" });
+  assert.equal(h.parentCalls("settle").length, 0);
+});
+
+test("a successful renewal extends how long the process may act", async () => {
+  let now = 1_000_000;
+  const h = harness({ ok: true }, false, true,
+    { heartbeatResult: { ok: true, state: "live", lease: { ttl_seconds: 300 } }, clock: () => now });
+  const ctx = { cwd: "/tmp/target", ui: { notify() {} }, abort() {}, getContextUsage: () => undefined };
+  await h.handlers.get("before_agent_start")!({ prompt: "PI_ORCHESTRATION_RUN_V1" }, ctx);
+  for (let turn = 0; turn < 5; turn += 1) {
+    now += 200_000;
+    await h.handlers.get("turn_end")!({}, ctx);
+  }
+  assert.equal(await h.handlers.get("tool_call")!({ toolName: "spawn_subagent", toolCallId: "w",
+    input: { task: "explore" } }, ctx), undefined);
 });

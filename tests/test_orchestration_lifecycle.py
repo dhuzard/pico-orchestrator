@@ -368,7 +368,7 @@ class LifecycleTest(unittest.TestCase):
         parent = po.ParentRun(worktree=self.target, repo_root=self.records)
         env = {**os.environ, "PI_ORCHESTRATOR_STATE_DIR": str(self.records / "provenance")}
         children = [subprocess.Popen([sys.executable, str(ROOT / "tools/parent_orchestration.py"),
-                   "event", parent.run_id], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                   "event", parent.run_id, "--owner", parent.owner_id], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                    stderr=subprocess.PIPE, text=True, env=env)
                    for _ in range(4)]
         for index, child in enumerate(children):

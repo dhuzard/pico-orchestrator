@@ -1109,74 +1109,118 @@ session, and quit close the parent. A crash leaves it resumable from the saved
 session; a terminal record cannot be reopened.
 
 **Single-owner run lease (audit A3).** `tools/run_lease.py` gives each parent
-run at most one owning process. The lease is a JSON file in orchestrator
-state beside the run records (`<state>/leases/<run_id>.json`, or
-`provenance/leases/` for a repository-local installation; never in the target
-checkout) holding `owner_id`, `pid`, `host`, `acquired_at`, `heartbeat_at`,
-`expires_at`, `ttl_seconds` (default 300) and the lease's `takeovers`. Every
-decision is made under an exclusive `flock` on `<run_id>.lock` with a bounded
-wait, and every write is an atomic replace through `tools/atomic_io.py`, so
-two processes can never both see the lease free.
+run one owner. The lease is a JSON file in orchestrator state beside the run
+records (`<state>/leases/<run_id>.json`, or `provenance/leases/` for a
+repository-local installation; never in the target checkout). It holds
+`owner_id`, `pid`, `pid_start` (start time from `/proc/<pid>/stat`, so a reused
+pid is not mistaken for the holder), `host` and `host_id` (a hash of the kernel
+boot id, machine id and pid namespace, so containers that share a hostname
+never judge each other's pids), `acquired_at`, `heartbeat_at`, `expires_at`,
+`ttl_seconds` (default 300) and the lease's `takeovers`. Every decision is
+made under an exclusive `flock` on `<run_id>.lock` with a bounded wait, and
+every write is an atomic replace through `tools/atomic_io.py`. A crash
+releases the flock with the process.
 
 ```sh
-python3 tools/run_lease.py acquire   <run_id> --owner <id> [--pid N] [--ttl S]
+python3 tools/run_lease.py acquire   <run_id> --owner <id> [--pid N] [--ttl S] [--handoff]
 python3 tools/run_lease.py heartbeat <run_id> --owner <id> [--pid N] [--ttl S]
 python3 tools/run_lease.py release   <run_id> --owner <id>
 python3 tools/run_lease.py status    <run_id>
-python3 tools/run_lease.py takeover  <run_id> --owner <id> --reason <CODE> [--pid N] [--ttl S]
+python3 tools/run_lease.py takeover  <run_id> --owner <id> --reason <CODE> [--force-reason <CODE>] [--pid N] [--ttl S]
 ```
 
 The CLI prints one JSON object and exits 0 (ok), 1 (refused) or 2 (invalid
-invocation); `--pid` defaults to the calling process. `acquire` takes a free
-lease or renews the caller's own (same owner id; the pid may change, which is
-how a launcher hands its lease to the process it starts). A live lease of
-another owner is refused with `RUN_LEASE_HELD` and a stale one with
-`RUN_LEASE_STALE`; acquire never waits and never takes over. A lease is
-stale when its heartbeat expired (`HEARTBEAT_EXPIRED`), its pid is dead on
-this host (`OWNER_PROCESS_DEAD`; a pid on another host cannot be probed, so
-only the expiry counts there) or the file is unreadable
-(`LEASE_UNREADABLE`). Only `takeover` recovers a stale lease: it refuses a
-live one (`RUN_LEASE_HELD`) or a missing one (`RUN_LEASE_NOT_HELD`), appends
-the previous holder, the stale reason and the caller's reason code to the
-run's `parent_orchestration.lease_takeovers` first, and refuses when that
-cannot be recorded (`RUN_LEASE_PROVENANCE_UNAVAILABLE`, including a terminal
-run). `heartbeat` and `release` act only on the caller's own lease
-(`RUN_LEASE_LOST` when another owner holds it, `RUN_LEASE_NOT_HELD` when
-there is none). Other codes: `RUN_LEASE_INVALID`, `RUN_LEASE_LOCK_TIMEOUT`,
-`RUN_LEASE_STORAGE_UNAVAILABLE`.
+invocation); `--pid` defaults to the calling process.
 
-Wiring: `parent_orchestration.py start --owner <id> --pid <pid>` takes the
-lease of the new run; `parent_orchestration.py resume <run_id> --worktree
-<path> --owner <id> --pid <pid>` verifies the target identity, takes the
-lease and verifies the resume checkpoint. The lifecycle extension calls
-`start` for a new run and `resume` (not `status`) when it restores a saved
-session, as owner `PI_ORCHESTRATION_LEASE_OWNER` if a launcher set it,
-otherwise `pi-<host>-<pid>-<session id>` (stable across a reload in the same
-process). It renews the lease every turn and every 60 seconds while the run
-is active. A refused restore blocks every worker and recorder write and never
-settles or replaces the other owner's run; a heartbeat that answers
-`RUN_LEASE_LOST`/`RUN_LEASE_NOT_HELD` detaches the process from the run the
-same way. Every explicit outcome (`finish`, `settle`, cancellation) releases
-the lease. The lease guards who may continue a run; it does not add
-idempotency keys at GitHub or other external mutation boundaries, and
-individual event writes are not checked against it.
+- `acquire` takes a free lease, or renews the caller's own (same owner id and
+  same pid). The same owner from another pid is refused with
+  `RUN_LEASE_PID_MISMATCH` unless it is the explicit hand-off (`--handoff`):
+  the caller is the current holder handing it to a process it started, or the
+  new process is a child of the holder. Another owner's live lease is refused
+  with `RUN_LEASE_HELD`, a stale one with `RUN_LEASE_STALE`. Acquire never
+  waits and never takes over.
+- A lease is stale when its heartbeat expired (`HEARTBEAT_EXPIRED`), its pid
+  is dead or reused on this machine (`OWNER_PROCESS_DEAD`), or the file is
+  unreadable or implausible (`LEASE_UNREADABLE`: bad JSON, an expiry beyond
+  the heartbeat plus the 24-hour maximum TTL, or a heartbeat more than 120
+  seconds in the future). A pid on another machine cannot be probed, so only
+  the expiry counts there. Without `/proc` (non-Linux) the pid start time and
+  machine key are unavailable: the hostname identifies the host, and a live
+  pid counts as the holder.
+- Only `takeover` recovers a stale lease. It refuses a live lease
+  (`RUN_LEASE_HELD`) or a missing one (`RUN_LEASE_NOT_HELD`). If the heartbeat
+  expired but the holder process is still running on this machine, it is
+  refused with `RUN_LEASE_HOLDER_ALIVE` unless a separate `--force-reason`
+  explains why a running holder may be displaced. It first appends the
+  previous holder, both reasons, `forced` and the new owner to the run's
+  `parent_orchestration.lease_takeovers` and sets `parent_orchestration.owner_id`,
+  and refuses when that cannot be recorded (`RUN_LEASE_PROVENANCE_UNAVAILABLE`,
+  including a terminal run).
+- `heartbeat` and `release` act only on the caller's own lease (`RUN_LEASE_LOST`
+  when another owner holds it, `RUN_LEASE_NOT_HELD` when there is none,
+  `RUN_LEASE_PID_MISMATCH` for a heartbeat from another pid). Other codes:
+  `RUN_LEASE_INVALID`, `RUN_LEASE_LOCK_TIMEOUT`, `RUN_LEASE_STORAGE_UNAVAILABLE`.
+
+**Owned writes.** `parent_orchestration.owner_id` records who owns a run: the
+owner that started it, a verified resume, or a takeover. Every write to the
+run (`event`, `finish`, `settle`, `context_budget.py start|checkpoint`) takes
+`--owner`, which the CLI requires. Under the lease lock, and before the run
+lock (always in that order), the write is refused unless the caller holds the
+lease, live or stale but never taken over, or the lease is free and the
+caller is the recorded owner (`RUN_LEASE_LOST`, `RUN_LEASE_NOT_HELD`). An
+explicit outcome releases the caller's lease inside the same lock; there is
+no owner-blind release. A process that slept past its expiry while another
+owner took the run over therefore can no longer settle, finish or write to
+that run, nor free the new owner's lease. Runs created in-process without an
+owner, and records from before leases, have no recorded owner and accept any
+writer while no lease exists; `ParentRun` gives its in-process run an owner.
+
+**Wiring.** `parent_orchestration.py start --owner <id> --pid <pid>` records the
+owner and takes the lease of the new run. `parent_orchestration.py resume
+<run_id> --worktree <path> --owner <id> --pid <pid> [--handoff]` verifies the
+target identity, takes the lease, re-reads the run under the run lock (a run
+that finished meanwhile is returned as it is and the lease released) and
+verifies the resume checkpoint. The lifecycle extension calls `start` for a
+new run and `resume` (not `status`) when it restores a saved session. Its
+owner id is the launcher's `PI_ORCHESTRATION_LEASE_OWNER`, which it reads once
+and removes from the environment so nested processes never inherit it, and
+then resumes with `--handoff`. Otherwise it is `pi-<host>-<pid>-<random
+per-process nonce>-<session id>`, stable across an extension reload in the
+same process. It renews the lease every turn and every 60 seconds and
+remembers the last successful renewal. A heartbeat answering `RUN_LEASE_LOST`,
+`RUN_LEASE_NOT_HELD` or `RUN_LEASE_PID_MISMATCH`, or a write refused for the
+lease, detaches the process from the run. So does any run of failures
+(including lock timeouts, storage errors or a subprocess timeout) that
+reaches the lease lifetime minus a 60-second margin (`RUN_LEASE_SELF_EXPIRED`).
+Detaching blocks every tool, aborts running ClaudeWorker processes and the
+current agent operation (which stops in-flight subagents), and never
+settles, finishes or replaces the other owner's run. A refused restore
+behaves the same way. The lease guards who may continue and write a run; it
+does not add idempotency keys at GitHub or other external mutation
+boundaries.
 
 **Resume checkpoint (audit A10).** `parent_orchestration.checkpoint` holds the
 parent checkout's resolved `worktree`, `branch` (null when detached), `head`,
 the `phase`, a `reason` and a `sequence`. It is written at run start and
-refreshed at every phase event, at worker approval (the lifecycle sends a
+refreshed at every phase event; at worker approval (the lifecycle sends a
 `checkpoint` event after a successful route preflight and after
-`bind_workspace`), when a wave is integrated and when a mutation count is
-recorded; an unchanged checkout leaves the record byte-identical. `resume`
-compares worktree, branch and HEAD with the live checkout while holding the
-lease and appends the result to `parent_orchestration.resume_checks`. Any
-difference finishes the run `BLOCKED` with `RESUME_CHECKPOINT_DRIFT`, keeps
-the recorded checkpoint, returns the expected and actual values in
-`details`, and releases the lease: the run is never re-based silently, and
-work continues only in a new run. A record from before checkpoints existed
-still loads, reports status and accepts events, but it cannot be verified:
-`resume` records it as `unverified` and finishes it `BLOCKED` with
-`RESUME_CHECKPOINT_MISSING`. Working-tree changes that were never committed
+`bind_workspace`); when a wave starts integrating, before integration changes
+the parent checkout; when it is integrated; and when a mutation count is
+recorded. A repeated event on an unchanged checkout leaves the record
+byte-identical. `resume` compares worktree, branch and HEAD with the live
+checkout while holding the lease and appends the result to
+`parent_orchestration.resume_checks`. Any difference refuses the resume with
+`RESUME_CHECKPOINT_DRIFT` and the expected and actual values in `details`. It
+releases the lease just taken and leaves the run `IN_PROGRESS` with its
+recorded owner and checkpoint unchanged: nothing is re-based or closed. An
+operator either restores the checkout and resumes again, or takes the free
+lease (`run_lease.py acquire`) and records an explicit outcome with
+`parent_orchestration.py finish --owner`. A crash in the middle of
+integration therefore shows up as drift against the pre-integration
+checkpoint. A record from before checkpoints existed still loads, reports
+status and accepts events, but cannot be verified: its resume is refused with
+`RESUME_CHECKPOINT_MISSING` (recorded as `unverified`) and it stays
+`IN_PROGRESS` for an operator. Working-tree changes that were never committed
 are not part of the comparison. Coverage: `tests/test_run_lease.py`,
 `tests/orchestration-lifecycle.test.ts`, `tests/external-cwd-lifecycle.test.ts`
 and `tests/test_headless_run.py`.
@@ -1559,20 +1603,27 @@ to SIGKILL after a grace period, and finishes the parent run `BLOCKED` with
 is bound to one repository: using it from another checkout fails with
 `EXECUTION_UNKNOWN` or `EXECUTION_TARGET_MISMATCH`.
 
-**Run lease.** Each launch gets a fresh lease owner id (stored as the
-execution's `lease_owner` and passed to Pi as `PI_ORCHESTRATION_LEASE_OWNER`),
-so the launched lifecycle takes the run lease under it. A `--resume` claims
-the lease before launching anything and then hands it to the child's pid. A
-live lease of another process refuses the resume with `RUN_LEASE_HELD`. A
-crashed launch leaves a stale lease (its pid is dead), so `--resume` alone
-fails with `RUN_LEASE_STALE`; `--resume --takeover-stale-lease` is the
-explicit recovery, recorded in the run's `lease_takeovers` with reason
-`HEADLESS_RESUME_TAKEOVER`. `pico workspace launch --resume
---takeover-stale-lease` passes it through, and the scheduler's explicit
-`--resume-interrupted` implies it. The launched lifecycle then verifies the
-resume checkpoint, so a checkout that moved since the crash ends the run
-`BLOCKED` with `RESUME_CHECKPOINT_DRIFT`. `status` and the execution's `run`
-block show the lease holder (`run.lease`: state, stale reason, owner, pid,
+**Run lease.** Each launch gets a fresh lease owner id, stored as the
+execution's `lease_owner` and passed to Pi as `PI_ORCHESTRATION_LEASE_OWNER`.
+The launched lifecycle therefore takes the run lease under it, and removes
+the variable from its environment. A `--resume` claims the lease before
+launching anything, then hands it to the child's pid (`handoff`). If the
+hand-off fails, the child is stopped and the execution records
+`lease_handoff_error` (`RUN_LEASE_HANDOFF_FAILED`), so nothing runs under a
+lease it does not hold. A live lease of another process refuses the resume
+with `RUN_LEASE_HELD`. A crashed launch leaves a stale lease (its pid is dead),
+so `--resume` alone fails with `RUN_LEASE_STALE`. `--resume
+--takeover-stale-lease` is the explicit recovery, recorded in the run's
+`lease_takeovers` with reason `HEADLESS_RESUME_TAKEOVER`. It never forces: a
+holder still running on this machine is refused with `RUN_LEASE_HOLDER_ALIVE`.
+`pico workspace launch --resume --takeover-stale-lease` passes it through, and
+the scheduler's explicit `--resume-interrupted` implies it, never with a force
+reason. The launched lifecycle then verifies the resume checkpoint, so a
+checkout that moved since the crash refuses the resume with
+`RESUME_CHECKPOINT_DRIFT` and leaves the run `IN_PROGRESS`. `cancel` closes the
+run as the execution's lease owner; a run another owner has taken over is not
+closed (`cancel_error_code`). `status` and the execution's `run` block show
+the lease holder (`run.lease`: state, stale reason, holder alive, owner, pid,
 host, heartbeat, expiry), as does Garden for each run.
 
 **Checkout hygiene.** Before launching, the runner records the target's

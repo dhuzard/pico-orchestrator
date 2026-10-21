@@ -449,9 +449,21 @@ def _launch_locked(path: Path, *, worktree: Path, identity: str, common: Path, e
     if continuing:
         # Hand the lease to the launched process, so its liveness is what keeps the lease live.
         try:
-            run_lease.acquire(record["run_id"], owner, pid=child.pid)
-        except (run_lease.LeaseError, OSError):
-            pass  # the child renews it under the same owner on restore
+            run_lease.acquire(record["run_id"], owner, pid=child.pid, handoff=True)
+        except (run_lease.LeaseError, OSError) as exc:
+            # Never leave a child running under a lease it cannot hold: stop it and say so.
+            code = exc.code if isinstance(exc, run_lease.LeaseError) else "RUN_LEASE_STORAGE_UNAVAILABLE"
+            try:
+                os.killpg(child.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            child.wait()
+            log.close()
+            record.update({"status": "interrupted", "pid": None, "lease_handoff_error": code,
+                           "launches": record["launches"] + 1, "outcome": "lease_handoff_failed"})
+            save_record(path, record)
+            raise HeadlessError("RUN_LEASE_HANDOFF_FAILED",
+                                f"the run lease could not be handed to the launched process ({code}); it was stopped") from exc
     record.update({"status": "launched", "pid": child.pid, "launches": record["launches"] + 1,
                    "started_at": _now(), "exit_code": None, "outcome": "resumed" if resume else "launched"})
     save_record(path, record)
@@ -474,12 +486,18 @@ def status(*, target: Path, explicit_repo: str, execution_id: str) -> dict:
         return record
 
 
-def _finish_cancelled(run_id: str | None) -> None:
+def _finish_cancelled(record: dict) -> None:
+    """Close the run as this execution's lease owner. Another owner's run is never closed from here."""
+    run_id = record.get("run_id")
     if not run_id:
         return
     try:
-        parent_orchestration.finish(run_id, "BLOCKED", blocker_code="EXECUTION_CANCELLED")
-    except (parent_orchestration.ParentRunError, provenance.ProvenanceError, OSError):
+        parent_orchestration.finish(run_id, "BLOCKED", blocker_code="EXECUTION_CANCELLED",
+                                    owner_id=record.get("lease_owner"))
+    except parent_orchestration.ParentRunError as exc:
+        if exc.error_code.startswith("RUN_LEASE_"):
+            record["cancel_error_code"] = exc.error_code
+    except (provenance.ProvenanceError, OSError):
         pass  # already terminal or unreadable; the refreshed run status tells which
 
 
@@ -500,7 +518,7 @@ def cancel(*, target: Path, explicit_repo: str, execution_id: str, grace: float 
             record["run_id"] = discover_run_id(Path(record["session_dir"]), record["session_id"])
         # Close the run before signalling, so a graceful Pi shutdown that settles
         # the parent finds it already terminal with the cancellation code.
-        _finish_cancelled(record.get("run_id"))
+        _finish_cancelled(record)
         pid = record.get("pid")
         if record["status"] == "launched" and pid_alive(pid):
             try:
@@ -519,7 +537,7 @@ def cancel(*, target: Path, explicit_repo: str, execution_id: str, grace: float 
         if record.get("run_id") is None:
             # The process may have created its run between discovery and the signal.
             record["run_id"] = discover_run_id(Path(record["session_dir"]), record["session_id"])
-            _finish_cancelled(record.get("run_id"))
+            _finish_cancelled(record)
         record["status"] = "cancelled"
         record["outcome"] = "cancelled"
         refresh(record)

@@ -449,24 +449,29 @@
             }
           }
         },
+        "owner_id": {
+          "type": ["string", "null"],
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$",
+          "description": "Recorded owner of the run (audit A3): set at start, by a verified resume and by a takeover. Writes require the run lease, or a free lease and this owner. Absent or null on unowned and historical runs, which accept any writer while no lease exists."
+        },
         "checkpoint": {
           "type": "object",
           "additionalProperties": false,
-          "description": "Resume checkpoint (audit A10): the parent checkout's resolved path, branch (null when detached) and HEAD (null without commits) at the latest phase boundary, worker approval, integrated wave or recorded mutation. A resumed run is compared with it before any mutation. Absent on historical records, which therefore cannot be resumed.",
+          "description": "Resume checkpoint (audit A10): the parent checkout's resolved path, branch (null when detached) and HEAD (null without commits) at the latest phase boundary, worker approval, integration start, integrated wave or recorded mutation. A resumed run is compared with it before any mutation. Absent on historical records, whose resume is therefore refused.",
           "required": ["worktree", "branch", "head", "phase", "reason", "recorded_at", "sequence"],
           "properties": {
             "worktree": {"type": "string", "minLength": 1, "maxLength": 4096, "pattern": "^[^\\u0000-\\u001f\\u007f]+$"},
             "branch": {"type": ["string", "null"], "maxLength": 255, "pattern": "^[^\\u0000-\\u001f\\u007f]+$"},
             "head": {"type": ["string", "null"], "pattern": "^[0-9a-f]{40,64}$"},
             "phase": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$"},
-            "reason": {"enum": ["run_start", "phase_boundary", "worker_approval", "wave_integrated", "mutation_recorded"]},
+            "reason": {"enum": ["run_start", "phase_boundary", "worker_approval", "integration_started", "wave_integrated", "mutation_recorded"]},
             "recorded_at": {"type": "string", "format": "date-time"},
             "sequence": {"type": "integer", "minimum": 1}
           }
         },
         "resume_checks": {
           "type": "array",
-          "description": "Append-only results of comparing the checkpoint with the live checkout when another process resumed the run. Drift or a missing checkpoint finishes the run BLOCKED; nothing is re-based.",
+          "description": "Append-only results of comparing the checkpoint with the live checkout when another process resumed the run. Drift or a missing checkpoint refuses the resume and leaves the run IN_PROGRESS for an operator; nothing is re-based.",
           "items": {
             "type": "object",
             "additionalProperties": false,
@@ -498,7 +503,7 @@
           "items": {
             "type": "object",
             "additionalProperties": false,
-            "required": ["at", "owner_id", "pid", "host", "reason", "stale_reason", "previous_owner_id", "previous_pid", "previous_host", "previous_heartbeat_at"],
+            "required": ["at", "owner_id", "pid", "host", "reason", "stale_reason", "forced", "force_reason", "previous_owner_id", "previous_pid", "previous_host", "previous_heartbeat_at"],
             "properties": {
               "at": {"type": "string", "format": "date-time"},
               "owner_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$"},
@@ -506,6 +511,8 @@
               "host": {"type": "string", "pattern": "^[A-Za-z0-9_.-]{1,64}$"},
               "reason": {"type": "string", "pattern": "^[A-Z][A-Z0-9_]{0,99}$"},
               "stale_reason": {"enum": ["HEARTBEAT_EXPIRED", "OWNER_PROCESS_DEAD", "LEASE_UNREADABLE"]},
+              "forced": {"type": "boolean", "description": "True when the expired holder was still running on this machine and an explicit force reason displaced it."},
+              "force_reason": {"type": ["string", "null"], "pattern": "^[A-Z][A-Z0-9_]{0,99}$"},
               "previous_owner_id": {"type": ["string", "null"], "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$"},
               "previous_pid": {"type": ["integer", "null"]},
               "previous_host": {"type": ["string", "null"], "maxLength": 64, "pattern": "^[^\\u0000-\\u001f\\u007f]*$"},
