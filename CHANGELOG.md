@@ -21,8 +21,9 @@ All notable changes to PICO are recorded here. The format follows
   say `Closes #N` and close its issue on merge. The publication gate accepts
   `Closes #N` only when the policy or the task opts in, and now refuses any
   unauthorized closing keyword anywhere in the body. The gate reads the
-  policy committed on the base branch, binds its blob into the plan hash,
-  and refuses issues outside the declared ones or the PR's repository.
+  policy at the base commit the GitHub remote reports (never a local ref),
+  binds that commit and the policy blob into the plan hash, and refuses
+  issues outside the declared ones or the PR's repository.
   PICO's own `.pi/autonomy.yaml` sets `closes`, and the pull request
   template uses `Closes #`.
 - Compatibility: an older PICO rejects a `.pi/autonomy.yaml` that contains

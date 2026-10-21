@@ -521,15 +521,26 @@ must be authorized, or the gate refuses with `PUBLICATION_BODY_INVALID`:
   `Closes #N` line, so a batch PR can close every issue it resolves.
 
 Closed issues must be in the PR's own repository. `issue_reference` is read
-from `.pi/autonomy.yaml` as committed on the local base branch (`git ls-tree`
-and `git cat-file`, validated against the schema), never from the working
-tree, so an uncommitted edit or a policy committed on the `pico/` branch
-cannot authorize closing. Before trusting it, the gate refuses with
-`AUTONOMY_POLICY_PATH_UNSAFE` when `.pi` or the policy file is a symlink
-(in the checkout or in the base commit) or `git status` shows the policy
-modified. The dry-run plan records `issue_reference`, `closes_issues`, the
-policy blob SHA (`issue_policy_blob`) and the body hash, so the reviewed
-`plan_hash` binds all of them. The match ignores Markdown structure: GitHub
+from `.pi/autonomy.yaml` at the base commit the verified GitHub remote
+reports (`git ls-remote <remote> refs/heads/<base>`), never from a local ref
+or the working tree: every worktree can rewrite `refs/heads/<base>` and
+`refs/remotes/...`, so an uncommitted edit, a policy committed on the `pico/`
+branch or a forged local base ref cannot authorize closing. The policy is
+read from that commit with `git --no-replace-objects ls-tree`/`cat-file`, so
+a local `git replace` cannot substitute it, and validated against the
+schema. When the remote base commit is not in the local object store, a
+closing publication fails with `PUBLICATION_BASE_NOT_FETCHED` (fetch the
+base branch and retry); a remote without the base branch means `refs`.
+Before trusting a `closes` policy, the gate also refuses with
+`AUTONOMY_POLICY_PATH_UNSAFE` when `.pi` or the policy file is a symlink (in
+the checkout or in the base commit) or `git status` shows the policy
+modified. The policy is consulted only when the body would close an issue
+the caller did not name. The dry-run plan records `base_commit`,
+`issue_reference`, `closes_issues`, the policy blob SHA (`issue_policy_blob`,
+when consulted) and the body hash, so the reviewed `plan_hash` binds all of
+them. A workspace task without `closes_issue` reads the same remote base
+commit to choose its body, and falls back to `Refs #N` when that commit has
+not been fetched. The match ignores Markdown structure: GitHub
 does not act on keywords in code spans or HTML comments, but the gate refuses
 them there too rather than reimplement GitHub's parser. Backlog-generated PR
 bodies stay `Refs #N` in every mode, because a backlog item's issue closes
