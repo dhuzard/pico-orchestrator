@@ -692,6 +692,19 @@
                 "total_tokens_complete": {
                   "type": "boolean"
                 },
+                "estimated_cost_usd": {
+                  "type": "number",
+                  "minimum": 0,
+                  "description": "Pi-reported list-price estimate of the lead's own calls; absent when unreported."
+                },
+                "cache_write_tokens": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "cost_complete": {
+                  "type": "boolean",
+                  "description": "False once any lead call had tokens but no (or a zero) cost."
+                },
                 "input_tokens": {
                   "type": "integer",
                   "minimum": 0
@@ -1551,6 +1564,18 @@
             "null"
           ],
           "minimum": 0
+        },
+        "cache_write_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "Tokens written to the prompt cache, billed as input unlike cache reads; absent in records that predate it."
+        },
+        "cost_complete": {
+          "type": "boolean",
+          "description": "False once any usage event had no cost, or a zero cost despite tokens."
         },
         "total_tokens": {
           "type": [

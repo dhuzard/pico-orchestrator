@@ -30,7 +30,7 @@
             <div class="stat"><span>Completed</span><strong id="ws-completed">—</strong><small id="ws-completed-caption">tasks finished</small></div>
             <div class="stat"><span>Tokens</span><strong id="ws-total-tokens">—</strong><small id="ws-tokens-caption">observed total</small></div>
           </div>
-          <div class="metric-strip"><span>Input <b id="ws-input">—</b></span><span>Output <b id="ws-output">—</b></span><span>Reported total <b id="ws-reported">—</b></span><span>Reported cost <b id="ws-cost">—</b></span><span>Max parallel <b id="ws-parallel">—</b></span><span>Plan <b id="ws-plan">—</b></span><span id="ws-budget-wrap" hidden>Budget <b id="ws-budget">—</b></span></div>
+          <div class="metric-strip"><span>Input <b id="ws-input">—</b></span><span>Output <b id="ws-output">—</b></span><span>Reported total <b id="ws-reported">—</b></span><span>Reported cost (lower bound if marked) <b id="ws-cost">—</b></span><span>Max parallel <b id="ws-parallel">—</b></span><span>Plan <b id="ws-plan">—</b></span><span id="ws-budget-wrap" hidden>Budget <b id="ws-budget">—</b></span></div>
           <div id="ws-budget-meter" class="budget-meter" hidden><i id="ws-budget-bar"></i></div>
           <div id="ws-actions-bar" class="ws-actions-bar" hidden></div>
         </section>
@@ -63,7 +63,7 @@
           <div class="stat"><span>At once</span><strong id="concurrency">—</strong><small>peak workers</small></div>
           <div class="stat"><span>Tokens</span><strong id="tokens">—</strong><small id="tokens-caption">observed total</small></div>
         </div>
-        <div class="metric-strip"><span>Input <b id="input-tokens">—</b></span><span>Output <b id="output-tokens">—</b></span><span>Parallel gain <b id="speedup">—</b></span><span>Reported cost <b id="cost">—</b></span></div>
+        <div class="metric-strip"><span>Input <b id="input-tokens">—</b></span><span>Output <b id="output-tokens">—</b></span><span>Parallel gain <b id="speedup">—</b></span><span>Reported cost (lower bound if marked) <b id="cost">—</b></span></div>
       </section>
       <section class="panel report-panel" aria-labelledby="report-title"><div class="section-heading"><div><p class="eyebrow">RUN REPORT</p><h2 id="report-title">How the work unfolded</h2></div><span id="report-status" class="soft-count">Awaiting tasks</span></div><div class="report-grid"><div class="progress-block"><div id="task-ring" class="task-ring"><span id="progress-percent">0%</span></div><div><strong>Task progress</strong><p id="progress-copy">No tasks recorded yet.</p></div></div><div class="token-report"><div class="token-report-heading"><strong>Observed token flow</strong><small>Input + output, where reported</small></div><div class="token-row"><span>Lead agent</span><div class="token-track"><i id="lead-token-bar" class="lead-token-bar"></i></div><b id="lead-token-count">—</b></div><div class="token-row"><span>Workers</span><div class="token-track"><i id="worker-token-bar" class="worker-token-bar"></i></div><b id="worker-token-count">—</b></div></div></div></section>
       <section class="panel observatory" aria-labelledby="observatory-title">

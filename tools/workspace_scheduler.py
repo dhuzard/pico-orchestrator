@@ -123,9 +123,12 @@ def dependents_closure(tasks: list[dict], roots: set[str]) -> set[str]:
     return blocked - roots
 
 
-def budget_state(plan: dict, record: dict | None = None, runs_dir: Path | None = None) -> dict | None:
+def budget_state(plan: dict, record: dict | None = None, runs_dir: Path | None = None, **kwargs) -> dict | None:
     """Spend against the manifest's budget (computation lives in workspace_run.budget_state)."""
-    return workspace_run.budget_state(plan, record, runs_dir)
+    return workspace_run.budget_state(plan, record, runs_dir, **kwargs)
+
+
+inflight_usage = workspace_run.inflight_usage
 
 
 def report(plan: dict, entries: dict, refused: dict, held: set[str] | None = None) -> dict:
@@ -198,9 +201,10 @@ def run(manifest: Path, *, max_parallel: int | None = None, allow_mutation: bool
         external = {t for t in entries if classify(entries[t]) == "running"}
         session["observed_running"] = sorted(external)
         held: set[str] = set()
+        run_cache: dict[str, str] = {}
         with cf.ThreadPoolExecutor(max_workers=cap) as pool:
             while True:
-                spend = budget_state(plan)
+                spend = budget_state(plan, running=set(owned) | external, run_cache=run_cache)
                 if spend is not None:
                     session["budget"] = spend
                 states = {t["id"]: state_of(t, entries.get(t["id"]), refused) for t in plan["tasks"]}
@@ -220,8 +224,9 @@ def run(manifest: Path, *, max_parallel: int | None = None, allow_mutation: bool
                     resume = resume_interrupted and states[tid] == "needs_reconciliation"
                     if not resume and not (states[tid] == "not_launched" and task["dispatchable"]):
                         continue
-                    if spend is not None and spend["exhausted"] and task.get("kind") != "qualification":
-                        # Over budget: launch nothing new; checks and running children are unaffected.
+                    if spend is not None and (spend["exhausted"] or spend["incomplete"]) and task.get("kind") != "qualification":
+                        # Over budget, or in-flight spend unknown (fail closed): launch nothing new;
+                        # checks and running children are unaffected.
                         held.add(tid)
                         continue
                     attempted.add(tid)
@@ -272,6 +277,26 @@ def run(manifest: Path, *, max_parallel: int | None = None, allow_mutation: bool
     return {"workspace_id": plan["workspace_id"], "cap": cap, "session": session, **result}
 
 
+def budget_lines(b: dict) -> list[str]:
+    """Budget summary: spent tokens against the limit, cost when known, and what the cost leaves out."""
+    limit = f"{b['max_tokens']:,}" if b.get("max_tokens") else "no limit"
+    line = f"  Budget: {b['spent_tokens']:,} of {limit} tokens (input + output + cache writes; cache reads excluded)"
+    if b.get("max_cost_usd"):
+        line += f", ${b['spent_cost_usd']:.2f} of ${b['max_cost_usd']:.2f} reported cost"
+    elif b.get("spent_cost_usd"):
+        line += f", ${b['spent_cost_usd']:.2f} reported cost"
+    unpriced = b.get("unpriced") or []
+    if unpriced:
+        line += f" (lower bound; cost excludes: {', '.join(unpriced)})"
+    if b.get("exhausted"):
+        line += " — exhausted, nothing new was launched"
+    lines = [line]
+    if b.get("incomplete"):
+        lines.append("  In-flight spend is unknown, so nothing new was launched: " + "; ".join(b.get("incomplete_reasons") or []))
+    lines.append("  The budget is a launch gate: children already running can still overshoot it.")
+    return lines
+
+
 def render(result: dict) -> str:
     lines = [f"Workspace {result['workspace_id']}: {result['status']} (cap {result['cap']})"]
     for row in result["tasks"]:
@@ -283,9 +308,7 @@ def render(result: dict) -> str:
         lines.append("  Inspect interrupted children, then rerun with --resume-interrupted to continue them.")
     if result.get("budget"):
         b = result["budget"]
-        lines.append(f"  Budget: {b['spent_tokens']:,} of {b['max_tokens'] or '—'} tokens"
-                     + (f", ${b['spent_cost_usd']:.2f} of ${b['max_cost_usd']:.2f} reported cost" if b["max_cost_usd"] else "")
-                     + (" — exhausted, nothing new was launched" if b["exhausted"] else ""))
+        lines.extend(budget_lines(b))
     if any(r["state"] == "waiting_for_readiness" for r in result["tasks"]):
         lines.append("  Waiting tasks dispatch on a later run once their upstream tasks are declared ready_for_downstream.")
     return "\n".join(lines)

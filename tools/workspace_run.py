@@ -228,14 +228,104 @@ def _entry(record: dict, task: dict, repo: dict, execution: dict, inputs: dict |
     return entry
 
 
-def budget_state(plan: dict, record: dict | None = None, runs_dir: Path | None = None) -> dict | None:
-    """Spend against the manifest's budget, from the workspace's recorded child runs."""
+def inflight_usage(plan: dict, task_ids, cache: dict | None = None) -> tuple[list[str], list[str]]:
+    """Run ids of children that have not exited, and the reasons any could not be resolved.
+
+    The workspace record links a child's run only after it exits, so a running
+    child's spend would otherwise be invisible to the budget gate. An unreadable
+    or missing execution record is reported as a problem, never skipped: the
+    caller must treat the spend as incomplete. `cache` maps task id to a run id
+    once found, so session files are not re-read on every poll.
+    """
+    cache = cache if cache is not None else {}
+    repos = {r["id"]: r for r in plan["repositories"]}
+    by_task = {t["id"]: t for t in plan["tasks"]}
+    headless = headless_run
+    found: list[str] = []
+    problems: list[str] = []
+    for tid in sorted(task_ids):
+        if tid in cache:
+            found.append(cache[tid])
+            continue
+        repo = repos.get(by_task.get(tid, {}).get("repository"))
+        if repo is None or not repo.get("git_common_dir"):
+            problems.append(f"{tid}: repository not resolved")
+            continue
+        try:
+            execution = headless.load_record(headless.execution_path(
+                Path(repo["git_common_dir"]), execution_id(plan["workspace_id"], tid)))
+        except (headless.HeadlessError, OSError, ValueError) as exc:
+            problems.append(f"{tid}: execution record unreadable ({getattr(exc, 'code', type(exc).__name__)})")
+            continue
+        if not execution:
+            problems.append(f"{tid}: no execution record")
+            continue
+        if not execution.get("session_dir") or not execution.get("session_id"):
+            problems.append(f"{tid}: execution record has no session")
+            continue
+        run_id = execution.get("run_id") or headless.discover_run_id(
+            Path(execution["session_dir"]), execution["session_id"])
+        if run_id:  # none yet means the child has not started its run, so it has spent nothing
+            cache[tid] = run_id
+            found.append(run_id)
+    return found, problems
+
+
+def _finished(entry) -> bool:
+    """A workspace entry that already links a finished run: that child is not running, whatever its record says."""
+    if not isinstance(entry, dict):
+        return False
+    return entry.get("execution_status") == "cancelled" or (
+        entry.get("execution_status") == "exited" and entry.get("run_status") not in (None, "IN_PROGRESS"))
+
+
+def running_tasks(plan: dict, exclude=(), workspace: dict | None = None) -> tuple[set[str], list[str]]:
+    """Tasks (other than `exclude`) whose child process is alive, from their execution records.
+
+    Tasks whose workspace entry already links a finished run are skipped, so a stale or corrupt
+    record of a long-finished task never blocks anything. An unreadable record of a task that could
+    be running is reported with its path.
+    """
+    repos = {r["id"]: r for r in plan["repositories"]}
+    if workspace is None:
+        workspace = load_workspace(workspace_record_path(plan["workspace_id"])) or {}
+    entries = workspace.get("tasks") if isinstance(workspace.get("tasks"), dict) else {}
+    running: set[str] = set()
+    problems: list[str] = []
+    for task in plan["tasks"]:
+        tid = task["id"]
+        repo = repos.get(task["repository"])
+        if (tid in exclude or task.get("kind") == "qualification" or not repo or not repo.get("git_common_dir")
+                or _finished(entries.get(tid))):
+            continue
+        path = headless_run.execution_path(Path(repo["git_common_dir"]), execution_id(plan["workspace_id"], tid))
+        try:
+            record = headless_run.load_record(path)
+        except (headless_run.HeadlessError, OSError, ValueError) as exc:
+            problems.append(f"{tid}: execution record {path} is unreadable ({getattr(exc, 'code', type(exc).__name__)})")
+            continue
+        if record and record.get("status") in {"launching", "launched"} and headless_run.pid_alive(record.get("pid")):
+            running.add(tid)
+    return running, problems
+
+
+def budget_state(plan: dict, record: dict | None = None, runs_dir: Path | None = None,
+                 running: tuple | list | set = (), run_cache: dict | None = None,
+                 extra_problems: list | None = None) -> dict | None:
+    """Spend against the manifest's budget, from the workspace's recorded child runs.
+
+    `running` names tasks whose children have not exited; inflight_usage resolves
+    their runs so in-flight spend counts toward the gate. When that cannot be
+    done the state is `incomplete` and callers must not launch anything new.
+    """
     budget = plan.get("budget")
     if not budget:
         return None
     if record is None:
         record = load_workspace(workspace_record_path(plan["workspace_id"])) or {}
-    used = usage.workspace_usage(runs_dir or headless_run.state_root() / "runs", record)
+    inflight, problems = inflight_usage(plan, running, run_cache) if running else ([], [])
+    problems = [*problems, *(extra_problems or [])]
+    used = usage.workspace_usage(runs_dir or headless_run.state_root() / "runs", record, inflight)
     cost = used.get("estimated_cost_usd") or 0.0
     reasons = []
     if budget.get("max_tokens") is not None and used["spent_tokens"] >= budget["max_tokens"]:
@@ -244,7 +334,9 @@ def budget_state(plan: dict, record: dict | None = None, runs_dir: Path | None =
         reasons.append("cost")
     return {"max_tokens": budget.get("max_tokens"), "spent_tokens": used["spent_tokens"],
             "max_cost_usd": budget.get("max_cost_usd"), "spent_cost_usd": round(cost, 6),
-            "runs": used["runs"], "exhausted": bool(reasons), "reasons": reasons}
+            "runs": used["runs"], "exhausted": bool(reasons), "reasons": reasons,
+            "cost_complete": used["cost_complete"], "unpriced": used["unpriced"],
+            "incomplete": bool(problems), "incomplete_reasons": problems}
 
 
 def launch(*, manifest: Path, task_id: str, allow_mutation: bool = False, resume: bool = False, wait: bool = True,
@@ -277,8 +369,21 @@ def launch(*, manifest: Path, task_id: str, allow_mutation: bool = False, resume
         nonlocal budget_override
         if budget_checked:
             return
-        spend = budget_state(plan)
-        if spend is None or not spend["exhausted"]:
+        # Children the scheduler or another launch started are still running: count their spend too,
+        # and fail closed when it cannot be resolved.
+        others, other_problems = running_tasks(plan, exclude={task_id})
+        spend = budget_state(plan, running=others, extra_problems=other_problems)
+        if spend is None or not (spend["exhausted"] or spend["incomplete"]):
+            return
+        if not spend["exhausted"]:
+            if not ignore_budget:
+                raise WorkspaceRunError(
+                    "WORKSPACE_BUDGET_UNKNOWN",
+                    "in-flight spend of running children cannot be resolved (" + "; ".join(spend["incomplete_reasons"])
+                    + "). If that task is not running, repair or delete the execution record named above; "
+                    "otherwise pass --ignore-budget (ignore_budget=True) to override explicitly")
+            budget_override = {"at": _now(), "reasons": ["unknown_in_flight_spend"], **{k: spend[k] for k in (
+                "spent_tokens", "max_tokens", "spent_cost_usd", "max_cost_usd")}}
             return
         if not ignore_budget:
             raise WorkspaceRunError(
