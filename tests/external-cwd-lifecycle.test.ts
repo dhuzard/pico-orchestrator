@@ -29,6 +29,7 @@ test("loaded lifecycle uses installed orchestrator resources from external cwd",
       "extensions/claude-worker.ts",
       "extensions/context-budget.ts", "routing/backend-compatibility.json", "routing/context-policy.yaml", "routing/default-policy.yaml",
       "tools/parent_orchestration.py", "tools/context_budget.py", "tools/session_scope.py",
+      "tools/run_lease.py", "tools/atomic_io.py",
       "tools/routing_engine.py", "schemas/context-policy.schema.json", "schemas/context-checkpoint.schema.json",
       "tools/provenance.py", "tools/backlog_store.py", "tools/github_integration.py", "tools/github_sync.py",
       "tools/claude_backend.py", "schemas/run-record.schema.json", "schemas/task.schema.json"]) {
@@ -67,6 +68,15 @@ test("loaded lifecycle uses installed orchestrator resources from external cwd",
     assert.equal(ready.details.result.target_repository, "Examplecorp/examplelab");
     const runId = ready.details.result.run_id;
     const recordPath = join(installed, "provenance/runs", `${runId}.json`);
+    // The run lease belongs to this process and lives in installation state, never in the target.
+    const leasePath = join(installed, "provenance/leases", `${runId}.json`);
+    const lease = JSON.parse(readFileSync(leasePath, "utf8"));
+    assert.equal(lease.pid, process.pid);
+    assert.match(lease.owner_id, /^pi-/);
+    assert.equal(existsSync(join(target, "provenance")), false);
+    const started = JSON.parse(readFileSync(recordPath, "utf8")).parent_orchestration.checkpoint;
+    assert.equal(started.worktree, realpathSync(target));
+    assert.equal(started.reason, "run_start");
     const initialBytes = readFileSync(recordPath, "utf8");
     const invalid = await recordTool.execute("event", { action: "event", event: {
       kind: "phase", phase: "preflight", status: "started",
@@ -110,6 +120,8 @@ test("loaded lifecycle uses installed orchestrator resources from external cwd",
     assert.equal(phaseA.child_run_ids[0], child.run_id);
     assert.equal(phaseA.child_run_ids.length, 1);
     assert.equal(record.parent_orchestration.final_status, "BLOCKED");
+    assert.equal(record.parent_orchestration.checkpoint.phase, "s1");
+    assert.equal(existsSync(leasePath), false, "an explicit outcome releases the run lease");
 
     await handlers.get("before_agent_start")!({ prompt: "PI_ORCHESTRATION_RUN_V1" }, context);
     const second = await recordTool.execute("probe", { action: "status" });

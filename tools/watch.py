@@ -18,6 +18,7 @@ import workspace_plan
 import workspace_run
 import garden_controls  # noqa: E402
 import garden_issues  # noqa: E402
+import run_lease  # noqa: E402
 from usage import TOKEN_FIELDS, cost_coverage, run_tokens, sum_tokens  # noqa: E402,F401
 import workspace_scheduler
 
@@ -125,6 +126,9 @@ def public_run(record: dict, directory: Path | None = None) -> dict:
         "activity": parent.get("activity") or [],
         "interactions": interactions,
         "links": publication_links(record, directory) if directory else [],
+        # Who holds the run lease (owner, pid, host, heartbeat, live/stale); null when nobody does.
+        "lease": (run_lease.summary(record["run_id"], directory=directory.parent / "leases")
+                  if directory and isinstance(record.get("run_id"), str) else None),
         "context": {key: context.get(key) for key in (
             "spawned_agents", "peak_concurrent_workers", "worker_active_ms",
             "peak_context_tokens", "compactions", "lead_usage", "worker_usage")},

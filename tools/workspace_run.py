@@ -304,7 +304,7 @@ def running_tasks(plan: dict, exclude=(), workspace: dict | None = None) -> tupl
         except (headless_run.HeadlessError, OSError, ValueError) as exc:
             problems.append(f"{tid}: execution record {path} is unreadable ({getattr(exc, 'code', type(exc).__name__)})")
             continue
-        if record and record.get("status") in {"launching", "launched"} and headless_run.pid_alive(record.get("pid")):
+        if record and record.get("status") in {"launching", "launched"} and headless_run.execution_alive(record):
             running.add(tid)
     return running, problems
 
@@ -341,9 +341,10 @@ def budget_state(plan: dict, record: dict | None = None, runs_dir: Path | None =
 
 def launch(*, manifest: Path, task_id: str, allow_mutation: bool = False, resume: bool = False, wait: bool = True,
            access_check=headless_run.workspace_plan.gh_access, pi_executable: str = "pi",
-           ignore_budget: bool = False, budget_checked: bool = False) -> dict:
+           ignore_budget: bool = False, budget_checked: bool = False, takeover_stale_lease: bool = False) -> dict:
     """ignore_budget is the explicit user override (recorded); budget_checked is for a caller that already
-    gated the budget itself (the scheduler) and skips the check without recording anything."""
+    gated the budget itself (the scheduler) and skips the check without recording anything.
+    takeover_stale_lease, with resume, explicitly recovers a stale run lease (recorded in provenance)."""
     plan = _plan(manifest, access_check=access_check)
     task, repo = _task(plan, task_id)
     if task["kind"] == "qualification":
@@ -413,7 +414,7 @@ def launch(*, manifest: Path, task_id: str, allow_mutation: bool = False, resume
                                        execution_id=execution_id(plan["workspace_id"], task_id),
                                        objective=objective, allow_mutation=allow_mutation,
                                        resume=resume, wait=wait, pi_executable=pi_executable,
-                                       before_spawn=budget_gate)
+                                       before_spawn=budget_gate, takeover=takeover_stale_lease)
     except headless_run.HeadlessError as exc:
         raise WorkspaceRunError(exc.code, exc.detail) from exc
     with locked_workspace(plan["workspace_id"]):
@@ -482,6 +483,8 @@ def main(argv: list[str] | None = None) -> int:
         if name == "launch":
             p.add_argument("--allow-mutation", action="store_true")
             p.add_argument("--resume", action="store_true")
+            p.add_argument("--takeover-stale-lease", action="store_true",
+                           help="with --resume: explicitly recover a stale run lease (recorded in provenance)")
             p.add_argument("--no-wait", action="store_true")
             p.add_argument("--ignore-budget", action="store_true",
                            help="launch although the workspace budget is exhausted; recorded as budget_override")
@@ -492,7 +495,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "launch":
             result = launch(manifest=args.manifest, task_id=args.task, allow_mutation=args.allow_mutation,
                             resume=args.resume, wait=not args.no_wait, access_check=access, pi_executable=args.pi,
-                            ignore_budget=args.ignore_budget)
+                            ignore_budget=args.ignore_budget, takeover_stale_lease=args.takeover_stale_lease)
             ok = result["task"]["execution_status"] == "launched" or result["task"]["run_status"] in {"COMPLETED", "PARTIAL"}
         elif args.command == "status":
             result = status(manifest=args.manifest, task_id=args.task, access_check=access)

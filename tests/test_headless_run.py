@@ -27,6 +27,7 @@ sys.path.insert(0, str(REPO_ROOT / "tools"))
 
 import headless_run as hr  # noqa: E402
 import provenance  # noqa: E402
+import run_lease  # noqa: E402
 import session_scope  # noqa: E402
 
 FAKE_PI = r'''#!/usr/bin/env python3
@@ -51,13 +52,19 @@ def pcmd(*a):
     return json.loads(out.stdout)
 existing = glob.glob(os.path.join(sdir, f"*_{sid}.jsonl"))
 run_id = None
+# Like the lifecycle: read the launcher's owner once, never pass it on, hand off explicitly.
+owner = os.environ.pop("PI_ORCHESTRATION_LEASE_OWNER", None) or f"fake-{os.getpid()}"
+handoff = ["--handoff"] if owner.startswith("headless-") else []
 marker = "PI_ORCHESTRATION_RUN_V1" in prompt
 if existing and marker:
     # Real lifecycle: before_agent_start settles the restored run and starts anew.
     for line in open(existing[0]):
         e = json.loads(line)
         if e.get("type") == "custom" and e.get("customType") == "pi-orchestration-parent-v1":
-            pcmd("settle", e["data"]["run_id"])
+            # Restore (lease + checkpoint), then settle as the restored run's owner.
+            pcmd("resume", e["data"]["run_id"], "--worktree", os.getcwd(), "--repo", os.environ["PI_TARGET_REPOSITORY"],
+                 "--owner", owner, "--pid", str(os.getpid()), *handoff)
+            pcmd("settle", e["data"]["run_id"], "--owner", owner)
     existing = []
     os.remove(glob.glob(os.path.join(sdir, f"*_{sid}.jsonl"))[0])
 if existing:
@@ -65,11 +72,16 @@ if existing:
         e = json.loads(line)
         if e.get("type") == "custom" and e.get("customType") == "pi-orchestration-parent-v1":
             run_id = e["data"]["run_id"]
-    st = pcmd("status", run_id, "--worktree", os.getcwd(), "--repo", os.environ["PI_TARGET_REPOSITORY"])
-    assert st.get("status") == "IN_PROGRESS", st
+    # Real lifecycle restore: verify identity, take the run lease, verify the resume checkpoint.
+    st = pcmd("resume", run_id, "--worktree", os.getcwd(), "--repo", os.environ["PI_TARGET_REPOSITORY"],
+              "--owner", owner, "--pid", str(os.getpid()), *handoff)
+    if st.get("status") != "IN_PROGRESS":
+        print(json.dumps({"type": "fake", "run_id": run_id, "resume_refused": st}))
+        sys.exit(4)
     session_file = existing[0]
 else:
-    started = pcmd("start", "--worktree", os.getcwd(), "--repo", os.environ["PI_TARGET_REPOSITORY"])
+    started = pcmd("start", "--worktree", os.getcwd(), "--repo", os.environ["PI_TARGET_REPOSITORY"],
+                   "--owner", owner, "--pid", str(os.getpid()))
     run_id = started["run_id"]
     session_file = os.path.join(sdir, f"20261019T000000_{sid}.jsonl")
     with open(session_file, "a") as f:
@@ -92,14 +104,15 @@ if usage:
              "total_tokens": int(numbers[0]) + int(numbers[1])}
     if len(numbers) > 2:
         event["estimated_cost_usd"] = float(numbers[2])
-    subprocess.run([sys.executable, parent, "event", run_id], input=json.dumps(event), capture_output=True, text=True)
+    subprocess.run([sys.executable, parent, "event", run_id, "--owner", owner], input=json.dumps(event),
+                   capture_output=True, text=True)
 if behavior == "slow":
     time.sleep(float(os.environ.get("FAKE_PI_SLEEP_" + here, os.environ.get("FAKE_PI_SLEEP", "0.4"))))
     behavior = "finish"
 if behavior == "finish":
-    pcmd("finish", run_id, "PARTIAL")
+    pcmd("finish", run_id, "PARTIAL", "--owner", owner)
 elif behavior == "settle":
-    pcmd("settle", run_id)
+    pcmd("settle", run_id, "--owner", owner)
 elif behavior == "crash":
     note("end")
     sys.exit(3)
@@ -191,8 +204,24 @@ class HeadlessRunTest(unittest.TestCase):
         again = self.start(behavior="finish")
         self.assertEqual(again["outcome"], "resume_required")
         self.assertEqual(again["launches"], 1)
-        resumed = self.start(behavior="finish", resume=True)
+        # The crashed process still names the lease: stale, recoverable only by an explicit takeover.
+        self.assertEqual(crashed["run"]["lease"]["state"], "stale")
+        self.assertEqual(crashed["run"]["lease"]["stale_reason"], "OWNER_PROCESS_DEAD")
+        with self.assertRaises(hr.HeadlessError) as refused:
+            self.start(behavior="finish", resume=True)
+        self.assertEqual(refused.exception.code, "RUN_LEASE_STALE")
+        self.assertEqual(self.status()["launches"], 1)
+        with self.assertRaises(hr.HeadlessError) as invalid:
+            self.start(behavior="finish", takeover=True)
+        self.assertEqual(invalid.exception.code, "TAKEOVER_REQUIRES_RESUME")
+        resumed = self.start(behavior="finish", resume=True, takeover=True)
         self.assertEqual(resumed["outcome"], "resumed")
+        trace = provenance.get_run(hr.ROOT, crashed["run_id"])["parent_orchestration"]
+        self.assertEqual([item["reason"] for item in trace["lease_takeovers"]], ["HEADLESS_RESUME_TAKEOVER"])
+        self.assertEqual(trace["lease_takeovers"][0]["stale_reason"], "OWNER_PROCESS_DEAD")
+        self.assertEqual([check["status"] for check in trace["resume_checks"]], ["verified"])
+        # The explicit outcome released the lease.
+        self.assertIsNone(resumed["run"]["lease"])
         self.assertEqual(resumed["launches"], 2)
         self.assertEqual(resumed["run_id"], crashed["run_id"])
         self.assertEqual(resumed["run"]["status"], "PARTIAL")
@@ -201,6 +230,87 @@ class HeadlessRunTest(unittest.TestCase):
         final = self.start(behavior="finish", resume=True)
         self.assertEqual(final["outcome"], "already_finished")
         self.assertEqual(final["launches"], 2)
+
+    def test_takeover_never_displaces_a_running_holder(self):
+        crashed = self.start(behavior="crash")
+        path = run_lease.lease_path(crashed["run_id"], hr.ROOT)
+        lease = json.loads(path.read_text())
+        # Pretend the holder is a live process on this machine whose heartbeat expired.
+        lease.update({"pid": os.getpid(), "pid_start": run_lease.pid_start(os.getpid()),
+                      "heartbeat_at": "2026-01-01T00:00:00Z", "expires_at": "2026-01-01T00:05:00Z"})
+        path.write_text(json.dumps(lease))
+        with self.assertRaises(hr.HeadlessError) as alive:
+            self.start(behavior="finish", resume=True, takeover=True)
+        self.assertEqual(alive.exception.code, "RUN_LEASE_HOLDER_ALIVE")
+        self.assertEqual(self.status()["launches"], 1)
+        self.assertNotIn("lease_takeovers", provenance.get_run(hr.ROOT, crashed["run_id"])["parent_orchestration"])
+
+    def test_budget_refusal_before_spawn_never_takes_or_leaks_a_lease(self):
+        crashed = self.start(behavior="crash")
+        before = run_lease.status(crashed["run_id"], repo_root=hr.ROOT)
+
+        def refuse():
+            raise hr.HeadlessError("WORKSPACE_BUDGET_EXHAUSTED", "budget spent")
+        with self.assertRaises(hr.HeadlessError) as refused:
+            self.start(behavior="finish", resume=True, takeover=True, before_spawn=refuse)
+        self.assertEqual(refused.exception.code, "WORKSPACE_BUDGET_EXHAUSTED")
+        after = run_lease.status(crashed["run_id"], repo_root=hr.ROOT)
+        self.assertEqual((after["state"], after["lease"]), (before["state"], before["lease"]))
+        self.assertNotIn("lease_takeovers", provenance.get_run(hr.ROOT, crashed["run_id"])["parent_orchestration"])
+        self.assertEqual(self.status()["launches"], 1)
+
+    def test_execution_liveness_rejects_a_reused_pid(self):
+        launched = self.start(behavior="hang", wait=False)
+        try:
+            self.assertEqual(launched["pid_start"], run_lease.pid_start(launched["pid"]))
+            self.assertTrue(hr.execution_alive(launched))
+            if launched["pid_start"] is not None:
+                # Same pid, different start time: another process now owns the pid.
+                self.assertFalse(hr.execution_alive({**launched, "pid_start": "1"}))
+            # Records written before the start time was kept still use the plain pid probe.
+            self.assertTrue(hr.execution_alive({**launched, "pid_start": None}))
+        finally:
+            hr.cancel(target=self.target, explicit_repo="acme/target", execution_id="exec-1", grace=1)
+        self.assertFalse(hr.execution_alive(launched))
+
+    def test_cancel_never_signals_a_reused_pid(self):
+        launched = self.start(behavior="hang", wait=False)
+        if launched["pid_start"] is None:
+            self.skipTest("no /proc: pid start time unavailable")
+        path = hr.execution_path(session_scope.common_dir(self.target), "exec-1")
+        try:
+            # The pid is alive but its start time no longer matches: another process reused it.
+            record = json.loads(path.read_text())
+            path.write_text(json.dumps({**record, "pid_start": "1"}))
+            with unittest.mock.patch.object(hr.os, "killpg") as killpg:
+                cancelled = hr.cancel(target=self.target, explicit_repo="acme/target", execution_id="exec-1", grace=0.2)
+            killpg.assert_not_called()
+            self.assertEqual((cancelled["status"], cancelled["outcome"]), ("cancelled", "cancelled"))
+            self.assertEqual(cancelled["child_gone_reason"], "PID_REUSED")
+            self.assertIsNone(cancelled["pid"])
+            self.assertTrue(hr.pid_alive(launched["pid"]), "the process holding the pid was left alone")
+        finally:
+            try:
+                os.killpg(launched["pid"], 9)
+            except ProcessLookupError:
+                pass
+
+    def test_failed_lease_handoff_stops_the_child_visibly(self):
+        crashed = self.start(behavior="crash")
+        real = run_lease.acquire
+
+        def refuse_handoff(*args, **kwargs):
+            if kwargs.get("handoff"):
+                raise run_lease.LeaseError("RUN_LEASE_LOCK_TIMEOUT", "busy")
+            return real(*args, **kwargs)
+        with unittest.mock.patch.object(hr.run_lease, "acquire", side_effect=refuse_handoff):
+            with self.assertRaises(hr.HeadlessError) as failed:
+                self.start(behavior="hang", resume=True, takeover=True, wait=False)
+        self.assertEqual(failed.exception.code, "RUN_LEASE_HANDOFF_FAILED")
+        record = self.status()
+        self.assertEqual((record["status"], record["lease_handoff_error"]), ("interrupted", "RUN_LEASE_LOCK_TIMEOUT"))
+        self.assertIsNone(record["pid"])
+        self.assertEqual(record["run_id"], crashed["run_id"])
 
     def test_interrupted_process_is_detected_and_resumable(self):
         launched = self.start(behavior="hang", wait=False)
@@ -225,7 +335,7 @@ class HeadlessRunTest(unittest.TestCase):
         self.assertEqual(observed["status"], "interrupted")
         blocked = self.start(behavior="finish")
         self.assertEqual(blocked["outcome"], "resume_required")
-        resumed = self.start(behavior="finish", resume=True)
+        resumed = self.start(behavior="finish", resume=True, takeover=True)
         self.assertEqual(resumed["run"]["status"], "PARTIAL")
         self.assertEqual(resumed["run_id"], observed["run_id"])
 

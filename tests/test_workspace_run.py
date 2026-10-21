@@ -120,7 +120,11 @@ class WorkspaceRunTest(unittest.TestCase):
         os.environ["FAKE_PI_BEHAVIOR"] = "finish"
         blocked = self.launch(manifest, "b1")
         self.assertEqual(blocked["task"]["outcome"], "resume_required")
-        resumed = self.launch(manifest, "b1", resume=True)
+        # The crashed child's lease is stale: resume without an explicit takeover is refused.
+        with self.assertRaises(wr.WorkspaceRunError) as refused:
+            self.launch(manifest, "b1", resume=True)
+        self.assertEqual(refused.exception.code, "RUN_LEASE_STALE")
+        resumed = self.launch(manifest, "b1", resume=True, takeover_stale_lease=True)
         self.assertEqual(resumed["task"]["run_id"], crashed["task"]["run_id"])
         self.assertEqual(resumed["task"]["run_status"], "PARTIAL")
         self.assertEqual(resumed["task"]["launches"], 2)
@@ -156,7 +160,7 @@ class WorkspaceRunTest(unittest.TestCase):
         hr.start(target=self.repos["alpha"][0], explicit_repo="acme/alpha", execution_id="ws--a1",
                  objective=legacy, pi_executable=str(self.pi))
         os.environ["FAKE_PI_BEHAVIOR"] = "finish"
-        resumed = self.launch(manifest, "a1", resume=True)
+        resumed = self.launch(manifest, "a1", resume=True, takeover_stale_lease=True)
         self.assertEqual(resumed["task"]["launches"], 2)
         saved = hr.status(target=self.repos["alpha"][0], explicit_repo="acme/alpha", execution_id="ws--a1")
         self.assertEqual(saved["objective"], legacy)
@@ -251,6 +255,14 @@ class WorkspaceRunTest(unittest.TestCase):
                 time.sleep(0.1)
             self.assertEqual(running, {"a1"})
             self.assertEqual(state["spent_tokens"], 3000)
+            # A record whose pid now belongs to another process (pid reuse) is not a running child.
+            record_path = hr.execution_path(Path(next(r for r in plan["repositories"] if r["id"] == "alpha")["git_common_dir"]),
+                                           "ws--a1")
+            record = json.loads(record_path.read_text())
+            if record.get("pid_start") is not None:
+                record_path.write_text(json.dumps({**record, "pid_start": "1"}))
+                self.assertEqual(wr.running_tasks(plan, exclude={"b1"})[0], set())
+                record_path.write_text(json.dumps(record))
             with self.assertRaises(wr.WorkspaceRunError) as ctx:
                 self.launch(manifest, "b1")
             self.assertEqual(ctx.exception.code, "WORKSPACE_BUDGET_EXHAUSTED")
@@ -313,7 +325,8 @@ class WorkspaceRunTest(unittest.TestCase):
         with self.assertRaises(wr.WorkspaceRunError) as ctx:
             self.launch(manifest, "b1", resume=True)
         self.assertEqual(ctx.exception.code, "WORKSPACE_BUDGET_EXHAUSTED")
-        resumed = self.launch(manifest, "b1", resume=True, ignore_budget=True)
+        # The budget refused first, so the crashed child's lease is still stale: recover it explicitly.
+        resumed = self.launch(manifest, "b1", resume=True, ignore_budget=True, takeover_stale_lease=True)
         self.assertEqual(resumed["task"]["outcome"], "resumed")
         self.assertIn("budget_override", resumed["task"])
 

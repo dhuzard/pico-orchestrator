@@ -1,6 +1,8 @@
 /** Parent-run trace and backend readiness boundary for /orchestrate. */
 import { spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { realpathSync } from "node:fs";
+import { hostname } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -17,6 +19,18 @@ const PREFLIGHT = join(ROOT, "tools", "backend_preflight.py");
 const SESSION_SCOPE = join(ROOT, "tools", "session_scope.py");
 const CONTEXT = join(ROOT, "tools", "context_budget.py");
 const AUTONOMY = join(ROOT, "tools", "autonomy_policy.py");
+const LEASE = join(ROOT, "tools", "run_lease.py");
+/** Renewal period of the single-owner run lease (tools/run_lease.py; default expiry 300 s). */
+export const LEASE_HEARTBEAT_MS = 60_000;
+/** Lease expiry assumed until the lease tool reports one. */
+export const DEFAULT_LEASE_TTL_MS = 300_000;
+/** Stop acting this long before the lease could expire without a successful renewal. */
+export const LEASE_SAFETY_MARGIN_MS = 60_000;
+/** Lease answers meaning another process now owns the run: this process detaches from it. */
+const LEASE_LOST = new Set(["RUN_LEASE_LOST", "RUN_LEASE_NOT_HELD", "RUN_LEASE_PID_MISMATCH"]);
+const LEASE_OWNER = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
+const LEASE_STATE = Symbol.for("pico.orchestration.lease");
+const OWNER_ENV = "PI_ORCHESTRATION_LEASE_OWNER";
 const WORKER_TOOLS = new Set(["AskClaude", "ClaudeWorker", "spawn_subagent", "message_subagent"]);
 const CLAUDE_TOOLS = new Set(["AskClaude", "ClaudeWorker"]);
 const MARKER = "PI_ORCHESTRATION_RUN_V1";
@@ -91,6 +105,37 @@ function isWorktreeAdd(call: { toolName: string; input: Record<string, unknown> 
   return (call.toolName === "bash" || call.toolName === "powershell") && typeof call.input.command === "string"
     && /\bgit\s+(?:-\S+\s+)*worktree\s+add\b/.test(call.input.command);
 }
+/** Lease identity of this Pi process; kept on globalThis so an extension reload keeps it. */
+export type LeaseProcessState = { nonce: string; launcherOwner: string | null };
+export function leaseProcessState(env: NodeJS.ProcessEnv = process.env): LeaseProcessState {
+  const store = globalThis as unknown as Record<symbol, LeaseProcessState | undefined>;
+  let state = store[LEASE_STATE];
+  if (!state) {
+    state = { nonce: randomBytes(6).toString("hex"), launcherOwner: null };
+    store[LEASE_STATE] = state;
+  }
+  const handed = env[OWNER_ENV];
+  if (handed !== undefined) {
+    // Read once and removed, so tools, workers and nested Pi processes never inherit the owner.
+    delete env[OWNER_ENV];
+    if (LEASE_OWNER.test(handed)) state.launcherOwner = handed;
+  }
+  return state;
+}
+
+/**
+ * Lease owner id of this Pi process for a session. A launcher (headless_run)
+ * hands its own owner id down through PI_ORCHESTRATION_LEASE_OWNER; otherwise
+ * host, pid, a per-process random nonce and the session make it stable across
+ * a reload in the same process and distinct for any other process.
+ */
+export function leaseOwner(sessionId: string | null, launcherOwner: string | null, pid: number, host: string,
+                           nonce: string): string {
+  if (launcherOwner && LEASE_OWNER.test(launcherOwner)) return launcherOwner;
+  const clean = (value: string, size: number) => value.replace(/[^A-Za-z0-9_.-]/g, "-").slice(0, size);
+  return `pi-${clean(host || "host", 32)}-${pid}-${clean(nonce, 16)}-${clean(sessionId ?? "nosession", 40)}`.slice(0, 128);
+}
+
 function count(value: unknown): number | null {
   return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : null;
 }
@@ -267,7 +312,7 @@ export function runJson(script: string, args: string[], input?: Json, timeoutMs 
   });
 }
 
-export function createOrchestrationLifecycle(command: typeof runJson = runJson) {
+export function createOrchestrationLifecycle(command: typeof runJson = runJson, clock: () => number = Date.now) {
 return function orchestrationLifecycle(pi: ExtensionAPI) {
   let runId: string | null = null;
   let lastRunId: string | null = null;
@@ -308,6 +353,70 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
   let recordedPeak = 0;
   let compactionFailed = false;
   let sessionId: string | null = null;
+  let leaseTimer: ReturnType<typeof setInterval> | null = null;
+  const leaseIdentity = leaseProcessState();
+  // Time of the last successful lease grant or renewal, and the lease's expiry.
+  let leaseRenewedAt = 0;
+  let leaseTtlMs = DEFAULT_LEASE_TTL_MS;
+  let lastCtx: ExtensionContext | null = null;
+  // toolCallId -> abort handle of a ClaudeWorker run, so a lost lease stops it.
+  const workerAborts = new Map<string, AbortController>();
+
+  const owner = () => leaseOwner(sessionId, leaseIdentity.launcherOwner, process.pid, hostname(), leaseIdentity.nonce);
+  const ownerArgs = () => ["--owner", owner()];
+  const leaseArgs = () => [...ownerArgs(), "--pid", String(process.pid)];
+  function stopHeartbeat(): void {
+    if (leaseTimer) clearInterval(leaseTimer);
+    leaseTimer = null;
+  }
+  function startHeartbeat(result: Json): void {
+    stopHeartbeat();
+    leaseGranted(result);
+    leaseTimer = setInterval(() => { void renewLease(); }, LEASE_HEARTBEAT_MS);
+    leaseTimer.unref?.();
+  }
+  function leaseGranted(result: Json): void {
+    leaseRenewedAt = clock();
+    const ttl = count((result.lease as Json | undefined)?.ttl_seconds);
+    if (ttl) leaseTtlMs = ttl * 1000;
+  }
+  /** True once the lease may have expired without this process knowing: it must stop acting. */
+  function leaseLapsed(): boolean {
+    return runId !== null && clock() >= leaseRenewedAt + leaseTtlMs - Math.min(LEASE_SAFETY_MARGIN_MS, leaseTtlMs / 2);
+  }
+  /**
+   * Leave the run to whoever owns it now: block every tool, abort work already
+   * running under the lost lease, and never settle, finish or write to it.
+   */
+  function detach(result: Json): void {
+    const id = runId;
+    stopHeartbeat();
+    runId = null;
+    if (id) lastRunId = id;
+    parentBlocked = true;
+    parentFailure = result;
+    blockAllWorktrees();
+    for (const controller of workerAborts.values()) controller.abort();
+    workerAborts.clear();
+    if (inFlight.size > 0) lastCtx?.abort?.();
+    resetRunState();
+    diagnose("lease", result);
+  }
+  function selfExpire(cause: unknown = null): void {
+    detach({ ok: false, error_code: "RUN_LEASE_SELF_EXPIRED", error_category: "LeaseNotRenewed",
+      run_id: runId, cause });
+  }
+  /** Renew the run lease; detach when another owner holds it or renewals failed for too long. */
+  async function renewLease(): Promise<void> {
+    const id = runId;
+    if (!id) { stopHeartbeat(); return; }
+    const result = await command(LEASE, ["heartbeat", id, ...leaseArgs()]);
+    if (runId !== id) return;
+    if (result.ok !== false) { leaseGranted(result); return; }
+    diagnose("lease_heartbeat", result);
+    if (LEASE_LOST.has(String(result.error_code))) detach(result);
+    else if (leaseLapsed()) selfExpire(result.error_code ?? result.error_category ?? null);
+  }
 
   const workspaceKey = (taskId: string, stepId: string) => `${taskId}\u0000${stepId}`;
   const worktreeReady = () => !parentBlocked && [...approvals.values()].some((approval) => approval.worktreeReady);
@@ -342,8 +451,13 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
       return;
     }
     targetCwd = ctx.cwd;
-    const args = ["status", data.run_id, "--worktree", ctx.cwd];
+    // Resume = verify identity, take the single-owner run lease, verify the
+    // resume checkpoint. A held or stale lease and checkpoint drift fail closed.
+    const args = ["resume", data.run_id, "--worktree", ctx.cwd];
     if (process.env.PI_TARGET_REPOSITORY) args.push("--repo", process.env.PI_TARGET_REPOSITORY);
+    args.push(...leaseArgs());
+    // A launcher-held lease moves to this process only through the explicit hand-off.
+    if (leaseIdentity.launcherOwner) args.push("--handoff");
     const result = await command(PARENT, args);
     if (result.status !== "IN_PROGRESS" || result.run_id !== data.run_id) {
       if (result.ok === false) { parentBlocked = true; parentFailure = result; lastRunId = data.run_id; }
@@ -361,6 +475,7 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
       if (typeof phase === "string") pendingReroutes.add(phase);
     }
     budget = initialBudgetState();
+    startHeartbeat(result);
   }
 
   function diagnose(operation: string, result: Json): void {
@@ -377,8 +492,9 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
 
   async function event(data: Json): Promise<boolean> {
     if (!runId) return false;
-    const result = await command(PARENT, ["event", runId], data);
+    const result = await command(PARENT, ["event", runId, ...ownerArgs()], data);
     if (result.ok === false) {
+      if (LEASE_LOST.has(String(result.error_code))) { detach(result); return false; }
       diagnose("event", result); parentFailure = result;
       parentBlocked = true; blockAllWorktrees(); return false;
     }
@@ -387,7 +503,7 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
   /** Telemetry is observational: a failed write is diagnosed but never blocks the run. */
   async function observe(data: Json): Promise<void> {
     if (!runId) return;
-    const result = await command(PARENT, ["event", runId], data);
+    const result = await command(PARENT, ["event", runId, ...ownerArgs()], data);
     if (result.ok === false) diagnose("telemetry", result);
   }
   function resetRunState(): void {
@@ -494,7 +610,7 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
   }
   async function settle(): Promise<void> {
     if (!runId) return;
-    const result = await command(PARENT, ["settle", runId]);
+    const result = await command(PARENT, ["settle", runId, ...ownerArgs()]);
     if (result.ok === false) {
       diagnose("settle", result);
       parentBlocked = true;
@@ -504,6 +620,7 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
     lastTerminal = result;
     persist(false);
     runId = null;
+    stopHeartbeat();
     parentBlocked = false;
     parentFailure = null;
     runSubagents.clear();
@@ -526,6 +643,7 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => { await restore(ctx); });
 
   pi.on("before_agent_start", async (trigger, ctx) => {
+    lastCtx = ctx;
     compactionFailed = false;
     // Pi >= 1.3 only carries `prompt` on runs started by a user prompt.
     if (!("prompt" in trigger) || !trigger.prompt.includes(MARKER)) return;
@@ -543,9 +661,10 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
     targetCwd = ctx.cwd;
     const explicit = process.env.PI_TARGET_REPOSITORY;
     if (explicit) args.push("--repo", explicit);
+    args.push(...leaseArgs());
     const result = await command(PARENT, args);
     runId = typeof result.run_id === "string" ? result.run_id : null;
-    if (runId) { lastRunId = runId; lastTerminal = null; persist(true); }
+    if (runId) { lastRunId = runId; lastTerminal = null; persist(true); leaseGranted(result); }
     resetRunState();
     parentBlocked = !runId || result.status !== "IN_PROGRESS";
     parentFailure = parentBlocked ? result : null;
@@ -556,9 +675,10 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
       return { message: { customType: "orchestration-blocker", display: true,
         content: `BLOCKED: parent orchestration initialization failed (${code}). Stop before repository inspection or workers. See orchestration-lifecycle diagnostic log.` } };
     }
-    const started = await command(CONTEXT, ["start", runId!], { cwd: ctx.cwd });
+    const started = await command(CONTEXT, ["start", runId!, ...ownerArgs()], { cwd: ctx.cwd });
     if (started.ok === false) diagnose("context_start", started);
     budget = initialBudgetState();
+    startHeartbeat(result);
   });
 
   type ClaudeRoute = { block: string } | { approval: RouteApproval; step: StepApproval; backend: Json;
@@ -694,6 +814,9 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
   }
 
   pi.on("tool_call", async (call, ctx) => {
+    lastCtx = ctx;
+    // No successful renewal for most of the lease's lifetime: stop before another owner may take it.
+    if (leaseLapsed()) selfExpire();
     if (!runId && !parentBlocked) return guardOutsideRun(call, ctx.cwd);
     if (parentBlocked && call.toolName !== "orchestration_record") {
       return { block: true, terminate: true,
@@ -920,6 +1043,8 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
         backend_device: claude.backend_device, backend_inode: claude.backend_inode } : null,
       steps });
     pendingReroutes.delete(taskId);
+    // Worker approval is a resume checkpoint: the parent checkout as approved.
+    await event({ kind: "checkpoint", phase, reason: "worker_approval" });
     const claudeEffort = claude ? assignedEffort(route, claude.step_id) : null;
     if (claude) await event({ kind: "worker", phase, step_id: claude.step_id,
       status: "not_started", model: claude.model, backend: "claude-code",
@@ -1031,7 +1156,9 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
         }
         const result = parentFailure ?? { ok: false, error_category: "NoActiveParentRun" };
         diagnose(params.action, result);
-        return { content: [{ type: "text", text: "BLOCKED: no active parent orchestration record. Start with /orchestrate <objective> in this Pi session, or resume the saved session; recorder writes outside that run are prohibited. See diagnostic log." }],
+        const code = typeof result.error_code === "string" && /^[A-Z][A-Z0-9_]{0,99}$/.test(result.error_code)
+          ? ` (${result.error_code})` : "";
+        return { content: [{ type: "text", text: `BLOCKED${code}: no active parent orchestration record. Start with /orchestrate <objective> in this Pi session, or resume the saved session; recorder writes outside that run are prohibited. See diagnostic log.` }],
                  details: { ok: false, active: false, run_id: null as string | null, result } };
       }
       if (params.action === "status" && pendingReroutes.size > 0 && !parentBlocked) {
@@ -1054,7 +1181,10 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
           ? await command(SESSION_SCOPE, [], { operation: "worktree", target_cwd: targetCwd, path: params.path })
           : { ok: false };
         const ok = checked.ok === true && typeof checked.path === "string";
-        if (ok) workspaces.set(workspaceKey(taskId, params.step_id), checked.path as string);
+        if (ok) {
+          workspaces.set(workspaceKey(taskId, params.step_id), checked.path as string);
+          await event({ kind: "checkpoint", phase: approvals.get(taskId)?.phase ?? taskId, reason: "worker_approval" });
+        }
         return reply(ok, ok
           ? `Step ${params.step_id} of task ${taskId} is bound to worktree ${String(checked.path)}.`
           : checked.blocker_code === "WORKER_WORKSPACE_PROTECTED_PATH"
@@ -1067,8 +1197,8 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
         return integration(params.action, params.wave_id);
       }
       const args = params.action === "status" ? ["status", runId]
-        : params.action === "event" ? ["event", runId]
-        : ["finish", runId, params.status,
+        : params.action === "event" ? ["event", runId, ...ownerArgs()]
+        : ["finish", runId, params.status, ...ownerArgs(),
            ...(params.blocker_code ? ["--blocker-code", params.blocker_code] : [])];
       const result = await command(PARENT, args,
         params.action === "event" ? params.event as Json : undefined);
@@ -1096,6 +1226,7 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
         lastTerminal = result;
         persist(false);
         runId = null;
+        stopHeartbeat();
         blockAllWorktrees();
       }
       const effectiveResult = ok ? result : parentFailure ?? result;
@@ -1134,7 +1265,16 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
         return { content: [{ type: "text" as const, text: "BLOCKED: WORKER_TASK_UNROUTED: ClaudeWorker runs only for a routed Claude step the orchestration lifecycle resolved." }],
                  details: { ok: false } as Json, isError: true };
       }
-      const outcome = await runClaudeWorker(plan, params.prompt, signal);
+      // Aborted by the tool signal, or by this lifecycle when the run lease is lost.
+      const controller = new AbortController();
+      workerAborts.set(toolCallId, controller);
+      let outcome: ClaudeWorkerOutcome;
+      try {
+        outcome = await runClaudeWorker(plan, params.prompt,
+          signal ? AbortSignal.any([signal, controller.signal]) : controller.signal);
+      } finally {
+        workerAborts.delete(toolCallId);
+      }
       const notes = [outcome.text];
       if (outcome.permissionDenials > 0) {
         const denied = outcome.deniedCalls.length ? `: ${outcome.deniedCalls.join("; ")}` : ".";
@@ -1155,9 +1295,11 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
   });
 
   pi.on("turn_end", async (_event, ctx) => {
+    lastCtx = ctx;
     // Worker tools block within one turn: anything still marked in flight never reported a result.
     for (const id of [...inFlight.keys()]) { snapshots.delete(id); await workerFinished(id); }
     workerPlans.clear();
+    if (runId) await renewLease();
     if (!runId || parentBlocked || !budget) return;
     const tokens = ctx.getContextUsage()?.tokens;
     if (typeof tokens !== "number") return;
@@ -1207,7 +1349,9 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
 
   pi.on("session_shutdown", async (event) => {
     if (event.reason === "quit" || event.reason === "new" || event.reason === "fork") await settle();
-    // Reload and explicit resume preserve the durable identity in this session.
+    // Reload and explicit resume preserve the durable identity in this session;
+    // the restoring instance renews the lease under the same owner id.
+    stopHeartbeat();
   });
   pi.on("agent_before_settle", async (event, ctx) => {
     if (event.outcome === "aborted" && !event.continue && !compactionFailed &&
