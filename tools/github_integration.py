@@ -670,19 +670,105 @@ def verified_issue_reference(repo: str, adapter=gh) -> tuple[str, str | None, st
     return (_issue_reference(authority["policy"]), authority["blob"], authority["commit"], authority["branch"])
 
 
+REPUBLICATION_LIMIT = 20
+
+
+def _is_ancestor(worktree: Path, ancestor: str, commit: str) -> bool:
+    """Whether `ancestor` is `commit` or one of its ancestors; False when either object is not local."""
+    proc = subprocess.run(["git", "-C", str(worktree), "merge-base", "--is-ancestor", ancestor, commit],
+                          capture_output=True, text=True, timeout=10)
+    return proc.returncode == 0
+
+
+def _local_branch_exists(worktree: Path, branch: str) -> bool:
+    proc = subprocess.run(["git", "-C", str(worktree), "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
+                          capture_output=True, text=True, timeout=10)
+    return proc.returncode == 0
+
+
+def republication_branch(worktree: Path, repo: str, base: str, head: str, adapter=gh, *,
+                         recorded_pr: dict | None = None, reserved: frozenset[str] = frozenset()) -> dict:
+    """Where a head whose PR was closed unmerged is published again (#67): the first `<head>-<n>` (n >= 2) that
+    holds this task's earlier republication (its open PR, or a push whose PR was not created yet; reused) or
+    is free: no PR, not on the remote, no local branch, and not `reserved` (the head of another task). An open
+    PR the task does not record, already at the validated commit, refuses rather than opening a second one.
+
+    Only for a head whose every PR was closed without merging: an open PR is published normally, a merged one
+    is never superseded, and a head with no PR needs no new branch. A closed PR's branch is never reused,
+    reopened or overwritten. A candidate's PRs are this task's only when `recorded_pr` (the task's recorded
+    PR: number, branch, supersedes) names them; a candidate with anyone else's PR is skipped, never taken over.
+    Returns {"remote_head", "supersedes"} (the closed PR numbers, oldest first).
+    """
+    remote = _publication_remote(worktree, repo)
+    commit = _git(worktree, "rev-parse", "--verify", f"refs/heads/{head}^{{commit}}")
+    prs = adapter.list_prs(base=base, head=head, repo=repo)
+    if not prs:
+        raise IntegrationError("PUBLICATION_NEW_BRANCH_UNNEEDED", "this branch has no PR to supersede; publish it as is")
+    states = {str(pr["state"]).lower() for pr in prs}
+    if "merged" in states:
+        raise IntegrationError("PUBLICATION_PR_CONFLICT", "this branch already has a merged PR; it is not superseded")
+    if "open" in states:
+        raise IntegrationError("PUBLICATION_NEW_BRANCH_UNNEEDED", "this branch has an open PR; publish it as is")
+    recorded = recorded_pr or {}
+    own = {recorded.get("number"), *(recorded.get("supersedes") or [])} - {None}
+    supersedes = sorted(pr["number"] for pr in prs)
+    for n in range(2, REPUBLICATION_LIMIT + 1):
+        candidate = f"{head}-{n}"
+        if candidate in reserved:  # another task's head or PR branch: never this task's, never refused for it
+            continue
+        found = adapter.list_prs(base=base, head=candidate, repo=repo)
+        foreign = [pr for pr in found if pr["number"] not in own]
+        if foreign:
+            # Someone else's PR: never taken over, never listed as superseded. An open one already at the
+            # validated commit is most likely this task's own PR from a creation whose answer was lost;
+            # skipping it would open a second PR for the same commit, so refuse instead.
+            unrecorded = [pr["number"] for pr in foreign if str(pr["state"]).lower() == "open"]
+            if unrecorded and _remote_head_commit(worktree, remote, candidate) == commit:
+                raise IntegrationError("PUBLICATION_PR_CONFLICT",
+                                       f"{candidate} has open PR #{unrecorded[0]} at the validated commit, but the "
+                                       "task does not record it. PICO cannot adopt it: check the PR, close it if "
+                                       "it duplicates this task, then publish again (the commit goes to the next "
+                                       "free branch)")
+            continue
+        states = {str(pr["state"]).lower() for pr in found}
+        if "merged" in states:
+            raise IntegrationError("PUBLICATION_PR_CONFLICT", f"{candidate} already has a merged PR")
+        if "open" in states:
+            if recorded.get("branch") != candidate or not any(pr["number"] == recorded.get("number") for pr in found):
+                continue
+            remote_commit = _remote_head_commit(worktree, remote, candidate)
+            if remote_commit is not None and not _is_ancestor(worktree, remote_commit, commit):
+                raise IntegrationError("PUBLICATION_PR_CONFLICT",
+                                       f"{candidate} holds a commit that is not part of the validated head")
+            return {"remote_head": candidate, "supersedes": supersedes}
+        if found:  # this task's earlier republication, closed as well: superseded too, never reused
+            supersedes = sorted(supersedes + [pr["number"] for pr in found])
+            continue
+        remote_commit = _remote_head_commit(worktree, remote, candidate)
+        if remote_commit == commit:  # this task's earlier push whose PR was not created yet
+            return {"remote_head": candidate, "supersedes": supersedes}
+        if remote_commit is None and not _local_branch_exists(worktree, candidate):
+            return {"remote_head": candidate, "supersedes": supersedes}
+    raise IntegrationError("PUBLICATION_PR_CONFLICT", f"no free republication branch up to {head}-{REPUBLICATION_LIMIT}")
+
+
 def _publication_state(worktree: Path, repo: str, base: str, head: str, adapter=gh,
-                       base_commit: str | None = None) -> dict:
+                       base_commit: str | None = None, remote_head: str | None = None) -> dict:
+    """`head` is the local branch; `remote_head` (default: the same name) is the branch it is pushed to."""
+    remote_head = remote_head or head
     remote = _publication_remote(worktree, repo)
     commit = _git(worktree, "rev-parse", "--verify", f"refs/heads/{head}^{{commit}}")
     if not re.fullmatch(r"[0-9a-f]{40,64}", commit):
         raise IntegrationError("PUBLICATION_REF_INVALID", "head is not a local commit")
-    remote_commit = _remote_head_commit(worktree, remote, head)
-    prs = adapter.list_prs(base=base, head=head, repo=repo)
+    remote_commit = _remote_head_commit(worktree, remote, remote_head)
+    prs = adapter.list_prs(base=base, head=remote_head, repo=repo)
     open_prs = [pr for pr in prs if pr["state"].lower() == "open"]
     if len(open_prs) > 1:
         raise IntegrationError("PUBLICATION_PR_CONFLICT", "multiple open PRs match this branch")
     if not open_prs and prs:
-        raise IntegrationError("PUBLICATION_PR_CONFLICT", "this branch already has a closed or merged PR")
+        raise IntegrationError("PUBLICATION_PR_CONFLICT",
+                               "this branch already has a closed or merged PR; after a closed (unmerged) PR, "
+                               "republish to a new branch with `pico workspace publish --new-branch`")
     return {"remote": remote, "commit": commit, "remote_commit": remote_commit, "base_commit": base_commit,
             "existing_pr": open_prs[0]["number"] if open_prs else None}
 
@@ -691,8 +777,13 @@ def publish(*, worktree: Path, base: str, head: str, title: str, body_file: Path
             explicit_repo: str | None = None, apply: bool = False,
             expected_plan_hash: str | None = None, adapter=gh,
             provenance_root: Path = ORCHESTRATOR_ROOT,
-            closes_issue: int | None = None) -> dict:
+            closes_issue: int | None = None, remote_head: str | None = None,
+            recorded_pr: dict | None = None, reserved: frozenset[str] = frozenset()) -> dict:
     """Dry-run and publish one reviewed pico branch through a fixed, non-force path.
+
+    `remote_head`, when it differs from `head`, republishes the head after its PR was closed unmerged (#67):
+    it must be what republication_branch() answers now with the same `recorded_pr` and `reserved` (else
+    GITHUB_STATE_CONFLICT), and the plan records it with the superseded PRs.
 
     The body must reference its issue with `Refs #N`. A closing keyword is
     accepted only for an issue of this repository that either an in-process
@@ -739,7 +830,14 @@ def publish(*, worktree: Path, base: str, head: str, title: str, body_file: Path
         body = _text(body_file.read_text(encoding="utf-8"), "body")
         if closes_issue is not None and (type(closes_issue) is not int or closes_issue < 1):
             raise IntegrationError("PUBLICATION_BODY_INVALID", "closes_issue must be an issue number")
-        state = _publication_state(worktree, repo, base, head, adapter, base_commit)
+        republished = None
+        if remote_head is not None and remote_head != head:
+            republished = republication_branch(worktree, repo, base, head, adapter,
+                                               recorded_pr=recorded_pr, reserved=reserved)
+            if republished["remote_head"] != remote_head:
+                raise IntegrationError("GITHUB_STATE_CONFLICT", "the republication branch changed; run the dry run again")
+        state = _publication_state(worktree, repo, base, head, adapter, base_commit,
+                                   remote_head=republished["remote_head"] if republished else None)
 
         def policy_closes() -> bool:
             return _issue_reference(policy) == "closes"
@@ -750,6 +848,9 @@ def publish(*, worktree: Path, base: str, head: str, title: str, body_file: Path
                 "authorization": "policy", **reference, "policy_branch": authority["branch"],
                 "policy_commit": authority["commit"], "policy_blob": policy_blob,
                 "publication_permissions": permissions}
+        if republished:
+            plan.update({"remote_head": republished["remote_head"], "supersedes_prs": republished["supersedes"]})
+        push_head = plan.get("remote_head", head)
         digest = hashlib.sha256(json.dumps(plan, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         meta["mutations_planned"] = int(state["remote_commit"] != state["commit"]) + int(state["existing_pr"] is None)
         if not apply:
@@ -759,7 +860,7 @@ def publish(*, worktree: Path, base: str, head: str, title: str, body_file: Path
                 raise IntegrationError("GITHUB_STATE_CONFLICT", "publication plan changed since dry-run")
             if state["remote_commit"] != state["commit"]:
                 proc = subprocess.run(["git", "-C", str(worktree), "push", "--porcelain", state["remote"],
-                                       f"{state['commit']}:refs/heads/{head}"], capture_output=True, text=True, timeout=120)
+                                       f"{state['commit']}:refs/heads/{push_head}"], capture_output=True, text=True, timeout=120)
                 if proc.returncode:
                     raise IntegrationError("PUBLICATION_PUSH_FAILED", "non-force branch push failed")
                 meta["mutations_applied"] += 1
@@ -767,7 +868,7 @@ def publish(*, worktree: Path, base: str, head: str, title: str, body_file: Path
                                       "label": None, "status": "applied"})
                 provenance.update_github_integration(provenance_root, record["run_id"], meta)
             if state["existing_pr"] is None:
-                created = adapter.create_pr(title, body, base=base, head=head, repo=repo, draft=True)
+                created = adapter.create_pr(title, body, base=base, head=push_head, repo=repo, draft=True)
                 pr_number = created["number"]
                 meta["mutations_applied"] += 1
                 meta["audit"].append({"operation": "create_draft_pr", "issue": None, "pr": pr_number,

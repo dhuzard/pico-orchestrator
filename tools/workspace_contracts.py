@@ -204,7 +204,8 @@ def issue_reference_decision(task: dict, repo: dict, adapter=gh) -> dict:
             "policy_commit": commit, "policy_blob": blob}
 
 
-def pr_body(plan: dict, task: dict, repo: dict, observed: dict, decision: dict | None = None) -> str:
+def pr_body(plan: dict, task: dict, repo: dict, observed: dict, decision: dict | None = None,
+            supersedes: list[int] | None = None) -> str:
     tasks = {t["id"]: t for t in plan["tasks"]}
     repos = {r["id"]: r for r in plan["repositories"]}
     every = workspace_run.observed_state(plan["workspace_id"])
@@ -231,6 +232,8 @@ def pr_body(plan: dict, task: dict, repo: dict, observed: dict, decision: dict |
             raise WorkspaceRunError("WORKSPACE_UPSTREAM_UNPUBLISHED", f"upstream task {dep} has no draft PR yet")
     if depends:
         lines += ["", "Depends on:"] + depends
+    if supersedes:
+        lines += ["", "Supersedes " + ", ".join(f"#{n}" for n in supersedes) + " (closed without merging)."]
     lines += ["", "Coordinated by a PICO workspace. Each repository's PR is reviewed and merged on its own; "
               "nothing merges automatically.", ""]
     body = "\n".join(lines)
@@ -239,7 +242,13 @@ def pr_body(plan: dict, task: dict, repo: dict, observed: dict, decision: dict |
     return body
 
 
-def publish(*, manifest: Path, task_id: str, apply: bool = False, plan_hash: str | None = None, adapter=gh) -> dict:
+def publish(*, manifest: Path, task_id: str, apply: bool = False, plan_hash: str | None = None, adapter=gh,
+            new_branch: bool = False) -> dict:
+    """Dry-run or apply the task's draft PR. `new_branch` republishes it after its PR was closed without merging
+    (#67): the validated commit goes to the next free `<head_branch>-<n>` branch, and the PR names the closed PRs
+    it supersedes. The closed PR's branch is never reused, reopened or overwritten, and a branch holding another
+    task's head or anyone else's PR is skipped. Pass `new_branch` to both the dry run and the apply. A released
+    task goes back to validated: its CI and promotion were observed on the superseded PR."""
     plan, task, repo = _context(manifest, task_id)
     if task["kind"] == "qualification":
         raise WorkspaceRunError("WORKSPACE_TASK_NOT_PUBLISHABLE", "qualification tasks have no pull request")
@@ -252,7 +261,24 @@ def publish(*, manifest: Path, task_id: str, apply: bool = False, plan_hash: str
     if _commit_of(checkout, f"refs/heads/{observed['head_branch']}") != observed["validated_commit"]:
         raise WorkspaceRunError("WORKSPACE_HEAD_CHANGED", "the head moved since validation; validate again")
     decision = issue_reference_decision(task, repo, adapter)
-    body = pr_body(plan, task, repo, observed, decision)
+    republished = None
+    republication = {}
+    if new_branch:
+        every = workspace_run.observed_state(plan["workspace_id"])
+        same_repo = {t["id"] for t in plan["tasks"] if t["repository"] == task["repository"] and t["id"] != task_id}
+        reserved = frozenset(branch for other in same_repo for branch in
+                             ((every.get(other) or {}).get("head_branch"),
+                              ((every.get(other) or {}).get("pr") or {}).get("branch")) if branch)
+        republication = {"recorded_pr": observed.get("pr"), "reserved": reserved}
+        try:
+            republished = github_integration.republication_branch(checkout, repo["repository"], repo["base_branch"],
+                                                                  observed["head_branch"], adapter, **republication)
+        except github_integration.IntegrationError as exc:
+            raise WorkspaceRunError(exc.code, exc.detail) from exc
+        except (gh.GithubSyncError, OSError, ValueError, subprocess.TimeoutExpired) as exc:
+            raise WorkspaceRunError("PUBLICATION_FAILED",
+                                    f"could not inspect the republication branches: {type(exc).__name__}") from exc
+    body = pr_body(plan, task, repo, observed, decision, supersedes=(republished or {}).get("supersedes"))
     scratch = _scratch(plan, task_id)
     scratch.mkdir(parents=True, exist_ok=True)
     body_file = scratch / "pr-body.md"
@@ -261,11 +287,23 @@ def publish(*, manifest: Path, task_id: str, apply: bool = False, plan_hash: str
                                         title=task["title"], body_file=body_file, explicit_repo=repo["repository"],
                                         apply=apply, expected_plan_hash=plan_hash, adapter=adapter,
                                         provenance_root=headless_run.ROOT,
-                                        closes_issue=task["issue"] if task.get("closes_issue") is True else None)
+                                        closes_issue=task["issue"] if task.get("closes_issue") is True else None,
+                                        remote_head=(republished or {}).get("remote_head"), **republication)
     if result["status"] == "COMPLETED" and result.get("pr"):
         def mutate(obs: dict) -> None:
+            previous = (obs.get("pr") or {}).get("number")
+            if previous == result["pr"] and not result["mutations_applied"]:
+                return  # a rerun that changed nothing keeps the run that published the PR, and its promotion
             obs["pr"] = {"number": result["pr"], "repository": repo["repository"],
                          "publication_run_id": result["run_id"], "published_at": _now()}
+            if republished:
+                obs["pr"].update({"branch": republished["remote_head"], "supersedes": republished["supersedes"]})
+            if republished and previous != result["pr"]:
+                # CI and promotion were observed on the superseded PR: promote again on the new one.
+                obs.pop("ci", None)
+                obs.pop("promoted_at", None)
+                if obs.get("readiness") == "ready_for_downstream":
+                    obs["readiness"] = "validated"
         _update(plan, manifest, task_id, mutate)
     ok = result["status"] in {"DRY_RUN", "COMPLETED"}
     return {"ok": ok, "task_id": task_id, **result, "issue_reference_decision": decision}
@@ -324,12 +362,16 @@ def main(argv: list[str] | None = None) -> int:
         if name == "publish":
             p.add_argument("--apply", action="store_true", help="push and open the draft PR")
             p.add_argument("--plan-hash", help="plan_hash from the reviewed dry run")
+            p.add_argument("--new-branch", action="store_true",
+                           help="after the task's PR was closed unmerged, publish to the next free <head>-<n> branch "
+                                "(pass it to both the dry run and --apply)")
     args = parser.parse_args(argv)
     try:
         if args.command == "validate":
             result = validate(manifest=args.manifest, task_id=args.task, head=args.head)
         elif args.command == "publish":
-            result = publish(manifest=args.manifest, task_id=args.task, apply=args.apply, plan_hash=args.plan_hash)
+            result = publish(manifest=args.manifest, task_id=args.task, apply=args.apply, plan_hash=args.plan_hash,
+                             new_branch=args.new_branch)
         elif args.command == "ci":
             result = ci(manifest=args.manifest, task_id=args.task)
         else:

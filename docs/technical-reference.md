@@ -2269,6 +2269,36 @@ objective or transcript, secret-scanned) goes to
 until `--apply` with the reviewed `--plan-hash`, the push is non-force, and the
 PR is a draft. The PR number and publication run id are recorded.
 
+**Republishing after a closed PR (#67).** A branch that already has a closed
+or merged PR is refused (`PUBLICATION_PR_CONFLICT`): a closed PR's branch is
+never reused, reopened or overwritten. When every PR of the task's branch was
+closed without merging, `publish --new-branch` pushes the validated commit to
+the first `<branch>-<n>` (n from 2) that holds this task's earlier
+republication (the open PR recorded in the task's `pr`, whose remote head is
+the validated commit or one of its ancestors, or a branch already at the
+validated commit with no PR, left by an apply that pushed but did not create
+the PR; it is reused), or is free: no PR, not on the remote, no local branch,
+and not the head branch or PR branch of another task of the same repository.
+A candidate with any PR the task's record does not name is skipped, never
+taken over and never listed as superseded, except an open one already at the
+validated commit: that is most likely this task's own PR from a creation whose
+answer was lost, so it refuses (`PUBLICATION_PR_CONFLICT`, naming the PR)
+instead of opening a second PR for the same commit. No command adopts such a
+PR: close it, then publish again, and the commit goes to the next free
+branch. Branches reserved by another task are skipped before this check. This task's own closed PRs met on the way are superseded as
+well, and a merged one refuses. Pass `--new-branch` to the apply as well: the
+plan hash binds `remote_head`, so an apply without it is refused. The body adds
+`Supersedes #N (closed without merging).`, the plan records `remote_head` and
+`supersedes_prs` (bound by the plan hash; a branch that changed between the
+dry run and the apply gives `GITHUB_STATE_CONFLICT`), and the task's `pr`
+records `branch` and `supersedes`. The observed CI and `promoted_at` of the
+superseded PR are dropped, and a `ready_for_downstream` task goes back to
+`validated`, so downstream waits until `promote` observes green CI on the new
+PR. An apply that changes nothing (same PR, no mutation) leaves the task's
+record, its publication run and its promotion as they were. A GitHub or git failure while choosing the branch returns
+`PUBLICATION_FAILED` instead of a traceback. The local branch keeps its name. `--new-branch` on a branch with
+no PR or an open one is refused with `PUBLICATION_NEW_BRANCH_UNNEEDED`.
+
 **`ci` and `promote`.** `ci` reads `gh pr view --json
 statusCheckRollup,headRefOid,state` (allowlisted, read-only):
 `github_sync.classify_checks` yields `green` only when at least one check
