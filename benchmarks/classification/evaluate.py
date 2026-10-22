@@ -38,8 +38,9 @@ FIXED_TASK_FIELDS = (
 EVIDENCE_KEY = "escalation_evidence"
 REQUIRED_CASE_KEYS = frozenset({"id", "request", "repository_evidence", "task_facts", "gold_classification"})
 # `project_routing` is a case's `.pi/routing.yaml` (in practice its
-# `path_floors`): production routing applies it, so `expected_decision` and the
-# `*_with_path_floors` metrics route through it; the classic metrics do not.
+# `path_floors`): production routing applies it and the built-in path floors,
+# so `expected_decision` and the `*_with_path_floors` metrics route through
+# both; the classic metrics use neither.
 OPTIONAL_CASE_KEYS = frozenset({"notes", "expected_decision", "project_routing"})
 
 
@@ -193,8 +194,13 @@ def decision_signature(
     task: dict[str, Any],
     assets: engine.PolicyAssets,
     project_routing: dict[str, Any] | None = None,
+    *,
+    path_floors: bool = True,
 ) -> dict[str, Any]:
-    resolution = engine.resolve_route(task, assets.policy, project_routing, assets.task_schema)
+    """The production decision for `task`. `path_floors=False` leaves out the
+    built-in and project path floors (the classic, no-path-floor metrics)."""
+    resolution = engine.resolve_route(task, assets.policy, project_routing, assets.task_schema,
+                                      path_floors=path_floors)
     route = resolution.selected_route
     effective = resolution.effective_classification
     intent = engine.derive_primary_intent(effective)
@@ -255,7 +261,7 @@ def evaluate(
         case_id = case["id"]
         gold_task = validate_case(case, fields, assets)
         gold_classification = case["gold_classification"]
-        gold_decision = decision_signature(gold_task, assets)
+        gold_decision = decision_signature(gold_task, assets, path_floors=False)
         project_routing = case.get("project_routing")
         gold_floored = decision_signature(gold_task, assets, project_routing)
 
@@ -298,7 +304,7 @@ def evaluate(
         if not wrong_fields:
             exact_correct += 1
 
-        candidate_decision = decision_signature(candidate_task, assets)
+        candidate_decision = decision_signature(candidate_task, assets, path_floors=False)
         if candidate_decision["route"] == gold_decision["route"]:
             route_correct += 1
         else:

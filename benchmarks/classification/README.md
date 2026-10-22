@@ -128,7 +128,12 @@ The evaluator reports:
   classification, i.e. what production routing would select. The rates above
   ignore `project_routing`, so the pair shows how much under-routing the
   project's path floors recover (cases without `project_routing` count the same
-  in both);
+  in both). The built-in path floors (`.pi/`, `.claude/`, `.mcp.json`,
+  `.github/workflows/`) apply to every case in the `with path floors` metrics
+  and in `expected_decision`. Path-floor cases recover by construction: their
+  floors are chosen to lift an understated classification back to the gold
+  route, so the pair measures how the floors interact with the policy, not how
+  well a real project's floors would be chosen;
 - **execution-decision accuracy** — route, primary intent, and assigned capacity
   tiers all match the gold decision;
 - **escalation rates** — for each escalating field, the fraction of scored

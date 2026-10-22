@@ -1464,7 +1464,7 @@ def _path_floor_lines(matches: Any, indent: str, label: str) -> list[str]:
         count = match.get("matched_path_count")
         more = (count if isinstance(count, int) else len(paths)) - len(shown)
         lines.append(
-            f"{indent}{label}: rule {_fmt(match.get('rule'))} {_fmt(match.get('patterns'))} "
+            f"{indent}{label}: {_fmt(match.get('source') or 'project')} rule {_fmt(match.get('rule'))} {_fmt(match.get('patterns'))} "
             f"floors {_fmt(match.get('floors'))} via {_fmt(', '.join(shown))}"
             + (f" (+{more} more)" if more > 0 else "")
         )

@@ -600,12 +600,15 @@ cases:
       security_sensitive: false
       destructive_operation: false
     expected_decision:
-      route: CLAUDE
+      route: CODEX_CLAUDE_CODEX
       primary_intent: implementation
       capacities:
-        claude_worker: light
-    notes: Over-routed in real runs (CODEX/CODEX_CLAUDE_CODEX with high effort). Rubric gold is all low-risk;
-      expected_decision reflects policy v6 graduated capacity rules.
+        codex_specifier: high
+        claude_worker: high
+        codex_reviewer: high
+    notes: Over-routed in real runs (CODEX/CODEX_CLAUDE_CODEX with high effort). Rubric gold stays all low-risk,
+      but .pi/ is a built-in path floor (security_sensitive, issue 76) since autonomy policy widens what agents may do,
+      so the production decision is CODEX_CLAUDE_CODEX; without path floors it is CLAUDE with a light worker.
 
   - id: classifier-018-review-agents-md-summarize
     request: Review AGENTS.md and the .pi configuration and summarize what they require.
@@ -640,9 +643,10 @@ cases:
       route: CODEX
       primary_intent: analysis
       capacities:
-        codex_worker: economy
+        codex_worker: standard
     notes: Over-routed in real runs (CODEX/CODEX_CLAUDE_CODEX with high effort). Rubric gold is all low-risk;
-      expected_decision reflects policy v6 graduated capacity rules.
+      the built-in .pi/ path floor (security_sensitive, issue 76) keeps the read-only analysis on CODEX but stops the
+      economy downgrade (without path floors the worker is economy).
 
   - id: classifier-019-rename-fields-per-review
     request: Rename the fields the PR reviewer flagged (runId -> run_id, cfg -> config) and update their

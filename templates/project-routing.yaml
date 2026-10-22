@@ -50,12 +50,15 @@ risk_overrides: {}
 # inside one path segment, a whole `**` segment matches zero or more segments
 # (`migrations/**` covers `migrations/` and everything below it). Character
 # classes, braces, backslashes, a leading `!` or `/`, and `.`/`..` segments are
-# rejected. Example:
+# rejected. Matching is case-sensitive. A declared directory also touches the
+# globs below it (`src` touches `src/db/migrations/**`). Built-in floors that
+# no project can remove already make `.pi/**`, `.claude/**`, `.mcp.json` and
+# `.github/workflows/**` security-sensitive. Example:
 #
 #   path_floors:
 #     - paths: ["migrations/**", "schemas/**"]
 #       floors: { failure_cost: high, behavior_preservation: required }
-#     - paths: [".github/workflows/**", "**/*secret*"]
+#     - paths: ["deploy/**", "**/*secret*"]
 #       floors: { security_sensitive: true }
 path_floors: []
 

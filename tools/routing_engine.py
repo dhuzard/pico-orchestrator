@@ -15,6 +15,7 @@ import copy
 import json
 import os
 import re
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -1819,20 +1820,39 @@ def merge_risk_floors(floor_sets: Iterable[dict], task_schema: dict) -> dict:
 # every other construct (character classes, braces, backslashes, a leading
 # `!` or `/`, empty, `.` or `..` segments, `**` inside a segment), so no
 # pattern can mean a negation or a relaxation.
+#
+# Matching is case-sensitive, like Git's index on a case-sensitive file
+# system. Both sides are compared in Unicode NFC, so a precomposed and a
+# decomposed spelling of the same name match the same globs.
+
+# Built-in floors, applied in every repository before the project's own
+# `path_floors` and by the same matcher: agent and harness configuration
+# (`.pi/` holds routing and autonomy policy, `.claude/` and `.mcp.json` hooks and
+# MCP servers) and CI workflows (they run with repository secrets). A task or a
+# diff touching them is security-sensitive. Recorded with `source: builtin`.
+BUILTIN_PATH_FLOORS: tuple[dict, ...] = (
+    {"paths": [".pi/**", ".claude/**", ".mcp.json", ".github/workflows/**"],
+     "floors": {"security_sensitive": True}},
+)
+# Recorded paths longer than this are cut (with the number of characters cut),
+# so a record stays schema-valid; matching always uses the full path.
+RECORDED_PATH_MAX = 4096
+
 
 def normalize_repo_path(value: Any) -> str | None:
-    """A declared area or changed path as a repository-relative POSIX path,
-    or None when it cannot name one (prose, absolute, or escaping the root).
-    Leading `./` and trailing `/` are dropped and repeated `/` collapsed."""
+    """A declared area or changed path as a repository-relative POSIX path in
+    Unicode NFC, or None when it cannot name one (control characters,
+    absolute, escaping the root, or using a backslash). Leading `./` and
+    trailing `/` are dropped and repeated `/` collapsed."""
     if not isinstance(value, str):
         return None
-    text = value.strip()
+    text = unicodedata.normalize("NFC", value.strip())
     while text.startswith("./"):
         text = text[2:]
     segments = [segment for segment in text.split("/") if segment not in ("", ".")]
-    if not segments or value.strip().startswith("/") or ".." in segments:
+    if not segments or text.startswith("/") or ".." in segments:
         return None
-    if any(re.search(r"[\x00-\x1f\\]", segment) for segment in segments):
+    if any(re.search(r"[\x00-\x1f\x7f\\]", segment) for segment in segments):
         return None
     return "/".join(segments)
 
@@ -1844,7 +1864,7 @@ def _glob_regex(pattern: str) -> re.Pattern:
     compiled = _GLOB_CACHE.get(pattern)
     if compiled is not None:
         return compiled
-    segments = pattern.split("/")
+    segments = unicodedata.normalize("NFC", pattern).split("/")
     regex = ""
     need_separator = False
     for index, segment in enumerate(segments):
@@ -1865,43 +1885,98 @@ def _glob_regex(pattern: str) -> re.Pattern:
 
 def path_glob_matches(pattern: str, path: str) -> bool:
     """True when the schema-valid glob `pattern` matches the normalized `path`."""
-    return _glob_regex(pattern).fullmatch(path) is not None
+    return _glob_regex(pattern).fullmatch(unicodedata.normalize("NFC", path)) is not None
 
 
-def match_path_floors(paths: Iterable[Any], path_floors: list[dict] | None) -> list[dict]:
-    """Every `path_floors` rule (in declared order) that at least one of
-    `paths` matches: its index, the patterns that matched, its floors, and the
-    matched normalized paths (sorted, bounded) with their exact count. Values
-    that are not repository-relative paths never match."""
+def _fixed_prefix(pattern: str) -> list[str]:
+    """The leading wildcard-free segments of a glob (`src/db/*.sql` -> `src`, `db`)."""
+    prefix = []
+    for segment in unicodedata.normalize("NFC", pattern).split("/"):
+        if "*" in segment or "?" in segment:
+            break
+        prefix.append(segment)
+    return prefix
+
+
+def declared_area_matches(pattern: str, area: str) -> bool:
+    """A declared `files_or_areas` entry touches a glob when the glob matches it,
+    or when it is a directory that is an ancestor of (or equal to) the glob's
+    wildcard-free prefix: declaring `src` touches `src/db/migrations/**`. A glob
+    with no fixed prefix (`**/*secret*`) is only matched as a path, and the root
+    never names an area (normalize_repo_path drops `.` and `/`)."""
+    if path_glob_matches(pattern, area):
+        return True
+    prefix = _fixed_prefix(pattern)
+    parts = area.split("/")
+    return bool(prefix) and len(parts) <= len(prefix) and prefix[:len(parts)] == parts
+
+
+def _recorded_path(path: str) -> str:
+    if len(path) <= RECORDED_PATH_MAX:
+        return path
+    keep = RECORDED_PATH_MAX - 32
+    return f"{path[:keep]}...(+{len(path) - keep} chars)"
+
+
+def match_path_floors(paths: Iterable[Any], path_floors: Iterable[dict] | None, *,
+                      source: str = "project", declared: bool = False) -> list[dict]:
+    """Every rule of `path_floors` (in declared order) that at least one of
+    `paths` matches: its `source` (`builtin` or `project`) and index, the
+    patterns that matched, its floors, and the matched normalized paths
+    (sorted, bounded, long ones cut) with their exact count. `declared` paths
+    are `files_or_areas` entries (see `declared_area_matches`); otherwise they
+    are real changed paths, matched as paths only. Values that are not
+    repository-relative paths never match: the post-diff check refuses them
+    before matching instead of dropping them."""
     normalized = sorted({path for path in (normalize_repo_path(value) for value in paths) if path is not None})
+    matcher = declared_area_matches if declared else path_glob_matches
     matches = []
-    for index, rule in enumerate(path_floors or []):
+    for index, rule in enumerate(path_floors or ()):
         hit_patterns = []
         hit_paths: set[str] = set()
         for pattern in rule["paths"]:
-            hits = [path for path in normalized if path_glob_matches(pattern, path)]
+            hits = [path for path in normalized if matcher(pattern, path)]
             if hits:
                 hit_patterns.append(pattern)
                 hit_paths.update(hits)
         if hit_paths:
             ordered = sorted(hit_paths)
             matches.append({
+                "source": source,
                 "rule": index,
                 "patterns": hit_patterns,
                 "floors": dict(rule["floors"]),
-                "matched_paths": ordered[:PATH_FLOOR_MATCHED_PATHS_LIMIT],
+                "matched_paths": [_recorded_path(path) for path in ordered[:PATH_FLOOR_MATCHED_PATHS_LIMIT]],
                 "matched_path_count": len(ordered),
             })
     return matches
 
 
-def project_risk_floors(task: dict, project_routing: dict | None, task_schema: dict) -> tuple[dict, list[dict]]:
+def match_all_path_floors(paths: Iterable[Any], project_routing: dict | None, *, declared: bool = False) -> list[dict]:
+    """Built-in floors, then the project's `path_floors`, matched against `paths`."""
+    paths = list(paths)
+    return [*match_path_floors(paths, BUILTIN_PATH_FLOORS, source="builtin", declared=declared),
+            *match_path_floors(paths, (project_routing or {}).get("path_floors"), declared=declared)]
+
+
+def project_risk_floors(task: dict, project_routing: dict | None, task_schema: dict, *,
+                        diff_paths: Iterable[Any] = (), path_floors: bool = True) -> tuple[dict, list[dict]]:
     """The floors `route_task` applies to `task`: project-wide `risk_overrides`
-    merged with every `path_floors` rule its `files_or_areas` match, plus the
-    path-floor matches themselves (recorded in the route result)."""
+    merged with every built-in and project path floor its `files_or_areas`
+    touch, plus those matches (recorded in the route result). `diff_paths` are
+    real changed paths, matched as paths and merged in as well (the post-diff
+    check). `path_floors=False` leaves path floors out entirely (the
+    classification benchmark's no-path-floor baseline)."""
     config = project_routing or {}
-    matches = match_path_floors(task.get("files_or_areas") or [], config.get("path_floors"))
-    floors = merge_risk_floors([config.get("risk_overrides") or {}, *(match["floors"] for match in matches)], task_schema)
+    matches: list[dict] = []
+    extra: list[dict] = []
+    if path_floors:
+        matches = match_all_path_floors(task.get("files_or_areas") or [], config, declared=True)
+        diff_paths = list(diff_paths)
+        if diff_paths:
+            extra = match_all_path_floors(diff_paths, config)
+    floors = merge_risk_floors([config.get("risk_overrides") or {},
+                                *(match["floors"] for match in [*matches, *extra])], task_schema)
     return floors, matches
 
 
@@ -2242,13 +2317,18 @@ def resolve_route(
     project_routing: dict | None,
     task_schema: dict,
     unavailable_routes: Iterable[str] | None = None,
+    *,
+    diff_paths: Iterable[Any] = (),
+    path_floors: bool = True,
 ) -> RouteResolution:
     """Route `task` under the global policy, then apply project risk floors.
 
     Project risk floors are the project-wide `risk_overrides` merged with every
-    `path_floors` rule the task's `files_or_areas` match (see
+    built-in and project path floor the task's `files_or_areas` touch (see
     `project_risk_floors`); the matches are kept on the resolution so the
     result records them and `validate_route_task_result` recomputes them.
+    `diff_paths` (the post-diff check) adds the floors a worker's real changed
+    paths match; `path_floors=False` is the benchmark's no-path-floor baseline.
 
     Availability-aware callers may provide routes that were observed to be
     unavailable during candidate preflight. Those route identities are excluded
@@ -2266,7 +2346,8 @@ def resolve_route(
     base_matched = match_routes(task, policy)
     base_route = select_route(base_matched, policy)
 
-    risk_floors, path_floor_matches = project_risk_floors(task, project_routing, task_schema)
+    risk_floors, path_floor_matches = project_risk_floors(task, project_routing, task_schema,
+                                                          diff_paths=diff_paths, path_floors=path_floors)
     effective_task = apply_risk_overrides(task, risk_floors, task_schema) if risk_floors else dict(task)
     effective_matched = match_routes(effective_task, policy) if risk_floors else base_matched
 
@@ -2533,34 +2614,42 @@ def _decision_view(route: str, capacity_assignments: list[dict]) -> dict:
 
 
 def check_diff_path_floors(route_result: Any, changed_paths: Iterable[Any], assets: PolicyAssets) -> dict:
-    """Re-route the task that ran with its real changed paths added to its
-    declared `files_or_areas`, under the same project constraints and
-    availability exclusions recorded in `route_result`, and compare.
+    """Re-route the task that ran with its real changed paths' floors added,
+    under the same project constraints and availability exclusions recorded in
+    `route_result`, and compare.
 
     `route_result` must be a valid `route_task` result
     (`validate_route_task_result`); its `project_constraints` are the floors
     that governed the run, so a worker that edits `.pi/routing.yaml` in its
-    worktree cannot remove a floor. The result is `blocked` with
-    CLASSIFICATION_UNDERRATED_BY_DIFF when the diff-floored decision selects
-    a route earlier in the policy `precedence` than the one that ran, or the
-    same route with a strictly higher capacity tier or reasoning effort for
-    any step. A diff that matches no floor reproduces the routed inputs
-    exactly and can never block. Anything that cannot be evaluated returns
-    `ok: false` with CLASSIFICATION_DIFF_UNVERIFIABLE (fail closed)."""
-    def unverifiable(message: str) -> dict:
+    worktree cannot remove a floor. Built-in floors always apply. The result
+    is `blocked` with CLASSIFICATION_UNDERRATED_BY_DIFF when the diff-floored
+    decision selects a route earlier in the policy `precedence` (a tie-break
+    order, not a risk ranking) than the one that ran, or the same route with a
+    strictly higher capacity tier or reasoning effort for any step. A diff
+    that matches no floor reproduces the routed inputs exactly and can never
+    block. Anything that cannot be evaluated returns `ok: false` with
+    CLASSIFICATION_DIFF_UNVERIFIABLE (fail closed), including a changed path
+    that is not a repository-relative path (control characters, a backslash):
+    such a path is never dropped."""
+    def unverifiable(message: str, path: str = "route_task_result") -> dict:
         return {"ok": False, "blocked": True, "blocker_code": CLASSIFICATION_DIFF_UNVERIFIABLE,
-                "errors": [{"path": "route_task_result", "message": message}]}
+                "errors": [{"path": path, "message": message}]}
 
     if not isinstance(route_result, dict) or route_result.get("ok") is not True:
         return unverifiable("the route result is not an ok:true route_task result")
+    raw = list(changed_paths)
+    unusable = [value for value in raw if normalize_repo_path(value) is None]
+    if unusable:
+        return unverifiable(f"{len(unusable)} changed path(s) are not repository-relative paths "
+                            "(control characters, a backslash, absolute or escaping the root)", "changed_paths")
     issues = validate_route_task_result(route_result, assets)
     if issues:
         return unverifiable("; ".join(str(issue) for issue in issues[:5]))
     base = route_result["classification"]["base"]
     project_constraints = route_result.get("project_constraints") or {}
     excluded = (route_result.get("route_availability") or {}).get("excluded_routes") or []
-    changed = sorted({path for path in map(normalize_repo_path, changed_paths) if path is not None})
-    diff_matches = match_path_floors(changed, project_constraints.get("path_floors"))
+    changed = sorted({normalize_repo_path(value) for value in raw})
+    diff_matches = match_all_path_floors(changed, project_constraints)
     ran = _decision_view(route_result["selected_route"], route_result["capacity_assignments"])
     result = {
         "ok": True,
@@ -2576,9 +2665,9 @@ def check_diff_path_floors(route_result: Any, changed_paths: Iterable[Any], asse
     }
     if not diff_matches:
         return result
-    widened = {**base, "files_or_areas": [*base["files_or_areas"], *changed]}
     try:
-        resolution = resolve_route(widened, assets.policy, project_constraints, assets.task_schema, excluded)
+        resolution = resolve_route(base, assets.policy, project_constraints, assets.task_schema, excluded,
+                                   diff_paths=changed)
     except NoAvailableRouteError as exc:
         # Every route the diff's floors allow is unavailable: still underrated, never integrated as is.
         result.update(blocked=True, blocker_code=CLASSIFICATION_UNDERRATED_BY_DIFF, required=None,
@@ -2600,3 +2689,73 @@ def check_diff_path_floors(route_result: Any, changed_paths: Iterable[Any], asse
     if route_raised or capacity_raised:
         result.update(blocked=True, blocker_code=CLASSIFICATION_UNDERRATED_BY_DIFF)
     return result
+
+
+# Routing-summary signals (orchestration-lifecycle routingSummary) per floored boolean field.
+_SUMMARY_SIGNALS = {
+    "cross_layer": "cross_layer",
+    "assumptions_must_be_explicit": "assumptions_must_be_explicit",
+    "production_feature": "production_feature",
+    "security_sensitive": "security_sensitive",
+    "destructive_operation": "destructive_operation",
+}
+
+
+def summary_satisfies_floors(summary: Any, floors: dict, task_schema: dict) -> bool:
+    """Whether a recorded phase routing summary (the run record's
+    `phases[].routing`: the effective classification's risk fields and
+    signals) is already at or above every floor in `floors`. When it is,
+    applying the floors again changes no field, so routing and capacity are
+    unchanged. A field the summary does not carry exactly
+    (`behavior_preservation` below `required`) counts as unsatisfied."""
+    if not isinstance(summary, dict):
+        return False
+    signals = summary.get("signals") if isinstance(summary.get("signals"), list) else []
+    for field, floor in floors.items():
+        if field == "ambiguity":
+            value = summary.get("ambiguity")
+            if not isinstance(value, int) or isinstance(value, bool) or value < floor:
+                return False
+        elif field == "behavior_preservation":
+            if floor != "not_required" and "behavior_preservation_required" not in signals:
+                return False
+        elif field in ORDERED_OVERRIDE_FIELDS:
+            enum = task_schema["properties"][field]["enum"]
+            if summary.get(field) not in enum or enum.index(summary[field]) < enum.index(floor):
+                return False
+        elif field == "diagnosis_required":
+            if summary.get("diagnosis_required") is not True:
+                return False
+        elif _SUMMARY_SIGNALS.get(field) not in signals:
+            return False
+    return True
+
+
+def check_recorded_path_floors(changed_paths: Iterable[Any], project_routing: dict | None,
+                               summaries: Iterable[Any], task_schema: dict) -> dict:
+    """The post-diff check where only the run record is reachable (workspace
+    validation and publication): a commit's changed paths against the built-in
+    floors and `project_routing` (read from the pinned base, never the work),
+    compared with the routing summaries the child run recorded. No floor
+    matched: passes. Some recorded summary already satisfies every matched
+    floor: passes (re-routing would change nothing). Otherwise
+    CLASSIFICATION_UNDERRATED_BY_DIFF; with no usable summary, or a changed
+    path that is not a repository-relative path,
+    CLASSIFICATION_DIFF_UNVERIFIABLE."""
+    raw = list(changed_paths)
+    if any(normalize_repo_path(value) is None for value in raw):
+        return {"ok": False, "blocked": True, "blocker_code": CLASSIFICATION_DIFF_UNVERIFIABLE,
+                "diff_path_floor_matches": [], "reason": "a changed path is not a repository-relative path"}
+    matches = match_all_path_floors(raw, project_routing)
+    result = {"ok": True, "blocked": False, "blocker_code": None, "diff_path_floor_matches": matches}
+    if not matches:
+        return result
+    floors = merge_risk_floors([match["floors"] for match in matches], task_schema)
+    usable = [summary for summary in summaries if isinstance(summary, dict)]
+    if not usable:
+        return {**result, "ok": False, "blocked": True, "blocker_code": CLASSIFICATION_DIFF_UNVERIFIABLE,
+                "reason": "the child run recorded no routing decision to compare the floors with"}
+    if any(summary_satisfies_floors(summary, floors, task_schema) for summary in usable):
+        return result
+    return {**result, "blocked": True, "blocker_code": CLASSIFICATION_UNDERRATED_BY_DIFF,
+            "reason": "no recorded routing decision meets the floors the commit's paths require"}

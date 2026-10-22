@@ -21,6 +21,18 @@ All notable changes to PICO are recorded here. The format follows
   `diff_floor_checks` and in `backlog.py trace`. The classification benchmark gained path-floor cases
   and reports under-routing with and without path floors. `protected_areas` stays free-text prompt
   context.
+- Hardened the post-diff check after review (#76). Built-in floors make `.pi/**`, `.claude/**`,
+  `.mcp.json` and `.github/workflows/**` security-sensitive in every repository (editing
+  `.pi/autonomy.yaml` now routes `CODEX_CLAUDE_CODEX`). A pending re-route refuses
+  `integrate_begin`/`integrate_end`, and the parent refuses `integrating`/`integrated` for a wave with an
+  unconfirmed member. The parent re-runs the engine on `diff_floors` events and confirms a
+  `PATH_FLOOR` re-route only with a route result that covers the floored paths. Every worktree bound
+  in the epoch is checked, floored ones again after the re-route, and `integrate_end` checks the
+  merged change itself. Unusable path names, assume-unchanged/skip-worktree files and a bound task
+  with nothing bound after a resume are `CLASSIFICATION_DIFF_UNVERIFIABLE`. A phase records at most 8
+  escalations (`PARENT_ESCALATION_LIMIT`). Declared ancestor directories touch deeper floors, paths
+  are compared in NFC, and `pico workspace validate`/`publish` re-check the work commit against the
+  pinned commit's floors and the run's recorded decisions.
 
 ### Documentation
 

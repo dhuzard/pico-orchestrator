@@ -26,6 +26,8 @@ function harness(preflight: Record<string, unknown>, failEvent = false, verifyOk
                    heartbeatResult?: Record<string, unknown>; eventResult?: Record<string, unknown>;
                    clock?: () => number; failKind?: string; sandboxProbe?: SandboxProbe;
                    diffFloors?: (input: Record<string, unknown>) => Record<string, unknown>;
+                   boundPhases?: string[];
+                   eventRefusal?: (input: Record<string, unknown>) => Record<string, unknown> | null;
                    gateRefusal?: (input: Record<string, unknown>) => Record<string, unknown> | null } = {}) {
   const handlers = new Map<string, Handler>();
   const tools = new Map<string, any>();
@@ -62,7 +64,11 @@ function harness(preflight: Record<string, unknown>, failEvent = false, verifyOk
     if (args[0] === "start") return { run_id: "parent-test", status: "IN_PROGRESS" };
     if (args[0] === "resume" && options.resumeResult) return options.resumeResult;
     if (args[0] === "status" || args[0] === "resume") return { run_id: args[1], status: options.parentStatus ?? "IN_PROGRESS",
-      reroute_phases: options.reroutePhases ?? [] };
+      reroute_phases: options.reroutePhases ?? [], bound_phases: options.boundPhases ?? [] };
+    if (args[0] === "event" && options.eventRefusal) {
+      const refusal = options.eventRefusal(input ?? {});
+      if (refusal) return refusal;
+    }
     if (args[0] === "settle" && options.settleFails) return { ok: false, error_code: "PARENT_STORAGE_UNAVAILABLE" };
     if (args[0] === "event" && input?.kind === "retry_gate" && options.failKind !== "retry_gate") {
       const refusal = options.gateRefusal?.(input) ?? null;
@@ -1836,17 +1842,36 @@ async function routeMutating(h: ReturnType<typeof harness>, ids: string[], extra
 }
 const wtTask = (label: string) => `work in /tmp/wt-${label.split(":")[0]}`;
 
-test("integrate_begin checks each bound worktree's diff against path floors and re-routes an underrated task", async () => {
-  const match = { rule: 1, patterns: [".github/workflows/**"], floors: { security_sensitive: true },
-    matched_paths: [".github/workflows/release.yml"], matched_path_count: 1 };
-  const verdicts: Record<string, Record<string, unknown>> = {
-    "/tmp/wt-A": { ok: true, blocked: true, blocker_code: "CLASSIFICATION_UNDERRATED_BY_DIFF", route_raised: false,
-      capacity_raised: true, required: { route: "CODEX_CLAUDE_CODEX" }, diff_path_floor_matches: [match] },
-    "/tmp/wt-B": { ok: true, blocked: false, blocker_code: null, diff_path_floor_matches: [] },
-  };
-  const h = harness({ ok: true, status: "READY" }, false, true,
-    { diffFloors: (input) => verdicts[String(input.worktree)] });
+// Post-diff path-floor check (#76). The fake diff tool is underrated for /tmp/wt-A unless the route result declares the
+// floored path (a re-route that covers it), and passes everything else; the parent-checkout operation passes.
+const FLOOR_MATCH = { source: "project", rule: 1, patterns: [".github/workflows/**"], floors: { security_sensitive: true },
+  matched_paths: [".github/workflows/release.yml"], matched_path_count: 1 };
+const UNDERRATED = { ok: true, blocked: true, blocker_code: "CLASSIFICATION_UNDERRATED_BY_DIFF", route_raised: false,
+  capacity_raised: true, required: { route: "CODEX_CLAUDE_CODEX" }, diff_path_floor_matches: [FLOOR_MATCH],
+  head: "b".repeat(40), changed_paths: [".github/workflows/release.yml"] };
+const PASSED = { ok: true, blocked: false, blocker_code: null, diff_path_floor_matches: [], changed_paths: ["a/x"] };
+function floorVerdicts(input: Record<string, unknown>): Record<string, unknown> {
+  if (input.operation === "parent") return { ok: true, blocked: false, blocker_code: null, verdicts: [] };
+  const declared = ((input.route_task_result as any)?.classification?.base?.files_or_areas ?? []) as string[];
+  if (String(input.worktree) === "/tmp/wt-A" && !declared.includes(".github/workflows/release.yml")) return UNDERRATED;
+  return { ...PASSED, ...(String(input.worktree) === "/tmp/wt-A" ? { diff_path_floor_matches: [FLOOR_MATCH] } : {}) };
+}
+/** A re-route of task A whose classification declares the floored path. */
+function coveringRoute(): any {
+  const route = structuredClone(routeFor("A", { specifierMutation: "allowed" })) as any;
+  route.details.result.classification.base.files_or_areas = [".github/workflows/release.yml"];
+  return route;
+}
+async function floorRun(options: Record<string, unknown> = {}) {
+  const h = harness({ ok: true, status: "READY" }, false, true, { diffFloors: floorVerdicts, ...options });
   await h.handlers.get("before_agent_start")!({ prompt: "PI_ORCHESTRATION_RUN_V1" }, { cwd: "/tmp/target", ui: { notify() {} } });
+  return h;
+}
+const diffChecks = (h: ReturnType<typeof harness>) => h.calls.filter((call) => call.script.endsWith("diff_floor_check.py"));
+const waveStatuses = (h: ReturnType<typeof harness>) => eventsOf(h).filter((item: any) => item.kind === "wave").map((item: any) => item.status);
+
+test("integrate_begin checks each bound worktree's diff against path floors and re-routes an underrated task", async () => {
+  const h = await floorRun();
   const record = h.tools.get("orchestration_record");
   await routeMutating(h, ["A", "B"]);
   assert.equal((await record.execute("w", { action: "declare_wave", wave_id: "w1",
@@ -1856,30 +1881,137 @@ test("integrate_begin checks each bound worktree's diff against path floors and 
   assert.match(begin.content[0].text, /^NEXT STEP \(CLASSIFICATION_UNDERRATED_BY_DIFF\): the run is active and not stopped/);
   assert.doesNotMatch(begin.content[0].text, /BLOCKED/);
   assert.match(begin.content[0].text, /A \(ran CODEX_CLAUDE_CODEX, needs CODEX_CLAUDE_CODEX with a higher capacity; floored paths \.github\/workflows\/release\.yml\)/);
-  // The check saw the route result that ran and the bound worktree of each task.
-  const checks = h.calls.filter((call) => call.script.endsWith("diff_floor_check.py"));
+  const checks = diffChecks(h);
   assert.deepEqual(checks.map((call) => call.input?.worktree), ["/tmp/wt-A", "/tmp/wt-B"]);
-  assert.equal((checks[0].input?.route_task_result as any).classification.base.id, "A");
   assert.equal(checks[0].input?.parent_checkout, "/tmp/target");
-  // A durable re-route, not an integration: no wave moved to integrating.
-  const events = eventsOf(h);
-  assert.deepEqual(events.filter((item: any) => item.kind === "diff_floors"), [{ kind: "diff_floors", phase: "A",
-    status: "underrated", from_route: "CODEX_CLAUDE_CODEX", to_route: "CODEX_CLAUDE_CODEX", capacity_raised: true,
-    matches: [match] }]);
-  assert.equal(events.some((item: any) => item.kind === "wave" && item.status === "integrating"), false);
-  // Status names the next step, and workers wait for the re-route.
+  // The parent gets what it needs to re-run the engine itself: the route result that ran and the floored paths.
+  const underrated = eventsOf(h).filter((item: any) => item.kind === "diff_floors") as any[];
+  assert.equal(underrated.length, 1);
+  assert.equal(underrated[0].route_task_result.classification.base.id, "A");
+  assert.deepEqual([underrated[0].status, underrated[0].from_route, underrated[0].to_route, underrated[0].capacity_raised,
+    underrated[0].paths, underrated[0].head], ["underrated", "CODEX_CLAUDE_CODEX", "CODEX_CLAUDE_CODEX", true,
+    [".github/workflows/release.yml"], "b".repeat(40)]);
+  assert.equal(waveStatuses(h).includes("integrating"), false);
   const status = await record.execute("s", { action: "status" });
   assert.match(status.content[0].text, /^NEXT STEP \(PARENT_ROUTE_RECHECK_REQUIRED\).*A/);
   const blocked = await h.handlers.get("tool_call")!({ toolName: "spawn_subagent", toolCallId: "x",
     input: { task: "work in /tmp/wt-A", label: "A:codex_specifier" } });
   assert.match(blocked.reason, /PARENT_ROUTE_RECHECK_REQUIRED/);
-  // After re-routing and re-binding, a diff that now matches the route integrates.
-  verdicts["/tmp/wt-A2"] = { ok: true, blocked: false, blocker_code: null, diff_path_floor_matches: [match] };
-  await h.handlers.get("tool_result")!(routeFor("A", { specifierMutation: "allowed" }));
+  // After a covering re-route and a fresh worktree, the floored worktree is checked again too, and both pass.
+  await h.handlers.get("tool_result")!(coveringRoute());
+  const phase = eventsOf(h).filter((item: any) => item.kind === "phase" && item.phase === "A").at(-1) as any;
+  assert.equal(phase.route_task_result.classification.base.files_or_areas[0], ".github/workflows/release.yml");
   await record.execute("b", { action: "bind_workspace", task_id: "A", step_id: "codex_specifier", path: "/tmp/wt-A2" });
   assert.equal((await record.execute("i", { action: "integrate_begin", wave_id: "w1" })).details.ok, true);
+  const recheck = diffChecks(h).slice(2).map((call) => [call.input?.worktree, call.input?.allow_missing ?? false]);
+  assert.deepEqual(recheck, [["/tmp/wt-A2", false], ["/tmp/wt-A", true], ["/tmp/wt-B", false]]);
   assert.deepEqual(eventsOf(h).filter((item: any) => item.kind === "diff_floors").at(-1),
-    { kind: "diff_floors", phase: "A", status: "passed", matches: [match] });
+    { kind: "diff_floors", phase: "A", status: "passed", matches: [FLOOR_MATCH] });
+  // integrate_end checks the merged change against every member, from the HEAD recorded at integrate_begin.
+  assert.equal((await record.execute("e", { action: "integrate_end", wave_id: "w1" })).details.ok, true);
+  const merged = diffChecks(h).at(-1)!.input as any;
+  assert.deepEqual([merged.operation, merged.base, merged.members.map((m: any) => m.task_id)], ["parent", "a".repeat(40), ["A", "B"]]);
+  assert.deepEqual(merged.members[0].exclude_paths, []);
+  assert.deepEqual(waveStatuses(h).slice(-2), ["integrating", "integrated"]);
+});
+
+test("regression T1: integrate_begin right after an underrated verdict is refused until the re-route", async () => {
+  const h = await floorRun();
+  const record = h.tools.get("orchestration_record");
+  await routeMutating(h, ["A"]);
+  await record.execute("w", { action: "declare_wave", wave_id: "w1", tasks: [{ task_id: "A", write_scope: ["a/**"] }] });
+  assert.match((await record.execute("i", { action: "integrate_begin", wave_id: "w1" })).content[0].text, /CLASSIFICATION_UNDERRATED_BY_DIFF/);
+  const second = await record.execute("i2", { action: "integrate_begin", wave_id: "w1" });
+  assert.equal(second.details.ok, false);
+  assert.match(second.content[0].text, /^NEXT STEP \(PARENT_ROUTE_RECHECK_REQUIRED\).*for A before its wave integrates/);
+  assert.equal(waveStatuses(h).includes("integrating"), false);
+});
+
+test("regression T2: rebinding a step to a clean worktree never hides the floored one", async () => {
+  const h = await floorRun();
+  const record = h.tools.get("orchestration_record");
+  await routeMutating(h, ["A"]);
+  await record.execute("w", { action: "declare_wave", wave_id: "w1", tasks: [{ task_id: "A", write_scope: ["a/**"] }] });
+  await record.execute("b", { action: "bind_workspace", task_id: "A", step_id: "codex_specifier", path: "/tmp/wt-clean" });
+  const begin = await record.execute("i", { action: "integrate_begin", wave_id: "w1" });
+  assert.match(begin.content[0].text, /^NEXT STEP \(CLASSIFICATION_UNDERRATED_BY_DIFF\)/);
+  assert.deepEqual(diffChecks(h).map((call) => call.input?.worktree), ["/tmp/wt-A"]);
+  assert.equal(waveStatuses(h).includes("integrating"), false);
+});
+
+test("regression T3: a re-route without the floored paths is not approved, and an unbound re-route never integrates", async () => {
+  // The parent refuses the confirming phase event of a re-route that does not cover the floored paths.
+  const h = await floorRun({ eventRefusal: (input: Record<string, unknown>) => input.kind === "phase" && input.phase === "A"
+    && !((input.route_task_result as any)?.classification?.base?.files_or_areas ?? []).length
+    && eventsOf(h).some((item: any) => item.kind === "diff_floors")
+    ? { ok: false, error_code: "CLASSIFICATION_UNDERRATED_BY_DIFF" } : null });
+  const record = h.tools.get("orchestration_record");
+  await routeMutating(h, ["A"]);
+  await record.execute("w", { action: "declare_wave", wave_id: "w1", tasks: [{ task_id: "A", write_scope: ["a/**"] }] });
+  await record.execute("i", { action: "integrate_begin", wave_id: "w1" });
+  const quiet = process.stderr.write;
+  process.stderr.write = (() => true) as typeof process.stderr.write;
+  let rerouted: any;
+  try { rerouted = await h.handlers.get("tool_result")!(routeFor("A", { specifierMutation: "allowed" })); }
+  finally { process.stderr.write = quiet; }
+  assert.match(rerouted.content.at(-1).text, /^NEXT STEP \(CLASSIFICATION_UNDERRATED_BY_DIFF\): the run is active and not stopped\. This route result does not cover/);
+  // Not a run-wide block: status still answers with the pending re-route.
+  assert.match((await record.execute("s", { action: "status" })).content[0].text, /^NEXT STEP \(PARENT_ROUTE_RECHECK_REQUIRED\)/);
+  assert.match((await record.execute("i2", { action: "integrate_begin", wave_id: "w1" })).content[0].text, /PARENT_ROUTE_RECHECK_REQUIRED/);
+  // A covering re-route with no new worktree bound: the floored diff cannot be integrated as is.
+  await h.handlers.get("tool_result")!(coveringRoute());
+  const unbound = await record.execute("i3", { action: "integrate_begin", wave_id: "w1" });
+  assert.match(unbound.content[0].text, /^BLOCKED: CLASSIFICATION_DIFF_UNVERIFIABLE: task A was re-routed but its new route's worktree is not bound/);
+  assert.equal(waveStatuses(h).includes("integrating"), false);
+});
+
+test("a resumed run with a bound task and nothing bound in the session refuses integration", async () => {
+  const cwd = process.cwd();
+  const entries: any[] = [{ type: "custom", customType: "pi-orchestration-parent-v1",
+    data: { run_id: "parent-test", session_id: "session-a", target_cwd: cwd, active: true } }];
+  const h = harness({ ok: true, status: "READY" }, false, true,
+    { entries, reroutePhases: ["A"], boundPhases: ["A"], diffFloors: floorVerdicts });
+  await h.handlers.get("session_start")!({ reason: "startup" }, { cwd,
+    sessionManager: { getSessionId: () => "session-a", getBranch: () => entries } });
+  await h.handlers.get("tool_result")!(routeFor("A"));
+  const record = h.tools.get("orchestration_record");
+  await record.execute("w", { action: "declare_wave", wave_id: "w1", tasks: [{ task_id: "A", write_scope: ["a/**"] }] });
+  const begin = await record.execute("i", { action: "integrate_begin", wave_id: "w1" });
+  assert.match(begin.content[0].text, /^BLOCKED: CLASSIFICATION_DIFF_UNVERIFIABLE: task A may have changed a worktree, but none is bound/);
+  assert.equal(diffChecks(h).length, 0);
+});
+
+test("integrate_end refuses a merged change that is underrated and re-routes the task", async () => {
+  const h = await floorRun({ diffFloors: (input: Record<string, unknown>) => input.operation === "parent"
+    ? { ok: true, blocked: true, blocker_code: "CLASSIFICATION_UNDERRATED_BY_DIFF",
+        verdicts: [{ task_id: "B", ...UNDERRATED }] } : PASSED });
+  const record = h.tools.get("orchestration_record");
+  await routeMutating(h, ["B"]);
+  await record.execute("w", { action: "declare_wave", wave_id: "w1", tasks: [{ task_id: "B", write_scope: ["b/**"] }] });
+  assert.equal((await record.execute("i", { action: "integrate_begin", wave_id: "w1" })).details.ok, true);
+  const end = await record.execute("e", { action: "integrate_end", wave_id: "w1" });
+  assert.equal(end.details.ok, false);
+  assert.match(end.content[0].text, new RegExp(`^NEXT STEP \\(CLASSIFICATION_UNDERRATED_BY_DIFF\\).*restore the parent checkout to ${"a".repeat(40)}`));
+  assert.equal(waveStatuses(h).includes("integrated"), false);
+  assert.equal((eventsOf(h).filter((item: any) => item.kind === "diff_floors").at(-1) as any).status, "underrated");
+  // Until the re-route is confirmed the integration cannot end.
+  assert.match((await record.execute("e2", { action: "integrate_end", wave_id: "w1" })).content[0].text, /PARENT_ROUTE_RECHECK_REQUIRED/);
+});
+
+test("the escalation limit refuses the re-route without blocking the run", async () => {
+  const h = await floorRun({ eventRefusal: (input: Record<string, unknown>) => input.kind === "diff_floors"
+    ? { ok: false, error_code: "PARENT_ESCALATION_LIMIT" } : null });
+  const record = h.tools.get("orchestration_record");
+  await routeMutating(h, ["A"]);
+  await record.execute("w", { action: "declare_wave", wave_id: "w1", tasks: [{ task_id: "A", write_scope: ["a/**"] }] });
+  const quiet = process.stderr.write;
+  process.stderr.write = (() => true) as typeof process.stderr.write;
+  let begin: any;
+  try { begin = await record.execute("i", { action: "integrate_begin", wave_id: "w1" }); }
+  finally { process.stderr.write = quiet; }
+  assert.match(begin.content[0].text, /^BLOCKED: PARENT_ESCALATION_LIMIT: task A/);
+  assert.equal(waveStatuses(h).includes("integrating"), false);
+  assert.equal((await record.execute("s", { action: "status" })).details.ok, true);
 });
 
 test("an unverifiable diff refuses integration fail-closed", async () => {
@@ -1896,7 +2028,7 @@ test("an unverifiable diff refuses integration fail-closed", async () => {
     assert.equal(begin.details.ok, false);
     assert.match(begin.content[0].text, /^BLOCKED: CLASSIFICATION_DIFF_UNVERIFIABLE/);
   } finally { process.stderr.write = quiet; }
-  assert.equal(eventsOf(h).some((item: any) => item.kind === "wave" && item.status === "integrating"), false);
+  assert.equal(waveStatuses(h).includes("integrating"), false);
 });
 
 test("gates still hold with implicit waves: concurrency, bind, bracket, and parent checkout", async () => {

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Path-triggered risk floors (#76): `.pi/routing.yaml` `path_floors` applied by
-route_task from a task's files_or_areas, recomputed by the route-result
-validator, and checked against a worker's real diff before integration.
+"""Path-triggered risk floors (#76): built-in floors and `.pi/routing.yaml`
+`path_floors` applied by route_task from a task's files_or_areas, recomputed by
+the route-result validator, checked against a worker's real diff before and
+after integration, and re-checked by workspace validation and publication.
 
 Deterministic: no model, no network, no GitHub. Git runs only on temporary
 repositories."""
@@ -13,7 +14,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import unicodedata
 import unittest
+import unittest.mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -25,16 +28,17 @@ import routing_engine as engine  # noqa: E402
 PROJECT = {
     "path_floors": [
         {"paths": ["migrations/**", "schemas/**"], "floors": {"failure_cost": "high", "behavior_preservation": "required"}},
-        {"paths": [".github/workflows/**", "**/*secret*"], "floors": {"security_sensitive": True}},
+        {"paths": ["deploy/**", "**/*secret*"], "floors": {"security_sensitive": True}},
     ],
 }
+CAPACITY_ONLY = {"path_floors": [{"paths": ["tuning/**"], "floors": {"ambiguity": 4}}]}
 
 
 def small_task(**changes) -> dict:
-    """A small, unflagged config edit: routed CLAUDE with a light worker."""
+    """A small, unflagged config edit on an unfloored path: routed CLAUDE with a light worker."""
     case = next(c for c in engine.load_yaml(ROOT / "tests/routing-cases.yaml")["cases"] if c["id"] == "case-17-config-edit")
     task = copy.deepcopy(case["task"])
-    task.update(changes)
+    task.update({"files_or_areas": ["src/settings.py"], **changes})
     return task
 
 
@@ -53,11 +57,17 @@ def git(*args: str, cwd: Path) -> str:
     return subprocess.run(["git", "-C", str(cwd), *args], check=True, capture_output=True, text=True).stdout
 
 
-class PathFloorRoutingTest(unittest.TestCase):
+class Routed(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.assets = engine.load_policy_assets(ROOT)
 
+    def route(self, task: dict, project: dict | None = PROJECT) -> dict:
+        resolution = engine.resolve_route(task, self.assets.policy, project, self.assets.task_schema)
+        return engine.build_result(resolution, self.assets.policy, project, self.assets.execution_plan_schema)
+
+
+class PathFloorRoutingTest(Routed):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.dir = Path(self.tmp.name)
@@ -65,24 +75,60 @@ class PathFloorRoutingTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def route(self, task: dict, project: dict | None = PROJECT) -> dict:
-        resolution = engine.resolve_route(task, self.assets.policy, project, self.assets.task_schema)
-        return engine.build_result(resolution, self.assets.policy, project, self.assets.execution_plan_schema)
-
     def test_globs_are_anchored_segment_aware_and_never_match_prose(self):
         cases = [("migrations/**", "migrations", True), ("migrations/**", "migrations/2026/001.sql", True),
                  ("migrations/**", "src/migrations/001.sql", False), ("**/*secret*", "config/app_secret.env", True),
                  ("**/*secret*", "secret", True), ("a/**/b", "a/b", True), ("a/**/b", "a/x/y/b", True),
                  ("a/**/b", "a/xb", False), ("*.sql", "x.sql", True), ("*.sql", "db/x.sql", False),
-                 ("src/db?/*.py", "src/db1/m.py", True), ("src/db?/*.py", "src/db10/m.py", False)]
+                 ("src/db?/*.py", "src/db1/m.py", True), ("src/db?/*.py", "src/db10/m.py", False),
+                 # Case-sensitive, documented.
+                 ("migrations/**", "Migrations/x.sql", False)]
         for pattern, path, expected in cases:
             with self.subTest(pattern=pattern, path=path):
                 self.assertIs(engine.path_glob_matches(pattern, path), expected)
         self.assertEqual([engine.normalize_repo_path(value) for value in
-                          ["./migrations//001.sql/", "/etc/passwd", "../outside", "the CI workflows", 3]],
-                         ["migrations/001.sql", None, None, "the CI workflows", None])
+                          ["./migrations//001.sql/", "/etc/passwd", "../outside", "the CI workflows", 3,
+                           "migrations/a\tb.sql", "migrations\\x", "a/../b"]],
+                         ["migrations/001.sql", None, None, "the CI workflows", None, None, None, None])
         matches = engine.match_path_floors(["the CI workflows", "/abs/migrations/x", "src/app.py"], PROJECT["path_floors"])
         self.assertEqual(matches, [])
+
+    def test_unicode_spellings_are_compared_in_nfc(self):
+        nfc, nfd = unicodedata.normalize("NFC", "données"), unicodedata.normalize("NFD", "données")
+        self.assertNotEqual(nfc, nfd)
+        for pattern, path in ((f"{nfc}/**", f"{nfd}/x"), (f"{nfd}/**", f"{nfc}/x")):
+            self.assertTrue(engine.path_glob_matches(pattern, path))
+        self.assertEqual(engine.normalize_repo_path(f"{nfd}/x"), f"{nfc}/x")
+
+    def test_declared_ancestor_directory_touches_deeper_floors_but_root_never_does(self):
+        rules = [{"paths": ["src/db/migrations/**"], "floors": {"failure_cost": "high"}},
+                 {"paths": ["**/*secret*"], "floors": {"security_sensitive": True}}]
+        for area, expected in (("src", [0]), ("src/db", [0]), ("src/db/migrations", [0]), ("src/db/migrations/1.sql", [0]),
+                               ("src/api", []), (".", []), ("/", []), ("./", []), ("srcx", [])):
+            with self.subTest(area=area):
+                self.assertEqual([m["rule"] for m in engine.match_path_floors([area], rules, declared=True)], expected)
+        # Real changed paths are matched as paths only: a changed file named `src` is not an ancestor.
+        self.assertEqual(engine.match_path_floors(["src"], rules), [])
+        routed = self.route(small_task(files_or_areas=["src"]),
+                            {"path_floors": [{"paths": ["src/db/migrations/**"], "floors": {"failure_cost": "high"}}]})
+        self.assertEqual(routed["selected_route"], "CODEX_CLAUDE_CODEX")
+        self.assertEqual(routed["path_floor_matches"][0]["matched_paths"], ["src"])
+
+    def test_builtin_floors_cover_agent_configuration_and_workflows(self):
+        for path in (".pi/autonomy.yaml", ".pi/routing.yaml", ".claude/settings.json", ".claude/hooks/pre.sh",
+                     ".mcp.json", ".github/workflows/ci.yml"):
+            with self.subTest(path=path):
+                routed = self.route(small_task(files_or_areas=[path]), None)
+                self.assertEqual(routed["selected_route"], "CODEX_CLAUDE_CODEX")
+                self.assertTrue(routed["classification"]["effective"]["security_sensitive"])
+                self.assertEqual(routed["path_floor_matches"][0]["source"], "builtin")
+                # And a diff touching it after an unfloored run is underrated, with no project config at all.
+                ran = self.route(small_task(), None)
+                verdict = engine.check_diff_path_floors(ran, ["src/settings.py", path], self.assets)
+                self.assertEqual(verdict["blocker_code"], engine.CLASSIFICATION_UNDERRATED_BY_DIFF)
+        for path in (".github/dependabot.yml", "pi/x", "docs/.claude.md", ".mcp.json.bak"):
+            with self.subTest(unfloored=path):
+                self.assertEqual(engine.match_all_path_floors([path], None), [])
 
     def test_schema_accepts_path_floors_and_rejects_weakening_unknown_and_malformed(self):
         self.assertEqual(engine.validate_project_routing_instance(PROJECT, self.assets.project_schema), [])
@@ -115,8 +161,7 @@ class PathFloorRoutingTest(unittest.TestCase):
     def test_route_task_applies_path_floors_from_files_or_areas_without_evidence(self):
         unfloored = run_route_task(small_task(), PROJECT, self.dir)
         self.assertEqual((unfloored["ok"], unfloored["selected_route"], unfloored["path_floor_matches"]), (True, "CLAUDE", []))
-        # The same small, unflagged task now declares the release workflow: the floor raises security_sensitive.
-        task = small_task(files_or_areas=[".github/workflows/release.yml", "README.md"])
+        task = small_task(files_or_areas=["deploy/release.sh", "README.md"])
         result = run_route_task(task, PROJECT, self.dir)
         self.assertTrue(result["ok"], result)
         self.assertEqual(result["selected_route"], "CODEX_CLAUDE_CODEX")
@@ -124,10 +169,9 @@ class PathFloorRoutingTest(unittest.TestCase):
         self.assertTrue(result["classification"]["effective"]["security_sensitive"])
         self.assertNotIn("escalation_evidence", task, "a floor-raised value needs no evidence")
         self.assertEqual(result["path_floor_matches"], [{
-            "rule": 1, "patterns": [".github/workflows/**"], "floors": {"security_sensitive": True},
-            "matched_paths": [".github/workflows/release.yml"], "matched_path_count": 1}])
+            "source": "project", "rule": 1, "patterns": ["deploy/**"], "floors": {"security_sensitive": True},
+            "matched_paths": ["deploy/release.sh"], "matched_path_count": 1}])
         self.assertEqual(engine.validate_route_task_result(result, self.assets), [])
-        # An escalating value the classifier set itself still needs evidence.
         raw = run_route_task(small_task(security_sensitive=True), PROJECT, self.dir)
         self.assertEqual(raw["blocker_code"], engine.CLASSIFICATION_EVIDENCE_MISSING)
 
@@ -136,59 +180,60 @@ class PathFloorRoutingTest(unittest.TestCase):
         self.assertEqual(result["selected_route"], "CODEX_CLAUDE_CODEX")
         self.assertEqual(engine.validate_route_task_result(result, self.assets), [])
         for forge in ({"path_floor_matches": []}, {"path_floor_matches": None},
-                      {"path_floor_matches": [dict(result["path_floor_matches"][0], matched_path_count=2)]}):
+                      {"path_floor_matches": [dict(result["path_floor_matches"][0], matched_path_count=2)]},
+                      {"path_floor_matches": [dict(result["path_floor_matches"][0], source="builtin")]}):
             with self.subTest(forge=forge):
                 issues = engine.validate_route_task_result({**result, **forge}, self.assets)
                 self.assertIn("result.path_floor_matches", [issue.path for issue in issues])
-        # Dropping the floors from project_constraints is caught as well (effective classification, route).
         stripped = copy.deepcopy(result)
         stripped["project_constraints"] = {}
         self.assertTrue(engine.validate_route_task_result(stripped, self.assets))
 
+    def test_recorded_paths_are_bounded(self):
+        long_path = "migrations/" + "x" * 5000 + ".sql"
+        match = engine.match_path_floors([long_path], PROJECT["path_floors"])[0]
+        self.assertLessEqual(len(match["matched_paths"][0]), engine.RECORDED_PATH_MAX)
+        self.assertTrue(match["matched_paths"][0].endswith("chars)"))
+        self.assertEqual(match["matched_path_count"], 1)
+
     def test_diff_touching_a_floored_path_blocks_a_small_unflagged_task(self):
         ran = self.route(small_task())
         self.assertEqual(ran["selected_route"], "CLAUDE")
-        verdict = engine.check_diff_path_floors(ran, [".pi/autonomy.yaml", ".github/workflows/release.yml"], self.assets)
+        verdict = engine.check_diff_path_floors(ran, ["src/settings.py", "deploy/release.sh"], self.assets)
         self.assertEqual((verdict["ok"], verdict["blocked"], verdict["blocker_code"]),
                          (True, True, engine.CLASSIFICATION_UNDERRATED_BY_DIFF))
         self.assertTrue(verdict["route_raised"])
         self.assertEqual(verdict["required"]["route"], "CODEX_CLAUDE_CODEX")
-        self.assertEqual(verdict["diff_path_floor_matches"][0]["matched_paths"], [".github/workflows/release.yml"])
-        # Re-routing with the floored paths declared selects exactly the required route, and its own diff passes.
-        rerouted = self.route(small_task(files_or_areas=[".pi/autonomy.yaml", ".github/workflows/release.yml"]))
+        self.assertEqual(verdict["diff_path_floor_matches"][0]["matched_paths"], ["deploy/release.sh"])
+        rerouted = self.route(small_task(files_or_areas=["src/settings.py", "deploy/release.sh"]))
         self.assertEqual(rerouted["selected_route"], verdict["required"]["route"])
-        again = engine.check_diff_path_floors(rerouted, [".pi/autonomy.yaml", ".github/workflows/release.yml"], self.assets)
-        self.assertFalse(again["blocked"])
+        self.assertFalse(engine.check_diff_path_floors(rerouted, ["deploy/release.sh"], self.assets)["blocked"])
 
     def test_diff_touching_only_unfloored_paths_changes_nothing(self):
         ran = self.route(small_task())
-        for changed in ([], [".pi/autonomy.yaml"], ["src/migrations_helper.py", "docs/schemas.md", "README.md"]):
+        for changed in ([], ["src/settings.py"], ["src/migrations_helper.py", "docs/schemas.md", "README.md"]):
             with self.subTest(changed=changed):
                 verdict = engine.check_diff_path_floors(ran, changed, self.assets)
                 self.assertEqual((verdict["ok"], verdict["blocked"], verdict["diff_path_floor_matches"]), (True, False, []))
                 self.assertEqual(verdict["required"], verdict["ran"])
-        # A floored path that was already declared (and floored) before the run does not block either.
         declared = self.route(small_task(files_or_areas=["schemas/task.schema.json"]))
         self.assertFalse(engine.check_diff_path_floors(declared, ["schemas/task.schema.json"], self.assets)["blocked"])
 
     def test_capacity_only_raise_blocks_on_the_same_route(self):
-        project = {"path_floors": [{"paths": ["config/**"], "floors": {"ambiguity": 4}}]}
-        ran = self.route(small_task(), project)
-        verdict = engine.check_diff_path_floors(ran, ["config/limits.yaml"], self.assets)
+        ran = self.route(small_task(), CAPACITY_ONLY)
+        verdict = engine.check_diff_path_floors(ran, ["tuning/limits.yaml"], self.assets)
         self.assertTrue(verdict["blocked"])
         self.assertEqual((verdict["route_raised"], verdict["capacity_raised"]), (False, True))
         self.assertEqual(verdict["required"]["route"], "CLAUDE")
         self.assertEqual((verdict["ran"]["capacities"]["claude_worker"], verdict["required"]["capacities"]["claude_worker"]),
                          ("light", "standard"))
 
-    def test_trace_shows_route_path_floor_matches(self):
-        result = self.route(small_task(files_or_areas=[f"migrations/{n:03}.sql" for n in range(12)]))
-        report = provenance.build_trace_report(self.dir, {"run_id": None, "route_task_result": result, "steps": []})
-        self.assertEqual(report["route"]["path_floor_matches"], result["path_floor_matches"])
-        text = provenance.render_trace_text(report)
-        self.assertIn("  Path floor (files_or_areas): rule 0 ['migrations/**'] floors "
-                      "{'failure_cost': 'high', 'behavior_preservation': 'required'} via migrations/000.sql, ", text)
-        self.assertIn("migrations/009.sql (+2 more)", text)
+    def test_unusable_changed_paths_are_unverifiable_never_dropped(self):
+        ran = self.route(small_task())
+        for path in ("migrations/a\tb.sql", "src/a\x01secret", "migrations\\x.sql", "/abs/x", "../x"):
+            with self.subTest(path=path):
+                verdict = engine.check_diff_path_floors(ran, ["src/settings.py", path], self.assets)
+                self.assertEqual((verdict["ok"], verdict["blocker_code"]), (False, engine.CLASSIFICATION_DIFF_UNVERIFIABLE))
 
     def test_invalid_route_result_is_unverifiable(self):
         ran = self.route(small_task())
@@ -196,16 +241,40 @@ class PathFloorRoutingTest(unittest.TestCase):
         forged["selected_route"] = "CODEX_CLAUDE_CODEX"
         for result in (None, {"ok": False}, forged):
             with self.subTest(result=type(result).__name__):
-                verdict = engine.check_diff_path_floors(result, [".github/workflows/release.yml"], self.assets)
+                verdict = engine.check_diff_path_floors(result, ["deploy/x"], self.assets)
                 self.assertEqual((verdict["ok"], verdict["blocker_code"]), (False, engine.CLASSIFICATION_DIFF_UNVERIFIABLE))
 
+    def test_trace_shows_route_path_floor_matches(self):
+        result = self.route(small_task(files_or_areas=[f"migrations/{n:03}.sql" for n in range(12)]))
+        report = provenance.build_trace_report(self.dir, {"run_id": None, "route_task_result": result, "steps": []})
+        self.assertEqual(report["route"]["path_floor_matches"], result["path_floor_matches"])
+        text = provenance.render_trace_text(report)
+        self.assertIn("  Path floor (files_or_areas): project rule 0 ['migrations/**'] floors "
+                      "{'failure_cost': 'high', 'behavior_preservation': 'required'} via migrations/000.sql, ", text)
+        self.assertIn("migrations/009.sql (+2 more)", text)
 
-class DiffFloorCheckToolTest(unittest.TestCase):
-    """tools/diff_floor_check.py collects the real changed paths of a bound worktree."""
+    def test_recorded_routing_check_for_workspace_validation(self):
+        schema = self.assets.task_schema
+        low = {"failure_cost": "low", "semantic_correctness": "normal", "ambiguity": 2, "diagnosis_required": False,
+               "implementation_scope": "small", "signals": []}
+        high = {**low, "failure_cost": "high", "signals": ["behavior_preservation_required"]}
+        verdict = engine.check_recorded_path_floors(["src/x.py"], PROJECT, [], schema)
+        self.assertEqual((verdict["ok"], verdict["blocked"]), (True, False))
+        verdict = engine.check_recorded_path_floors(["migrations/1.sql"], PROJECT, [low], schema)
+        self.assertEqual(verdict["blocker_code"], engine.CLASSIFICATION_UNDERRATED_BY_DIFF)
+        self.assertFalse(engine.check_recorded_path_floors(["migrations/1.sql"], PROJECT, [low, high], schema)["blocked"])
+        self.assertEqual(engine.check_recorded_path_floors(["migrations/1.sql"], PROJECT, [], schema)["blocker_code"],
+                         engine.CLASSIFICATION_DIFF_UNVERIFIABLE)
+        self.assertEqual(engine.check_recorded_path_floors([".pi/autonomy.yaml"], None, [high], schema)["blocker_code"],
+                         engine.CLASSIFICATION_UNDERRATED_BY_DIFF)
+        self.assertFalse(engine.check_recorded_path_floors([".pi/autonomy.yaml"], None,
+                                                           [{**low, "signals": ["security_sensitive"]}], schema)["blocked"])
+        self.assertEqual(engine.check_recorded_path_floors(["a\tb"], None, [high], schema)["blocker_code"],
+                         engine.CLASSIFICATION_DIFF_UNVERIFIABLE)
 
-    @classmethod
-    def setUpClass(cls):
-        cls.assets = engine.load_policy_assets(ROOT)
+
+class DiffFloorCheckToolTest(Routed):
+    """tools/diff_floor_check.py collects the real changed paths of a bound worktree or of the merged change."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -215,8 +284,8 @@ class DiffFloorCheckToolTest(unittest.TestCase):
         git("init", "-q", "-b", "main", cwd=self.repo)
         git("config", "user.email", "test@example.invalid", cwd=self.repo)
         git("config", "user.name", "Test", cwd=self.repo)
-        (self.repo / ".pi").mkdir()
-        (self.repo / ".pi/autonomy.yaml").write_text("push: false\n")
+        (self.repo / "src").mkdir()
+        (self.repo / "src/settings.py").write_text("PUSH = False\n")
         (self.repo / "migrations").mkdir()
         (self.repo / "migrations/0001_init.sql").write_text("create table t (id int);\n")
         (self.repo / ".gitignore").write_text("build/\n")
@@ -224,40 +293,47 @@ class DiffFloorCheckToolTest(unittest.TestCase):
         git("commit", "-q", "-m", "init", cwd=self.repo)
         self.worktree = base / "wt"
         git("worktree", "add", "-q", "-b", "task", str(self.worktree), cwd=self.repo)
-        resolution = engine.resolve_route(small_task(), self.assets.policy, PROJECT, self.assets.task_schema)
-        self.route = engine.build_result(resolution, self.assets.policy, PROJECT, self.assets.execution_plan_schema)
+        self.ran = self.route(small_task())
 
     def tearDown(self):
         self.tmp.cleanup()
 
-    def check(self, worktree: Path | None = None, route: dict | None = None) -> dict:
-        payload = {"route_task_result": route or self.route, "worktree": str(worktree or self.worktree),
-                   "parent_checkout": str(self.repo)}
+    def run_tool(self, payload: dict) -> dict:
         done = subprocess.run([sys.executable, str(ROOT / "tools/diff_floor_check.py")], input=json.dumps(payload),
                               capture_output=True, text=True, check=True, timeout=60)
         return json.loads(done.stdout)
 
+    def check(self, worktree: Path | None = None, **extra) -> dict:
+        return self.run_tool({"route_task_result": self.ran, "worktree": str(worktree or self.worktree),
+                              "parent_checkout": str(self.repo), **extra})
+
+    def reset(self):
+        git("checkout", "-q", "-f", "task", cwd=self.worktree)
+        git("reset", "-q", "--hard", "main", cwd=self.worktree)
+        git("clean", "-qfd", cwd=self.worktree)
+
     def test_unfloored_changes_pass(self):
-        (self.worktree / ".pi/autonomy.yaml").write_text("push: true\n")
+        (self.worktree / "src/settings.py").write_text("PUSH = True\n")
         (self.worktree / "build").mkdir()
         (self.worktree / "build/migrations.log").write_text("ignored\n")
         verdict = self.check()
         self.assertEqual((verdict["ok"], verdict["blocked"], verdict["changed_path_count"]), (True, False, 1))
+        self.assertEqual(verdict["changed_paths"], ["src/settings.py"])
+        self.assertEqual(verdict["head"], git("rev-parse", "HEAD", cwd=self.worktree).strip())
 
     def test_committed_staged_untracked_and_deleted_floored_paths_are_seen(self):
         variants = {
-            "committed": lambda wt: ((wt / ".github/workflows").mkdir(parents=True),
-                                     (wt / ".github/workflows/ci.yml").write_text("on: push\n"),
+            "committed": lambda wt: ((wt / "deploy").mkdir(parents=True),
+                                     (wt / "deploy/run.sh").write_text("echo\n"),
                                      git("add", ".", cwd=wt), git("commit", "-q", "-m", "ci", cwd=wt)),
             "untracked": lambda wt: (wt / "config_secret.env").write_text("x=1\n"),
             "deleted": lambda wt: git("rm", "-q", "migrations/0001_init.sql", cwd=wt),
             "renamed": lambda wt: git("mv", "migrations/0001_init.sql", "sql/0001_init.sql", cwd=wt),
+            "builtin": lambda wt: ((wt / ".claude").mkdir(), (wt / ".claude/settings.json").write_text("{}\n")),
         }
         for name, change in variants.items():
             with self.subTest(change=name):
-                git("checkout", "-q", "-f", "task", cwd=self.worktree)
-                git("reset", "-q", "--hard", "main", cwd=self.worktree)
-                git("clean", "-qfd", cwd=self.worktree)
+                self.reset()
                 (self.worktree / "sql").mkdir(exist_ok=True)
                 change(self.worktree)
                 verdict = self.check()
@@ -265,18 +341,40 @@ class DiffFloorCheckToolTest(unittest.TestCase):
                                  (True, True, engine.CLASSIFICATION_UNDERRATED_BY_DIFF), verdict)
                 self.assertEqual(verdict["base"], git("rev-parse", "main", cwd=self.repo).strip())
 
+    def test_control_characters_and_hidden_edits_are_unverifiable(self):
+        variants = {
+            "control-char untracked": lambda wt: (wt / "migrations/a\tb.sql").write_text("drop\n"),
+            "control-char committed": lambda wt: ((wt / "migrations/a\tb.sql").write_text("drop\n"),
+                                                  git("add", "-A", cwd=wt), git("commit", "-qm", "c", cwd=wt)),
+            "assume-unchanged": lambda wt: (git("update-index", "--assume-unchanged", "migrations/0001_init.sql", cwd=wt),
+                                            (wt / "migrations/0001_init.sql").write_text("changed\n")),
+            "skip-worktree": lambda wt: (git("update-index", "--skip-worktree", "migrations/0001_init.sql", cwd=wt),
+                                         (wt / "migrations/0001_init.sql").write_text("changed\n")),
+        }
+        for name, change in variants.items():
+            with self.subTest(change=name):
+                git("update-index", "--no-assume-unchanged", "--no-skip-worktree", "migrations/0001_init.sql", cwd=self.worktree)
+                self.reset()
+                change(self.worktree)
+                verdict = self.check()
+                self.assertEqual((verdict["ok"], verdict["blocker_code"]), (False, engine.CLASSIFICATION_DIFF_UNVERIFIABLE), verdict)
+
     def test_parent_progress_after_the_fork_is_not_the_worker_diff(self):
-        # The parent integrated an earlier wave touching a floored path; the worker never did.
         (self.repo / "migrations/0002_more.sql").write_text("alter table t add c int;\n")
         git("add", ".", cwd=self.repo)
         git("commit", "-q", "-m", "earlier wave", cwd=self.repo)
-        (self.worktree / ".pi/autonomy.yaml").write_text("push: true\n")
+        (self.worktree / "src/settings.py").write_text("PUSH = True\n")
         self.assertFalse(self.check()["blocked"])
 
     def test_a_worker_cannot_remove_the_floor_in_its_worktree(self):
-        (self.worktree / ".pi/routing.yaml").write_text("path_floors: []\n")
         (self.worktree / "migrations/0002_drop.sql").write_text("drop table t;\n")
+        (self.worktree / "routing.yaml").write_text("path_floors: []\n")
         self.assertTrue(self.check()["blocked"])
+
+    def test_missing_earlier_worktree_is_reported_only_when_allowed(self):
+        gone = Path(self.tmp.name) / "removed"
+        self.assertEqual(self.check(worktree=gone, allow_missing=True)["missing"], True)
+        self.assertEqual(self.check(worktree=gone)["blocker_code"], engine.CLASSIFICATION_DIFF_UNVERIFIABLE)
 
     def test_unbound_or_foreign_paths_are_unverifiable(self):
         other = Path(self.tmp.name) / "other"
@@ -290,13 +388,31 @@ class DiffFloorCheckToolTest(unittest.TestCase):
                                    capture_output=True, text=True, check=True, timeout=60)
         self.assertEqual(json.loads(malformed.stdout)["blocker_code"], engine.CLASSIFICATION_DIFF_UNVERIFIABLE)
 
+    def test_merged_change_is_checked_at_integrate_end(self):
+        base = git("rev-parse", "HEAD", cwd=self.repo).strip()
+        payload = lambda members: {"operation": "parent", "parent_checkout": str(self.repo), "base": base,  # noqa: E731
+                                   "members": members}
+        member = {"task_id": self.ran["classification"]["base"]["id"], "route_task_result": self.ran, "exclude_paths": []}
+        (self.repo / "src/settings.py").write_text("PUSH = True\n")
+        self.assertEqual(self.run_tool(payload([member]))["blocked"], False)
+        # A branch merged from elsewhere (the worktree's HEAD stayed clean) still lands in the merged change.
+        git("checkout", "-qb", "decoy", cwd=self.worktree)
+        (self.worktree / "migrations/0002.sql").write_text("y\n")
+        git("add", "-A", cwd=self.worktree)
+        git("commit", "-qm", "decoy", cwd=self.worktree)
+        git("merge", "-q", "--no-edit", "decoy", cwd=self.repo)
+        verdict = self.run_tool(payload([member]))
+        self.assertEqual((verdict["ok"], verdict["blocked"], verdict["blocker_code"]),
+                         (True, True, engine.CLASSIFICATION_UNDERRATED_BY_DIFF))
+        self.assertEqual(verdict["verdicts"][0]["diff_path_floor_matches"][0]["matched_paths"], ["migrations/0002.sql"])
+        # A path another member's checked worktree changed is that member's, not this one's.
+        self.assertFalse(self.run_tool(payload([{**member, "exclude_paths": ["migrations/0002.sql"]}]))["blocked"])
+        self.assertEqual(self.run_tool({**payload([member]), "base": "0" * 40})["blocker_code"],
+                         engine.CLASSIFICATION_DIFF_UNVERIFIABLE)
 
-class DiffFloorReRouteTest(unittest.TestCase):
+
+class DiffFloorReRouteTest(Routed):
     """An underrated diff is a required re-route of the parent run, never a terminal finish."""
-
-    @classmethod
-    def setUpClass(cls):
-        cls.assets = engine.load_policy_assets(ROOT)
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -316,108 +432,245 @@ class DiffFloorReRouteTest(unittest.TestCase):
     def event(self, data: dict) -> dict:
         return po.record_event(self.run_id, data, repo_root=self.records)
 
-    def route(self, task: dict, project: dict = PROJECT) -> dict:
-        resolution = engine.resolve_route(task, self.assets.policy, project, self.assets.task_schema)
-        return engine.build_result(resolution, self.assets.policy, project, self.assets.execution_plan_schema)
+    def phase(self, index: int = 0) -> dict:
+        return provenance.get_run(self.records, self.run_id)["parent_orchestration"]["phases"][index]
 
-    def phase(self) -> dict:
-        return provenance.get_run(self.records, self.run_id)["parent_orchestration"]["phases"][0]
+    def routed_phase(self, result: dict) -> str:
+        task_id = result["classification"]["base"]["id"]
+        self.event({"kind": "phase", "phase": task_id, "status": "in_progress", "route": result["selected_route"],
+                    "route_task_result": result})
+        return task_id
 
     def underrated(self, verdict: dict, ran: dict) -> dict:
         """The event the lifecycle extension records for a blocked verdict."""
+        paths = sorted({p for match in verdict["diff_path_floor_matches"] for p in match["matched_paths"]})
         return {"kind": "diff_floors", "phase": ran["classification"]["base"]["id"], "status": "underrated",
                 "from_route": ran["selected_route"], "to_route": verdict["required"]["route"],
-                "capacity_raised": verdict["capacity_raised"], "matches": verdict["diff_path_floor_matches"]}
+                "capacity_raised": verdict["capacity_raised"], "matches": verdict["diff_path_floor_matches"],
+                "route_task_result": ran, "paths": paths, "head": "c" * 40}
 
     def test_underrated_diff_requires_a_reroute_and_resume_reaches_the_higher_route(self):
         ran = self.route(small_task())
-        task_id = ran["classification"]["base"]["id"]
-        self.event({"kind": "phase", "phase": task_id, "status": "in_progress", "route": ran["selected_route"]})
+        task_id = self.routed_phase(ran)
         self.event({"kind": "worker", "phase": task_id, "step_id": "claude_worker", "status": "in_progress"})
         self.event({"kind": "worker", "phase": task_id, "step_id": "claude_worker", "status": "completed"})
+        self.event({"kind": "wave", "wave_id": "w1", "task_ids": [task_id], "status": "declared"})
         self.event({"kind": "checkpoint", "phase": task_id, "reason": "worker_approval", "workspace_bound": True})
-        changed = [".pi/autonomy.yaml", ".github/workflows/release.yml"]
+        changed = ["src/settings.py", "deploy/release.sh"]
         verdict = engine.check_diff_path_floors(ran, changed, self.assets)
         self.assertEqual(verdict["blocker_code"], engine.CLASSIFICATION_UNDERRATED_BY_DIFF)
         self.event(self.underrated(verdict, ran))
 
         phase = self.phase()
         self.assertEqual(phase["status"], "in_progress", "an underrated diff is not a terminal outcome")
-        self.assertEqual(phase["escalations"][-1], {**phase["escalations"][-1], "from_route": "CLAUDE",
-                         "to_route": "CODEX_CLAUDE_CODEX", "reason": "PATH_FLOOR", "confirmed": False})
-        self.assertEqual(phase["diff_floor_checks"][-1]["status"], "underrated")
-        self.assertEqual(phase["diff_floor_checks"][-1]["matches"][0]["matched_paths"], [".github/workflows/release.yml"])
-        # Resume: the phase is a pending re-route, and nothing completes until it is confirmed.
-        self.assertEqual(po.status(self.run_id, repo_root=self.records)["reroute_phases"], [task_id])
+        escalation = phase["escalations"][-1]
+        self.assertEqual({k: escalation[k] for k in ("from_route", "to_route", "reason", "confirmed", "paths")},
+                         {"from_route": "CLAUDE", "to_route": "CODEX_CLAUDE_CODEX", "reason": "PATH_FLOOR",
+                          "confirmed": False, "paths": ["deploy/release.sh"]})
+        self.assertEqual(escalation["required_capacities"]["claude_worker"], "high")
+        self.assertEqual(phase["diff_floor_checks"][-1]["head"], "c" * 40)
+        status = po.status(self.run_id, repo_root=self.records)
+        self.assertEqual((status["reroute_phases"], status["bound_phases"]), ([task_id], [task_id]))
         with self.assertRaises(po.ParentRunError) as pending:
             po.finish(self.run_id, "COMPLETED", repo_root=self.records)
         self.assertEqual(pending.exception.error_code, "PARENT_ROUTE_RECHECK_REQUIRED")
-        # Re-routing with the old classification cannot confirm it.
+        # The wave cannot integrate while the re-route is unconfirmed (probe_parent: it used to be accepted).
+        for wave_status in ("integrating", "integrated"):
+            with self.assertRaises(po.ParentRunError) as refused:
+                self.event({"kind": "wave", "wave_id": "w1", "task_ids": [task_id], "status": wave_status})
+            self.assertEqual(refused.exception.error_code, "PARENT_ROUTE_RECHECK_REQUIRED")
         with self.assertRaises(po.ParentRunError) as stale:
-            self.event({"kind": "phase", "phase": task_id, "status": "in_progress", "route": "CLAUDE"})
+            self.event({"kind": "phase", "phase": task_id, "status": "in_progress", "route": "CLAUDE",
+                        "route_task_result": ran})
         self.assertEqual(stale.exception.error_code, "PARENT_EVENT_CONFLICT")
-        # Re-routing with the floored paths declared reaches the required route and confirms the re-route.
+        # The required route without the route result, or with one that does not cover the paths, is refused.
         rerouted = self.route(small_task(files_or_areas=changed))
         self.assertEqual(rerouted["selected_route"], "CODEX_CLAUDE_CODEX")
-        self.event({"kind": "phase", "phase": task_id, "status": "in_progress", "route": rerouted["selected_route"]})
+        with self.assertRaises(po.ParentRunError) as bare:
+            self.event({"kind": "phase", "phase": task_id, "status": "in_progress", "route": "CODEX_CLAUDE_CODEX"})
+        self.assertEqual(bare.exception.error_code, engine.CLASSIFICATION_UNDERRATED_BY_DIFF)
+        with self.assertRaises(po.ParentRunError) as foreign:
+            self.event({"kind": "phase", "phase": task_id, "status": "in_progress", "route": "CODEX_CLAUDE_CODEX",
+                        "route_task_result": self.route(small_task(id="other-task", files_or_areas=changed))})
+        self.assertEqual(foreign.exception.error_code, "PARENT_DIFF_FLOORS_INVALID")
+        self.assertFalse(self.phase()["escalations"][-1]["confirmed"])
+        self.event({"kind": "phase", "phase": task_id, "status": "in_progress", "route": rerouted["selected_route"],
+                    "route_task_result": rerouted})
         self.assertTrue(self.phase()["escalations"][-1]["confirmed"])
-        self.assertFalse(engine.check_diff_path_floors(rerouted, changed, self.assets)["blocked"])
+        self.event({"kind": "wave", "wave_id": "w1", "task_ids": [task_id], "status": "integrating"})
         run = provenance.get_run(self.records, self.run_id)
         text = provenance.render_trace_text(provenance.build_trace_report(self.records, run))
         self.assertIn("Re-route (PATH_FLOOR): CLAUDE -> CODEX_CLAUDE_CODEX; confirmed True", text)
         self.assertIn("Diff floor check (route epoch 0, route CLAUDE): underrated (CLASSIFICATION_UNDERRATED_BY_DIFF) -> CODEX_CLAUDE_CODEX", text)
-        self.assertIn("Path floor (diff): rule 1 ['.github/workflows/**'] floors {'security_sensitive': True} via .github/workflows/release.yml", text)
+        self.assertIn("Path floor (diff): project rule 1 ['deploy/**'] floors {'security_sensitive': True} via deploy/release.sh", text)
 
-    def test_capacity_only_reroute_keeps_the_route(self):
-        project = {"path_floors": [{"paths": ["config/**"], "floors": {"ambiguity": 4}}]}
-        ran = self.route(small_task(), project)
-        task_id = ran["classification"]["base"]["id"]
-        self.event({"kind": "phase", "phase": task_id, "status": "in_progress", "route": "CLAUDE"})
-        verdict = engine.check_diff_path_floors(ran, ["config/limits.yaml"], self.assets)
+    def test_capacity_only_reroute_needs_a_result_that_covers_the_paths(self):
+        ran = self.route(small_task(), CAPACITY_ONLY)
+        task_id = self.routed_phase(ran)
+        verdict = engine.check_diff_path_floors(ran, ["tuning/limits.yaml"], self.assets)
         self.event(self.underrated(verdict, ran))
         self.assertEqual(self.phase()["escalations"][-1]["to_route"], "CLAUDE")
         self.assertEqual(po.status(self.run_id, repo_root=self.records)["reroute_phases"], [task_id])
-        self.event({"kind": "phase", "phase": task_id, "status": "in_progress", "route": "CLAUDE"})
+        # The same classification rerun (same route, same light worker) no longer confirms it.
+        with self.assertRaises(po.ParentRunError) as same:
+            self.event({"kind": "phase", "phase": task_id, "status": "in_progress", "route": "CLAUDE",
+                        "route_task_result": self.route(small_task(), CAPACITY_ONLY)})
+        self.assertEqual(same.exception.error_code, engine.CLASSIFICATION_UNDERRATED_BY_DIFF)
+        self.assertFalse(self.phase()["escalations"][-1]["confirmed"])
+        covering = self.route(small_task(files_or_areas=["src/settings.py", "tuning/limits.yaml"]), CAPACITY_ONLY)
+        self.assertEqual(covering["capacity_assignments"][0]["assigned_capacity_tier"], "standard")
+        self.event({"kind": "phase", "phase": task_id, "status": "in_progress", "route": "CLAUDE",
+                    "route_task_result": covering})
         self.assertTrue(self.phase()["escalations"][-1]["confirmed"])
 
-    def test_passed_check_records_matches_without_a_reroute(self):
+    def test_the_parent_reruns_the_engine_and_accepts_only_the_required_route(self):
+        ran = self.route(small_task())
+        task_id = self.routed_phase(ran)
+        verdict = engine.check_diff_path_floors(ran, ["deploy/x.sh"], self.assets)
+        good = self.underrated(verdict, ran)
+        bad_events = [
+            {**good, "from_route": "CODEX"},                            # not the current route
+            {**good, "to_route": "CODEX"},                              # an earlier route, but not the required one
+            {**good, "to_route": "CLAUDE", "capacity_raised": True},    # same route
+            {**good, "paths": ["src/settings.py"]},                     # paths that the engine does not floor
+            {**good, "paths": []},
+            {**good, "paths": ["deploy/../x"]},
+            {**{k: v for k, v in good.items() if k != "route_task_result"}},
+            {**good, "route_task_result": self.route(small_task(id="other-task"))},
+            {**good, "matches": []},
+            {**good, "status": "lowered"},
+            {**good, "head": "not-a-commit"},
+            {**good, "matches": [{**good["matches"][0], "matched_paths": ["a\nb"]}]},
+            {**good, "matches": [{**good["matches"][0], "source": "plugin"}]},
+            {**good, "matches": [{**good["matches"][0], "floors": {"task_type": "migration"}}]},
+            {"kind": "diff_floors", "phase": task_id, "status": "passed", "matches": [], "to_route": "CODEX"},
+        ]
+        for bad in bad_events:
+            with self.subTest(bad={k: v for k, v in bad.items() if k != "route_task_result"}):
+                with self.assertRaises(po.ParentRunError) as refused:
+                    self.event(bad)
+                self.assertEqual(refused.exception.error_code, "PARENT_DIFF_FLOORS_INVALID")
+        self.assertNotIn("escalations", self.phase())
+        self.assertNotIn("diff_floor_checks", self.phase())
+        self.event(good)
+        self.assertEqual(self.phase()["escalations"][-1]["to_route"], "CODEX_CLAUDE_CODEX")
+
+    def fill_escalations(self, route: str) -> None:
+        """Record MAX_ESCALATIONS_PER_PHASE confirmed escalations on the first phase, staying on `route`."""
+        record = provenance.get_run(self.records, self.run_id)
+        phase = record["parent_orchestration"]["phases"][0]
+        phase["escalations"] = [{"from_route": route, "to_route": route, "reason": "AMBIGUITY", "at": record["started_at"],
+                                 "confirmed": True} for _ in range(po.MAX_ESCALATIONS_PER_PHASE)]
+        provenance.update_parent_orchestration(self.records, self.run_id, record["parent_orchestration"])
+
+    def test_lead_escalations_are_capped_and_the_run_stays_resumable(self):
+        ran = self.route(small_task())
+        task_id = self.routed_phase(ran)
+        self.event({"kind": "escalation", "phase": task_id, "from_route": "CLAUDE", "to_route": "CLAUDE_CODEX",
+                    "reason": "AMBIGUITY"})
+        self.fill_escalations("CLAUDE")
+        with self.assertRaises(po.ParentRunError) as capped:
+            self.event({"kind": "escalation", "phase": task_id, "from_route": "CLAUDE", "to_route": "CLAUDE_CODEX",
+                        "reason": "AMBIGUITY"})
+        self.assertEqual(capped.exception.error_code, "PARENT_ESCALATION_LIMIT")
+        self.assertEqual(len(self.phase()["escalations"]), po.MAX_ESCALATIONS_PER_PHASE)
+        self.assertEqual(provenance.get_run(self.records, self.run_id)["outcome"], "in_progress")
+
+    def test_capped_underrated_diff_is_refused_with_the_limit_code(self):
+        ran = self.route(small_task(), CAPACITY_ONLY)
+        task_id = self.routed_phase(ran)
+        verdict = engine.check_diff_path_floors(ran, ["tuning/limits.yaml"], self.assets)
+        self.fill_escalations("CLAUDE")
+        with self.assertRaises(po.ParentRunError) as capped:
+            self.event(self.underrated(verdict, ran))
+        self.assertEqual(capped.exception.error_code, "PARENT_ESCALATION_LIMIT")
+        self.assertEqual(po.status(self.run_id, repo_root=self.records)["reroute_phases"], [task_id])
+        po.finish(self.run_id, "PARTIAL", repo_root=self.records)
+
+    def test_passed_check_records_matches_and_routing_summary_paths_are_masked(self):
         declared = self.route(small_task(files_or_areas=["schemas/task.schema.json"]))
         task_id = declared["classification"]["base"]["id"]
-        self.event({"kind": "phase", "phase": task_id, "status": "in_progress", "route": declared["selected_route"]})
+        token = "ghp_" + "a" * 30
+        match = dict(declared["path_floor_matches"][0], matched_paths=[f"schemas/{token}.json"])
+        self.event({"kind": "phase", "phase": task_id, "status": "in_progress", "route": declared["selected_route"],
+                    "routing": {"task_type": "config_edit", "ambiguity": 2, "failure_cost": "high",
+                                "semantic_correctness": "normal", "diagnosis_required": False,
+                                "implementation_scope": "small", "signals": [], "matches": [], "fallback_applied": False,
+                                "assignments": [], "path_floor_matches": [match]}})
+        self.assertNotIn(token, json.dumps(self.phase()["routing"]))
         verdict = engine.check_diff_path_floors(declared, ["schemas/task.schema.json"], self.assets)
         self.assertFalse(verdict["blocked"])
         self.event({"kind": "diff_floors", "phase": task_id, "status": "passed", "matches": verdict["diff_path_floor_matches"]})
         phase = self.phase()
         self.assertNotIn("escalations", phase)
         self.assertEqual(phase["diff_floor_checks"][0]["status"], "passed")
-        self.assertEqual(po.status(self.run_id, repo_root=self.records)["reroute_phases"], [task_id])  # in progress
 
-    def test_invalid_diff_floor_events_change_nothing(self):
-        ran = self.route(small_task())
-        task_id = ran["classification"]["base"]["id"]
-        self.event({"kind": "phase", "phase": task_id, "status": "in_progress", "route": "CLAUDE"})
-        verdict = engine.check_diff_path_floors(ran, [".github/workflows/release.yml"], self.assets)
-        good = self.underrated(verdict, ran)
-        bad_events = [
-            {**good, "from_route": "CODEX"},                       # not the current route
-            {**good, "to_route": "CLAUDE", "capacity_raised": False},  # same route without a capacity raise
-            {**good, "matches": []},                               # no floor matched
-            {**good, "status": "lowered"},
-            {**good, "matches": [{**good["matches"][0], "matched_paths": ["a\nb"]}]},
-            {**good, "matches": [{**good["matches"][0], "floors": {"task_type": "migration"}}]},
-            {"kind": "diff_floors", "phase": task_id, "status": "passed", "matches": [], "to_route": "CODEX"},
-        ]
-        for bad in bad_events:
-            with self.subTest(bad=bad):
-                with self.assertRaises(po.ParentRunError) as refused:
-                    self.event(bad)
-                self.assertEqual(refused.exception.error_code, "PARENT_DIFF_FLOORS_INVALID")
-        # A lower-precedence target is never a re-route (floors only raise).
-        self.event({"kind": "phase", "phase": "other", "status": "in_progress", "route": "CODEX_CLAUDE_CODEX"})
-        with self.assertRaises(po.ParentRunError):
-            self.event({**good, "phase": "other", "from_route": "CODEX_CLAUDE_CODEX", "to_route": "CLAUDE"})
-        self.assertNotIn("escalations", self.phase())
-        self.assertNotIn("diff_floor_checks", self.phase())
+
+class WorkspaceValidationFloorsTest(unittest.TestCase):
+    """`pico workspace validate` and `publish` re-check the work commit against the pinned commit's floors."""
+
+    def setUp(self):
+        import workspace_contracts as wc
+        self.wc = wc
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self.tmp.name) / "alpha"
+        self.repo.mkdir()
+        git("init", "-q", "-b", "main", cwd=self.repo)
+        git("config", "user.email", "test@example.invalid", cwd=self.repo)
+        git("config", "user.name", "Test", cwd=self.repo)
+        (self.repo / ".pi").mkdir()
+        (self.repo / ".pi/routing.yaml").write_text(json.dumps(PROJECT))
+        (self.repo / "README.md").write_text("x\n")
+        git("add", ".", cwd=self.repo)
+        git("commit", "-q", "-m", "init", cwd=self.repo)
+        self.pin = git("rev-parse", "HEAD", cwd=self.repo).strip()
+        self.plan = {"workspace_id": "ws"}
+        self.task = {"id": "a1"}
+        self.repo_entry = {"resolved_path": str(self.repo), "pinned_commit": self.pin}
+        self.summaries: list = []
+        self._patches = [unittest.mock.patch.object(wc, "_entry", return_value={"run_id": "r"}),
+                         unittest.mock.patch.object(wc, "_recorded_routing", side_effect=lambda run_id: self.summaries)]
+        for patch in self._patches:
+            patch.start()
+
+    def tearDown(self):
+        for patch in self._patches:
+            patch.stop()
+        self.tmp.cleanup()
+
+    def commit(self, path: str, content: str = "x\n") -> str:
+        target = self.repo / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content)
+        git("add", "-A", cwd=self.repo)
+        git("commit", "-q", "-m", path, cwd=self.repo)
+        return git("rev-parse", "HEAD", cwd=self.repo).strip()
+
+    def check(self, commit: str) -> dict:
+        return self.wc.path_floor_check(self.plan, self.task, self.repo_entry, commit)
+
+    def test_unfloored_commit_passes_without_a_run(self):
+        self.assertEqual(self.check(self.commit("src/a.py"))["blocked"], False)
+
+    def test_floored_commit_needs_a_recorded_decision_at_or_above_the_floors(self):
+        commit = self.commit("migrations/1.sql")
+        self.assertEqual(self.check(commit)["blocker_code"], engine.CLASSIFICATION_DIFF_UNVERIFIABLE)
+        self.summaries = [{"failure_cost": "low", "semantic_correctness": "normal", "ambiguity": 2,
+                           "diagnosis_required": False, "implementation_scope": "small", "signals": []}]
+        self.assertEqual(self.check(commit)["blocker_code"], engine.CLASSIFICATION_UNDERRATED_BY_DIFF)
+        with self.assertRaises(self.wc.WorkspaceRunError) as refused:
+            self.wc._refuse_underrated(self.check(commit))
+        self.assertEqual(refused.exception.code, engine.CLASSIFICATION_UNDERRATED_BY_DIFF)
+        self.summaries.append({**self.summaries[0], "failure_cost": "high", "signals": ["behavior_preservation_required"]})
+        self.assertFalse(self.check(commit)["blocked"])
+
+    def test_the_work_cannot_remove_the_pinned_floors(self):
+        self.summaries = [{"failure_cost": "low", "semantic_correctness": "normal", "ambiguity": 2,
+                           "diagnosis_required": False, "implementation_scope": "small", "signals": ["security_sensitive"]}]
+        self.commit(".pi/routing.yaml", "path_floors: []\n")
+        commit = self.commit("migrations/1.sql")
+        # The edited routing.yaml is itself a built-in floor (satisfied: security_sensitive), the migration is not.
+        self.assertEqual(self.check(commit)["blocker_code"], engine.CLASSIFICATION_UNDERRATED_BY_DIFF)
 
 
 if __name__ == "__main__":

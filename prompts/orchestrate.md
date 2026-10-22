@@ -697,7 +697,9 @@ Concretely, a project file may declare:
 - `path_floors`, the same floors applied only to a task that touches one of
   a rule's repository-relative globs: `route_task` matches them against the
   task's `files_or_areas`, so list the real paths the task will change there,
-  and `integrate_begin` matches them against the worker's real diff.
+  and `integrate_begin` and `integrate_end` match them against the worker's
+  real diff and the merged change. Built-in floors always make `.pi/**`,
+  `.claude/**`, `.mcp.json` and `.github/workflows/**` security-sensitive.
   `protected_areas` stays free-text context for you and the worker contract;
   no tool enforces it.
 

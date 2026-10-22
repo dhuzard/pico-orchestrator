@@ -188,6 +188,13 @@ class ClassifierBenchmarkTest(unittest.TestCase):
                 for field, value in engine.ESCALATING_CLASSIFICATION_VALUES.items():
                     self.assertNotEqual(gold[field], value)
                 self.assertFalse(gold["diagnosis_required"])
+                if engine.match_all_path_floors(case["task_facts"]["files_or_areas"], None, declared=True):
+                    # A built-in path floor (.pi/ and friends) is not a rubric judgment; without path floors the
+                    # low-risk gold still stays off the strongest route.
+                    task = benchmark.materialize_task(case["task_facts"], gold)
+                    self.assertNotEqual(benchmark.decision_signature(task, self.assets, path_floors=False)["route"],
+                                        "CODEX_CLAUDE_CODEX")
+                    continue
                 self.assertNotEqual(case["expected_decision"]["route"], "CODEX_CLAUDE_CODEX")
 
     def _understated(self, case_id: str) -> tuple[dict, dict]:
