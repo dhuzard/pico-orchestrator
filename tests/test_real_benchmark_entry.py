@@ -186,14 +186,17 @@ class EntryPointRunTest(unittest.TestCase):
             self.assertEqual((marker["publication"], marker["max_tokens"], marker["issues"]), (True, 120000, {"lib-slugify": 3}))
             report = json.loads((out / "report.json").read_text())
             self.assertEqual((report["publication"], report["access_check"]), (True, True))
-            # --continue reuses the recorded mode: the access check stays on.
-            again = subprocess.run([sys.executable, str(RUN_REAL), head, "sandbox", "--output-dir", str(out), "--continue"],
-                                   env=env, capture_output=True, text=True, check=False)
+            self.assertFalse(report["allow_mutation"])
+            # --continue reuses the recorded mode: the access check stays on. Mutation is asked for explicitly.
+            again = subprocess.run([sys.executable, str(RUN_REAL), head, "sandbox", "--output-dir", str(out), "--continue",
+                                    "--allow-mutation"], env=env, capture_output=True, text=True, check=False)
             self.assertEqual(again.returncode, 0, again.stderr)
+            self.assertTrue(json.loads((out / "report.json").read_text())["allow_mutation"])
             schedules = [json.loads(line) for line in log.read_text().splitlines() if json.loads(line)[:2] == ["workspace", "schedule"]]
             self.assertEqual(len(schedules), 2)
             for argv in schedules:
                 self.assertNotIn("--no-access-check", argv)
+            self.assertEqual(["--allow-mutation" in argv for argv in schedules], [False, True])
 
 
 if __name__ == "__main__":

@@ -3,7 +3,7 @@
 
     PICO_REAL_BENCHMARK=1 benchmarks/synthetic-workspace/run-real.sh <40-hex-revision> <label>
         [--output-dir DIR] [--owner OWNER] [--max-tokens N] [--continue] [--pico PATH]
-        [--publication --i-own-these-repos --issue TASK=N ...]
+        [--publication --i-own-these-repos --issue TASK=N ...] [--allow-mutation]
 
 This is the only supported entry point of the real-agent benchmark. It spends tokens and time on whatever
 backends `pi` is configured with, so it refuses to run unless PICO_REAL_BENCHMARK=1 is set, exactly that
@@ -25,7 +25,9 @@ sandbox repositories you own: pass --publication --i-own-these-repos (and --issu
 needs to commit the sandbox policy. In that mode `pico workspace schedule` keeps its repository access check,
 so missing or inaccessible repositories fail closed. Push the baselines, publish and promote by hand as the
 README describes, then run this script again with --continue: it skips setup and repeats launch, validate
-and metrics on the same state, with the options recorded by the first run.
+and metrics on the same state, with the options recorded by the first run. The sandbox policy grants
+worktrees, commits, pushes and draft PRs, so a headless child refuses with MUTATION_NOT_AUTHORIZED unless
+--allow-mutation is passed; it is never implied, it is asked for on each invocation and recorded in the report.
 This script never pushes, never opens a pull request and never merges.
 """
 from __future__ import annotations
@@ -182,7 +184,8 @@ def run(args: argparse.Namespace) -> int:
     env = pico_env(args.revision, state)
     # Sandbox repositories exist on GitHub: keep the access check so an unresolved identity fails closed.
     access = [] if publication else ["--no-access-check"]
-    schedule = execute([pico, "workspace", "schedule", str(manifest), *access, "--json"], env, "launch")
+    mutation = ["--allow-mutation"] if args.allow_mutation else []
+    schedule = execute([pico, "workspace", "schedule", str(manifest), *access, *mutation, "--json"], env, "launch")
     steps.append(schedule)
     if schedule["output"] is None:
         raise Refused(f"`pico workspace schedule` produced no JSON (exit {schedule['exit_code']}): {schedule['stderr_tail']}", code=1)
@@ -193,6 +196,7 @@ def run(args: argparse.Namespace) -> int:
     report = {"report_version": REPORT_VERSION, "kind": "real-agent-benchmark", "label": args.label,
               "pico_revision": args.revision, "workspace_id": workspace["id"], "started_at": started, "finished_at": now(),
               "continued": bool(args.resume), "publication": publication, "access_check": publication,
+              "allow_mutation": args.allow_mutation,
               "backend": {"pi": shutil.which("pi"), "pico": pico},
               "launch": {"exit_code": schedule["exit_code"], "status": schedule["output"].get("status"),
                          "session": schedule["output"].get("session"), "tasks": schedule["output"].get("tasks")},
@@ -219,6 +223,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="with --publication and --owner: confirms the repositories are your own sandbox repositories")
     parser.add_argument("--issue", action="append", default=[], metavar="TASK=N",
                         help="issue number in the task's repository that its draft PR references")
+    parser.add_argument("--allow-mutation", action="store_true",
+                        help="let headless children use what the repository policy grants (recorded on each execution)")
     parser.add_argument("--continue", dest="resume", action="store_true",
                         help="skip setup and repeat launch, validate and metrics on an earlier run's workspace and state")
     parser.add_argument("--pico", default=os.environ.get("PICO_BIN", "pico"), help="the pico launcher (default: pico on PATH)")
