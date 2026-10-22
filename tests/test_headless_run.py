@@ -500,6 +500,16 @@ class HeadlessRunTest(HeadlessFixture):
         self.assertIn("is ready", hr.RESUME_PROMPT)
         self.assertIn("explicit outcome", hr.RESUME_PROMPT)
 
+    def test_resume_prompt_treats_a_required_reroute_as_the_next_step(self):
+        # The #4 pilot: the resumed lead got the reroute reply, which then began with BLOCKED, and stopped as this
+        # prompt told it to (#69). The prompt names the extension's exact reply, which never says BLOCKED.
+        extension = (REPO_ROOT / "extensions" / "orchestration-lifecycle.ts").read_text(encoding="utf-8")
+        marker = "NEXT STEP (PARENT_ROUTE_RECHECK_REQUIRED)"
+        self.assertIn(f"`{marker}: the run is active and not stopped.", extension)
+        self.assertIn(marker, hr.RESUME_PROMPT)
+        self.assertLess(hr.RESUME_PROMPT.index(marker), hr.RESUME_PROMPT.index("BLOCKED, stop"))
+        self.assertIn("rerun route_task", hr.RESUME_PROMPT)
+
     def test_cancel_closes_run_before_a_graceful_shutdown_can_settle_it(self):
         launched = self.start(behavior="hang", wait=False)
         deadline = time.monotonic() + 5

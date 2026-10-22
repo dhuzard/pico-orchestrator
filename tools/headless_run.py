@@ -77,10 +77,12 @@ FAILURE_BUDGET_SOURCES = ("cli", "task", "manifest")  # `policy` and the default
 # marker by settling the restored run and starting a new one. Without it,
 # session_start restores the IN_PROGRESS run and the agent continues it.
 RESUME_PROMPT = ("Continue the active orchestration run recorded in this session. First call "
-                 "orchestration_record with {\"action\":\"status\"}. Continue only when its reply says the "
-                 "record is ready with ok: true and active: true; if it says finalized or BLOCKED, stop and "
-                 "report the blocker. Then resume from the last recorded phase and finish the run with an "
-                 "explicit outcome.")
+                 "orchestration_record with {\"action\":\"status\"}. If its reply says NEXT STEP "
+                 "(PARENT_ROUTE_RECHECK_REQUIRED), that is the expected first step of a resume, not a blocker: "
+                 "rerun route_task for the named task, complete its backend preflight, and call status again. "
+                 "Continue only when its reply says the record is ready with ok: true and active: true; if it "
+                 "says finalized or BLOCKED, stop and report the blocker. Then resume from the last recorded "
+                 "phase and finish the run with an explicit outcome.")
 
 
 class HeadlessError(Exception):
