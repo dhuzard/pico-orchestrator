@@ -23,6 +23,7 @@ function harness(preflight: Record<string, unknown>, failEvent = false, verifyOk
                    escalationWorkerConflict?: boolean; resumeResult?: Record<string, unknown>;
                    heartbeatResult?: Record<string, unknown>; eventResult?: Record<string, unknown>;
                    clock?: () => number; failKind?: string;
+                   diffFloors?: (input: Record<string, unknown>) => Record<string, unknown>;
                    gateRefusal?: (input: Record<string, unknown>) => Record<string, unknown> | null } = {}) {
   const handlers = new Map<string, Handler>();
   const tools = new Map<string, any>();
@@ -43,6 +44,7 @@ function harness(preflight: Record<string, unknown>, failEvent = false, verifyOk
       return options.scopeOk === false
         ? { ok: false, blocker_code: "SESSION_REPOSITORY_MISMATCH" } : { ok: true, blocker_code: null };
     }
+    if (script.endsWith("diff_floor_check.py") && options.diffFloors) return options.diffFloors(input ?? {});
     if (script.endsWith("autonomy_policy.py")) return options.limits ?? { ok: true, parallel_tasks: 3, open_prs: 2, pr_granularity: "batch" };
     if (script.endsWith("context_budget.py")) {
       if (args[0] === "policy") return { ok: true, policy: { schema_version: 1, checkpoint: { max_output_tokens: 4096 } } };
@@ -1821,6 +1823,69 @@ async function routeMutating(h: ReturnType<typeof harness>, ids: string[], extra
   }
 }
 const wtTask = (label: string) => `work in /tmp/wt-${label.split(":")[0]}`;
+
+test("integrate_begin checks each bound worktree's diff against path floors and re-routes an underrated task", async () => {
+  const match = { rule: 1, patterns: [".github/workflows/**"], floors: { security_sensitive: true },
+    matched_paths: [".github/workflows/release.yml"], matched_path_count: 1 };
+  const verdicts: Record<string, Record<string, unknown>> = {
+    "/tmp/wt-A": { ok: true, blocked: true, blocker_code: "CLASSIFICATION_UNDERRATED_BY_DIFF", route_raised: false,
+      capacity_raised: true, required: { route: "CODEX_CLAUDE_CODEX" }, diff_path_floor_matches: [match] },
+    "/tmp/wt-B": { ok: true, blocked: false, blocker_code: null, diff_path_floor_matches: [] },
+  };
+  const h = harness({ ok: true, status: "READY" }, false, true,
+    { diffFloors: (input) => verdicts[String(input.worktree)] });
+  await h.handlers.get("before_agent_start")!({ prompt: "PI_ORCHESTRATION_RUN_V1" }, { cwd: "/tmp/target", ui: { notify() {} } });
+  const record = h.tools.get("orchestration_record");
+  await routeMutating(h, ["A", "B"]);
+  assert.equal((await record.execute("w", { action: "declare_wave", wave_id: "w1",
+    tasks: [{ task_id: "A", write_scope: ["a/**"] }, { task_id: "B", write_scope: ["b/**"] }] })).details.ok, true);
+  const begin = await record.execute("i", { action: "integrate_begin", wave_id: "w1" });
+  assert.equal(begin.details.ok, false);
+  assert.match(begin.content[0].text, /^NEXT STEP \(CLASSIFICATION_UNDERRATED_BY_DIFF\): the run is active and not stopped/);
+  assert.doesNotMatch(begin.content[0].text, /BLOCKED/);
+  assert.match(begin.content[0].text, /A \(ran CODEX_CLAUDE_CODEX, needs CODEX_CLAUDE_CODEX with a higher capacity; floored paths \.github\/workflows\/release\.yml\)/);
+  // The check saw the route result that ran and the bound worktree of each task.
+  const checks = h.calls.filter((call) => call.script.endsWith("diff_floor_check.py"));
+  assert.deepEqual(checks.map((call) => call.input?.worktree), ["/tmp/wt-A", "/tmp/wt-B"]);
+  assert.equal((checks[0].input?.route_task_result as any).classification.base.id, "A");
+  assert.equal(checks[0].input?.parent_checkout, "/tmp/target");
+  // A durable re-route, not an integration: no wave moved to integrating.
+  const events = eventsOf(h);
+  assert.deepEqual(events.filter((item: any) => item.kind === "diff_floors"), [{ kind: "diff_floors", phase: "A",
+    status: "underrated", from_route: "CODEX_CLAUDE_CODEX", to_route: "CODEX_CLAUDE_CODEX", capacity_raised: true,
+    matches: [match] }]);
+  assert.equal(events.some((item: any) => item.kind === "wave" && item.status === "integrating"), false);
+  // Status names the next step, and workers wait for the re-route.
+  const status = await record.execute("s", { action: "status" });
+  assert.match(status.content[0].text, /^NEXT STEP \(PARENT_ROUTE_RECHECK_REQUIRED\).*A/);
+  const blocked = await h.handlers.get("tool_call")!({ toolName: "spawn_subagent", toolCallId: "x",
+    input: { task: "work in /tmp/wt-A", label: "A:codex_specifier" } });
+  assert.match(blocked.reason, /PARENT_ROUTE_RECHECK_REQUIRED/);
+  // After re-routing and re-binding, a diff that now matches the route integrates.
+  verdicts["/tmp/wt-A2"] = { ok: true, blocked: false, blocker_code: null, diff_path_floor_matches: [match] };
+  await h.handlers.get("tool_result")!(routeFor("A", { specifierMutation: "allowed" }));
+  await record.execute("b", { action: "bind_workspace", task_id: "A", step_id: "codex_specifier", path: "/tmp/wt-A2" });
+  assert.equal((await record.execute("i", { action: "integrate_begin", wave_id: "w1" })).details.ok, true);
+  assert.deepEqual(eventsOf(h).filter((item: any) => item.kind === "diff_floors").at(-1),
+    { kind: "diff_floors", phase: "A", status: "passed", matches: [match] });
+});
+
+test("an unverifiable diff refuses integration fail-closed", async () => {
+  const h = harness({ ok: true, status: "READY" }, false, true,
+    { diffFloors: () => ({ ok: false, blocked: true, blocker_code: "CLASSIFICATION_DIFF_UNVERIFIABLE" }) });
+  await h.handlers.get("before_agent_start")!({ prompt: "PI_ORCHESTRATION_RUN_V1" }, { cwd: "/tmp/target", ui: { notify() {} } });
+  await routeMutating(h, ["A"]);
+  assert.equal((await h.tools.get("orchestration_record").execute("w", { action: "declare_wave", wave_id: "w1",
+    tasks: [{ task_id: "A", write_scope: ["a/**"] }] })).details.ok, true);
+  const quiet = process.stderr.write;
+  process.stderr.write = (() => true) as typeof process.stderr.write;
+  try {
+    const begin = await h.tools.get("orchestration_record").execute("i", { action: "integrate_begin", wave_id: "w1" });
+    assert.equal(begin.details.ok, false);
+    assert.match(begin.content[0].text, /^BLOCKED: CLASSIFICATION_DIFF_UNVERIFIABLE/);
+  } finally { process.stderr.write = quiet; }
+  assert.equal(eventsOf(h).some((item: any) => item.kind === "wave" && item.status === "integrating"), false);
+});
 
 test("gates still hold with implicit waves: concurrency, bind, bracket, and parent checkout", async () => {
   const dir = realpathSync(mkdtempSync(join(tmpdir(), "pico-implicit-gates-")));

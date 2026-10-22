@@ -91,6 +91,15 @@ ESCALATING_CLASSIFICATION_VALUES: dict[str, Any] = {
     "destructive_operation": True,
 }
 CLASSIFICATION_EVIDENCE_MISSING = "CLASSIFICATION_EVIDENCE_MISSING"
+# Post-diff check (`check_diff_path_floors`): the worker's real changed paths
+# hit `.pi/routing.yaml` `path_floors` that select a higher-precedence route,
+# or a higher capacity/effort on the same route, than the one that ran.
+CLASSIFICATION_UNDERRATED_BY_DIFF = "CLASSIFICATION_UNDERRATED_BY_DIFF"
+# The post-diff check could not be evaluated (invalid route result, unreadable
+# worktree): integration fails closed.
+CLASSIFICATION_DIFF_UNVERIFIABLE = "CLASSIFICATION_DIFF_UNVERIFIABLE"
+# Bound on the paths recorded per matched path floor (the count is exact).
+PATH_FLOOR_MATCHED_PATHS_LIMIT = 50
 
 FORBIDDEN_PROJECT_KEYS = frozenset({
     "task_type",
@@ -1774,6 +1783,128 @@ def apply_risk_overrides(task: dict, risk_overrides: dict, task_schema: dict) ->
     return constrained
 
 
+def merge_risk_floors(floor_sets: Iterable[dict], task_schema: dict) -> dict:
+    """Combine several risk-floor maps (project `risk_overrides`, matched
+    `path_floors`) into one map of the same shape: each ordered field takes
+    the strongest floor in its schema enum order (numeric max for ambiguity),
+    and each safety boolean is true if any set forces it. Merging can only
+    raise, so the result never weakens any input floor."""
+    merged: dict = {}
+    for floors in floor_sets:
+        for field in ORDERED_OVERRIDE_FIELDS:
+            if field not in floors:
+                continue
+            if field not in merged:
+                merged[field] = floors[field]
+            elif field == "ambiguity":
+                merged[field] = max(merged[field], floors[field])
+            else:
+                enum = task_schema["properties"][field]["enum"]
+                merged[field] = enum[max(enum.index(merged[field]), enum.index(floors[field]))]
+        for field in SAFETY_OVERRIDE_FIELDS:
+            if floors.get(field) is True:
+                merged[field] = True
+    return {field: merged[field] for field in (*ORDERED_OVERRIDE_FIELDS, *SAFETY_OVERRIDE_FIELDS) if field in merged}
+
+
+# ---------------------------------------------------------------------------
+# Path-triggered risk floors (`path_floors` in .pi/routing.yaml)
+# ---------------------------------------------------------------------------
+#
+# Globs are repository-relative POSIX patterns, anchored at the repository
+# root: `*` matches any characters inside one path segment (a leading dot
+# included), `?` one character inside a segment, and a whole `**` segment
+# zero or more segments (`migrations/**` matches `migrations` itself and
+# everything below it; `**/*secret*` matches at any depth). The schema rejects
+# every other construct (character classes, braces, backslashes, a leading
+# `!` or `/`, empty, `.` or `..` segments, `**` inside a segment), so no
+# pattern can mean a negation or a relaxation.
+
+def normalize_repo_path(value: Any) -> str | None:
+    """A declared area or changed path as a repository-relative POSIX path,
+    or None when it cannot name one (prose, absolute, or escaping the root).
+    Leading `./` and trailing `/` are dropped and repeated `/` collapsed."""
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    while text.startswith("./"):
+        text = text[2:]
+    segments = [segment for segment in text.split("/") if segment not in ("", ".")]
+    if not segments or value.strip().startswith("/") or ".." in segments:
+        return None
+    if any(re.search(r"[\x00-\x1f\\]", segment) for segment in segments):
+        return None
+    return "/".join(segments)
+
+
+_GLOB_CACHE: dict[str, re.Pattern] = {}
+
+
+def _glob_regex(pattern: str) -> re.Pattern:
+    compiled = _GLOB_CACHE.get(pattern)
+    if compiled is not None:
+        return compiled
+    segments = pattern.split("/")
+    regex = ""
+    need_separator = False
+    for index, segment in enumerate(segments):
+        last = index == len(segments) - 1
+        if segment == "**":
+            if last:
+                regex += "(?:/.*)?" if need_separator else ".*"
+            else:
+                regex += "(?:/[^/]+)*" if need_separator else "(?:[^/]+/)*"
+            continue
+        body = "".join("[^/]*" if char == "*" else "[^/]" if char == "?" else re.escape(char) for char in segment)
+        regex += ("/" if need_separator else "") + body
+        need_separator = True
+    compiled = re.compile(regex, re.DOTALL)
+    _GLOB_CACHE[pattern] = compiled
+    return compiled
+
+
+def path_glob_matches(pattern: str, path: str) -> bool:
+    """True when the schema-valid glob `pattern` matches the normalized `path`."""
+    return _glob_regex(pattern).fullmatch(path) is not None
+
+
+def match_path_floors(paths: Iterable[Any], path_floors: list[dict] | None) -> list[dict]:
+    """Every `path_floors` rule (in declared order) that at least one of
+    `paths` matches: its index, the patterns that matched, its floors, and the
+    matched normalized paths (sorted, bounded) with their exact count. Values
+    that are not repository-relative paths never match."""
+    normalized = sorted({path for path in (normalize_repo_path(value) for value in paths) if path is not None})
+    matches = []
+    for index, rule in enumerate(path_floors or []):
+        hit_patterns = []
+        hit_paths: set[str] = set()
+        for pattern in rule["paths"]:
+            hits = [path for path in normalized if path_glob_matches(pattern, path)]
+            if hits:
+                hit_patterns.append(pattern)
+                hit_paths.update(hits)
+        if hit_paths:
+            ordered = sorted(hit_paths)
+            matches.append({
+                "rule": index,
+                "patterns": hit_patterns,
+                "floors": dict(rule["floors"]),
+                "matched_paths": ordered[:PATH_FLOOR_MATCHED_PATHS_LIMIT],
+                "matched_path_count": len(ordered),
+            })
+    return matches
+
+
+def project_risk_floors(task: dict, project_routing: dict | None, task_schema: dict) -> tuple[dict, list[dict]]:
+    """The floors `route_task` applies to `task`: project-wide `risk_overrides`
+    merged with every `path_floors` rule its `files_or_areas` match, plus the
+    path-floor matches themselves (recorded in the route result)."""
+    config = project_routing or {}
+    matches = match_path_floors(task.get("files_or_areas") or [], config.get("path_floors"))
+    floors = merge_risk_floors([config.get("risk_overrides") or {}, *(match["floors"] for match in matches)], task_schema)
+    return floors, matches
+
+
 # ---------------------------------------------------------------------------
 # project-routing.schema.json <-> task.schema.json structural consistency
 # ---------------------------------------------------------------------------
@@ -1839,6 +1970,22 @@ def validate_project_routing_schema(project_schema: dict, task_schema: dict, iss
                     "enum: [true] (safety booleans may only be forced true)"
                 )
             ))
+
+    # path_floors reuse the risk_overrides definition verbatim, so a path rule
+    # can never accept a value (or a key) a project-wide floor would reject.
+    path_floors = props.get("path_floors", {})
+    rule = path_floors.get("items", {}) if isinstance(path_floors, dict) else {}
+    floors = rule.get("properties", {}).get("floors", {}) if isinstance(rule, dict) else {}
+    if (path_floors.get("type") != "array" or rule.get("additionalProperties") is not False
+            or set(rule.get("required", [])) != {"paths", "floors"}
+            or set(rule.get("properties", {})) != {"paths", "floors"}
+            or floors.get("$ref") != "#/properties/risk_overrides"):
+        issues.append(ValidationIssue(
+            message=(
+                "schemas/project-routing.schema.json path_floors must be an array of closed "
+                "{paths, floors} rules whose floors $ref #/properties/risk_overrides"
+            )
+        ))
 
 
 # ---------------------------------------------------------------------------
@@ -2086,6 +2233,7 @@ class RouteResolution:
     fallback_applied: bool
     unavailable_routes: tuple[str, ...] = ()
     route_availability: dict | None = None
+    path_floor_matches: tuple[dict, ...] = ()
 
 
 def resolve_route(
@@ -2096,6 +2244,11 @@ def resolve_route(
     unavailable_routes: Iterable[str] | None = None,
 ) -> RouteResolution:
     """Route `task` under the global policy, then apply project risk floors.
+
+    Project risk floors are the project-wide `risk_overrides` merged with every
+    `path_floors` rule the task's `files_or_areas` match (see
+    `project_risk_floors`); the matches are kept on the resolution so the
+    result records them and `validate_route_task_result` recomputes them.
 
     Availability-aware callers may provide routes that were observed to be
     unavailable during candidate preflight. Those route identities are excluded
@@ -2113,9 +2266,9 @@ def resolve_route(
     base_matched = match_routes(task, policy)
     base_route = select_route(base_matched, policy)
 
-    risk_overrides = (project_routing or {}).get("risk_overrides", {})
-    effective_task = apply_risk_overrides(task, risk_overrides, task_schema) if risk_overrides else dict(task)
-    effective_matched = match_routes(effective_task, policy) if risk_overrides else base_matched
+    risk_floors, path_floor_matches = project_risk_floors(task, project_routing, task_schema)
+    effective_task = apply_risk_overrides(task, risk_floors, task_schema) if risk_floors else dict(task)
+    effective_matched = match_routes(effective_task, policy) if risk_floors else base_matched
 
     union_matched = base_matched | effective_matched
     candidates = union_matched | {base_route}
@@ -2150,6 +2303,7 @@ def resolve_route(
         fallback_applied=fallback_applied,
         unavailable_routes=observed_unavailable,
         route_availability=availability,
+        path_floor_matches=tuple(path_floor_matches),
     )
 
 
@@ -2241,6 +2395,11 @@ def validate_route_task_result(result: Any, assets: PolicyAssets) -> list[Valida
                 issues.append(ValidationIssue(
                     path="result.classification.effective",
                     message="effective classification must equal classification.base after project risk floors",
+                ))
+            if not json_deep_eq(result.get("path_floor_matches"), list(expected_resolution.path_floor_matches)):
+                issues.append(ValidationIssue(
+                    path="result.path_floor_matches",
+                    message="path_floor_matches must equal the project path_floors matched by classification.base files_or_areas",
                 ))
             expected_matches = {
                 "base": sorted(expected_resolution.base_matches),
@@ -2349,6 +2508,7 @@ def build_result(
             "effective": sorted(resolution.effective_matches),
         },
         "fallback_applied": resolution.fallback_applied,
+        "path_floor_matches": [copy.deepcopy(match) for match in resolution.path_floor_matches],
         "selected_route": selected,
         "execution_plan": execution_plan,
         "capacity_assignments": capacity_assignments,
@@ -2357,4 +2517,86 @@ def build_result(
     }
     if resolution.route_availability is not None:
         result["route_availability"] = resolution.route_availability
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Post-diff classification check (path floors against a worker's real diff)
+# ---------------------------------------------------------------------------
+
+def _decision_view(route: str, capacity_assignments: list[dict]) -> dict:
+    return {
+        "route": route,
+        "capacities": {entry["step_id"]: entry["assigned_capacity_tier"] for entry in capacity_assignments},
+        "reasoning_efforts": {entry["step_id"]: entry.get("assigned_reasoning_effort") for entry in capacity_assignments},
+    }
+
+
+def check_diff_path_floors(route_result: Any, changed_paths: Iterable[Any], assets: PolicyAssets) -> dict:
+    """Re-route the task that ran with its real changed paths added to its
+    declared `files_or_areas`, under the same project constraints and
+    availability exclusions recorded in `route_result`, and compare.
+
+    `route_result` must be a valid `route_task` result
+    (`validate_route_task_result`); its `project_constraints` are the floors
+    that governed the run, so a worker that edits `.pi/routing.yaml` in its
+    worktree cannot remove a floor. The result is `blocked` with
+    CLASSIFICATION_UNDERRATED_BY_DIFF when the diff-floored decision selects
+    a route earlier in the policy `precedence` than the one that ran, or the
+    same route with a strictly higher capacity tier or reasoning effort for
+    any step. A diff that matches no floor reproduces the routed inputs
+    exactly and can never block. Anything that cannot be evaluated returns
+    `ok: false` with CLASSIFICATION_DIFF_UNVERIFIABLE (fail closed)."""
+    def unverifiable(message: str) -> dict:
+        return {"ok": False, "blocked": True, "blocker_code": CLASSIFICATION_DIFF_UNVERIFIABLE,
+                "errors": [{"path": "route_task_result", "message": message}]}
+
+    if not isinstance(route_result, dict) or route_result.get("ok") is not True:
+        return unverifiable("the route result is not an ok:true route_task result")
+    issues = validate_route_task_result(route_result, assets)
+    if issues:
+        return unverifiable("; ".join(str(issue) for issue in issues[:5]))
+    base = route_result["classification"]["base"]
+    project_constraints = route_result.get("project_constraints") or {}
+    excluded = (route_result.get("route_availability") or {}).get("excluded_routes") or []
+    changed = sorted({path for path in map(normalize_repo_path, changed_paths) if path is not None})
+    diff_matches = match_path_floors(changed, project_constraints.get("path_floors"))
+    ran = _decision_view(route_result["selected_route"], route_result["capacity_assignments"])
+    result = {
+        "ok": True,
+        "blocked": False,
+        "blocker_code": None,
+        "task_id": base["id"],
+        "changed_path_count": len(changed),
+        "diff_path_floor_matches": diff_matches,
+        "ran": ran,
+        "required": ran,
+        "route_raised": False,
+        "capacity_raised": False,
+    }
+    if not diff_matches:
+        return result
+    widened = {**base, "files_or_areas": [*base["files_or_areas"], *changed]}
+    try:
+        resolution = resolve_route(widened, assets.policy, project_constraints, assets.task_schema, excluded)
+    except NoAvailableRouteError as exc:
+        # Every route the diff's floors allow is unavailable: still underrated, never integrated as is.
+        result.update(blocked=True, blocker_code=CLASSIFICATION_UNDERRATED_BY_DIFF, required=None,
+                      route_raised=True, errors=[{"path": "route_availability", "message": str(exc)}])
+        return result
+    intent = derive_primary_intent(resolution.effective_classification)
+    plan = materialize_execution_plan(assets.policy, assets.execution_plan_schema, resolution.selected_route, intent)
+    required = _decision_view(resolution.selected_route,
+                              assign_capacities(assets.policy, plan, resolution.effective_classification))
+    precedence = assets.policy["precedence"]
+    route_raised = precedence.index(required["route"]) < precedence.index(ran["route"])
+    capacity_raised = required["route"] == ran["route"] and any(
+        CAPACITY_TIER_RANK[required["capacities"][step]] > CAPACITY_TIER_RANK[tier]
+        or REASONING_EFFORT_ORDER.get(required["reasoning_efforts"][step], -1)
+        > REASONING_EFFORT_ORDER.get(ran["reasoning_efforts"][step], -1)
+        for step, tier in ran["capacities"].items() if step in required["capacities"]
+    )
+    result.update(required=required, route_raised=route_raised, capacity_raised=capacity_raised)
+    if route_raised or capacity_raised:
+        result.update(blocked=True, blocker_code=CLASSIFICATION_UNDERRATED_BY_DIFF)
     return result

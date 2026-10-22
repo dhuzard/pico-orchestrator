@@ -20,6 +20,9 @@ const SESSION_SCOPE = join(ROOT, "tools", "session_scope.py");
 const CONTEXT = join(ROOT, "tools", "context_budget.py");
 const AUTONOMY = join(ROOT, "tools", "autonomy_policy.py");
 const LEASE = join(ROOT, "tools", "run_lease.py");
+const DIFF_FLOORS = join(ROOT, "tools", "diff_floor_check.py");
+const DIFF_UNDERRATED = "CLASSIFICATION_UNDERRATED_BY_DIFF";
+const DIFF_UNVERIFIABLE = "CLASSIFICATION_DIFF_UNVERIFIABLE";
 /** Renewal period of the single-owner run lease (tools/run_lease.py; default expiry 300 s). */
 export const LEASE_HEARTBEAT_MS = 60_000;
 /** Lease expiry assumed until the lease tool reports one. */
@@ -252,6 +255,8 @@ function routingSummary(route: Json): Json | null {
       "production_feature", "many_routine_decisions"].filter((key) => effective[key] === true).concat(
       effective.behavior_preservation === "required" ? ["behavior_preservation_required"] : []),
     matches: (route.matches as Json)?.effective, fallback_applied: route.fallback_applied,
+    ...(Array.isArray(route.path_floor_matches) && route.path_floor_matches.length > 0
+      ? { path_floor_matches: route.path_floor_matches } : {}),
     assignments };
 }
 
@@ -276,7 +281,9 @@ export type StepApproval = { id: string; family: string; model: string | null; e
   mode: "read" | "full" };
 /** Per-task approval created by a successful route_task + preflight; replaced only by re-routing that task. */
 export type RouteApproval = { taskId: string; route: string; phase: string; worktreeReady: boolean;
-  taskType: string | null; claudeBackend: Json | null; steps: Map<string, StepApproval> };
+  taskType: string | null; claudeBackend: Json | null; steps: Map<string, StepApproval>;
+  /** The complete route_task result, re-validated by the post-diff path-floor check at integrate_begin. */
+  result: Json };
 export type Attribution = { taskId: string; stepId: string };
 /** A ClaudeWorker run resolved by the guard from the task's route approval. */
 type WorkerPlan = ClaudeWorkerPlan & { taskId: string; stepId: string; phase: string; canonical: string };
@@ -1406,7 +1413,7 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
       claudeBackend: claude ? { backend_executable: claude.backend_executable,
         backend_version_output: claude.backend_version_output,
         backend_device: claude.backend_device, backend_inode: claude.backend_inode } : null,
-      steps });
+      steps, result: route });
     pendingReroutes.delete(taskId);
     // Worker approval is a resume checkpoint: the parent checkout as approved.
     await event({ kind: "checkpoint", phase, reason: "worker_approval" });
@@ -1487,6 +1494,70 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
       { wave_id: waveId, task_ids: ids, parallel_tasks: limit });
   }
 
+  /**
+   * Post-diff classification check, before a wave's worktrees are merged into the parent checkout: every worktree
+   * bound for a member task is diffed and its real changed paths are matched against the path floors of the route
+   * result that ran (tools/diff_floor_check.py; the decision is routing_engine.check_diff_path_floors). A task whose
+   * diff needs an earlier route in the policy precedence, or a higher capacity on the same route, is not integrated:
+   * the parent record gets a PATH_FLOOR re-route (a `diff_floors` event), and the task is re-routed here exactly like
+   * an escalation, so the run stays active and resumable. Anything unverifiable refuses the integration. Returns the
+   * refusal reply, or null when the wave may integrate.
+   */
+  async function diffFloorGate(members: string[]) {
+    const underrated: string[] = [];
+    for (const taskId of members) {
+      const bound = [...new Set([...workspaces].filter(([key]) => key.startsWith(`${taskId}\u0000`))
+        .map(([, path]) => path))].sort();
+      if (bound.length === 0) continue; // no worktree was bound for the task, so no worker of it could write one
+      const approval = approvals.get(taskId);
+      if (!approval || !targetCwd) {
+        return reply(false, `BLOCKED: ${DIFF_UNVERIFIABLE}: task ${taskId} has a bound worktree but no route result to check its diff against.`);
+      }
+      for (const path of bound) {
+        const verdict = await command(DIFF_FLOORS, [],
+          { route_task_result: approval.result, worktree: path, parent_checkout: targetCwd });
+        const matches = Array.isArray(verdict.diff_path_floor_matches) ? verdict.diff_path_floor_matches : [];
+        if (verdict.ok !== true) {
+          diagnose("diff_floors", { ...verdict, error_code: DIFF_UNVERIFIABLE });
+          return reply(false, `BLOCKED: ${DIFF_UNVERIFIABLE}: the diff of task ${taskId} in ${path} could not be checked against the project path floors; nothing was integrated.`, verdict);
+        }
+        if (verdict.blocked !== true) {
+          // Recorded only when the diff hit a floor, so the trace shows which floors the real diff matched.
+          if (matches.length > 0) await observe({ kind: "diff_floors", phase: approval.phase, status: "passed", matches });
+          continue;
+        }
+        const required = (verdict.required ?? null) as Json | null;
+        const toRoute = typeof required?.route === "string" ? required.route : null;
+        if (!toRoute) {
+          return reply(false, `BLOCKED: ${DIFF_UNDERRATED}: the diff of task ${taskId} needs a stronger route and none is available; nothing was integrated.`, verdict);
+        }
+        if (!await event({ kind: "diff_floors", phase: approval.phase, status: "underrated", from_route: approval.route,
+                           to_route: toRoute, capacity_raised: verdict.capacity_raised === true, matches })) {
+          return reply(false, "BLOCKED: parent provenance update failed; see diagnostic log.", parentFailure ?? {});
+        }
+        // The same state change as a recorded escalation: a new route epoch whose route_task must be rerun.
+        pendingReroutes.add(taskId);
+        routeEpochs.set(taskId, (routeEpochs.get(taskId) ?? 0) + 1);
+        approvals.delete(taskId);
+        for (const key of [...workspaces.keys()]) if (key.startsWith(`${taskId}\u0000`)) workspaces.delete(key);
+        for (const [id, tasks] of [...implicitOpen]) {
+          if (tasks.length === 1 && tasks[0] === taskId) { implicitOpen.delete(id); implicitEpoch.delete(id); }
+        }
+        const floored = [...new Set(matches.flatMap((match) => Array.isArray((match as Json).matched_paths)
+          ? (match as Json).matched_paths as string[] : []))].sort().slice(0, 12);
+        underrated.push(`${taskId} (ran ${approval.route}, needs ${toRoute}` +
+          `${toRoute === approval.route ? " with a higher capacity" : ""}; floored paths ${floored.join(", ")})`);
+        break;
+      }
+    }
+    if (underrated.length === 0) return null;
+    // Not "BLOCKED": the run is active and its next step is the re-route (#69).
+    return reply(false, `NEXT STEP (${DIFF_UNDERRATED}): the run is active and not stopped. The diff of ${underrated.join("; ")} ` +
+      "touches project path floors its classification did not cover, so the wave was not integrated. Add those paths to the " +
+      "task's files_or_areas, rerun route_task and backend preflight, run the new route's steps in a fresh bound worktree, " +
+      "then integrate again.", { error_code: DIFF_UNDERRATED, tasks: members.filter((id) => pendingReroutes.has(id)) });
+  }
+
   async function integration(action: "integrate_begin" | "integrate_end", requestedWaveId: string) {
     // The lead names an implicitly recorded single-task wave as "auto".
     let waveId = requestedWaveId;
@@ -1506,6 +1577,8 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
       if (inFlight.size > 0) {
         return reply(false, `BLOCKED: INTEGRATION_WORKERS_IN_FLIGHT: ${inFlight.size} worker call(s) are still running; integrate only between waves.`);
       }
+      const underrated = await diffFloorGate(members);
+      if (underrated) return underrated;
       if (!await event({ kind: "wave", wave_id: waveId, task_ids: members, status: "integrating" })) {
         return reply(false, "BLOCKED: parent provenance update failed; see diagnostic log.", parentFailure ?? {});
       }
