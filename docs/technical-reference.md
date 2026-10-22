@@ -2269,6 +2269,20 @@ objective or transcript, secret-scanned) goes to
 until `--apply` with the reviewed `--plan-hash`, the push is non-force, and the
 PR is a draft. The PR number and publication run id are recorded.
 
+**Republishing after a closed PR (#67).** A branch that already has a closed
+or merged PR is refused (`PUBLICATION_PR_CONFLICT`): a closed PR's branch is
+never reused, reopened or overwritten. When every PR of the task's branch was
+closed without merging, `publish --new-branch` pushes the validated commit to
+the first `<branch>-<n>` (n from 2) that has an open PR, which is reused, or
+no PR and no other commit on the remote. Closed PRs met on the way are
+superseded as well, and a merged PR anywhere on the way refuses. The body adds
+`Supersedes #N (closed without merging).`, the plan records `remote_head` and
+`supersedes_prs` (bound by the plan hash; a branch that changed between the
+dry run and the apply gives `GITHUB_STATE_CONFLICT`), and the task's `pr`
+records `branch` and `supersedes`, while the observed CI of the superseded PR
+is dropped. The local branch keeps its name. `--new-branch` on a branch with
+no PR or an open one is refused with `PUBLICATION_NEW_BRANCH_UNNEEDED`.
+
 **`ci` and `promote`.** `ci` reads `gh pr view --json
 statusCheckRollup,headRefOid,state` (allowlisted, read-only):
 `github_sync.classify_checks` yields `green` only when at least one check

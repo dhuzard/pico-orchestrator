@@ -115,6 +115,12 @@ All notable changes to PICO are recorded here. The format follows
 
 ### Fixed
 
+- A task can be published again after its draft PR was closed without merging (#67). Its branch
+  stayed refused with `PUBLICATION_PR_CONFLICT` for good, and the #4 pilot had to delete and recreate a
+  repository. `pico workspace publish --new-branch` pushes the validated commit to the next free
+  `pico/<task>-<n>` branch, with a draft PR that names the closed PRs it supersedes. The closed PR's
+  branch is never reused, reopened or overwritten, a merged PR is never superseded, and without the flag
+  the refusal stays (its message now names the flag).
 - A resumed headless run no longer stops at its required re-route (#69). In the #4 pilot the resumed lead
   called `orchestration_record status` and got "BLOCKED: rerun route_task ...", and the resume prompt
   told it to stop on BLOCKED, so it did, and the run ended `ORCHESTRATION_OUTCOME_UNRECORDED`. That status

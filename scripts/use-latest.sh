@@ -55,7 +55,7 @@ Usage:
   use-latest.sh run [target-repo] [--repo owner/repository] [-- pi-args...]
   use-latest.sh watch [target-repo] [--repo owner/repository | --all | --workspace <id|manifest> [--controls]] [--port 8765]
   use-latest.sh plan <workspace-manifest> [--json] [--no-access-check]
-  use-latest.sh workspace validate|publish|ci|promote <workspace-manifest> --task <id> [--head pico/<branch>] [--apply --plan-hash <hash>]
+  use-latest.sh workspace validate|publish|ci|promote <workspace-manifest> --task <id> [--head pico/<branch>] [--apply --plan-hash <hash>] [--new-branch]
   use-latest.sh workspace schedule <workspace-manifest> [--max-parallel N] [--allow-mutation] [--resume-interrupted] [--json] [--no-access-check]
   use-latest.sh workspace launch|status|cancel <workspace-manifest> [--task <id>] [--allow-mutation] [--resume] [--no-wait] [--ignore-budget] [--no-access-check]
   use-latest.sh exec start|status|cancel --repo owner/repository --execution-id <id> [--target repo] [--objective ...] [--allow-mutation] [--resume] [--no-wait] [--max-duration SECONDS] [--max-lead-calls N] [--lead-calls-warn-at N]
