@@ -1013,7 +1013,10 @@ test("aborting a ClaudeWorker call kills its Claude Code process", async () => {
     assert.equal(after, undefined);
     const aborted = h.parentCalls("event").map((call) => call.input!).filter((input) => input.kind === "worker").at(-1)!;
     assert.deepEqual([aborted.status, aborted.blocker_code], ["blocked", "WORKER_ABORTED"]);
-    assert.throws(() => process.kill(pid, 0), "the Claude Code child is gone");
+    // The kill is asynchronous: a dying or not yet reaped child still answers signal 0 (#41).
+    const gone = () => { try { process.kill(pid, 0); return false; } catch (error) { return (error as NodeJS.ErrnoException).code === "ESRCH"; } };
+    for (let tries = 0; tries < 100 && !gone(); tries += 1) await new Promise((done) => setTimeout(done, 20));
+    assert.equal(gone(), true, "the Claude Code child is gone");
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
