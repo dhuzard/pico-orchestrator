@@ -112,6 +112,11 @@ All notable changes to PICO are recorded here. The format follows
 
 ### Fixed
 
+- A resumed headless run no longer stops at its required re-route (#69). In the #4 pilot the resumed lead
+  called `orchestration_record status` and got "BLOCKED: rerun route_task ...", and the resume prompt
+  told it to stop on BLOCKED, so it did, and the run ended `ORCHESTRATION_OUTCOME_UNRECORDED`. That status
+  reply now begins `NEXT STEP (PARENT_ROUTE_RECHECK_REQUIRED): the run is active and not stopped`. The
+  resume prompt and the orchestrate prompts name it as the expected first step of a resume.
 - A task no longer launches on a parent checkout left dirty by the previous run (#68). In the #4
   pilot a lead applied its integrated diff to the parent checkout, and the next task in that
   repository launched on it because only `HEAD` was checked. `workspace launch` and scheduler

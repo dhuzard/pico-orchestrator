@@ -357,7 +357,12 @@ test("restart with an unfinished routed phase requires route preflight again", a
     sessionManager: { getSessionId: () => "session-a", getBranch: () => entries } });
   const status = await h.tools.get("orchestration_record").execute("status", { action: "status" });
   assert.equal(status.details.ok, false);
-  assert.match(status.content[0].text, /rerun route_task/);
+  assert.equal(status.details.active, true);
+  assert.match(status.content[0].text, /Rerun route_task/);
+  // A resumed lead stops on BLOCKED (RESUME_PROMPT); a required reroute is its next step, not a stop (#69).
+  assert.match(status.content[0].text, /^NEXT STEP \(PARENT_ROUTE_RECHECK_REQUIRED\): the run is active and not stopped\./);
+  assert.doesNotMatch(status.content[0].text, /BLOCKED/);
+  assert.doesNotMatch(status.content[0].text, /is ready/);
 });
 
 test("rerouting one restored phase does not clear another phase's recovery", async () => {
@@ -377,7 +382,7 @@ test("rerouting one restored phase does not clear another phase's recovery", asy
   assert.match(premature.reason, /PARENT_ROUTE_RECHECK_REQUIRED/);
   const status = await h.tools.get("orchestration_record").execute("status", { action: "status" });
   assert.equal(status.details.ok, false);
-  assert.match(status.content[0].text, /for B before/);
+  assert.match(status.content[0].text, /for B, then/);
 });
 
 test("terminal and cross-session markers cannot restore a parent", async () => {
