@@ -281,6 +281,18 @@ class SchedulerTest(SchedulerFixture):
         record = wr.load_workspace(wr.workspace_record_path("ws"))
         self.assertTrue(record["tasks"]["a1"]["checkout"]["restored"])
 
+    def test_second_task_is_refused_when_the_first_left_the_checkout_dirty(self):
+        # The #4 pilot: a lead applied its diff to the parent checkout; the next task in that repository
+        # launched on the dirty checkout because only HEAD was checked (#68).
+        os.environ["FAKE_PI_MESS"] = "parent-apply"
+        tasks = [{"id": "a1", "repository": "alpha", "title": "first"}, {"id": "a2", "repository": "alpha", "title": "second"}]
+        result = self.schedule(self.manifest(tasks, max_parallel=1))
+        self.assertEqual(self.states(result), {"a1": "partial", "a2": "refused"}, result)
+        self.assertEqual(result["session"]["refused"], {"a2": "WORKSPACE_CHECKOUT_DIRTY"})
+        record = wr.load_workspace(wr.workspace_record_path("ws"))
+        self.assertEqual(record["tasks"]["a1"]["checkout"]["dirty_files"], ["README.md"])
+        self.assertNotIn("a2", record["tasks"])
+
     def test_cli(self):
         manifest = self.manifest(self.one_per_repo()[:2])
         out = io.StringIO()

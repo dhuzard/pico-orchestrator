@@ -243,7 +243,8 @@ def _entry(record: dict, task: dict, repo: dict, execution: dict, inputs: dict |
         cleanup = execution["checkout"]
         entry["checkout"] = {"restored": cleanup["restored"], "branch": cleanup["branch_after"],
                              "removed_worktrees": len(cleanup["removed_worktrees"]),
-                             "kept_worktrees": len(cleanup["kept_worktrees"]), "left_reason": cleanup["left_reason"]}
+                             "kept_worktrees": len(cleanup["kept_worktrees"]), "left_reason": cleanup["left_reason"],
+                             "dirty_files": cleanup.get("dirty_files"), "dirty_count": cleanup.get("dirty_count")}
     record["tasks"][task["id"]] = entry
     return entry
 
@@ -454,6 +455,28 @@ def launch(*, manifest: Path, task_id: str, allow_mutation: bool = False, resume
         budget_override = {"at": _now(), **{k: spend[k] for k in (
             "reasons", "spent_tokens", "max_tokens", "spent_cost_usd", "max_cost_usd")}}
 
+    def checkout_gate() -> None:
+        # Runs only when a child would really start or resume, like the budget gate, and is never skipped:
+        # a task must not build on, commit or validate against changes no run recorded (#68).
+        dirty = headless_run.tracked_changes(checkout)
+        if dirty is None:
+            raise WorkspaceRunError("WORKSPACE_CHECKOUT_DIRTY",
+                                    f"cannot read the status of the {repo['id']} checkout; refusing to launch")
+        if not dirty:
+            return
+        shown = ", ".join(dirty[:10]) + (f" and {len(dirty) - 10} more" if len(dirty) > 10 else "")
+        record = load_workspace(workspace_record_path(plan["workspace_id"])) or {}
+        culprits = [f"{tid} ({entry.get('run_id') or 'no run id'})" for tid, entry in sorted((record.get("tasks") or {}).items())
+                    if entry.get("repository") == repo["id"] and (entry.get("checkout") or {}).get("dirty_count")]
+        left_by = f"; left by {', '.join(culprits)}" if culprits else ""
+        raise WorkspaceRunError("WORKSPACE_CHECKOUT_DIRTY",
+                                f"the {repo['id']} checkout has uncommitted tracked changes: {shown}{left_by}. "
+                                "Inspect them, then commit, move or discard them yourself; PICO never cleans a checkout")
+
+    def before_spawn() -> None:
+        checkout_gate()
+        budget_gate()
+
     with locked_workspace(plan["workspace_id"]):
         prior = load_workspace(workspace_record_path(plan["workspace_id"]))
         saved_inputs = ((prior or {}).get("tasks") or {}).get(task_id, {}).get("inputs")
@@ -473,7 +496,7 @@ def launch(*, manifest: Path, task_id: str, allow_mutation: bool = False, resume
                                        execution_id=execution_id(plan["workspace_id"], task_id),
                                        objective=objective, allow_mutation=allow_mutation,
                                        resume=resume, wait=wait, pi_executable=pi_executable,
-                                       before_spawn=budget_gate, takeover=takeover_stale_lease,
+                                       before_spawn=before_spawn, takeover=takeover_stale_lease,
                                        max_duration_seconds=max_duration, max_lead_calls=max_lead_calls,
                                        max_lead_calls_source=lead_source, lead_calls_warn_at=lead_warn_at,
                                        failure_retry_budget=failure_budget, failure_retry_budget_source=failure_source,
