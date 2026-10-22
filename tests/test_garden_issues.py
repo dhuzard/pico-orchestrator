@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -270,8 +271,16 @@ class IssuesRobustnessTest(IssuesFixture):
         first.start()
         self.assertTrue(fake.entered.wait(5))
         try:
-            api, web = source.view()["repositories"]  # returns while the first request is still stuck
-            self.assertEqual((api["error_code"], api["issues"]), ("ISSUES_FETCH_IN_PROGRESS", None))
+            # The first request also reads acme/web in parallel; on a loaded runner that read may still
+            # be in flight, so retry (bounded) until it is cached (#50). Every retry returns while the
+            # first request is still stuck on acme/app.
+            for _ in range(250):
+                api, web = source.view()["repositories"]
+                self.assertEqual((api["error_code"], api["issues"]), ("ISSUES_FETCH_IN_PROGRESS", None))
+                if web["available"]:
+                    break
+                self.assertEqual(web["error_code"], "ISSUES_FETCH_IN_PROGRESS")
+                time.sleep(0.02)
             self.assertTrue(web["available"])
         finally:
             fake.release.set()
