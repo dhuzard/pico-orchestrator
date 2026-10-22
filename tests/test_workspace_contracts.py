@@ -444,6 +444,23 @@ class ContractLifecycleTest(unittest.TestCase):
         self.assertIn(f"#{orphan}", ctx.exception.detail)
         self.assertEqual([c["head"] for c in self.fake.created].count("pico/a1-3"), 0)
 
+    def test_republication_skips_another_tasks_open_pr_at_the_same_commit(self):
+        manifest = self.manifest()
+        a1_commit = self._closed_and_published(manifest)
+        self.fake.states[101] = "CLOSED"
+        checkout = self.repos["alpha"][0]
+        git("-C", str(checkout), "push", "-q", str(self.bare["alpha"]), f"{a1_commit}:refs/heads/pico/a1-2")
+        self._foreign_pr(150, "pico/a1-2")
+        chosen = gi.republication_branch(checkout, "acme/alpha", "main", "pico/a1", self.fake,
+                                         recorded_pr={"number": 101}, reserved=frozenset({"pico/a1-2"}))
+        self.assertEqual(chosen, {"remote_head": "pico/a1-3", "supersedes": [101]})
+        # Not reserved, the same PR refuses, and the message says how to recover.
+        with self.assertRaises(gi.IntegrationError) as ctx:
+            gi.republication_branch(checkout, "acme/alpha", "main", "pico/a1", self.fake, recorded_pr={"number": 101})
+        self.assertEqual(ctx.exception.code, "PUBLICATION_PR_CONFLICT")
+        self.assertIn("close it", ctx.exception.detail)
+        self.assertNotIn("or record it", ctx.exception.detail)
+
     def test_republication_resumes_a_push_whose_pr_was_not_created(self):
         manifest = self.manifest()
         a1_commit = self._closed_and_published(manifest)

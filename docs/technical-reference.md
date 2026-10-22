@@ -2283,7 +2283,9 @@ A candidate with any PR the task's record does not name is skipped, never
 taken over and never listed as superseded, except an open one already at the
 validated commit: that is most likely this task's own PR from a creation whose
 answer was lost, so it refuses (`PUBLICATION_PR_CONFLICT`, naming the PR)
-instead of opening a second PR for the same commit. This task's own closed PRs met on the way are superseded as
+instead of opening a second PR for the same commit. No command adopts such a
+PR: close it, then publish again, and the commit goes to the next free
+branch. Branches reserved by another task are skipped before this check. This task's own closed PRs met on the way are superseded as
 well, and a merged one refuses. Pass `--new-branch` to the apply as well: the
 plan hash binds `remote_head`, so an apply without it is refused. The body adds
 `Supersedes #N (closed without merging).`, the plan records `remote_head` and

@@ -714,6 +714,8 @@ def republication_branch(worktree: Path, repo: str, base: str, head: str, adapte
     supersedes = sorted(pr["number"] for pr in prs)
     for n in range(2, REPUBLICATION_LIMIT + 1):
         candidate = f"{head}-{n}"
+        if candidate in reserved:  # another task's head or PR branch: never this task's, never refused for it
+            continue
         found = adapter.list_prs(base=base, head=candidate, repo=repo)
         foreign = [pr for pr in found if pr["number"] not in own]
         if foreign:
@@ -724,8 +726,9 @@ def republication_branch(worktree: Path, repo: str, base: str, head: str, adapte
             if unrecorded and _remote_head_commit(worktree, remote, candidate) == commit:
                 raise IntegrationError("PUBLICATION_PR_CONFLICT",
                                        f"{candidate} has open PR #{unrecorded[0]} at the validated commit, but the "
-                                       "task does not record it; check whether it is this task's PR and close it "
-                                       "or record it before publishing again")
+                                       "task does not record it. PICO cannot adopt it: check the PR, close it if "
+                                       "it duplicates this task, then publish again (the commit goes to the next "
+                                       "free branch)")
             continue
         states = {str(pr["state"]).lower() for pr in found}
         if "merged" in states:
@@ -740,8 +743,6 @@ def republication_branch(worktree: Path, repo: str, base: str, head: str, adapte
             return {"remote_head": candidate, "supersedes": supersedes}
         if found:  # this task's earlier republication, closed as well: superseded too, never reused
             supersedes = sorted(supersedes + [pr["number"] for pr in found])
-            continue
-        if candidate in reserved:
             continue
         remote_commit = _remote_head_commit(worktree, remote, candidate)
         if remote_commit == commit:  # this task's earlier push whose PR was not created yet
