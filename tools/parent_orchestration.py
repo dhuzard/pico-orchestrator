@@ -56,6 +56,12 @@ REASONING_EFFORTS = {"low", "medium", "high"}
 # implicit: the parent records one of these when it re-classifies a phase.
 ESCALATION_REASONS = {"FAILED_ATTEMPTS", "REVIEW_FINDINGS", "AMBIGUITY", "ARCHITECTURE",
                       "SECURITY_SENSITIVE", "SEMANTIC_RISK", "CONTEXT_BUDGET"}
+# Written only by a `diff_floors` event: the worker's real diff hit `.pi/routing.yaml` path floors that require a
+# stronger route or capacity than the one that ran (CLASSIFICATION_UNDERRATED_BY_DIFF).
+PATH_FLOOR_REASON = "PATH_FLOOR"
+DIFF_FLOOR_STATUSES = {"passed", "underrated"}
+MAX_DIFF_FLOOR_CHECKS = 20
+MAX_PATH_FLOOR_RULES = 64
 COMPACTION_REASONS = {"budget", "threshold", "overflow", "manual"}
 USAGE_BACKENDS = {"claude-code", "pi-subagent"}
 USAGE_COUNTERS = ("duration_ms", "input_tokens", "output_tokens", "cached_tokens", "cache_write_tokens", "total_tokens")
@@ -845,6 +851,75 @@ def _wave_event(parent: dict, event: dict) -> None:
             task_phase.pop("workspace_bound", None)  # merged: its bound worktrees (every epoch) are covered
 
 
+def _path_floor_matches(value: Any) -> list[dict]:
+    """Closed, bounded copy of path-floor matches (routing_engine.match_path_floors) for the record."""
+    floor_fields = set(engine.ORDERED_OVERRIDE_FIELDS) | set(engine.SAFETY_OVERRIDE_FIELDS)
+    keys = {"rule", "patterns", "floors", "matched_paths", "matched_path_count"}
+    if not isinstance(value, list) or len(value) > MAX_PATH_FLOOR_RULES:
+        raise ParentRunError("invalid path floor matches", error_code="PARENT_DIFF_FLOORS_INVALID")
+    matches = []
+    for item in value:
+        if (not isinstance(item, dict) or set(item) != keys or type(item["rule"]) is not int
+                or not 0 <= item["rule"] < MAX_PATH_FLOOR_RULES or type(item["matched_path_count"]) is not int
+                or not isinstance(item["floors"], dict) or not item["floors"] or set(item["floors"]) - floor_fields
+                or any(type(floor) not in (str, int, bool) for floor in item["floors"].values())):
+            raise ParentRunError("invalid path floor match", error_code="PARENT_DIFF_FLOORS_INVALID")
+        texts = {}
+        for field, limit in (("patterns", 32), ("matched_paths", engine.PATH_FLOOR_MATCHED_PATHS_LIMIT)):
+            entries = item[field]
+            if (not isinstance(entries, list) or not entries or len(entries) > limit
+                    or not all(isinstance(entry, str) and 0 < len(entry) <= 4096 and not CONTROL_RE.search(entry)
+                               for entry in entries)):
+                raise ParentRunError("invalid path floor match", error_code="PARENT_DIFF_FLOORS_INVALID")
+            texts[field] = [_mask_secrets(entry) for entry in entries]
+        if item["matched_path_count"] < len(texts["matched_paths"]):
+            raise ParentRunError("invalid path floor match", error_code="PARENT_DIFF_FLOORS_INVALID")
+        matches.append({"rule": item["rule"], "patterns": texts["patterns"], "floors": dict(item["floors"]),
+                        "matched_paths": texts["matched_paths"], "matched_path_count": item["matched_path_count"]})
+    return matches
+
+
+def _diff_floors_event(parent: dict, event: dict) -> None:
+    """Record the post-diff path-floor check of a task's bound worktree, and on an underrated diff require a re-route.
+
+    `passed` only records which path floors the real diff matched. `underrated` (CLASSIFICATION_UNDERRATED_BY_DIFF:
+    the diff's floors select an earlier route in the policy precedence, or the same route with a higher capacity)
+    appends an unconfirmed `PATH_FLOOR` escalation from the current route to `to_route`. Like any escalation it
+    starts a new route epoch and keeps the run IN_PROGRESS: `status` lists the phase in `reroute_phases`, worker
+    dispatch waits for a rerun route_task whose phase event must name `to_route`, and COMPLETED is refused with
+    PARENT_ROUTE_RECHECK_REQUIRED until then. It is never a terminal finish. `to_route` may equal the current route
+    (a capacity-only raise) and, unlike a lead escalation, may be any route earlier in the policy precedence.
+    """
+    phase = _phase(parent, event["phase"])
+    status = event["status"]
+    if status not in DIFF_FLOOR_STATUSES:
+        raise ParentRunError("invalid diff floor check status", error_code="PARENT_DIFF_FLOORS_INVALID")
+    matches = _path_floor_matches(event["matches"])
+    epoch = len(phase.get("escalations") or [])
+    current = (phase.get("escalations") or [{}])[-1].get("to_route") or phase["route"]
+    entry = {"at": _now(), "status": status, "route_epoch": epoch, "route": current, "matches": matches}
+    if status == "underrated":
+        if phase["status"] in {"completed", "blocked", "failed", "partial"} or current is None:
+            raise ParentRunError("an underrated diff needs an open, routed phase", error_code="PARENT_DIFF_FLOORS_INVALID")
+        try:
+            precedence = engine.load_yaml(POLICY_PATH)["precedence"]
+        except (OSError, KeyError, TypeError, ValueError, engine.yaml.YAMLError) as exc:
+            raise ParentRunError("routing policy is unavailable", error_code="PARENT_POLICY_UNAVAILABLE") from exc
+        to_route = event.get("to_route")
+        if (event.get("from_route") != current or to_route not in ROUTES or not matches
+                or precedence.index(to_route) > precedence.index(current)
+                or (to_route == current and event.get("capacity_raised") is not True)):
+            raise ParentRunError("invalid underrated diff re-route", error_code="PARENT_DIFF_FLOORS_INVALID")
+        entry.update(to_route=to_route, capacity_raised=event.get("capacity_raised") is True)
+        phase.setdefault("escalations", []).append({"from_route": current, "to_route": to_route,
+            "reason": PATH_FLOOR_REASON, "at": entry["at"], "confirmed": False})
+    elif set(event) & {"from_route", "to_route", "capacity_raised"}:
+        raise ParentRunError("a passed diff floor check names no re-route", error_code="PARENT_DIFF_FLOORS_INVALID")
+    checks = phase.setdefault("diff_floor_checks", [])
+    checks.append(entry)
+    phase["diff_floor_checks"] = checks[-MAX_DIFF_FLOOR_CHECKS:]
+
+
 def _topology(peak: int) -> str:
     return ("direct" if peak == 0 else "one_worker" if peak == 1 else "two_workers" if peak == 2
             else "three_to_four_workers" if peak <= 4 else "larger_team")
@@ -945,6 +1020,7 @@ def _record_event_unlocked(run_id: str, event: dict, *, repo_root: Path = ROOT) 
         "failure": {"kind", "phase", "step_id", "code", "head", "inputs_digest", "blocker_kind"},
         "retry_gate": {"kind", "phase", "step_id", "head", "inputs_digest", "retry_budget", "source"},
         "worker_sandbox": {"kind", "state", "source", "allowed_domains", "cache_directories", "policy_source"},
+        "diff_floors": {"kind", "phase", "status", "from_route", "to_route", "capacity_raised", "matches"},
     }
     required = {
         "phase": {"kind", "phase", "status"},
@@ -967,6 +1043,7 @@ def _record_event_unlocked(run_id: str, event: dict, *, repo_root: Path = ROOT) 
         "failure": {"kind", "phase", "step_id", "code"},
         "retry_gate": {"kind", "phase", "step_id", "retry_budget", "source"},
         "worker_sandbox": {"kind", "state", "source"},
+        "diff_floors": {"kind", "phase", "status", "matches"},
     }
     if kind not in allowed or set(event) - allowed[kind]:
         raise ParentRunError("unsupported event or unexpected fields")
@@ -1266,6 +1343,8 @@ def _record_event_unlocked(run_id: str, event: dict, *, repo_root: Path = ROOT) 
         _failure_event(parent, event)
     elif kind == "worker_sandbox":
         _worker_sandbox_event(parent, event)
+    elif kind == "diff_floors":
+        _diff_floors_event(parent, event)
     elif kind == "retry_gate":
         gate = _retry_gate_event(parent, event)
         provenance.update_parent_orchestration(repo_root, run_id, parent)
