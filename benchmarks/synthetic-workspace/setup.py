@@ -38,6 +38,11 @@ COMMIT_ENV = {
 }
 REPOSITORIES = ("synth-lib", "synth-app")
 TASK_IDS = ("lib-slugify", "lib-stopwords", "app-post-url", "qualify-integration")
+# What CI runs in each repository. synth-lib runs only the slugify tests: test_stopwords cannot pass (its approved
+# input never exists, lib-stopwords ends PARTIAL), and the whole suite would keep lib-slugify's PR red forever, so
+# nothing downstream could be promoted. synth-app runs its whole suite.
+CI_COMMANDS = {"synth-lib": "python3 -m unittest tests.test_slugify",
+               "synth-app": "python3 -m unittest discover -s tests -t ."}
 DEFAULT_MAX_TOKENS = 5_000_000
 
 AUTONOMY = {
@@ -69,7 +74,8 @@ def build_repository(target: Path, name: str, owner: str, publication: bool) -> 
     shutil.copytree(HERE / "files" / name, repo)
     workflows = repo / ".github" / "workflows"
     workflows.mkdir(parents=True)
-    shutil.copy(HERE / "files" / "ci" / "tests.yml", workflows / "tests.yml")
+    workflow = (HERE / "files" / "ci" / "tests.yml").read_text(encoding="utf-8")
+    (workflows / "tests.yml").write_text(workflow.replace("__CI_COMMAND__", CI_COMMANDS[name]), encoding="utf-8")
     (repo / ".gitignore").write_text("__pycache__/\n*.pyc\n", encoding="utf-8")
     if publication:
         (repo / ".pi").mkdir()

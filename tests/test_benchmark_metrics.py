@@ -517,6 +517,11 @@ class SyntheticWorkspace(unittest.TestCase):
         self.assertEqual([c["repository"] for c in qualify], ["synth-app", "synth-lib"])
         for check in qualify:
             self.assertEqual(run_check(check["argv"], {"synth-lib": lib, "synth-app": app}[check["repository"]]), 0)
+        # CI (the committed workflow's command) passes in both repositories once the verified tasks are done; a red
+        # synth-lib CI would keep lib-slugify from ever being promoted.
+        for repo in (lib, app):
+            command = yaml.safe_load((repo / ".github" / "workflows" / "tests.yml").read_text())["jobs"]["unittest"]["steps"][-1]["run"]
+            self.assertEqual(run_check(command.split(), repo), 0, f"CI must pass in {repo.name} with the reference solution")
         # The PARTIAL task cannot be satisfied without the missing input.
         self.assertNotEqual(run_check(tasks["lib-stopwords"]["checks"][0]["argv"], lib), 0)
         self.assertFalse((lib / "data" / "approved-stopwords.txt").exists())
