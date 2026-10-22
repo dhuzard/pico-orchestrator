@@ -2273,14 +2273,23 @@ PR is a draft. The PR number and publication run id are recorded.
 or merged PR is refused (`PUBLICATION_PR_CONFLICT`): a closed PR's branch is
 never reused, reopened or overwritten. When every PR of the task's branch was
 closed without merging, `publish --new-branch` pushes the validated commit to
-the first `<branch>-<n>` (n from 2) that has an open PR, which is reused, or
-no PR and no other commit on the remote. Closed PRs met on the way are
-superseded as well, and a merged PR anywhere on the way refuses. The body adds
+the first `<branch>-<n>` (n from 2) that holds this task's earlier
+republication (the open PR recorded in the task's `pr`, whose remote head is
+the validated commit or one of its ancestors; it is reused), or is free: no
+PR, no other commit on the remote, no local branch, and not the head branch
+or PR branch of another task of the same repository. A candidate with any PR
+the task's record does not name is skipped, never taken over and never listed
+as superseded. This task's own closed PRs met on the way are superseded as
+well, and a merged one refuses. Pass `--new-branch` to the apply as well: the
+plan hash binds `remote_head`, so an apply without it is refused. The body adds
 `Supersedes #N (closed without merging).`, the plan records `remote_head` and
 `supersedes_prs` (bound by the plan hash; a branch that changed between the
 dry run and the apply gives `GITHUB_STATE_CONFLICT`), and the task's `pr`
-records `branch` and `supersedes`, while the observed CI of the superseded PR
-is dropped. The local branch keeps its name. `--new-branch` on a branch with
+records `branch` and `supersedes`. The observed CI and `promoted_at` of the
+superseded PR are dropped, and a `ready_for_downstream` task goes back to
+`validated`, so downstream waits until `promote` observes green CI on the new
+PR. A GitHub or git failure while choosing the branch returns
+`PUBLICATION_FAILED` instead of a traceback. The local branch keeps its name. `--new-branch` on a branch with
 no PR or an open one is refused with `PUBLICATION_NEW_BRANCH_UNNEEDED`.
 
 **`ci` and `promote`.** `ci` reads `gh pr view --json

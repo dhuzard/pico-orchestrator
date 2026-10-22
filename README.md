@@ -271,7 +271,8 @@ Each task then moves forward only on evidence:
 pico workspace validate workspace.yaml --task a1 --head pico/batch-1   # checks pass on that exact commit
 pico workspace publish  workspace.yaml --task a1                       # dry run: review the plan_hash
 pico workspace publish  workspace.yaml --task a1 --apply --plan-hash <hash>
-pico workspace publish  workspace.yaml --task a1 --new-branch             # after its draft PR was closed unmerged
+pico workspace publish  workspace.yaml --task a1 --new-branch          # after its draft PR was closed unmerged;
+                                                                       # pass --new-branch with --apply too
 pico workspace promote  workspace.yaml --task a1                       # CI observed green -> ready_for_downstream
 ```
 
@@ -281,8 +282,10 @@ Publication uses the existing reviewed path: `.pi/autonomy.yaml` must allow
 whose body links the upstream PRs it depends on. A head that moved after
 validation is refused. A branch whose PR was closed is never reused: after a
 closed, unmerged PR, `--new-branch` publishes the validated commit to
-`pico/<task>-2` (then `-3`, and so on) with a PR that names the one it
-supersedes. A downstream task dispatches only after its upstream is
+`<head>-2` (for example `pico/batch-1-2`, then `-3`, and so on) with a PR
+that names the one it supersedes; pass `--new-branch` to the apply as well.
+A branch that holds another task's head or someone else's PR is skipped, and
+a promoted task must be promoted again on the new PR. A downstream task dispatches only after its upstream is
 promoted and every contract it requires is validated at the required version.
 The scheduler runs qualification tasks as their own check wave once their
 dependencies are validated. `pico workspace ci` observes CI and a merge;
