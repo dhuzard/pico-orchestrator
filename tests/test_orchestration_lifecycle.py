@@ -86,8 +86,34 @@ class LifecycleTest(unittest.TestCase):
         self.assertEqual(self.route["backend_bindings"]["claude"]["capacity_models"]["high"]["model"],
                          "anthropic/claude-opus-5-5")
 
+    def test_worker_sandbox_needs_its_minimum_claude_code_unless_explicitly_opted_out(self):
+        # 2.1.280 meets the model floor but not the worker sandbox floor (#63): the settings PICO passes
+        # (strictAllowlist, the repository lock behind allowUnsandboxedCommands: false) need 2.1.285.
+        floor = json.loads((ROOT / "routing" / "backend-compatibility.json").read_text())
+        self.assertEqual(floor["claude_code_worker_sandbox_minimum_version"], "2.1.285")
+        for value in (None, "", "1"):
+            with self.subTest(sandbox=value), unittest.mock.patch.dict("os.environ", {}, clear=False):
+                os.environ.pop("PI_ORCHESTRATOR_WORKER_SANDBOX", None)
+                if value is not None:
+                    os.environ["PI_ORCHESTRATOR_WORKER_SANDBOX"] = value
+                result = self.check(version="2.1.280")
+                self.assertEqual(result["blocker_code"], "MODEL_BACKEND_VERSION_UNSUPPORTED")
+                self.assertEqual((result["required_backend_version"], result["requirement"]), (">=2.1.285", "worker_sandbox"))
+                self.assertEqual(result["installed_backend_version"], "2.1.280")
+                self.assertEqual(self.check(version="2.1.285")["status"], "READY")
+        with unittest.mock.patch.dict("os.environ", {"PI_ORCHESTRATOR_WORKER_SANDBOX": "0"}):
+            self.assertEqual(self.check(version="2.1.280")["status"], "READY")
+            # The model floor still applies to an opted-out run.
+            self.assertEqual(self.check(version="2.1.251")["required_backend_version"], ">=2.1.280")
+        broken = {"schema_version": 1, "claude_code_minimum_versions": {}, "claude_code_worker_sandbox_minimum_version": "x",
+                  "claude_code_model_ids": {"anthropic/claude-opus-5-5": "claude-opus-5-5"}}
+        with unittest.mock.patch.dict("os.environ", {"PI_ORCHESTRATOR_WORKER_SANDBOX": "1"}):
+            result = bp.preflight(self.route, ["spawn_subagent", "ClaudeWorker"], executable=str(self.fake_claude()),
+                                  run=self.runner("2.1.287"), pinned_identity=self.pin("2.1.287"), compatibility=broken)
+        self.assertEqual(result["blocker_code"], "MODEL_BACKEND_CONFIG_INVALID")
+
     def test_supported_backend_proceeds_but_model_entitlement_remains_unverified(self):
-        result = self.check(version="2.1.280")
+        result = self.check(version="2.1.287")
         self.assertEqual(result["status"], "READY")
         claude = next(step for step in result["checked_steps"] if step["backend"] == "claude")
         self.assertEqual(claude["model"], "anthropic/claude-opus-5-5")
@@ -95,15 +121,15 @@ class LifecycleTest(unittest.TestCase):
         self.assertEqual(claude["model_access"], "unverified")
 
     def test_auth_and_invocation_unavailable_are_blockers(self):
-        self.assertEqual(self.check(version="2.1.280", authenticated=False)["blocker_code"],
+        self.assertEqual(self.check(version="2.1.287", authenticated=False)["blocker_code"],
                          "MODEL_AUTH_UNAVAILABLE")
         self.assertEqual(self.check(tools=["spawn_subagent"])["blocker_code"],
                          "MODEL_BACKEND_UNAVAILABLE")
 
     def test_unrecognized_configured_model_fails_closed(self):
         result = bp.preflight(self.route, ["spawn_subagent", "ClaudeWorker"],
-                              executable=str(self.fake_claude()), run=self.runner("2.1.280"),
-                              pinned_identity=self.pin("2.1.280"),
+                              executable=str(self.fake_claude()), run=self.runner("2.1.287"),
+                              pinned_identity=self.pin("2.1.287"),
                               compatibility={"schema_version": 1, "claude_code_minimum_versions": {},
                                              "claude_code_model_ids": {}})
         self.assertEqual(result["blocker_code"], "MODEL_IDENTIFIER_UNSUPPORTED")
@@ -122,21 +148,21 @@ class LifecycleTest(unittest.TestCase):
                 self.assertIn("scripts/run-local.sh", result["remediation"])
 
     def test_changed_pinned_identity_remains_backend_mismatch(self):
-        drifted = json.loads(self.pin("2.1.280"))
+        drifted = json.loads(self.pin("2.1.287"))
         drifted["backend_inode"] += 1
-        result = self.check(version="2.1.280", pinned_identity=json.dumps(drifted))
+        result = self.check(version="2.1.287", pinned_identity=json.dumps(drifted))
         self.assertEqual(result["blocker_code"], "MODEL_BACKEND_MISMATCH")
         self.assertNotIn("MODEL_BACKEND_MISMATCH", bp.REROUTABLE_BLOCKERS)
         self.assertNotIn("BACKEND_IDENTITY_UNINITIALIZED", bp.REROUTABLE_BLOCKERS)
 
     def test_pin_defaults_to_launcher_environment(self):
-        with unittest.mock.patch.dict("os.environ", {bp.PIN_ENV: self.pin("2.1.280")}):
+        with unittest.mock.patch.dict("os.environ", {bp.PIN_ENV: self.pin("2.1.287")}):
             ready = bp.preflight(self.route, ["spawn_subagent", "ClaudeWorker"],
-                                 executable=str(self.fake_claude()), run=self.runner("2.1.280"))
+                                 executable=str(self.fake_claude()), run=self.runner("2.1.287"))
         self.assertEqual(ready["status"], "READY")
         with unittest.mock.patch.dict("os.environ", {}, clear=True):
             blocked = bp.preflight(self.route, ["spawn_subagent", "ClaudeWorker"],
-                                   executable=str(self.fake_claude()), run=self.runner("2.1.280"))
+                                   executable=str(self.fake_claude()), run=self.runner("2.1.287"))
         self.assertEqual(blocked["blocker_code"], "BACKEND_IDENTITY_UNINITIALIZED")
 
     def test_invalid_or_forged_route_fails_before_backend_probe(self):
@@ -176,7 +202,7 @@ class LifecycleTest(unittest.TestCase):
         order = []
         with po.ParentRun(worktree=self.target, repo_root=self.records) as parent:
             value = parent.prepare_implementation(self.route,
-                lambda route: (order.append("preflight") or self.check(version="2.1.280")),
+                lambda route: (order.append("preflight") or self.check(version="2.1.287")),
                 lambda: (order.append("worktree") or "created"))
             self.assertEqual(value, "created")
             run_id = parent.run_id

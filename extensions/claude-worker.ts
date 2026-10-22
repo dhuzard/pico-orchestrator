@@ -7,8 +7,8 @@
  * every input of a run (executable, cwd, model, effort, mode); the model never
  * chooses them.
  */
-import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
+import { existsSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -139,8 +139,11 @@ export type WorkerSandboxSummary = { state: "enabled" | "opted_out"; source: "de
 export type SandboxSupport = { available: boolean; detail: string };
 export type SandboxProbe = (env: Record<string, string>) => SandboxSupport;
 
-/** Host allowlist entry: a DNS name or `*.` wildcard of at least two labels, optional `:port`; no bare `*`, no IP. */
-export const SANDBOX_DOMAIN = /^(\*\.)?([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]([a-z0-9-]{0,61}[a-z0-9])?(:[0-9]{1,5})?$/;
+/**
+ * Host allowlist entry: a DNS name or `*.` wildcard of at least two labels, optional `:port` from 1 to 65535
+ * without leading zeros; no bare `*`, no IP. Mirrored in schemas/autonomy.schema.json and tools/parent_orchestration.py.
+ */
+export const SANDBOX_DOMAIN = /^(\*\.)?([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]([a-z0-9-]{0,61}[a-z0-9])?(:([1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5]))?$/;
 /** Cache directory entry: a relative path under the user cache directory, no `.`/`..` segments, no globs. */
 export const SANDBOX_CACHE_DIRECTORY = /^[A-Za-z0-9_][A-Za-z0-9._-]*(\/[A-Za-z0-9_][A-Za-z0-9._-]*)*$/;
 const MAX_ALLOWED_DOMAINS = 50;
@@ -201,41 +204,81 @@ export function workerSandboxConfig(policy: { allowed_domains?: unknown; cache_d
     allowedDomains: list(policy?.allowed_domains, SANDBOX_DOMAIN, MAX_ALLOWED_DOMAINS, "network.allowed_domains") };
 }
 
+/** Runs one probe command; true when it exits 0 within its timeout. */
+export type ProbeRunner = (file: string, args: string[], env: Record<string, string>) => boolean;
 /**
- * Whether Claude Code's sandbox can start here, from what its documentation
- * names as requirements: Seatbelt (`sandbox-exec`) on macOS, `bwrap` and
- * `socat` on the worker's PATH on Linux (WSL2 included). Other platforms,
- * native Windows among them, have no sandbox. Claude Code's own
- * `failIfUnavailable` check stays the final word; this one only lets PICO
- * fail closed before starting a process, with a stable code.
+ * The bubblewrap probe: a fresh user, PID and network namespace with a new /proc, the shape Claude Code's
+ * sandbox needs. It fails where bwrap is installed but unusable (AppArmor's unprivileged user-namespace
+ * restriction on Ubuntu 24.04 and later, or a container that forbids namespaces or a /proc mount).
+ */
+export const BWRAP_PROBE_ARGS: readonly string[] = ["--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
+  "--unshare-user", "--unshare-pid", "--unshare-net", "--die-with-parent", "true"];
+const PROBE_TIMEOUT_MS = 5_000;
+const runProbe: ProbeRunner = (file, args, env) => {
+  const result = spawnSync(file, args, { env, stdio: "ignore", timeout: PROBE_TIMEOUT_MS, shell: false });
+  return result.error === undefined && result.status === 0;
+};
+
+/**
+ * Whether Claude Code's sandbox can start here. macOS: Seatbelt
+ * (`/usr/bin/sandbox-exec`) exists. Linux (WSL2 included): `bwrap` and
+ * `socat` are on the worker's PATH, and bwrap actually starts a namespaced
+ * `true` (BWRAP_PROBE_ARGS, 5 s timeout), which Claude Code's own dependency
+ * check does not try. Other platforms, native Windows among them, have no
+ * sandbox. This is a prerequisite check, not proof that every sandboxed
+ * command will work; Claude Code's `failIfUnavailable` stays the final word.
  */
 export function detectWorkerSandbox(env: Record<string, string>, platform: NodeJS.Platform = process.platform,
-                                    exists: (path: string) => boolean = existsSync): SandboxSupport {
+                                    exists: (path: string) => boolean = existsSync,
+                                    run: ProbeRunner = runProbe): SandboxSupport {
   if (platform === "darwin") {
     return exists("/usr/bin/sandbox-exec") ? { available: true, detail: "Seatbelt (sandbox-exec)" }
       : { available: false, detail: "macOS without /usr/bin/sandbox-exec" };
   }
   if (platform !== "linux") return { available: false, detail: `no Claude Code sandbox on platform ${platform}` };
-  const onPath = (name: string) => (env.PATH ?? "").split(delimiter)
-    .some((dir) => dir !== "" && isAbsolute(dir) && exists(join(dir, name)));
-  const missing = ["bwrap", "socat"].filter((name) => !onPath(name));
-  return missing.length === 0 ? { available: true, detail: "bubblewrap and socat" }
-    : { available: false, detail: `${missing.join(" and ")} not found on the worker PATH (install bubblewrap and socat)` };
+  const locate = (name: string) => (env.PATH ?? "").split(delimiter)
+    .map((dir) => dir !== "" && isAbsolute(dir) ? join(dir, name) : null)
+    .find((path): path is string => path !== null && exists(path)) ?? null;
+  const bwrap = locate("bwrap");
+  const missing = [bwrap ? null : "bwrap", locate("socat") ? null : "socat"].filter((name): name is string => name !== null);
+  if (missing.length) {
+    return { available: false, detail: `${missing.join(" and ")} not found on the worker PATH (install bubblewrap and socat)` };
+  }
+  if (!run(bwrap!, [...BWRAP_PROBE_ARGS], { PATH: env.PATH ?? "" })) {
+    return { available: false, detail: `${bwrap} cannot create the sandbox namespaces (on Ubuntu 24.04 and later, ` +
+      "AppArmor may restrict unprivileged user namespaces; see Claude Code's sandboxing documentation)" };
+  }
+  return { available: true, detail: "bubblewrap (namespaces probed) and socat" };
 }
 
 function absoluteOrNull(value: string | undefined): string | null {
   return value && isAbsolute(value) ? resolve(value) : null;
 }
 
-/** Paths a worker must not read: PICO state directories (provenance, leases) and credential locations. */
-export function sandboxDeniedReads(parentEnv: NodeJS.ProcessEnv, home: string): string[] {
+/** A path and, when it resolves through a symlink to somewhere else, its real location too. */
+function withRealPath(path: string, realpath: (path: string) => string): string[] {
+  try {
+    const real = realpath(path);
+    return real === path ? [path] : [path, real];
+  } catch {
+    return [path]; // absent: nothing to resolve
+  }
+}
+
+/**
+ * Paths a worker must not read: PICO state directories (provenance, leases) and credential locations, each
+ * also at its resolved location when it is a symlink (for example `~/.ssh` linked into a dotfiles repository).
+ */
+export function sandboxDeniedReads(parentEnv: NodeJS.ProcessEnv, home: string,
+                                   realpath: (path: string) => string = realpathSync): string[] {
   const xdgState = absoluteOrNull(parentEnv.XDG_STATE_HOME) ?? join(home, ".local", "state");
   const xdgConfig = absoluteOrNull(parentEnv.XDG_CONFIG_HOME);
   const state = [absoluteOrNull(parentEnv.PI_ORCHESTRATOR_STATE_DIR) ?? join(ORCHESTRATOR_ROOT, "provenance"),
     absoluteOrNull(parentEnv.PI_CODING_ORCHESTRATOR_STATE_DIR), join(xdgState, PICO_DIR_NAME)];
   const credentials = [...SANDBOX_CREDENTIAL_PATHS.map((path) => join(home, path)),
     xdgConfig ? join(xdgConfig, "gh") : null, absoluteOrNull(parentEnv.GH_CONFIG_DIR)];
-  return [...new Set([...state, ...credentials].filter((path): path is string => path !== null))];
+  return [...new Set([...state, ...credentials].filter((path): path is string => path !== null)
+    .flatMap((path) => withRealPath(path, realpath)))];
 }
 
 /** PICO's launcher cache (it holds the code PICO runs) and user configuration: never writable by a worker. */
@@ -251,10 +294,12 @@ function within(path: string, root: string): boolean {
 }
 
 /**
- * The `--settings` object of one worker. Always: `permissions.deny` Read rules
- * for the PICO state directory and credential locations (they bind Claude's
- * Read, Edit and Write tools, which the OS sandbox does not cover). For a
- * mutating worker with the sandbox on, also `sandbox`: enabled, exit at
+ * The `--settings` object of one worker. Always: `disableAllHooks` (hooks from
+ * any settings file, a repository's `.claude/settings.json` included, would run
+ * outside the sandbox with the user's access), and `permissions.deny` Read and
+ * Edit rules for the PICO state directory and credential locations (they bind
+ * Claude's Read, Glob, Grep, Edit and Write tools, which the OS sandbox does not
+ * cover). For a mutating worker with the sandbox on, also `sandbox`: enabled, exit at
  * startup when it cannot start, no unsandboxed retry (which also makes Claude
  * Code ignore a repository's own `.claude/settings.json` widening entries),
  * the same reads denied at the OS level, writes beyond the working directory
@@ -281,8 +326,8 @@ export function workerSandboxSettings(input: { cwd: string; mode: "read" | "full
     if (clash) throw new WorkerConfigError(`worker_sandbox cache directory ${cache} overlaps ${clash}, which the worker sandbox protects.`);
   }
   // Permission rules take `//` for an absolute path; sandbox paths take a plain absolute path.
-  const deny = deniedReads.flatMap((path) => [`Read(/${path})`, `Read(/${path}/**)`]);
-  const settings: Record<string, unknown> = { permissions: { deny } };
+  const deny = deniedReads.flatMap((path) => [`Read(/${path})`, `Read(/${path}/**)`, `Edit(/${path})`, `Edit(/${path}/**)`]);
+  const settings: Record<string, unknown> = { disableAllHooks: true, permissions: { deny } };
   if (input.mode === "full" && input.config.state === "enabled") {
     settings.sandbox = { enabled: true, failIfUnavailable: true, allowUnsandboxedCommands: false,
       filesystem: { ...(caches.length ? { allowWrite: caches } : {}), denyRead: deniedReads, denyWrite: protectedWrites },
@@ -291,9 +336,14 @@ export function workerSandboxSettings(input: { cwd: string; mode: "read" | "full
   return settings;
 }
 
-/** Claude Code's own startup refusal when `failIfUnavailable` is set and its sandbox cannot start. */
-export function sandboxUnavailableText(text: string): boolean {
-  return /sandbox/i.test(text) && /failIfUnavailable/.test(text);
+/**
+ * Claude Code's own startup refusal when `failIfUnavailable` is set and its sandbox cannot start, as Claude Code
+ * 2.1.287 writes it to stderr before exiting 1 with no result: "Error: sandbox required but unavailable: <reason>"
+ * then "sandbox.failIfUnavailable is set — refusing to start without a working sandbox."
+ */
+export const SANDBOX_REFUSAL = "refusing to start without a working sandbox";
+export function sandboxUnavailableText(stderr: string): boolean {
+  return stderr.includes("sandbox required but unavailable") && stderr.includes(SANDBOX_REFUSAL);
 }
 export const DEFAULT_TIMEOUT_MS = 30 * 60_000;
 const MAX_STDOUT = 8 * 1024 * 1024;
@@ -343,6 +393,8 @@ export function claudeWorkerArgs(plan: ClaudeWorkerPlan, settings?: Record<strin
     "--permission-mode", plan.mode === "full" ? "acceptEdits" : "default",
     "--tools", tools.join(","), "--allowedTools", ...tools, "--disallowedTools", ...FORBIDDEN_TOOLS,
     "--append-system-prompt", contract, "--output-format", "json", "--no-session-persistence",
+    // No MCP server from a repository's .mcp.json or any settings file: none is passed with --mcp-config.
+    "--strict-mcp-config",
     ...(settings ? ["--settings", JSON.stringify(settings)] : [])];
 }
 
@@ -427,8 +479,9 @@ export function runClaudeWorker(plan: ClaudeWorkerPlan, prompt: string, signal?:
       const elapsedMs = Date.now() - started;
       const base = { exitCode, elapsedMs, sessionId: null, permissionDenials: 0, deniedCalls: [] as string[],
         envDropped: dropped, sandbox: summary };
-      // Claude Code's own failIfUnavailable refusal: the sandbox could not start, so nothing ran.
-      const refusedSandbox = (text: string) => summary.applied && exitCode !== 0 && sandboxUnavailableText(text);
+      // Claude Code's own failIfUnavailable refusal: exit 1 with no result, the fixed phrase on stderr. Only that
+      // branch is matched; a JSON result (model text) can never be reclassified as a sandbox prerequisite.
+      const refusedSandbox = summary.applied && exitCode !== 0 && sandboxUnavailableText(stderr);
       if (failure) {
         const detail = failure === "TIMEOUT" ? `timed out after ${timeoutMs} ms`
           : failure === "ABORTED" ? "aborted" : failure === "OUTPUT_LIMIT" ? `exceeded ${MAX_STDOUT} bytes of output`
@@ -439,7 +492,7 @@ export function runClaudeWorker(plan: ClaudeWorkerPlan, prompt: string, signal?:
       const parsed = parseClaudeResult(stdout);
       if (!parsed) {
         const text = stderr.trim().slice(0, 2000) || "Claude worker returned no JSON result.";
-        resolve({ ok: false, text, error: refusedSandbox(`${stderr}\n${stdout}`) ? "SANDBOX_UNAVAILABLE" : "MALFORMED_OUTPUT",
+        resolve({ ok: false, text, error: refusedSandbox ? "SANDBOX_UNAVAILABLE" : "MALFORMED_OUTPUT",
           usage: empty, durationMs: null, ...base });
         return;
       }
@@ -448,7 +501,7 @@ export function runClaudeWorker(plan: ClaudeWorkerPlan, prompt: string, signal?:
         : typeof result.subtype === "string" ? `Claude worker ended with ${result.subtype}.` : "";
       const failed = result.is_error === true || exitCode !== 0;
       resolve({ ok: !failed, text: text.length > MAX_TEXT ? `${text.slice(0, MAX_TEXT)}\n[truncated]` : text,
-        error: !failed ? null : refusedSandbox(`${text}\n${stderr}`) ? "SANDBOX_UNAVAILABLE" : "BACKEND_ERROR", usage, durationMs: count(result.duration_ms), exitCode, elapsedMs,
+        error: failed ? "BACKEND_ERROR" : null, usage, durationMs: count(result.duration_ms), exitCode, elapsedMs,
         sessionId: typeof result.session_id === "string" ? result.session_id : null,
         permissionDenials: Array.isArray(result.permission_denials) ? result.permission_denials.length : 0,
         deniedCalls: describeDenials(result.permission_denials), envDropped: dropped, sandbox: summary });

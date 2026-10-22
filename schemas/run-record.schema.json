@@ -97,7 +97,7 @@
         "worker_sandbox": {
           "type": "array",
           "maxItems": 50,
-          "description": "The OS sandbox posture the lifecycle extension applied to this run's Claude workers (#63), one entry per run start or resume (consecutive identical postures are kept once). state enabled is the default; opted_out is only the user's explicit PI_ORCHESTRATOR_WORKER_SANDBOX=0 (source env). allowed_domains and cache_directories are the repository's opt-in widening from .pi/autonomy.yaml (policy_source policy), empty when absent (default) or when the policy could not be read (invalid). Sandbox denials inside a worker are not recorded here: Claude Code reports them to the model, not in its JSON result.",
+          "description": "The OS sandbox posture the lifecycle extension applied to this run's Claude workers (#63), one entry per run start or resume (consecutive identical entries are kept once; the first, pinning entry is never trimmed). state enabled is the default; opted_out is only the user's explicit PI_ORCHESTRATOR_WORKER_SANDBOX=0 (source env). allowed_domains and cache_directories are the widening workers actually used: from .pi/autonomy.yaml on the repository's default branch on GitHub (policy_source default_branch, at policy_commit), empty when the default branch has no policy (default), when it could not be read (unavailable) or is invalid (invalid). The first entry pins the run's widening; a later entry never widens it, and what it asked beyond the pin is in refused_allowed_domains / refused_cache_directories. local_drift: the checkout's own copy declares a different worker_sandbox (informational, never used). user_settings_widening: widening keys present in the user's own Claude Code settings, which merge into every worker's settings (recorded only). Sandbox denials inside a worker are not recorded here: Claude Code reports them to the model, not in its JSON result.",
           "items": {
             "type": "object",
             "additionalProperties": false,
@@ -108,7 +108,12 @@
               "source": {"enum": ["default", "env"]},
               "allowed_domains": {"type": "array", "maxItems": 50, "items": {"type": "string"}},
               "cache_directories": {"type": "array", "maxItems": 20, "items": {"type": "string"}},
-              "policy_source": {"enum": ["default", "policy", "invalid"]}
+              "refused_allowed_domains": {"type": "array", "maxItems": 50, "items": {"type": "string"}},
+              "refused_cache_directories": {"type": "array", "maxItems": 20, "items": {"type": "string"}},
+              "policy_source": {"enum": ["default_branch", "default", "unavailable", "invalid"]},
+              "policy_commit": {"type": ["string", "null"], "pattern": "^[0-9a-f]{40,64}$"},
+              "local_drift": {"type": "boolean"},
+              "user_settings_widening": {"type": "array", "maxItems": 3, "items": {"enum": ["sandbox.excludedCommands", "sandbox.filesystem.allowWrite", "sandbox.network.allowedDomains"]}}
             }
           }
         },

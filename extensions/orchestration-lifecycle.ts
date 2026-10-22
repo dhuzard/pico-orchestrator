@@ -19,6 +19,7 @@ const PREFLIGHT = join(ROOT, "tools", "backend_preflight.py");
 const SESSION_SCOPE = join(ROOT, "tools", "session_scope.py");
 const CONTEXT = join(ROOT, "tools", "context_budget.py");
 const AUTONOMY = join(ROOT, "tools", "autonomy_policy.py");
+const WORKER_SANDBOX_POLICY = join(ROOT, "tools", "worker_sandbox_policy.py");
 const LEASE = join(ROOT, "tools", "run_lease.py");
 /** Renewal period of the single-owner run lease (tools/run_lease.py; default expiry 300 s). */
 export const LEASE_HEARTBEAT_MS = 60_000;
@@ -675,26 +676,32 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
   }
   /**
    * Resolve the run's worker sandbox (#63) and record it on the run: on by default, `opted_out` only through an
-   * explicit PI_ORCHESTRATOR_WORKER_SANDBOX=0, plus the repository's opt-in network allowlist and cache directories
-   * (`worker_sandbox` in the target checkout's `.pi/autonomy.yaml`, never a worker's worktree). An unreadable or
-   * invalid policy contributes nothing: workers then get no network and no extra writable directory. An invalid
-   * PI_ORCHESTRATOR_WORKER_SANDBOX value records nothing; each ClaudeWorker call then fails WORKER_CONFIG_INVALID.
+   * explicit PI_ORCHESTRATOR_WORKER_SANDBOX=0, plus the opt-in network allowlist and cache directories from
+   * `worker_sandbox` in `.pi/autonomy.yaml` on the repository's DEFAULT branch on GitHub (tools/worker_sandbox_policy.py,
+   * read like publication permissions). The checkout's working tree is never authority: worker commits are
+   * integrated into it. A failed or invalid read widens nothing. The recorder pins the widening at run start and
+   * returns what workers may use; a resume can narrow it, never widen it (the refused part is recorded). When the
+   * record cannot be written, nothing is widened. An invalid PI_ORCHESTRATOR_WORKER_SANDBOX value records nothing;
+   * each ClaudeWorker call then fails WORKER_CONFIG_INVALID.
    */
   async function configureWorkerSandbox(): Promise<void> {
     workerSandbox = null;
     if (!runId) return;
-    const limits = await command(AUTONOMY, ["limits", "--worktree", targetCwd ?? "."]);
-    const declared = limits.ok === false ? null : limits.worker_sandbox;
+    const repo = process.env.PI_TARGET_REPOSITORY;
+    const verdict = await command(WORKER_SANDBOX_POLICY, ["--worktree", targetCwd ?? ".", ...(repo ? ["--repo", repo] : [])]);
+    const declared = verdict.ok === false ? null : verdict.worker_sandbox;
     const policy = declared && typeof declared === "object" && !Array.isArray(declared) ? declared as Json : null;
-    let policySource = limits.ok === false ? "invalid"
-      : typeof limits.source === "string" && limits.source !== "default" ? "policy" : "default";
+    const sources = new Set(["default_branch", "default", "unavailable", "invalid"]);
+    let policySource = verdict.ok !== false && typeof verdict.policy_source === "string" && sources.has(verdict.policy_source)
+      ? verdict.policy_source : "unavailable";
+    let requested: WorkerSandboxConfig;
     try {
       try {
-        workerSandbox = workerSandboxConfig(policy);
+        requested = workerSandboxConfig(policySource === "default_branch" ? policy : null);
       } catch (error) {
         if (!(error instanceof WorkerConfigError) || policy === null) throw error;
         policySource = "invalid";
-        workerSandbox = workerSandboxConfig(null);
+        requested = workerSandboxConfig(null);
       }
     } catch (error) {
       if (!(error instanceof WorkerConfigError)) throw error;
@@ -702,9 +709,21 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
         error: error.message });
       return;
     }
-    await observe({ kind: "worker_sandbox", state: workerSandbox.state, source: workerSandbox.source,
-      allowed_domains: workerSandbox.allowedDomains, cache_directories: workerSandbox.cacheDirectories,
-      policy_source: policySource });
+    const commit = typeof verdict.policy_commit === "string" && /^[0-9a-f]{40,64}$/.test(verdict.policy_commit)
+      ? verdict.policy_commit : null;
+    const userKeys = Array.isArray(verdict.user_settings_widening)
+      ? verdict.user_settings_widening.filter((key): key is string => typeof key === "string") : [];
+    const recorded = await command(PARENT, ["event", runId, ...ownerArgs()], { kind: "worker_sandbox",
+      state: requested.state, source: requested.source, allowed_domains: requested.allowedDomains,
+      cache_directories: requested.cacheDirectories, policy_source: policySource, policy_commit: commit,
+      local_drift: verdict.local_drift === true, user_settings_widening: userKeys });
+    if (recorded.ok === false) diagnose("worker_sandbox", recorded);
+    // Only what the recorder kept (the run-start pin, or less) is used; without that answer nothing is widened.
+    const effective = recorded.ok === false ? null : recorded.worker_sandbox_effective as Json | undefined;
+    const keep = (value: unknown, wanted: string[]) => Array.isArray(value)
+      ? wanted.filter((item) => (value as unknown[]).includes(item)) : [];
+    workerSandbox = { ...requested, allowedDomains: keep(effective?.allowed_domains, requested.allowedDomains),
+      cacheDirectories: keep(effective?.cache_directories, requested.cacheDirectories) };
   }
   /**
    * The HEAD a step's state is measured at: its own bound worktree; for an unbound step (a read-only reviewer) the

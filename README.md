@@ -807,7 +807,7 @@ checkpoints. Backend conversation history is never reused.
 | `WAVE_UNDECLARED` | Workers of different tasks would overlap outside one declared wave. |
 | `INTEGRATION_IN_PROGRESS` | A worker launch while the parent integrates a wave. |
 | `WORKER_CONFIG_INVALID` | `PI_ORCHESTRATOR_WORKER_ENV_ALLOW` names an invalid variable, `PI_ORCHESTRATOR_WORKER_SANDBOX` is not unset, `0` or `1`, or the worker sandbox cannot be expressed (the worktree, or a declared cache directory, overlaps a protected path). The worker is not started. |
-| `WORKER_SANDBOX_UNAVAILABLE` | A mutating Claude worker needs the OS sandbox (on by default) and it cannot start: no bubblewrap or socat on Linux, an unsupported platform, or Claude Code's own `failIfUnavailable` refusal. The worker is not started. Install the prerequisites, or opt out explicitly with `PI_ORCHESTRATOR_WORKER_SANDBOX=0` (recorded on the run). |
+| `WORKER_SANDBOX_UNAVAILABLE` | A mutating Claude worker needs the OS sandbox (on by default) and it cannot start: no bubblewrap or socat on Linux, a bubblewrap that cannot create namespaces (for example AppArmor on Ubuntu 24.04+), an unsupported platform, or Claude Code's own `failIfUnavailable` refusal. The worker is not started. Install the prerequisites, or opt out explicitly with `PI_ORCHESTRATOR_WORKER_SANDBOX=0` (recorded on the run). |
 | `WORKER_SCOPE_VIOLATION` | The parent checkout changed during a worker call. Further workers are blocked; nothing is reverted. |
 | `MUTATION_MODE_MISMATCH` | The `AskClaude` `mode` differs from the routed step's mutation permission. |
 | `WORKER_TIMEOUT` / `WORKER_ABORTED` / `WORKER_OUTPUT_LIMIT` | A `ClaudeWorker` run exceeded `PI_CLAUDE_WORKER_TIMEOUT_MS` (default 30 min), was aborted, or exceeded its output cap; its Claude Code process is killed. |
@@ -829,8 +829,15 @@ by default (bubblewrap and socat on Linux and WSL2, Seatbelt on macOS): they
 may write only in the bound worktree, its git metadata, the temp directory and
 cache directories the repository declares; they cannot read PICO's state
 directory, `~/.config/gh` or other credential files; and they have no network
-unless `.pi/autonomy.yaml` allowlists hosts under `worker_sandbox`. Without the
-prerequisites the worker fails closed with `WORKER_SANDBOX_UNAVAILABLE`;
+unless `.pi/autonomy.yaml` on the repository's default branch on GitHub
+allowlists hosts under `worker_sandbox` (pinned at run start; the checkout's
+copy is never used). Every Claude worker runs with hooks and MCP servers off.
+The user's own `~/.claude/settings.json` (`excludedCommands`, `allowWrite`,
+`allowedDomains`) still merges in and can widen the sandbox; PICO records
+which of those keys it sets. Declared cache directories are the user's real
+caches, so a worker can poison them. Without the prerequisites (bubblewrap
+that can create namespaces, socat, Claude Code 2.1.285 or later) the worker
+fails closed with `WORKER_SANDBOX_UNAVAILABLE`;
 `PI_ORCHESTRATOR_WORKER_SANDBOX=0` is the explicit opt-out and is recorded on
 the run. Codex workers and the lead are not sandboxed by PICO. Details and
 limits: "Worker sandbox" in [the technical reference](docs/technical-reference.md).

@@ -491,37 +491,56 @@ most 100).
 **Worker sandbox (#63).** A mutating Claude worker's shell commands run in
 Claude Code's own OS sandbox by default (bubblewrap and socat on Linux and
 WSL2, Seatbelt on macOS). `workerSandboxSettings` in
-`extensions/claude-worker.ts` builds one `--settings` JSON argument per worker:
+`extensions/claude-worker.ts` builds one `--settings` JSON argument per worker,
+and every Claude worker, read-only reviewers included, also gets
+`--strict-mcp-config` with no `--mcp-config`:
 
-| Settings key | Value PICO sets | What it does |
+| Settings key or flag | Value PICO sets | What it does |
 | --- | --- | --- |
+| `--strict-mcp-config` (all workers) | flag, no `--mcp-config` | No MCP server starts: neither a repository's `.mcp.json` nor any settings file can add one. |
+| `disableAllHooks` (all workers) | `true` | No hook runs, including hooks a repository plants in `.claude/settings.json`; hooks run outside the OS sandbox with the user's access. |
+| `permissions.deny` (all workers) | `Read(//<path>)`, `Read(//<path>/**)`, `Edit(//<path>)`, `Edit(//<path>/**)` for every `denyRead` path | The OS sandbox covers shell commands only. Read rules stop Read, Glob and Grep; Edit rules stop Edit and Write, creating a new file included. (NotebookEdit is not in any worker's tool set.) |
 | `sandbox.enabled` | `true` | Runs Bash (and its child processes) in the sandbox. |
 | `sandbox.failIfUnavailable` | `true` | Claude Code exits at startup when the sandbox cannot start, instead of running commands unconfined. |
 | `sandbox.allowUnsandboxedCommands` | `false` | Claude Code ignores `dangerouslyDisableSandbox`, so a blocked command is never retried outside the sandbox. From `--settings` this also makes the sandbox "admin-required": a repository's `.claude/settings.json` can no longer add `excludedCommands`, `allowWrite`, `allowedDomains` or other widening entries. |
 | `sandbox.filesystem.allowWrite` | the declared cache directories, if any | Writes beyond Claude Code's defaults (the working directory, which is the bound worktree, and a per-user temp directory that `$TMPDIR` points to). For a linked worktree Claude Code also allows writes to the repository's shared `.git`, except `hooks/` and `config`. |
 | `sandbox.filesystem.denyWrite` | PICO's launcher cache (`$PI_CODING_ORCHESTRATOR_HOME`, else `$XDG_CACHE_HOME/pi-coding-orchestrator`) and `$XDG_CONFIG_HOME/pi-coding-orchestrator` | The code PICO runs and its user configuration are never writable. |
-| `sandbox.filesystem.denyRead` | the PICO state directory (`$PI_ORCHESTRATOR_STATE_DIR`, else this checkout's `provenance/`), `$PI_CODING_ORCHESTRATOR_STATE_DIR`, `$XDG_STATE_HOME/pi-coding-orchestrator`, and credential locations: `~/.config/gh` (and `$XDG_CONFIG_HOME/gh`, `$GH_CONFIG_DIR`), `~/.ssh`, `~/.gnupg`, `~/.netrc`, `~/.git-credentials`, `~/.config/git/credentials`, `~/.aws`, `~/.azure`, `~/.config/gcloud`, `~/.kube`, `~/.docker/config.json`, `~/.npmrc`, `~/.pypirc`, `~/.cargo/credentials.toml`, `~/.config/hub`, `~/.claude/.credentials.json` | Sandboxed commands cannot read run records, leases, checkpoints or these credentials. Claude Code's own process (outside the sandbox) still reads its login. |
+| `sandbox.filesystem.denyRead` | the PICO state directory (`$PI_ORCHESTRATOR_STATE_DIR`, else this checkout's `provenance/`), `$PI_CODING_ORCHESTRATOR_STATE_DIR`, `$XDG_STATE_HOME/pi-coding-orchestrator`, and credential locations: `~/.config/gh` (and `$XDG_CONFIG_HOME/gh`, `$GH_CONFIG_DIR`), `~/.ssh`, `~/.gnupg`, `~/.netrc`, `~/.git-credentials`, `~/.config/git/credentials`, `~/.aws`, `~/.azure`, `~/.config/gcloud`, `~/.kube`, `~/.docker/config.json`, `~/.npmrc`, `~/.pypirc`, `~/.cargo/credentials.toml`, `~/.config/hub`, `~/.claude/.credentials.json`; each path that is a symlink is denied at its resolved location too | Sandboxed commands cannot read run records, leases, checkpoints or these credentials. Claude Code's own process (outside the sandbox) still reads its login. |
 | `sandbox.network.allowedDomains` | the repository allowlist, empty by default | Hosts sandboxed commands may reach through Claude Code's proxy. Empty: no network. |
 | `sandbox.network.strictAllowlist` | `true` | A host outside the allowlist is refused outright instead of prompting (a headless worker cannot answer a prompt). |
-| `permissions.deny` | `Read(//<path>)` and `Read(//<path>/**)` for every `denyRead` path | The OS sandbox covers shell commands only; these rules stop Claude's Read tool, and through it Edit and Write, on the same paths. |
 
 Sources: each key was checked against the settings schema bundled in the
 installed Claude Code 2.1.287 binary and against
 <https://code.claude.com/docs/en/sandboxing>,
 <https://code.claude.com/docs/en/settings-reference> and
 <https://code.claude.com/docs/en/permissions> (path prefixes: sandbox paths are
-plain absolute paths; permission rules use `//` for an absolute path). The
-`strictAllowlist` key needs Claude Code 2.1.219 or later and the repository
-lock behind `allowUnsandboxedCommands: false` needs 2.1.285 or later; older
-releases are not supported by this setting set.
+plain absolute paths; permission rules use `//` for an absolute path).
+`--strict-mcp-config` is in `claude --help` of 2.1.287 ("Only use MCP servers
+from --mcp-config, ignoring all other MCP configurations"). Against the real
+2.1.287, with an isolated `CLAUDE_CONFIG_DIR`, a dummy API key and a closed
+local API endpoint (so no model is reachable), a planted project
+`SessionStart`/`UserPromptSubmit` hook and a planted `.mcp.json` server ran
+without these settings and did not run with `disableAllHooks` and
+`--strict-mcp-config`.
+
+**Minimum Claude Code.** `routing/backend-compatibility.json` sets
+`claude_code_worker_sandbox_minimum_version` (2.1.285: `strictAllowlist`
+needs 2.1.219, the repository lock behind `allowUnsandboxedCommands: false`
+needs 2.1.285). Route preflight (`tools/backend_preflight.py`, the same check
+as the per-model minimums) refuses an older pinned executable with
+`MODEL_BACKEND_VERSION_UNSUPPORTED`, `required_backend_version` and
+`requirement: worker_sandbox`, unless the user opted out of the sandbox. Like
+the other version blocker it is reroutable to a policy-valid route without
+Claude.
 
 `PI_ORCHESTRATOR_WORKER_SANDBOX` decides the posture: unset or empty is on
 (`source: default`), `1` is on (`source: env`), `0` is the explicit opt-out
 (`state: opted_out`, `source: env`), and any other value refuses every Claude
-worker with `WORKER_CONFIG_INVALID`. A repository cannot turn the sandbox off.
-It can only widen it, through an optional `worker_sandbox` section of
-`.pi/autonomy.yaml` (schema-validated, unknown keys rejected, the whole policy
-fails `AUTONOMY_POLICY_INVALID` otherwise):
+worker with `WORKER_CONFIG_INVALID`. With the opt-out, workers still get
+`disableAllHooks`, `--strict-mcp-config` and the deny rules. A repository
+cannot turn the sandbox off. It can only widen it, through an optional
+`worker_sandbox` section of `.pi/autonomy.yaml` (schema-validated, unknown keys
+rejected, the whole policy fails `AUTONOMY_POLICY_INVALID` otherwise):
 
 ```yaml
 worker_sandbox:
@@ -531,35 +550,57 @@ worker_sandbox:
 ```
 
 Domains are lower-case DNS names with an optional leading `*.` (at least two
-labels after it) and `:port`; a bare `*` and IP literals are refused. Cache
-directories are relative paths without `.`, `..` or globs, never PICO's own
-`pi-coding-orchestrator` cache, and a worker is refused (`WORKER_CONFIG_INVALID`)
-when a cache directory overlaps a denied or protected path, or when its bound
-worktree lies inside one. The section is read from the target checkout at run
-start and resume (never from a worker's worktree); an unreadable policy
-widens nothing. Allowing a broad domain such as `github.com` reopens an
-exfiltration path, and Claude Code's proxy decides on the hostname without
-inspecting TLS, so keep the list to package registries the checks need.
+labels after it) and a `:port` from 1 to 65535 without leading zeros; a bare
+`*` and IP literals are refused. Cache directories are relative paths without
+`.`, `..` or globs, never PICO's own `pi-coding-orchestrator` cache, and a
+worker is refused (`WORKER_CONFIG_INVALID`) when a cache directory overlaps a
+denied or protected path, or when its bound worktree lies inside one.
+
+**Where the widening comes from.** Only the policy on the repository's
+**default branch on GitHub** counts, read by `tools/worker_sandbox_policy.py`
+through the same GitHub API adapter and `authority_policy` as publication
+permissions (#39, #64). The checkout's working tree is never used: worker
+commits are integrated into it, so a worker could otherwise widen the sandbox
+of the workers after it. A read that fails (no `gh`, no authentication,
+offline, an unresolved repository) or a default-branch policy that is invalid
+or a symlink widens nothing; the run continues with network off and no extra
+writable directory. A copy in the checkout that differs is recorded as
+`local_drift`, never applied.
+
+**Pinned at run start.** The first `worker_sandbox` entry of a run pins its
+widening. On resume the policy is read again, but the recorder keeps only what
+is both pinned and still granted: a resume can narrow the allowlist, never
+widen it, and what it asked beyond the pin is recorded as
+`refused_allowed_domains` / `refused_cache_directories`. When the posture
+cannot be recorded, nothing is widened.
 
 At run start and resume the lifecycle records the posture on the run, as an
 entry of `parent_orchestration.worker_sandbox` (`state`, `source`,
-`allowed_domains`, `cache_directories`, `policy_source` `default`, `policy` or
-`invalid`); an opt-out therefore stays on the record. Each `ClaudeWorker`
-result also carries `sandbox` (`state`, `source`, `applied`,
+`allowed_domains`, `cache_directories`, `policy_source` `default_branch`,
+`default`, `unavailable` or `invalid`, `policy_commit`, `local_drift`,
+`user_settings_widening`); an opt-out therefore stays on the record. Each
+`ClaudeWorker` result also carries `sandbox` (`state`, `source`, `applied`,
 `allowed_domains`, `cache_directories`). A read-only step has no Bash, so it
-gets only the `permissions.deny` rules, never the sandbox block, and never
-needs the sandbox's prerequisites.
+never gets the sandbox block and never needs its prerequisites.
 
-Before it starts a mutating worker with the sandbox on, PICO checks the
-documented prerequisites (`/usr/bin/sandbox-exec` on macOS; `bwrap` and
-`socat` on the worker's `PATH` on Linux; no other platform, native Windows
-included, has the sandbox). When they are missing the worker is not started
-and the step fails closed with `WORKER_SANDBOX_UNAVAILABLE`, a prerequisite
-code (it never counts toward a repeated-failure loop). Claude Code's own
-`failIfUnavailable` refusal at startup, for example bubblewrap blocked by
-AppArmor's user-namespace restriction on Ubuntu 24.04, is reported with the
-same code. Install the prerequisites, or opt out explicitly with
-`PI_ORCHESTRATOR_WORKER_SANDBOX=0`.
+**What PICO checks before starting a mutating worker** with the sandbox on:
+`/usr/bin/sandbox-exec` on macOS; on Linux, `bwrap` and `socat` on the
+worker's `PATH`, and a real bubblewrap probe (`bwrap --ro-bind / / --dev /dev
+--proc /proc --unshare-user --unshare-pid --unshare-net --die-with-parent
+true`, 5 s timeout). The probe catches a bwrap that is installed but cannot
+create namespaces, for example under AppArmor's unprivileged user-namespace
+restriction on Ubuntu 24.04 and later, or in a container that forbids them;
+Claude Code's own check only looks for the binaries. Other platforms, native
+Windows included, have no sandbox. A failed check means the worker is not
+started and the step fails closed with `WORKER_SANDBOX_UNAVAILABLE`, a
+prerequisite code (it never counts toward a repeated-failure loop). Claude
+Code's own refusal is reported with the same code only when Claude Code exits
+non-zero with no JSON result and its stderr carries the startup message of
+2.1.287 ("sandbox required but unavailable" ... "refusing to start without a
+working sandbox"); a JSON result is never reclassified, whatever its text.
+These checks do not prove that every sandboxed command will work (a socat
+that fails at run time, a seccomp gap); slice 1 has to measure that. Install
+the prerequisites, or opt out explicitly with `PI_ORCHESTRATOR_WORKER_SANDBOX=0`.
 
 What the worker sandbox does not cover:
 
@@ -567,22 +608,29 @@ What the worker sandbox does not cover:
   blocked write, read or connection to the model, inside the Bash tool result
   (a `<sandbox_violations>` block); its `--output-format json` result, which is
   all PICO reads, does not carry them. `denied_calls` still lists the
-  permission denials Claude Code does report, which includes Read, Edit and
-  Write calls refused by the `permissions.deny` rules. Recording sandbox
-  denials needs a stream of tool results (`--output-format stream-json`) and is
-  not done.
-- **Claude's own tools and helper processes.** Read, Edit, Write and Glob/Grep
-  follow permission rules, not the OS sandbox; hooks, MCP servers and other
-  processes Claude Code starts, including a repository's own
-  `.claude/settings.json` hooks, run outside it with the user's access.
-- **Settings PICO does not control.** Array settings merge across sources, so
-  `excludedCommands`, `allowWrite` or `allowedDomains` in the user's
-  `~/.claude/settings.json` or in managed settings still apply to workers.
+  permission denials Claude Code does report, which includes file-tool calls
+  refused by the `permissions.deny` rules. Recording sandbox denials needs a
+  stream of tool results (`--output-format stream-json`) and is not done.
+- **The user's own Claude Code settings.** Array settings merge across
+  sources, so `sandbox.excludedCommands`, `sandbox.filesystem.allowWrite` and
+  `sandbox.network.allowedDomains` in the user's `~/.claude/settings.json` (or
+  `$CLAUDE_CONFIG_DIR/settings.json`), and in managed settings, still apply to
+  workers and can widen the sandbox. PICO records which of these three keys the
+  user's settings set (`user_settings_widening`); it does not refuse them, and
+  it does not inspect managed settings.
+- **Declared cache directories are the user's real caches.** A worker can write
+  to them, so it can poison what other tools later read from them (a pip or
+  Playwright cache, for example). Declare only caches the checks need.
+- **Claude's other helper processes.** Hooks and MCP servers are off, but the
+  status line command, `apiKeyHelper` and LSP servers configured in user or
+  managed settings run outside the sandbox.
 - **Reads elsewhere.** Only the paths above are hidden; a sandboxed command can
   still read the rest of the filesystem, other checkouts included.
 - **The shared `.git` of a linked worktree** is writable (Claude Code's own
   rule, so `git commit` works), so a worker can still move refs of other
   branches in the same repository. Its `hooks/` and `config` are not writable.
+- **Flagging changes to `.pi/**`, `.claude/**` or `.mcp.json` in a worker's
+  diff** belongs to the diff check of #76, not to this sandbox.
 - **Codex workers and the lead.** `spawn_subagent` workers get no OS sandbox
   from PICO (#63 slice 5), and the lead's own bash is not sandboxed (slice 6).
 - **Platforms without the sandbox** (native Windows, WSL1): a mutating Claude
@@ -590,6 +638,13 @@ What the worker sandbox does not cover:
 - **Not measured.** No real worker has run with these settings yet; slice 1 of
   #63 (sandbox on against off, real agents) has to measure what breaks
   (installs, caches, test runners, git in worktrees, the Claude login).
+
+The opt-in test `PICO_REAL_CLAUDE_SANDBOX_PROBE=1 node --test --test-name-pattern
+"real Claude Code refuses" tests/orchestration-lifecycle.test.ts` starts the
+real `claude` (or `PICO_REAL_CLAUDE_EXECUTABLE`) with these settings, an
+isolated `CLAUDE_CONFIG_DIR`, a dummy API key, `ANTHROPIC_BASE_URL` on a closed
+local port and `socat` removed from `PATH`, and requires the startup refusal
+(`WORKER_SANDBOX_UNAVAILABLE`, exit 1, no usage). It cannot reach a model.
 
 Claude Code protects every `.git`
 directory and denies edits there even in `acceptEdits` mode, so a mutating
@@ -770,9 +825,10 @@ Agent-side tool denylists do not fully stop a same-user process: one can still
 call `gh` directly, so they are not a substitute for branch protection.
 Mutating Claude workers now run their shell commands in Claude Code's OS
 sandbox by default, limited to their worktree, with no network unless the
-repository allowlists hosts and no read access to the state directory or the
-`gh` configuration (see "Worker sandbox" above). Codex workers and the lead are
-not sandboxed yet (#63 slices 5 and 6).
+default branch's `.pi/autonomy.yaml` allowlists hosts, no read access to the
+state directory or the `gh` configuration, and no hooks or MCP servers (see
+"Worker sandbox" above). The user's own Claude Code settings can still widen
+it. Codex workers and the lead are not sandboxed yet (#63 slices 5 and 6).
 The containment tests this needs, and the separation of planning, execution, publication
 and promotion authority for the queue dispatcher (#34), are in
 [`docs/containment-and-authority.md`](containment-and-authority.md).

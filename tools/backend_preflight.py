@@ -39,6 +39,7 @@ def _run(args: list[str]) -> subprocess.CompletedProcess:
 
 
 PIN_ENV = "PI_ORCHESTRATOR_CLAUDE_BACKEND_IDENTITY"
+WORKER_SANDBOX_ENV = "PI_ORCHESTRATOR_WORKER_SANDBOX"
 IDENTITY_KEYS = ("backend_executable", "backend_version_output", "backend_device", "backend_inode")
 LAUNCH_GUIDANCE = (
     "Start Pi through a canonical launcher, which pins the Claude backend identity before "
@@ -178,6 +179,19 @@ def preflight(route: dict, available_tools: list[str], *, executable: str | None
                                     backend_model=backend_model,
                                     installed_backend_version=installed_text,
                                     required_backend_version=f">={required_text}")
+            # The worker sandbox settings (#63) need a Claude Code that honours them; unless the user opted out of
+            # the sandbox explicitly, an older executable is refused with the same version blocker.
+            sandbox_text = rules.get("claude_code_worker_sandbox_minimum_version")
+            if sandbox_text is not None and os.environ.get(WORKER_SANDBOX_ENV, "").strip() != "0":
+                sandbox_minimum = _version(sandbox_text) if isinstance(sandbox_text, str) else None
+                if sandbox_minimum is None:
+                    return _blocked("MODEL_BACKEND_CONFIG_INVALID", step, model)
+                if installed < sandbox_minimum:
+                    return _blocked("MODEL_BACKEND_VERSION_UNSUPPORTED", step, model,
+                                    backend_model=backend_model,
+                                    installed_backend_version=installed_text,
+                                    required_backend_version=f">={sandbox_text}",
+                                    requirement="worker_sandbox")
             try:
                 auth_result = run([binary, "auth", "status", "--json"])
                 auth = json.loads(auth_result.stdout) if auth_result.returncode == 0 else {}
