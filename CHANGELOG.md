@@ -118,6 +118,10 @@ All notable changes to PICO are recorded here. The format follows
   dispatches now refuse a checkout with uncommitted tracked changes with `WORKSPACE_CHECKOUT_DIRTY`,
   naming the files and the run that left them. Each execution's `checkout` block records
   `dirty_files` and `dirty_count`. Nothing is cleaned automatically.
+- Each execution's `checkout` block also reports untracked entries that appeared in the parent
+  checkout during the run (`new_untracked`, `new_untracked_count`; `.pi/worktrees/` and ignored
+  files excluded). They are a report only, so they never refuse a launch, but they show a write
+  outside the run's worktrees (#63).
 - A run that ends PARTIAL, BLOCKED, FAILED or settled no longer leaves phases or
   workers `in_progress`. Finishing without COMPLETED sets each still-open phase
   and worker (`not_started` or `in_progress`) to `abandoned` and appends it to

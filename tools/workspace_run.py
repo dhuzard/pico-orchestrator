@@ -244,7 +244,9 @@ def _entry(record: dict, task: dict, repo: dict, execution: dict, inputs: dict |
         entry["checkout"] = {"restored": cleanup["restored"], "branch": cleanup["branch_after"],
                              "removed_worktrees": len(cleanup["removed_worktrees"]),
                              "kept_worktrees": len(cleanup["kept_worktrees"]), "left_reason": cleanup["left_reason"],
-                             "dirty_files": cleanup.get("dirty_files"), "dirty_count": cleanup.get("dirty_count")}
+                             "dirty_files": cleanup.get("dirty_files"), "dirty_count": cleanup.get("dirty_count"),
+                             "new_untracked": cleanup.get("new_untracked"),
+                             "new_untracked_count": cleanup.get("new_untracked_count")}
     record["tasks"][task["id"]] = entry
     return entry
 
