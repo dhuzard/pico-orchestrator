@@ -86,6 +86,10 @@ Provenance completeness (#43): `benchmark_metrics.provenance_diff(before_record,
 
 The #43 failure and recovery modes (resume after an interruption, a worker failure, an integration conflict) are not produced by this happy-path workspace; inject them as separate runs on the same workspace (kill a child and `pico workspace launch --resume`, then record what the extension wrote) and measure them with the same tool.
 
+## Recorded results
+
+- [`results/2026-10-22-pilot-4/`](results/2026-10-22-pilot-4/README.md): the first real four-task run on sandbox repositories (#4), with its `benchmark_metrics` reports.
+
 ## Two parts, kept apart (#49)
 
 Stochastic model behavior and cache variance must not hide a change in scheduler correctness, and a CI run must not spend tokens. So the workspace serves two separate benchmarks:

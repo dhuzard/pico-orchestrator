@@ -1,0 +1,164 @@
+{
+  "headline": {
+    "metric": "tokens per verified task (input + output + cache_write)",
+    "spend_complete": true,
+    "value": "n/a",
+    "verified_tasks": 0
+  },
+  "label": "pico-bench",
+  "report_version": 1,
+  "runs": [
+    {
+      "bind_source": "session",
+      "calls": {
+        "lead": 11,
+        "orchestration_record": {
+          "by_action": {
+            "status": 2
+          },
+          "event_kinds": {},
+          "total": 2
+        },
+        "workers": {}
+      },
+      "cost": {
+        "cost_complete": true,
+        "estimated_usd": 0.089027,
+        "unpriced": []
+      },
+      "ended_at": "2026-10-22T09:31:47Z",
+      "outcome": {
+        "blocker_code": "ORCHESTRATION_OUTCOME_UNRECORDED",
+        "checks": [],
+        "checks_passed": null,
+        "final_status": "BLOCKED",
+        "verified": false
+      },
+      "provenance_facts": [
+        {
+          "category": "phase",
+          "key": [
+            "lib-slugify"
+          ],
+          "value": {
+            "blocker_code": null,
+            "escalations": 0,
+            "in_wave": false,
+            "route": "CLAUDE_CODEX",
+            "status": "abandoned"
+          }
+        },
+        {
+          "category": "worker",
+          "key": [
+            "lib-slugify",
+            "claude_worker",
+            "0"
+          ],
+          "value": {
+            "backend": "claude-code",
+            "backend_model": "sonnet",
+            "blocker_code": null,
+            "model": "sonnet",
+            "status": "abandoned"
+          }
+        },
+        {
+          "category": "finish",
+          "key": [
+            "reconciled",
+            "phase",
+            "lib-slugify",
+            "None",
+            "None"
+          ],
+          "value": {
+            "from_status": "in_progress",
+            "to": "abandoned"
+          }
+        },
+        {
+          "category": "finish",
+          "key": [
+            "reconciled",
+            "worker",
+            "lib-slugify",
+            "claude_worker",
+            "0"
+          ],
+          "value": {
+            "from_status": "not_started",
+            "to": "abandoned"
+          }
+        },
+        {
+          "category": "finish",
+          "key": [
+            "run"
+          ],
+          "value": {
+            "blocker_code": "ORCHESTRATION_OUTCOME_UNRECORDED",
+            "final_status": "BLOCKED",
+            "outcome": "blocked"
+          }
+        }
+      ],
+      "run_id": "run-7d794b20c5d1",
+      "spend_complete": true,
+      "spend_tokens": 34116,
+      "started_at": "2026-10-22T09:30:20Z",
+      "task": "lib-slugify",
+      "tokens": {
+        "lead": {
+          "cache_read": 132352,
+          "cache_write": 0,
+          "cost_usd": 0.089027,
+          "input": 33171,
+          "model": "openai-codex/gpt-6.1-sol",
+          "output": 945
+        },
+        "workers": {}
+      },
+      "unresolved_binds": [],
+      "wall_clock_seconds": 87.0
+    }
+  ],
+  "totals": {
+    "calls": {
+      "lead": 11,
+      "orchestration_record": {
+        "by_action": {
+          "status": 2
+        },
+        "total": 2
+      },
+      "workers": {}
+    },
+    "cost": {
+      "cost_complete": true,
+      "estimated_usd": 0.089027,
+      "unpriced": []
+    },
+    "run_seconds_sum": 87.0,
+    "spend_complete": true,
+    "spend_tokens": 34116,
+    "tasks": {
+      "completed": 0,
+      "qualification": [],
+      "runs": 1,
+      "verified": 0
+    },
+    "tokens": {
+      "lead": {
+        "cache_read": 132352,
+        "cache_write": 0,
+        "cost_usd": 0.089027,
+        "input": 33171,
+        "output": 945
+      },
+      "workers": {}
+    },
+    "wall_clock_span_seconds": 87.0
+  },
+  "workspace_id": "pico-bench"
+}

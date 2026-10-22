@@ -1,0 +1,553 @@
+{
+  "headline": {
+    "metric": "tokens per verified task (input + output + cache_write)",
+    "spend_complete": true,
+    "value": 217275.5,
+    "verified_tasks": 2
+  },
+  "label": "pico-bench",
+  "report_version": 1,
+  "runs": [
+    {
+      "bind_source": "session",
+      "calls": {
+        "lead": 23,
+        "orchestration_record": {
+          "by_action": {
+            "bind_workspace": 1,
+            "event": 1,
+            "finish": 1,
+            "integrate_begin": 1,
+            "integrate_end": 1,
+            "status": 1
+          },
+          "event_kinds": {
+            "phase": 1
+          },
+          "total": 6
+        },
+        "workers": {
+          "claude-code": 1,
+          "pi-subagent": 1
+        }
+      },
+      "cost": {
+        "cost_complete": false,
+        "estimated_usd": 0.792641,
+        "unpriced": [
+          "pi-subagent"
+        ]
+      },
+      "ended_at": "2026-10-22T09:28:15Z",
+      "outcome": {
+        "blocker_code": null,
+        "checks": [
+          {
+            "id": "post-url-tests",
+            "status": "passed"
+          }
+        ],
+        "checks_passed": true,
+        "final_status": "COMPLETED",
+        "verified": true
+      },
+      "provenance_facts": [
+        {
+          "category": "phase",
+          "key": [
+            "app-post-url"
+          ],
+          "value": {
+            "blocker_code": null,
+            "escalations": 0,
+            "in_wave": true,
+            "route": "CLAUDE_CODEX",
+            "status": "completed"
+          }
+        },
+        {
+          "category": "worker",
+          "key": [
+            "app-post-url",
+            "claude_worker",
+            "0"
+          ],
+          "value": {
+            "backend": "claude-code",
+            "backend_model": "sonnet",
+            "blocker_code": null,
+            "model": "sonnet",
+            "status": "completed"
+          }
+        },
+        {
+          "category": "worker",
+          "key": [
+            "app-post-url",
+            "codex_reviewer",
+            "0"
+          ],
+          "value": {
+            "backend": null,
+            "backend_model": null,
+            "blocker_code": null,
+            "model": "openai-codex/gpt-6-luna",
+            "status": "completed"
+          }
+        },
+        {
+          "category": "wave",
+          "ids": [
+            "auto-51eb3624-app-post-url"
+          ],
+          "key": [
+            "app-post-url",
+            "0"
+          ],
+          "value": {
+            "task_ids": [
+              "app-post-url"
+            ]
+          }
+        },
+        {
+          "category": "integrate",
+          "ids": [
+            "auto-51eb3624-app-post-url"
+          ],
+          "key": [
+            "app-post-url",
+            "0",
+            "begin"
+          ],
+          "value": {}
+        },
+        {
+          "category": "integrate",
+          "ids": [
+            "auto-51eb3624-app-post-url"
+          ],
+          "key": [
+            "app-post-url",
+            "0",
+            "end"
+          ],
+          "value": {}
+        },
+        {
+          "category": "bind",
+          "evidence": "session",
+          "key": [
+            "app-post-url",
+            "claude_worker"
+          ],
+          "value": {}
+        },
+        {
+          "category": "finish",
+          "key": [
+            "run"
+          ],
+          "value": {
+            "blocker_code": null,
+            "final_status": "COMPLETED",
+            "outcome": "completed"
+          }
+        }
+      ],
+      "run_id": "run-a722b08a565a",
+      "spend_complete": true,
+      "spend_tokens": 203571,
+      "started_at": "2026-10-22T09:25:35Z",
+      "task": "app-post-url",
+      "tokens": {
+        "lead": {
+          "cache_read": 334976,
+          "cache_write": 0,
+          "cost_usd": 0.144845,
+          "input": 45814,
+          "model": "openai-codex/gpt-6.1-sol",
+          "output": 1972
+        },
+        "workers": {
+          "claude-code": {
+            "cache_read": 208999,
+            "cache_write": 149374,
+            "cost_usd": 0.647796,
+            "input": 10,
+            "invocations": 1,
+            "output": 848
+          },
+          "pi-subagent": {
+            "cache_read": 1920,
+            "cache_write": 0,
+            "cost_usd": null,
+            "input": 4660,
+            "invocations": 1,
+            "output": 893
+          }
+        }
+      },
+      "unresolved_binds": [],
+      "wall_clock_seconds": 160.0
+    },
+    {
+      "bind_source": "session",
+      "calls": {
+        "lead": 22,
+        "orchestration_record": {
+          "by_action": {
+            "bind_workspace": 1,
+            "event": 2,
+            "finish": 1,
+            "integrate_begin": 1,
+            "integrate_end": 1,
+            "status": 1
+          },
+          "event_kinds": {
+            "interaction": 1,
+            "phase": 1
+          },
+          "total": 7
+        },
+        "workers": {
+          "claude-code": 1,
+          "pi-subagent": 2
+        }
+      },
+      "cost": {
+        "cost_complete": false,
+        "estimated_usd": 0.803164,
+        "unpriced": [
+          "pi-subagent"
+        ]
+      },
+      "ended_at": "2026-10-22T09:16:18Z",
+      "outcome": {
+        "blocker_code": null,
+        "checks": [
+          {
+            "id": "slugify-tests",
+            "status": "passed"
+          }
+        ],
+        "checks_passed": true,
+        "final_status": "COMPLETED",
+        "verified": true
+      },
+      "provenance_facts": [
+        {
+          "category": "phase",
+          "key": [
+            "lib-slugify"
+          ],
+          "value": {
+            "blocker_code": null,
+            "escalations": 0,
+            "in_wave": true,
+            "route": "CLAUDE_CODEX",
+            "status": "completed"
+          }
+        },
+        {
+          "category": "worker",
+          "key": [
+            "lib-slugify",
+            "claude_worker",
+            "0"
+          ],
+          "value": {
+            "backend": "claude-code",
+            "backend_model": "sonnet",
+            "blocker_code": null,
+            "model": "sonnet",
+            "status": "completed"
+          }
+        },
+        {
+          "category": "worker",
+          "key": [
+            "lib-slugify",
+            "codex_reviewer",
+            "0"
+          ],
+          "value": {
+            "backend": null,
+            "backend_model": null,
+            "blocker_code": null,
+            "model": "openai-codex/gpt-6-luna",
+            "status": "completed"
+          }
+        },
+        {
+          "category": "wave",
+          "ids": [
+            "auto-05563913-lib-slugify"
+          ],
+          "key": [
+            "lib-slugify",
+            "0"
+          ],
+          "value": {
+            "task_ids": [
+              "lib-slugify"
+            ]
+          }
+        },
+        {
+          "category": "integrate",
+          "ids": [
+            "auto-05563913-lib-slugify"
+          ],
+          "key": [
+            "lib-slugify",
+            "0",
+            "begin"
+          ],
+          "value": {}
+        },
+        {
+          "category": "integrate",
+          "ids": [
+            "auto-05563913-lib-slugify"
+          ],
+          "key": [
+            "lib-slugify",
+            "0",
+            "end"
+          ],
+          "value": {}
+        },
+        {
+          "category": "bind",
+          "evidence": "session",
+          "key": [
+            "lib-slugify",
+            "claude_worker"
+          ],
+          "value": {}
+        },
+        {
+          "category": "finish",
+          "key": [
+            "run"
+          ],
+          "value": {
+            "blocker_code": null,
+            "final_status": "COMPLETED",
+            "outcome": "completed"
+          }
+        }
+      ],
+      "run_id": "run-b1835f1b7b1f",
+      "spend_complete": true,
+      "spend_tokens": 206260,
+      "started_at": "2026-10-22T09:12:48Z",
+      "task": "lib-slugify",
+      "tokens": {
+        "lead": {
+          "cache_read": 407936,
+          "cache_write": 0,
+          "cost_usd": 0.1238,
+          "input": 27818,
+          "model": "openai-codex/gpt-6.1-sol",
+          "output": 2737
+        },
+        "workers": {
+          "claude-code": {
+            "cache_read": 204671,
+            "cache_write": 156550,
+            "cost_usd": 0.679364,
+            "input": 10,
+            "invocations": 1,
+            "output": 1221
+          },
+          "pi-subagent": {
+            "cache_read": 1280,
+            "cache_write": 0,
+            "cost_usd": null,
+            "input": 15806,
+            "invocations": 2,
+            "output": 2118
+          }
+        }
+      },
+      "unresolved_binds": [],
+      "wall_clock_seconds": 210.0
+    },
+    {
+      "bind_source": "session",
+      "calls": {
+        "lead": 8,
+        "orchestration_record": {
+          "by_action": {
+            "event": 1,
+            "finish": 1,
+            "status": 1
+          },
+          "event_kinds": {
+            "phase": 1
+          },
+          "total": 3
+        },
+        "workers": {}
+      },
+      "cost": {
+        "cost_complete": true,
+        "estimated_usd": 0.067441,
+        "unpriced": []
+      },
+      "ended_at": "2026-10-22T09:26:29Z",
+      "outcome": {
+        "blocker_code": "APPROVED_INPUTS_UNAVAILABLE",
+        "checks": [],
+        "checks_passed": null,
+        "final_status": "PARTIAL",
+        "verified": false
+      },
+      "provenance_facts": [
+        {
+          "category": "phase",
+          "key": [
+            "lib-stopwords"
+          ],
+          "value": {
+            "blocker_code": "APPROVED_INPUTS_UNAVAILABLE",
+            "escalations": 0,
+            "in_wave": false,
+            "route": "CLAUDE_CODEX",
+            "status": "blocked"
+          }
+        },
+        {
+          "category": "worker",
+          "key": [
+            "lib-stopwords",
+            "claude_worker",
+            "0"
+          ],
+          "value": {
+            "backend": "claude-code",
+            "backend_model": "sonnet",
+            "blocker_code": null,
+            "model": "sonnet",
+            "status": "abandoned"
+          }
+        },
+        {
+          "category": "finish",
+          "key": [
+            "reconciled",
+            "worker",
+            "lib-stopwords",
+            "claude_worker",
+            "0"
+          ],
+          "value": {
+            "from_status": "not_started",
+            "to": "abandoned"
+          }
+        },
+        {
+          "category": "finish",
+          "key": [
+            "run"
+          ],
+          "value": {
+            "blocker_code": "APPROVED_INPUTS_UNAVAILABLE",
+            "final_status": "PARTIAL",
+            "outcome": "partial"
+          }
+        }
+      ],
+      "run_id": "run-548fa04b0e34",
+      "spend_complete": true,
+      "spend_tokens": 24720,
+      "started_at": "2026-10-22T09:25:35Z",
+      "task": "lib-stopwords",
+      "tokens": {
+        "lead": {
+          "cache_read": 105216,
+          "cache_write": 0,
+          "cost_usd": 0.067441,
+          "input": 23785,
+          "model": "openai-codex/gpt-6.1-sol",
+          "output": 935
+        },
+        "workers": {}
+      },
+      "unresolved_binds": [],
+      "wall_clock_seconds": 54.0
+    }
+  ],
+  "totals": {
+    "calls": {
+      "lead": 53,
+      "orchestration_record": {
+        "by_action": {
+          "bind_workspace": 2,
+          "event": 4,
+          "finish": 3,
+          "integrate_begin": 2,
+          "integrate_end": 2,
+          "status": 3
+        },
+        "total": 16
+      },
+      "workers": {
+        "claude-code": 2,
+        "pi-subagent": 3
+      }
+    },
+    "cost": {
+      "cost_complete": false,
+      "estimated_usd": 1.663246,
+      "unpriced": [
+        "pi-subagent"
+      ]
+    },
+    "run_seconds_sum": 424.0,
+    "spend_complete": true,
+    "spend_tokens": 434551,
+    "tasks": {
+      "completed": 2,
+      "qualification": [
+        {
+          "task": "qualify-integration",
+          "validation": "passed"
+        }
+      ],
+      "runs": 3,
+      "verified": 2
+    },
+    "tokens": {
+      "lead": {
+        "cache_read": 848128,
+        "cache_write": 0,
+        "cost_usd": 0.336086,
+        "input": 97417,
+        "output": 5644
+      },
+      "workers": {
+        "claude-code": {
+          "cache_read": 413670,
+          "cache_write": 305924,
+          "cost_usd": 1.3271600000000001,
+          "input": 20,
+          "invocations": 2,
+          "output": 2069
+        },
+        "pi-subagent": {
+          "cache_read": 3200,
+          "cache_write": 0,
+          "cost_usd": null,
+          "input": 20466,
+          "invocations": 3,
+          "output": 3011
+        }
+      }
+    },
+    "wall_clock_span_seconds": 927.0
+  },
+  "workspace_id": "pico-bench"
+}
