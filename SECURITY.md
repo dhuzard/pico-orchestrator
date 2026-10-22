@@ -60,15 +60,21 @@ are in scope:
   Claude Code's OS sandbox by default: writes only in its bound worktree (and
   that worktree's git metadata, the temp directory and declared cache
   directories), no reads of PICO's state directory, `~/.config/gh` or other
-  credential files, and no network unless the repository allowlists hosts.
+  credential files, and no network unless the default branch's policy
+  allowlists hosts. Every Claude worker runs with hooks and MCP servers off.
   The command deny list is best-effort defense in depth, not a boundary. A way
   for a worker, or for prompt-injected repository, issue or PR text, to escape
   its bound worktree, reach secrets or run denied Git or GitHub actions is in
   scope.
 - **What the worker sandbox does not cover.** Codex workers (`spawn_subagent`)
-  and the lead's own bash are not sandboxed by PICO. Claude Code's file tools,
-  hooks and MCP servers run outside its OS sandbox (PICO adds Read deny rules
-  for the same paths). A user can opt out with
+  and the lead's own bash are not sandboxed by PICO. Claude Code's file tools
+  run outside its OS sandbox (PICO adds Read and Edit deny rules for the same
+  paths), and so do helper processes from user or managed settings (status
+  line, `apiKeyHelper`). The user's own `~/.claude/settings.json`
+  (`excludedCommands`, `allowWrite`, `allowedDomains`) still merges into every
+  worker's settings and can widen the sandbox; PICO only records which of those
+  keys are set. Declared cache directories are the user's real caches and can
+  be poisoned by a worker. A user can opt out with
   `PI_ORCHESTRATOR_WORKER_SANDBOX=0`, which is recorded on the run; native
   Windows has no sandbox. Sandbox denials are reported to the model, not to
   PICO, so they are not in provenance. These are known limits, not

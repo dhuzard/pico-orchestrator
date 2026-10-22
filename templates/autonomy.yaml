@@ -37,7 +37,8 @@ permissions:
 # by default: writes only in their bound worktree (and its git metadata), no
 # reads of PICO's state directory or credential files such as ~/.config/gh, and
 # no network. Only the user can opt out (PI_ORCHESTRATOR_WORKER_SANDBOX=0). A
-# repository may widen it for its own checks, for example:
+# repository may widen it for its own checks; only the copy of this file on the
+# default branch on GitHub counts, pinned when a run starts. For example:
 # worker_sandbox:
 #   network:
 #     allowed_domains: [registry.npmjs.org, pypi.org, files.pythonhosted.org]

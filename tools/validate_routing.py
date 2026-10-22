@@ -390,7 +390,8 @@ def validate_backend_compatibility(policy, errors):
     except Exception as exc:  # noqa: BLE001
         errors.add(f"routing/backend-compatibility.json is unreadable: {exc}")
         return
-    if not isinstance(data, dict) or set(data) != {"schema_version", "claude_code_minimum_versions", "claude_code_model_ids"} or data.get("schema_version") != 1:
+    if not isinstance(data, dict) or set(data) != {"schema_version", "claude_code_minimum_versions", "claude_code_model_ids",
+                                                   "claude_code_worker_sandbox_minimum_version"} or data.get("schema_version") != 1:
         errors.add("routing/backend-compatibility.json has invalid top-level fields")
         return
     minimums = data.get("claude_code_minimum_versions")
@@ -408,6 +409,9 @@ def validate_backend_compatibility(policy, errors):
     for model, version in minimums.items():
         if model not in known or not isinstance(version, str) or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
             errors.add(f"invalid backend minimum for model {model!r}")
+    sandbox_minimum = data.get("claude_code_worker_sandbox_minimum_version")
+    if not isinstance(sandbox_minimum, str) or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", sandbox_minimum):
+        errors.add("invalid claude_code_worker_sandbox_minimum_version")
 
 
 def main():

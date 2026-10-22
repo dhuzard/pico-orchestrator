@@ -25,7 +25,9 @@ The parent orchestrator reads these values from it:
   `cache_directories` (#63). The verdict always carries `worker_sandbox` with
   both lists, empty by default (no network, no extra writable directory). The
   sandbox itself is on unless the user sets PI_ORCHESTRATOR_WORKER_SANDBOX=0;
-  a repository cannot turn it off.
+  a repository cannot turn it off. The lifecycle never takes this section from
+  the working tree: tools/worker_sandbox_policy.py reads it from the default
+  branch on GitHub, like publication permissions.
 
 A repository without the file gets the defaults below. A file that exists but
 does not validate against `schemas/autonomy.schema.json` fails closed with
