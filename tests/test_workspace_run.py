@@ -139,6 +139,16 @@ class WorkspaceRunTest(WorkspaceRunFixture):
         git("-C", str(alpha), "reset", "-q", "--hard")
         self.assertEqual(self.launch(manifest, "a2")["task"]["run_status"], "PARTIAL")
 
+    def test_new_untracked_files_are_reported_on_the_task_and_do_not_block_the_next_launch(self):
+        manifest = self.manifest(tasks=[{"id": "a1", "repository": "alpha", "title": "First"},
+                                        {"id": "a2", "repository": "alpha", "title": "Second"}])
+        os.environ["FAKE_PI_MESS"] = "parent-new-file"
+        first = self.launch(manifest, "a1")
+        self.assertEqual((first["task"]["checkout"]["new_untracked"], first["task"]["checkout"]["new_untracked_count"]),
+                         (["generated/"], 1))
+        os.environ.pop("FAKE_PI_MESS")
+        self.assertEqual(self.launch(manifest, "a2")["task"]["run_status"], "PARTIAL")
+
     def test_relaunch_is_idempotent_and_crash_resumes_same_run(self):
         manifest = self.manifest()
         first = self.launch(manifest, "a1")
