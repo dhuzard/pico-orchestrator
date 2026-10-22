@@ -314,22 +314,23 @@ class Controls:
                            for c in result["checks"]]}
 
     def _publish(self, plan, task, repo, data, confirm):
-        grant_once = data.get("grant_once") is True
-        grant = {"one_shot": True, "granted_by": "garden"} if grant_once else None
-        preview = workspace_contracts.publish(manifest=self.manifest, task_id=task["id"], adapter=self.adapter,
-                                              grant=grant)
+        if "grant_once" in data:
+            # Removed (#59): whoever holds the session token, an agent included, could confirm a grant.
+            raise ControlError(400, "CONTROL_BODY_INVALID", "one-shot publication grants were removed; allow "
+                               "push_branch and create_pr in .pi/autonomy.yaml on the default branch on GitHub")
+        preview = workspace_contracts.publish(manifest=self.manifest, task_id=task["id"], adapter=self.adapter)
         if preview["status"] != "DRY_RUN":
             result = {"ok": False, "stage": "refused", "error_code": preview["blocker_code"],
                       "error": "publication was refused by its preconditions or the autonomy policy"}
             if preview["blocker_code"] == "PUBLICATION_NOT_AUTHORIZED":
-                result["grantable"] = True
                 result["error"] = ("this repository's .pi/autonomy.yaml on the default branch on GitHub does not allow "
-                                   "push_branch and create_pr; you can allow them for this one PR")
+                                   "push_branch and create_pr; allow them in the permissions panel, commit the policy "
+                                   "and merge it into the default branch")
             elif preview["blocker_code"] == "AUTONOMY_POLICY_PATH_UNSAFE":
                 result["error"] = ("the checkout's .pi/autonomy.yaml is a symlink; "
                                    "restore it before publishing")
             return result
-        expected = self._confirm("publish", task["id"], preview["plan_hash"], grant_once)
+        expected = self._confirm("publish", task["id"], preview["plan_hash"])
         if confirm is None:
             body_path = workspace_contracts._scratch(plan, task["id"]) / "pr-body.md"
             body = body_path.read_text(encoding="utf-8") if body_path.is_file() else ""
@@ -341,7 +342,7 @@ class Controls:
                                 "authorization": preview["plan"]["authorization"]}}
         self._check_confirm(confirm, expected)
         result = workspace_contracts.publish(manifest=self.manifest, task_id=task["id"], apply=True,
-                                             plan_hash=preview["plan_hash"], adapter=self.adapter, grant=grant)
+                                             plan_hash=preview["plan_hash"], adapter=self.adapter)
         return {"ok": result["ok"] and result["status"] == "COMPLETED", "stage": "done", "status": result["status"],
                 "audit": {"authorization": preview["plan"]["authorization"]},
                 "error_code": result["blocker_code"], "pr": result.get("pr"),
@@ -474,10 +475,10 @@ class Controls:
                     "preview": {"repository": repo["repository"], "permission": name, "value": value,
                                 "creates_file": not before, "diff": diff or "(no change)",
                                 "note": "Writes the repository's .pi/autonomy.yaml. The change stays uncommitted "
-                                        "until you commit it. Publishing (push branch, create PR) ignores this file: "
-                                        "it reads the policy committed on the default branch on GitHub, so "
-                                        "this change has no effect on publication until it is committed "
-                                        "and pushed to the default branch."}}
+                                        "until you commit it. Publishing (push branch, create PR) and GitHub "
+                                        "issue and comment writes ignore this file: they read the policy "
+                                        "committed on the default branch on GitHub, so this change has no "
+                                        "effect on them until it is committed and pushed to the default branch."}}
         self._check_confirm(confirm, expected)
         _safe_policy_location(path)
         path.parent.mkdir(exist_ok=True)

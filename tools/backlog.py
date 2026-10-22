@@ -32,6 +32,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import backlog_store as store  # noqa: E402
+import github_integration  # noqa: E402
 import github_sync as gh  # noqa: E402
 import provenance  # noqa: E402
 
@@ -62,6 +63,16 @@ class UnmappedIssueError(Exception):
 
 class PrLifecycleError(Exception):
     """Refused to create/link a PR because lifecycle preconditions are unmet."""
+
+
+def _require_issue_writes(repo: str) -> None:
+    """Issue writes need `create_github_issues` in `.pi/autonomy.yaml` on the
+    repository's default branch on GitHub (#58), read through the same API
+    path as publication. The checkout's own copy is never consulted. Raises
+    `github_integration.IntegrationError` (GITHUB_WRITE_NOT_AUTHORIZED, or an
+    unreadable-policy code) before any mutating call."""
+    authority = github_integration.authority_policy(repo, gh)
+    github_integration.authorize(authority["policy"], ["create_github_issues"], "GITHUB_WRITE_NOT_AUTHORIZED")
 
 
 
@@ -268,6 +279,7 @@ def github_push_task(id: str, repo_root: Path = REPO_ROOT, *, establish_baseline
     if issue_number is None:
         body = _format_issue_body(item)
         repo = _repo_name(repo_root)
+        _require_issue_writes(repo)
         created = gh.create_issue(item["title"], body, labels=item.get("labels"), repo=repo)
         snapshot = {
             "last_synced_at": store.now_iso(),
@@ -332,6 +344,8 @@ def github_push_task(id: str, repo_root: Path = REPO_ROOT, *, establish_baseline
     if removed_labels:
         edit_kwargs["remove_labels"] = removed_labels
 
+    if edit_kwargs or state_changing:
+        _require_issue_writes(repo)
     if edit_kwargs:
         gh.edit_issue(issue_number, repo=repo, **edit_kwargs)
         if "title" in edit_kwargs:
@@ -846,7 +860,8 @@ def _cmd_github_push(args: argparse.Namespace) -> int:
     try:
         _print_json(github_push_task(args.id, REPO_ROOT, establish_baseline=args.establish_baseline))
         return 0
-    except (store.BacklogError, gh.GithubSyncError, SyncConflictError, CloseGuardError) as exc:
+    except (store.BacklogError, gh.GithubSyncError, SyncConflictError, CloseGuardError,
+            github_integration.IntegrationError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 

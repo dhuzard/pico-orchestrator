@@ -353,11 +353,13 @@ the full launch URL from the terminal again. Without `--controls` the Garden sta
 
 The buttons call the same commands as the terminal, so the autonomy policy
 still decides. When **Request PR** is refused because `.pi/autonomy.yaml` does
-not allow `push_branch` and `create_pr`, you can either allow them for that one
-reviewed PR (the policy file stays unchanged and the grant is recorded with the
-publication), or switch them on in the permissions panel. Selecting a
-permission there shows the exact diff of `.pi/autonomy.yaml` before writing
-it; the change stays uncommitted until you commit it. `merge`, `deploy` and
+not allow `push_branch` and `create_pr`, switch them on in the permissions
+panel, commit the policy and merge it into the default branch: publication
+reads the policy on the default branch on GitHub only. There is no "allow once"
+override; it was removed because anything holding the Garden token, an agent
+included, could confirm it. Selecting a permission shows the exact diff of
+`.pi/autonomy.yaml` before writing it; the change stays uncommitted until you
+commit it. `merge`, `deploy` and
 `mark_pr_ready` can only be changed in the file.
 
 A permission change stays uncommitted until you select **Commit policy** next

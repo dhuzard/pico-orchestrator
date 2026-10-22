@@ -795,11 +795,6 @@ function showResult(result) {
   }
   if (result.checks?.length) content.append(el("pre", "action-pre", result.checks.map((c) => `${c.status.padEnd(9)} ${c.id} [${c.repository}] ${c.duration_ms ?? "—"} ms`).join("\n")));
   $("action-confirm").hidden = true;
-  if (result.grantable && result.action === "publish") {
-    content.append(el("p", "action-note", "The policy file stays unchanged. The grant covers only this reviewed publication and is recorded with it."));
-    const confirm = $("action-confirm"); confirm.textContent = "Allow push and PR for this PR only"; confirm.hidden = false; confirm.disabled = false;
-    confirm.onclick = async () => { confirm.disabled = true; await previewThenRun("publish", { action: "publish", task: result.task, grant_once: true }); };
-  }
   controlState.fetchedAt = 0;
 }
 function showPreview(action, result, onConfirm) {
@@ -832,7 +827,7 @@ function showPreview(action, result, onConfirm) {
   }
   if (p.note) content.append(el("p", "action-note", p.note));
   const confirm = $("action-confirm");
-  const labels = { publish: p.authorization === "one_shot_grant" ? "Allow once, push and open draft PR" : "Push and open draft PR", promote: "Promote",
+  const labels = { publish: "Push and open draft PR", promote: "Promote",
     cancel: "Cancel the run", schedule: "Launch", set_permission: "Write the policy", commit_policy: "Commit", set_model: "Save the model", reset_model: "Reset the model" };
   confirm.textContent = labels[action] || "Run checks";
   confirm.hidden = !result.ok; confirm.disabled = false;

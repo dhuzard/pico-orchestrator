@@ -597,17 +597,19 @@ before any local ref is inspected:
 2. The default-branch policy is read; a symlink, a `type`/`path` mismatch, a
    directory or an unreadable file is `AUTONOMY_POLICY_PATH_UNSAFE` or
    `AUTONOMY_POLICY_INVALID`, and a schema-invalid policy is
-   `AUTONOMY_POLICY_INVALID` (a one-shot grant never overrides these).
+   `AUTONOMY_POLICY_INVALID`.
 3. A missing default branch or policy, or a policy that does not set both
-   permissions to `true`, is `PUBLICATION_NOT_AUTHORIZED`, unless an in-process
-   one-shot grant covers the withheld permissions (unchanged: Garden-confirmed,
-   never from the command line).
+   permissions to `true`, is `PUBLICATION_NOT_AUTHORIZED`. Nothing overrides
+   it: the Garden one-shot grant was removed (#59, see "Trust boundary
+   summary" below).
 
 The plan records `policy_branch`, `policy_commit`, `policy_blob` (always,
 replacing the earlier `issue_policy_blob`), `publication_permissions` (the two
-booleans the policy evaluated to, so a grant shows `false`/`false` next to
-`authorization: one_shot_grant`), `base_commit` and `authorization`; all are in
-the hashed plan. A merge that changes the default branch between the dry run
+booleans the policy evaluated to), `base_commit` and `authorization` (always
+`policy`); all are in the hashed plan. The publication record's
+`authorization` field carries `source: policy`, the `permissions` checked and
+the `policy_commit` that granted them; records written before #59 may show
+`source: one_shot_grant` with `granted_by` and `granted`. A merge that changes the default branch between the dry run
 and the apply changes `policy_commit` and so yields `GITHUB_STATE_CONFLICT`; a
 change that withdraws the permissions is `PUBLICATION_NOT_AUTHORIZED` at apply
 time.
@@ -633,31 +635,46 @@ Who else reads autonomy permissions (issue #39 audit):
 | --- | --- | --- |
 | `github_integration.publish` (push, draft PR); reached by `--publish`, `workspace_contracts.publish` and the Garden `publish` action | GitHub write | default-branch policy on GitHub (changed) |
 | `backlog github-pr-create` | opened a PR for any base and head with no permission check, dry run or plan hash | **removed**; PRs are opened only by `publish`, and `github-pr-link` links the result. Removal was smaller and safer than rebuilding a second gated path |
-| Garden one-shot grant | in-process override for one reviewed plan | unchanged; covers only the two permissions the policy withholds |
-| `github_integration.execute`, `backlog github-push` | GitHub write | see "Not enforced" below |
+| Garden one-shot grant | in-process override for one reviewed plan | **removed** (#59): whoever held the session token, an agent included, could confirm it |
+| `github_integration.execute`, `backlog github-push` | GitHub write | default-branch policy on GitHub (#58), see "Issue and comment writes" below |
 | `headless_run.mutation_permitted` | decides whether `start` needs `--allow-mutation` for a local run | working tree, left: it can only add a prompt for the operator, it authorizes no GitHub write |
 | `autonomy_policy.limits` (`parallel_tasks`, `open_prs`, `pr_granularity`) | local scheduling | working tree, left |
-| Garden permissions panel | display and `set_permission`/`commit_policy` | checkout, left; its preview and panel say that publication ignores it until the change is committed and pushed to the default branch |
+| Garden permissions panel | display and `set_permission`/`commit_policy` | checkout, left; its preview and panel say that publication and issue and comment writes ignore it until the change is committed and pushed to the default branch |
 
-**Not enforced today (follow-up: #58).** `create_github_issues`,
-`comment_on_issue` and `comment_on_pr` in `.pi/autonomy.yaml` are **not**
-enforced by `github_integration.execute` or `backlog github-push`. Those paths
-rely on the parent's dry run and plan hash (and `--allow-destructive` for
-closes) alone; a policy that sets these permissions to `false` does not stop
-them. Do not treat those three flags as a control until #58 lands.
+**Issue and comment writes (#58).** `github_integration.execute` and
+`backlog github-push` read the same default-branch policy on GitHub as
+publication, through the same API path, before any write:
 
-**Trust boundary summary.** Publication authority rests on the default branch
-on GitHub (see "Root of trust" above) and on the Garden session token for
-one-shot grants. Agent-side tool denylists do not fully stop a same-user
-process (S1, #59): a process running as the user can read the token or call
-`gh` directly, so they are not a substitute for branch protection.
+| Operation | Needs |
+| --- | --- |
+| `create_issue`, `update_issue`, `close_issue`, `reopen_issue`, `create_label`, `add_label`, `remove_label`; `github-push` creating, editing, closing or reopening an issue | `create_github_issues` |
+| `comment_issue` | `comment_on_issue` |
+| `comment_pr` | `comment_on_pr` |
+| `update_pr` (title or body) | `create_pr` |
 
-**Garden one-shot grant trust (follow-up: #59).** The grant trusts whoever
-holds the Garden session token. `pico watch` prints the token, so a process
-running as the same user, including a lead running bash outside a sandbox,
-can obtain it and confirm a grant. That is inside the same-user trust boundary
-tracked with worker isolation (S1); the token does not defend against a
-same-user process.
+`execute` checks every write in the plan, the dry run included, so a reviewer
+never approves a batch that cannot run; a no-op batch needs nothing. A missing
+default branch or policy, or a permission that is not `true`, is
+`GITHUB_WRITE_NOT_AUTHORIZED`, and the reason names each missing permission;
+an unreadable or unsafe policy is `AUTONOMY_POLICY_INVALID` or
+`AUTONOMY_POLICY_PATH_UNSAFE`. Closing an issue still also needs
+`--allow-destructive`. `github-push` checks only when it is about to write, so
+an in-sync push needs nothing. The run record's `authorization` carries the
+permissions checked and the `policy_commit`. There is no override. With the
+`manual` profile every permission is off, so backlog sync, issue comments and
+closing an issue on backlog completion are refused until the repository's
+default branch sets the keys. `report_pico_issue.py`, which files a report you
+wrote in the PICO repository itself, is not governed by the target's policy.
+
+**Trust boundary summary.** GitHub write authority rests on the default branch
+on GitHub (see "Root of trust" above) and nowhere else. The Garden one-shot
+publication grant was removed (#59): it trusted whoever held the session
+token, and `pico watch` prints the token, so a process running as the user,
+including a lead running bash outside a sandbox, could start its own Garden
+and confirm a grant that the record then showed as `granted_by: garden`.
+Agent-side tool denylists do not fully stop a same-user process: one can still
+call `gh` directly, so they are not a substitute for branch protection.
+Running workers in a sandbox limited to their worktree is tracked in #63.
 
 The trust boundary stops at the push. The branch push itself still runs
 through local git (`git push` with the checkout's remote and config), so a
@@ -1190,6 +1207,11 @@ python3 tools/backlog.py github-pr-link ORCH-001 17
 python3 tools/backlog.py update ORCH-001 --status completed
 python3 tools/backlog.py github-push ORCH-001  # close-guard permits closing now
 ```
+
+`github-push` needs `create_github_issues: true` in `.pi/autonomy.yaml` on the
+repository's default branch on GitHub whenever it would create, edit, close or
+reopen an issue (#58); otherwise it stops with `GITHUB_WRITE_NOT_AUTHORIZED`
+before writing anything.
 
 Important safety limits are intentional: these tools do not deploy, merge PRs,
 push branches, or allow workers to mutate GitHub. PR bodies generated by the
@@ -2391,21 +2413,17 @@ HMAC confirmation and are audited:
 
 | Action | Preview | Bound to | Effect |
 | --- | --- | --- | --- |
-| `publish` + `grant_once` | plan with `authorization: one_shot_grant` | plan hash (which includes the authorization source) and the grant flag | publishes once under an in-process grant |
 | `cancel` | execution status and run | execution id, run id, status | `workspace_run.cancel` |
 | `schedule` | tasks to launch and resume, cap, mutating permissions per repository | those lists, `allow_mutation`, cap | `workspace_scheduler.run` in a background thread; one at a time |
 | `set_permission` | unified diff of `.pi/autonomy.yaml` (created from the template if absent) | repository, permission, value, SHA-256 of the file before | atomic write (unique temp file, fsync, replace), schema-validated, comments kept; not committed. Refused with `AUTONOMY_POLICY_PATH_UNSAFE` when `.pi` or `.pi/autonomy.yaml` is a symlink or resolves outside the checkout |
 | `set_model` / `reset_model` | current and new model and capacity | family, tier, target, SHA-256 of the user model config | `model_profiles.cmd_set` / `cmd_reset` |
 
-**One-shot publication grant.** `github_integration.publish(..., grant=...)`
-accepts `{"one_shot": true, "granted_by": "<name>"}` from in-process callers
-only; there is no command-line flag, so `--publish` behaves exactly as before.
-A grant covers only the permissions the default-branch policy withholds (`push_branch`,
-`create_pr`), never an unreadable or invalid policy (`AUTONOMY_POLICY_INVALID`
-still blocks). The publication record's new optional `authorization` field
-(`source: policy | one_shot_grant`, `granted_by`, `granted`) and the plan hash
-both carry the authorization source, so a preview made under a grant cannot be
-applied without it and vice versa.
+**No one-shot publication grant.** The Garden `publish` action used to take
+`grant_once` to publish once when the default-branch policy withheld
+`push_branch` and `create_pr`. It was removed (#59): a request that still
+carries `grant_once` is refused with `CONTROL_BODY_INVALID`, and a refusal
+tells the user to allow the permissions in the policy, commit it and merge it
+into the default branch.
 
 **Editable scope.** `set_permission` accepts only `create_backlog_items`,
 `create_github_issues`, `create_worktrees`, `commit`, `push_branch`,

@@ -70,9 +70,9 @@ are in scope:
   and `--controls` adds confirmed actions. Bypassing its Host or Origin
   checks, its per-session token or its confirmations, reading data it should
   not serve, or making it write outside the target checkout are in scope.
-- **The GitHub adapter and publication.** Ways to publish, push, merge or
-  close something without the autonomy policy or a recorded grant are in
-  scope.
+- **The GitHub adapter and publication.** Ways to publish, push, merge,
+  create, edit, close or comment on something without the autonomy policy on
+  the repository's default branch are in scope.
 - **Provenance and state.** Ways to make secrets end up in run provenance or
   in local state are in scope.
 
