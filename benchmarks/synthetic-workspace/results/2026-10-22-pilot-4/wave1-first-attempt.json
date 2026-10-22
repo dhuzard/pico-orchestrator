@@ -1,0 +1,260 @@
+{
+  "headline": {
+    "metric": "tokens per verified task (input + output + cache_write)",
+    "spend_complete": true,
+    "value": 159139.0,
+    "verified_tasks": 1
+  },
+  "label": "pico-bench",
+  "report_version": 1,
+  "runs": [
+    {
+      "bind_source": "session",
+      "calls": {
+        "lead": 16,
+        "orchestration_record": {
+          "by_action": {
+            "bind_workspace": 1,
+            "event": 1,
+            "finish": 1,
+            "integrate_begin": 1,
+            "integrate_end": 1,
+            "status": 1
+          },
+          "event_kinds": {
+            "phase": 1
+          },
+          "total": 6
+        },
+        "workers": {
+          "claude-code": 1,
+          "pi-subagent": 1
+        }
+      },
+      "cost": {
+        "cost_complete": false,
+        "estimated_usd": 0.614921,
+        "unpriced": [
+          "pi-subagent"
+        ]
+      },
+      "ended_at": "2026-10-22T07:29:40Z",
+      "outcome": {
+        "blocker_code": null,
+        "checks": [
+          {
+            "id": "slugify-tests",
+            "status": "passed"
+          }
+        ],
+        "checks_passed": true,
+        "final_status": "COMPLETED",
+        "verified": true
+      },
+      "provenance_facts": [
+        {
+          "category": "phase",
+          "key": [
+            "lib-slugify"
+          ],
+          "value": {
+            "blocker_code": null,
+            "escalations": 0,
+            "in_wave": true,
+            "route": "CLAUDE_CODEX",
+            "status": "completed"
+          }
+        },
+        {
+          "category": "worker",
+          "key": [
+            "lib-slugify",
+            "claude_worker",
+            "0"
+          ],
+          "value": {
+            "backend": "claude-code",
+            "backend_model": "sonnet",
+            "blocker_code": null,
+            "model": "sonnet",
+            "status": "completed"
+          }
+        },
+        {
+          "category": "worker",
+          "key": [
+            "lib-slugify",
+            "codex_reviewer",
+            "0"
+          ],
+          "value": {
+            "backend": null,
+            "backend_model": null,
+            "blocker_code": null,
+            "model": "openai-codex/gpt-6-luna",
+            "status": "completed"
+          }
+        },
+        {
+          "category": "wave",
+          "ids": [
+            "auto-4750b3f6-lib-slugify"
+          ],
+          "key": [
+            "lib-slugify",
+            "0"
+          ],
+          "value": {
+            "task_ids": [
+              "lib-slugify"
+            ]
+          }
+        },
+        {
+          "category": "integrate",
+          "ids": [
+            "auto-4750b3f6-lib-slugify"
+          ],
+          "key": [
+            "lib-slugify",
+            "0",
+            "begin"
+          ],
+          "value": {}
+        },
+        {
+          "category": "integrate",
+          "ids": [
+            "auto-4750b3f6-lib-slugify"
+          ],
+          "key": [
+            "lib-slugify",
+            "0",
+            "end"
+          ],
+          "value": {}
+        },
+        {
+          "category": "bind",
+          "evidence": "session",
+          "key": [
+            "lib-slugify",
+            "claude_worker"
+          ],
+          "value": {}
+        },
+        {
+          "category": "finish",
+          "key": [
+            "run"
+          ],
+          "value": {
+            "blocker_code": null,
+            "final_status": "COMPLETED",
+            "outcome": "completed"
+          }
+        }
+      ],
+      "run_id": "run-b1ec2c229bf6",
+      "spend_complete": true,
+      "spend_tokens": 159139,
+      "started_at": "2026-10-22T07:26:47Z",
+      "task": "lib-slugify",
+      "tokens": {
+        "lead": {
+          "cache_read": 260736,
+          "cache_write": 0,
+          "cost_usd": 0.149341,
+          "input": 50589,
+          "model": "openai-codex/gpt-6.1-sol",
+          "output": 2209
+        },
+        "workers": {
+          "claude-code": {
+            "cache_read": 290972,
+            "cache_write": 98619,
+            "cost_usd": 0.46558,
+            "input": 10,
+            "invocations": 1,
+            "output": 1289
+          },
+          "pi-subagent": {
+            "cache_read": 3968,
+            "cache_write": 0,
+            "cost_usd": null,
+            "input": 5256,
+            "invocations": 1,
+            "output": 1167
+          }
+        }
+      },
+      "unresolved_binds": [],
+      "wall_clock_seconds": 173.0
+    }
+  ],
+  "totals": {
+    "calls": {
+      "lead": 16,
+      "orchestration_record": {
+        "by_action": {
+          "bind_workspace": 1,
+          "event": 1,
+          "finish": 1,
+          "integrate_begin": 1,
+          "integrate_end": 1,
+          "status": 1
+        },
+        "total": 6
+      },
+      "workers": {
+        "claude-code": 1,
+        "pi-subagent": 1
+      }
+    },
+    "cost": {
+      "cost_complete": false,
+      "estimated_usd": 0.614921,
+      "unpriced": [
+        "pi-subagent"
+      ]
+    },
+    "run_seconds_sum": 173.0,
+    "spend_complete": true,
+    "spend_tokens": 159139,
+    "tasks": {
+      "completed": 1,
+      "qualification": [],
+      "runs": 1,
+      "verified": 1
+    },
+    "tokens": {
+      "lead": {
+        "cache_read": 260736,
+        "cache_write": 0,
+        "cost_usd": 0.149341,
+        "input": 50589,
+        "output": 2209
+      },
+      "workers": {
+        "claude-code": {
+          "cache_read": 290972,
+          "cache_write": 98619,
+          "cost_usd": 0.46558,
+          "input": 10,
+          "invocations": 1,
+          "output": 1289
+        },
+        "pi-subagent": {
+          "cache_read": 3968,
+          "cache_write": 0,
+          "cost_usd": null,
+          "input": 5256,
+          "invocations": 1,
+          "output": 1167
+        }
+      }
+    },
+    "wall_clock_span_seconds": 173.0
+  },
+  "workspace_id": "pico-bench"
+}

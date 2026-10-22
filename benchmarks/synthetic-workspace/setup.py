@@ -3,6 +3,7 @@
 
     python3 benchmarks/synthetic-workspace/setup.py TARGET_DIR [--owner OWNER] [--workspace-id ID]
                                                     [--publication [--i-own-these-repos]] [--issue TASK=N ...]
+                                                    [--max-tokens N]
 
 TARGET_DIR must not exist yet (or be empty) and must not lie inside the PICO
 repository. It receives `synth-lib/`, `synth-app/` and `workspace.yaml`.
@@ -37,6 +38,12 @@ COMMIT_ENV = {
 }
 REPOSITORIES = ("synth-lib", "synth-app")
 TASK_IDS = ("lib-slugify", "lib-stopwords", "app-post-url", "qualify-integration")
+# What CI runs in each repository. synth-lib runs only the slugify tests: test_stopwords cannot pass (its approved
+# input never exists, lib-stopwords ends PARTIAL), and the whole suite would keep lib-slugify's PR red forever, so
+# nothing downstream could be promoted. synth-app runs its whole suite.
+CI_COMMANDS = {"synth-lib": "python3 -m unittest tests.test_slugify",
+               "synth-app": "python3 -m unittest discover -s tests -t ."}
+DEFAULT_MAX_TOKENS = 5_000_000
 
 AUTONOMY = {
     "profile": "guarded", "pr_granularity": "task", "issue_reference": "refs",
@@ -67,7 +74,8 @@ def build_repository(target: Path, name: str, owner: str, publication: bool) -> 
     shutil.copytree(HERE / "files" / name, repo)
     workflows = repo / ".github" / "workflows"
     workflows.mkdir(parents=True)
-    shutil.copy(HERE / "files" / "ci" / "tests.yml", workflows / "tests.yml")
+    workflow = (HERE / "files" / "ci" / "tests.yml").read_text(encoding="utf-8")
+    (workflows / "tests.yml").write_text(workflow.replace("__CI_COMMAND__", CI_COMMANDS[name]), encoding="utf-8")
     (repo / ".gitignore").write_text("__pycache__/\n*.pyc\n", encoding="utf-8")
     if publication:
         (repo / ".pi").mkdir()
@@ -83,7 +91,8 @@ def check(check_id: str, repository: str, *argv: str, timeout: int = 120) -> dic
     return {"id": check_id, "repository": repository, "argv": ["python3", *argv], "timeout_seconds": timeout}
 
 
-def build_manifest(workspace_id: str, owner: str, pins: dict[str, str], issues: dict[str, int]) -> dict:
+def build_manifest(workspace_id: str, owner: str, pins: dict[str, str], issues: dict[str, int],
+                   max_tokens: int = DEFAULT_MAX_TOKENS) -> dict:
     tasks = [
         {"id": "lib-slugify", "repository": "synth-lib", "title": "Add slugify to synth-lib",
          "objective": ("In synth-lib, add function slugify(text) to synthlib/text.py. Semantics: raise TypeError if text is "
@@ -110,9 +119,12 @@ def build_manifest(workspace_id: str, owner: str, pins: dict[str, str], issues: 
          "depends_on": ["lib-slugify"], "max_duration_seconds": 900,
          "requires": [{"contract": "slugify", "version": "1"}],
          "checks": [check("post-url-tests", "synth-app", "-m", "unittest", "tests.test_links")]},
+        # Checks both repositories, each at the commit its dependency was validated at. Only the slugify tests run in
+        # synth-lib: lib-stopwords is meant to end PARTIAL, and qualification does not depend on it.
         {"id": "qualify-integration", "repository": "synth-app", "title": "Qualify the validated tasks together",
          "kind": "qualification", "depends_on": ["lib-slugify", "app-post-url"],
-         "checks": [check("app-suite", "synth-app", "-m", "unittest", "discover", "-s", "tests", "-t", ".")]},
+         "checks": [check("app-suite", "synth-app", "-m", "unittest", "discover", "-s", "tests", "-t", "."),
+                    check("lib-slugify-suite", "synth-lib", "-m", "unittest", "tests.test_slugify")]},
     ]
     for task in tasks:
         if task["id"] in issues:
@@ -120,7 +132,7 @@ def build_manifest(workspace_id: str, owner: str, pins: dict[str, str], issues: 
     return {"schema_version": 1, "id": workspace_id,
             "goal": "Synthetic benchmark: add slugify, use it from another repository, and end one task PARTIAL.",
             "max_parallel": 2, "max_duration_seconds": 1800,
-            "budget": {"max_tokens": 5_000_000},
+            "budget": {"max_tokens": max_tokens},
             "repositories": [{"id": name, "repository": f"{owner}/{name}", "path": name,
                               "pinned_commit": pins[name], "base_branch": "main"} for name in REPOSITORIES],
             "tasks": tasks}
@@ -149,7 +161,8 @@ def inside_git(target: Path) -> bool:
 
 
 def create(target: Path, *, owner: str = DEFAULT_OWNER, workspace_id: str = DEFAULT_WORKSPACE_ID,
-           publication: bool = False, issues: dict[str, int] | None = None, confirm_owned: bool = False) -> dict:
+           publication: bool = False, issues: dict[str, int] | None = None, confirm_owned: bool = False,
+           max_tokens: int = DEFAULT_MAX_TOKENS) -> dict:
     target = target.expanduser().resolve()
     if target == ROOT or ROOT in target.parents:
         raise SetupError("target must be outside the PICO repository")
@@ -167,16 +180,19 @@ def create(target: Path, *, owner: str = DEFAULT_OWNER, workspace_id: str = DEFA
                          "repositories: pass --i-own-these-repos to confirm they are your sandbox repositories")
     if target.exists() and (not target.is_dir() or any(target.iterdir())):
         raise SetupError("target exists and is not an empty directory")
+    if isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or max_tokens < 1:
+        raise SetupError("max_tokens must be a positive integer")
     issues = issues or {}
     unknown = sorted(set(issues) - set(TASK_IDS))
     if unknown:
         raise SetupError("unknown task id for --issue: " + ", ".join(unknown))
     target.mkdir(parents=True, exist_ok=True)
     pins = {name: build_repository(target, name, owner, publication) for name in REPOSITORIES}
-    manifest = build_manifest(workspace_id, owner, pins, issues)
+    manifest = build_manifest(workspace_id, owner, pins, issues, max_tokens)
     path = target / "workspace.yaml"
     path.write_text(yaml.safe_dump(manifest, sort_keys=False, width=120), encoding="utf-8")
     return {"manifest": str(path), "workspace_id": workspace_id, "owner": owner, "publication": publication,
+            "max_tokens": max_tokens,
             "repositories": {name: str(target / name) for name in REPOSITORIES}, "pinned_commits": pins}
 
 
@@ -192,6 +208,8 @@ def main(argv: list[str] | None = None) -> int:
                              "repositories are your own sandbox repositories")
     parser.add_argument("--issue", action="append", default=[], metavar="TASK=N",
                         help="issue number in the task's repository that its draft PR references")
+    parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS,
+                        help="workspace budget.max_tokens (input + output + cache-write tokens; default %(default)s)")
     args = parser.parse_args(argv)
     try:
         issues = {}
@@ -201,7 +219,8 @@ def main(argv: list[str] | None = None) -> int:
                 raise SetupError(f"--issue expects TASK=N, got {item!r}")
             issues[task] = int(number)
         result = create(args.target, owner=args.owner, workspace_id=args.workspace_id,
-                        publication=args.publication, issues=issues, confirm_owned=args.confirm_owned)
+                        publication=args.publication, issues=issues, confirm_owned=args.confirm_owned,
+                        max_tokens=args.max_tokens)
     except SetupError as exc:
         print(f"setup failed: {exc}", file=sys.stderr)
         return 1
