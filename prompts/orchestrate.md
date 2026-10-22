@@ -15,7 +15,8 @@ Before inspecting the target repository or spawning workers, call
 says the record is ready with `ok: true`. After a saved-session restart or
 escalation, `PARENT_ROUTE_RECHECK_REQUIRED` permits only rerunning `route_task`
 for the unfinished task and its backend preflight; call status again before
-worker dispatch. If the parent is blocked because multiple GitHub
+worker dispatch. Its status reply begins `NEXT STEP`: the run is active, not
+stopped, so do this rather than ending the run. If the parent is blocked because multiple GitHub
 remotes need disambiguation, stop and ask the launcher to be rerun with the
 parent-authorized `--repo owner/repository` option; do not choose a remote by
 name or let a worker choose the target.

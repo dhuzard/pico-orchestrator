@@ -115,12 +115,21 @@ All notable changes to PICO are recorded here. The format follows
 
 ### Fixed
 
+- A resumed headless run no longer stops at its required re-route (#69). In the #4 pilot the resumed lead
+  called `orchestration_record status` and got "BLOCKED: rerun route_task ...", and the resume prompt
+  told it to stop on BLOCKED, so it did, and the run ended `ORCHESTRATION_OUTCOME_UNRECORDED`. That status
+  reply now begins `NEXT STEP (PARENT_ROUTE_RECHECK_REQUIRED): the run is active and not stopped`. The
+  resume prompt and the orchestrate prompts name it as the expected first step of a resume.
 - A task no longer launches on a parent checkout left dirty by the previous run (#68). In the #4
   pilot a lead applied its integrated diff to the parent checkout, and the next task in that
   repository launched on it because only `HEAD` was checked. `workspace launch` and scheduler
   dispatches now refuse a checkout with uncommitted tracked changes with `WORKSPACE_CHECKOUT_DIRTY`,
   naming the files and the run that left them. Each execution's `checkout` block records
   `dirty_files` and `dirty_count`. Nothing is cleaned automatically.
+- Each execution's `checkout` block also reports untracked entries that appeared in the parent
+  checkout during the run (`new_untracked`, `new_untracked_count`; `.pi/worktrees/` and ignored
+  files excluded). They are a report only, so they never refuse a launch, but they show a write
+  outside the run's worktrees (#63).
 - A run that ends PARTIAL, BLOCKED, FAILED or settled no longer leaves phases or
   workers `in_progress`. Finishing without COMPLETED sets each still-open phase
   and worker (`not_started` or `in_progress`) to `abandoned` and appends it to

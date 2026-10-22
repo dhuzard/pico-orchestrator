@@ -1566,7 +1566,8 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
                  details: { ok: false, active: false, run_id: null as string | null, result } };
       }
       if (params.action === "status" && pendingReroutes.size > 0 && !parentBlocked) {
-        return { content: [{ type: "text", text: `BLOCKED: rerun route_task and complete backend preflight for ${[...pendingReroutes].sort().join(", ")} before the parent is ready.` }],
+        // Not "BLOCKED": a resumed lead is told to stop on BLOCKED, and this is its expected next step (#69).
+        return { content: [{ type: "text", text: `NEXT STEP (PARENT_ROUTE_RECHECK_REQUIRED): the run is active and not stopped. Rerun route_task and complete backend preflight for ${[...pendingReroutes].sort().join(", ")}, then call status again before dispatching workers.` }],
           details: { ok: false, active: true, run_id: runId,
             result: { error_code: "PARENT_ROUTE_RECHECK_REQUIRED" } } };
       }

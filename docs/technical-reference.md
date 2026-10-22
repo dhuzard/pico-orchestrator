@@ -2059,8 +2059,13 @@ are never deleted, since they hold the work. The result is recorded as the
 execution's `checkout` block (`restored`, `removed_worktrees`,
 `kept_worktrees`, `left_reason`, and `dirty_files`/`dirty_count`: the tracked
 changes the run left uncommitted in the parent checkout itself, `null` when
-Git cannot answer) and summarised on the workspace task entry. Nothing dirty is
-ever cleaned, stashed or reset.
+Git cannot answer; `new_untracked`/`new_untracked_count`: untracked, not
+ignored entries that appeared in the parent checkout during the run, an
+untracked directory counting as one entry and `.pi/worktrees/` excluded) and
+summarised on the workspace task entry. Untracked entries are a report only:
+they never refuse a launch, because they cannot change a commit or a check at
+the recorded commits, but they show a write outside the run's worktrees (#63).
+Nothing dirty is ever cleaned, stashed or reset.
 This keeps the next task in the same repository launchable: the launcher
 requires the checkout to be at its pinned commit. The orchestrate prompt also
 tells the lead to integrate in a dedicated integration worktree and never

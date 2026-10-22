@@ -94,6 +94,12 @@ if os.environ.get("FAKE_PI_MESS") == "parent-apply":
     # What a real lead did in the #4 pilot: `git diff ... | git apply` in the parent checkout itself (#68).
     with open("README.md", "a") as tracked:
         tracked.write("applied in the parent checkout\n")
+elif os.environ.get("FAKE_PI_MESS") == "parent-new-file":
+    # The same, writing a new file: untracked, so reported and never refused.
+    os.makedirs(os.path.join(".pi", "worktrees", "own"), exist_ok=True)
+    open(os.path.join(".pi", "worktrees", "own", "f.txt"), "w").write("PICO's own worktree area\n")
+    os.makedirs("generated", exist_ok=True)
+    open(os.path.join("generated", "slug.py"), "w").write("new file outside any worktree\n")
 elif os.environ.get("FAKE_PI_MESS"):
     # What real leads did: switch the parent checkout to a batch branch and leave a worker worktree.
     subprocess.run(["git", "switch", "-q", "-c", "pico/batch-1"], capture_output=True)
@@ -478,12 +484,23 @@ class HeadlessRunTest(HeadlessFixture):
         os.environ["FAKE_PI_MESS"] = "clean"
         clean = self.start()
         self.assertEqual((clean["checkout"]["dirty_files"], clean["checkout"]["dirty_count"]), ([], 0))
+        self.assertEqual((clean["checkout"]["new_untracked"], clean["checkout"]["new_untracked_count"]), ([], 0))
         os.environ["FAKE_PI_MESS"] = "parent-apply"
         os.environ["FAKE_PI_BEHAVIOR"] = "finish"
         record = hr.start(target=self.target, explicit_repo="acme/target", execution_id="exec-apply",
                           objective="Inspect", pi_executable=str(self.pi))
         self.assertEqual((record["checkout"]["dirty_files"], record["checkout"]["dirty_count"]), (["README.md"], 1))
         self.assertIn("applied in the parent checkout", (self.target / "README.md").read_text())  # never cleaned
+
+    def test_new_untracked_entries_are_reported_but_not_refused_or_removed(self):
+        (self.target / "scratch.txt").write_text("there before the run\n")
+        os.environ["FAKE_PI_MESS"] = "parent-new-file"
+        record = self.start()
+        cleanup = record["checkout"]
+        # Only what appeared during the run, an untracked directory as one entry, PICO's .pi/worktrees/ excluded.
+        self.assertEqual((cleanup["new_untracked"], cleanup["new_untracked_count"]), (["generated/"], 1))
+        self.assertEqual((cleanup["dirty_files"], cleanup["dirty_count"]), ([], 0))
+        self.assertTrue((self.target / "generated" / "slug.py").is_file())
 
     def test_tracked_changes_ignore_untracked_files_and_name_renames_once(self):
         self.assertEqual(hr.tracked_changes(self.target), [])
@@ -499,6 +516,16 @@ class HeadlessRunTest(HeadlessFixture):
         # The model must be able to match the lifecycle's visible status text.
         self.assertIn("is ready", hr.RESUME_PROMPT)
         self.assertIn("explicit outcome", hr.RESUME_PROMPT)
+
+    def test_resume_prompt_treats_a_required_reroute_as_the_next_step(self):
+        # The #4 pilot: the resumed lead got the reroute reply, which then began with BLOCKED, and stopped as this
+        # prompt told it to (#69). The prompt names the extension's exact reply, which never says BLOCKED.
+        extension = (REPO_ROOT / "extensions" / "orchestration-lifecycle.ts").read_text(encoding="utf-8")
+        marker = "NEXT STEP (PARENT_ROUTE_RECHECK_REQUIRED)"
+        self.assertIn(f"`{marker}: the run is active and not stopped.", extension)
+        self.assertIn(marker, hr.RESUME_PROMPT)
+        self.assertLess(hr.RESUME_PROMPT.index(marker), hr.RESUME_PROMPT.index("BLOCKED, stop"))
+        self.assertIn("rerun route_task", hr.RESUME_PROMPT)
 
     def test_cancel_closes_run_before_a_graceful_shutdown_can_settle_it(self):
         launched = self.start(behavior="hang", wait=False)
