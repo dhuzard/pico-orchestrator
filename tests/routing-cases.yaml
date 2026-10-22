@@ -10,7 +10,8 @@ version: 1
 #
 # `override_cases` exercise the project-constraint selection algorithm
 # described in prompts/orchestrate.md: route the base task, apply
-# `project_routing.risk_overrides` as floors, route the constrained task,
+# `project_routing.risk_overrides` (and every `path_floors` rule the task's
+# `files_or_areas` match) as floors, route the constrained task,
 # union the matches, add the base task's own selected route (`base_route`,
 # which is `fallback_route` when nothing matched) as a selection candidate,
 # and select the earliest route under global precedence. `base_route` is
@@ -637,6 +638,72 @@ override_cases:
     expected_matches_with_overrides: [CLAUDE]
     expected_route_with_overrides: CODEX
 
+  - id: override-d-path-floor-from-files-or-areas
+    task:
+      id: override-d-path-floor-from-files-or-areas
+      goal: Bump the Node version used by the release workflow.
+      task_type: config_edit
+      failure_cost: low
+      semantic_correctness: normal
+      ambiguity: 1
+      implementation_scope: small
+      implementation_required: true
+      cross_layer: false
+      behavior_preservation: not_required
+      diagnosis_required: false
+      assumptions_must_be_explicit: false
+      many_routine_decisions: false
+      production_feature: false
+      security_sensitive: false
+      destructive_operation: false
+      dependencies: []
+      acceptance_criteria:
+        - The release workflow uses the new Node version.
+      files_or_areas:
+        - .github/workflows/release.yml
+    project_routing:
+      path_floors:
+        - paths: ["migrations/**"]
+          floors: { failure_cost: high }
+        - paths: [".github/workflows/**", "**/*secret*"]
+          floors: { security_sensitive: true }
+    expected_matches: [CLAUDE]
+    expected_route: CLAUDE
+    expected_matches_with_overrides: [CLAUDE, CODEX_CLAUDE_CODEX]
+    expected_route_with_overrides: CODEX_CLAUDE_CODEX
+
+  - id: override-e-path-floor-unmatched-area
+    task:
+      id: override-e-path-floor-unmatched-area
+      goal: Fix a typo in the contributor guide.
+      task_type: documentation
+      failure_cost: low
+      semantic_correctness: normal
+      ambiguity: 0
+      implementation_scope: small
+      implementation_required: true
+      cross_layer: false
+      behavior_preservation: not_required
+      diagnosis_required: false
+      assumptions_must_be_explicit: false
+      many_routine_decisions: false
+      production_feature: false
+      security_sensitive: false
+      destructive_operation: false
+      dependencies: []
+      acceptance_criteria:
+        - The typo is fixed.
+      files_or_areas:
+        - docs/CONTRIBUTING.md
+    project_routing:
+      path_floors:
+        - paths: ["migrations/**", ".github/workflows/**"]
+          floors: { failure_cost: high, security_sensitive: true }
+    expected_matches: [CLAUDE]
+    expected_route: CLAUDE
+    expected_matches_with_overrides: [CLAUDE]
+    expected_route_with_overrides: CLAUDE
+
 invalid_project_routing_examples:
 
   - id: invalid-unknown-top-level-key
@@ -667,3 +734,60 @@ invalid_project_routing_examples:
     config:
       risk_overrides:
         failure_cost: extreme
+
+  - id: invalid-path-floor-boolean-false
+    reason: a path floor may only force a safety boolean to true, never weaken it
+    config:
+      path_floors:
+        - paths: ["src/auth/**"]
+          floors: { security_sensitive: false }
+
+  - id: invalid-path-floor-unknown-floor
+    reason: task_type is not an overridable risk field, in path floors as in risk_overrides
+    config:
+      path_floors:
+        - paths: ["migrations/**"]
+          floors: { task_type: migration }
+
+  - id: invalid-path-floor-unknown-rule-key
+    reason: a path floor rule has exactly paths and floors
+    config:
+      path_floors:
+        - paths: ["migrations/**"]
+          floors: { failure_cost: high }
+          route: CODEX
+
+  - id: invalid-path-floor-empty-floors
+    reason: a path floor rule must raise at least one field
+    config:
+      path_floors:
+        - paths: ["migrations/**"]
+          floors: {}
+
+  - id: invalid-path-floor-negated-glob
+    reason: a leading ! would read as a negation (a relaxing rule) and is rejected
+    config:
+      path_floors:
+        - paths: ["!docs/**"]
+          floors: { failure_cost: high }
+
+  - id: invalid-path-floor-glob-double-star-in-segment
+    reason: malformed glob, ** must be a whole path segment
+    config:
+      path_floors:
+        - paths: ["src/**.py"]
+          floors: { failure_cost: high }
+
+  - id: invalid-path-floor-glob-character-class
+    reason: malformed glob, character classes are not supported
+    config:
+      path_floors:
+        - paths: ["[ab]/x"]
+          floors: { failure_cost: high }
+
+  - id: invalid-path-floor-glob-parent-segment
+    reason: malformed glob, a glob may not leave the repository root
+    config:
+      path_floors:
+        - paths: ["../outside/**"]
+          floors: { failure_cost: high }

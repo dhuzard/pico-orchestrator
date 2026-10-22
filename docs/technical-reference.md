@@ -83,7 +83,8 @@ not task risk. Escalating values must be justified per task in the optional
 | `destructive_operation` | `true` |
 
 `tools/route_task.py` checks the classification as submitted (before project
-risk floors, so floor-raised values are exempt) and otherwise returns
+risk floors, so values raised by `risk_overrides` or by matched `path_floors`
+are exempt) and otherwise returns
 `{"ok": false, "blocker_code": "CLASSIFICATION_EVIDENCE_MISSING",
 "missing_evidence_fields": [...], "errors": [...]}`. The single list lives in
 `tools/routing_engine.py` `ESCALATING_CLASSIFICATION_VALUES`.
@@ -249,7 +250,9 @@ project may add local constraints via `.pi/routing.yaml`, validated against
 
 - It may declare `critical_invariants`, `architecture_constraints`,
   `protected_areas`, and extra `validation.commands` — all additive, never a
-  replacement for global requirements.
+  replacement for global requirements. `protected_areas` stays free text: the
+  orchestrating prompt and worker contracts see it, no tool enforces it. Areas
+  whose changes must raise routing belong in `path_floors`.
 - It may declare `risk_overrides`, which are **floors**, not replacements:
   - Ordered fields (`failure_cost`, `semantic_correctness`, `ambiguity`,
     `implementation_scope`, `behavior_preservation`) raise a task's effective
@@ -266,14 +269,18 @@ project may add local constraints via `.pi/routing.yaml`, validated against
   categories, or completion requirements.
   `schemas/project-routing.schema.json` sets `additionalProperties: false`
   and excludes these keys entirely, so any attempt fails closed.
+- It may declare `path_floors`: the same floors, applied only to a task that
+  touches one of a rule's paths (see "Path floors and the post-diff check").
 
 Route selection under project constraints:
 
 1. Route the task's original classification under the global policy; call
    the result `base_route` (the matched route, or `fallback_route` if
    nothing matched).
-2. Apply `risk_overrides` floors to produce a constrained classification, and
-   route that under the global policy too.
+2. Apply the project risk floors -- `risk_overrides` merged with every
+   `path_floors` rule the task's `files_or_areas` match, each field taking the
+   strongest floor -- to produce a constrained classification, and route that
+   under the global policy too.
 3. Build the candidate set: the union of routes matched by both
    classifications, plus `base_route` itself. `base_route` must be included
    explicitly even when it is `fallback_route` and matched nothing, otherwise
@@ -286,6 +293,95 @@ Because `base_route` is always a member of the candidate set, the selected
 route's precedence rank can never be worse (later) than `base_route`'s —
 this can only escalate or preserve a route relative to the unconstrained
 classification, never downgrade it.
+
+### Path floors and the post-diff check
+
+`risk_overrides` apply to every task of the project. `path_floors` tie a floor
+to what a task touches:
+
+```yaml
+path_floors:
+  - paths: ["migrations/**", "schemas/**"]
+    floors: { failure_cost: high, behavior_preservation: required }
+  - paths: [".github/workflows/**", "**/*secret*"]
+    floors: { security_sensitive: true }
+```
+
+- **Shape.** An ordered list (at most 64) of closed `{paths, floors}` rules.
+  `floors` is `$ref: #/properties/risk_overrides` with `minProperties: 1`, so a
+  path floor accepts exactly the keys and raise-only values of a project-wide
+  floor: ordered fields can only be raised, booleans can only be `true`, and
+  unknown keys are rejected. `validate_project_routing_schema` checks that the
+  reference stays in place.
+- **Globs.** 1-32 unique repository-relative POSIX patterns per rule, anchored
+  at the root. `*` and `?` match inside one path segment (a leading dot
+  included); a whole `**` segment matches zero or more segments, so
+  `migrations/**` matches `migrations` and everything below it and
+  `**/*secret*` matches at any depth. The schema rejects character classes,
+  braces, backslashes, a leading `!` (it would read as a negation) or `/`,
+  empty, `.` or `..` segments, `**` inside a segment, and surrounding
+  whitespace. Nothing in a rule can relax routing.
+- **Before the run.** `route_task` normalizes each `files_or_areas` entry
+  (leading `./` and trailing `/` dropped, repeated `/` collapsed) and matches
+  it as a path. An entry that is prose, absolute or escapes the root matches
+  nothing, and a declared parent directory (`src`) does not match a deeper
+  floor (`src/db/migrations/**`): the post-diff check covers both. Matched
+  floors are merged with `risk_overrides` before rule evaluation (step 2
+  above), and floor-raised values are exempt from `escalation_evidence` like
+  project floors. The result records each matched rule in
+  `path_floor_matches` (`rule` index, the `patterns` that matched, its
+  `floors`, the sorted `matched_paths` -- at most 50 -- and the exact
+  `matched_path_count`); `validate_route_task_result` recomputes the list
+  from `classification.base` and `project_constraints` and rejects any
+  difference.
+- **After the run, before integration.** `integrate_begin` is the one point
+  every wave passes through before its workers' worktrees are merged into the
+  parent checkout. For each member task with a bound worktree, the lifecycle
+  extension calls `tools/diff_floor_check.py` with the route result that ran.
+  The tool collects the worktree's real changed paths: everything between the
+  merge base of the worktree's HEAD and the parent checkout's HEAD and the
+  worktree's working tree (committed, staged, unstaged, both sides of a
+  rename, deletions) plus untracked files that are not ignored. Work the
+  parent integrated after the fork is not counted.
+  `routing_engine.check_diff_path_floors` then re-validates the route result,
+  re-routes the same base classification with the changed paths added to its
+  `files_or_areas`, under the same `project_constraints` and availability
+  exclusions, and compares. The floors are the ones recorded in the route
+  result, so a worker that edits `.pi/routing.yaml` in its worktree cannot
+  remove one. If the diff's floors select a route earlier in the policy
+  `precedence`, or the same route with a strictly higher capacity tier or
+  reasoning effort for any step, the verdict is
+  `CLASSIFICATION_UNDERRATED_BY_DIFF`. A diff that matches no floor, or only
+  floors already applied before the run, reproduces the routed inputs exactly
+  and never blocks. A worktree, diff or route result that cannot be verified
+  refuses the integration with `CLASSIFICATION_DIFF_UNVERIFIABLE`.
+- **Re-route, not a stop.** An underrated task is not integrated. The
+  extension records a `diff_floors` event (`status: underrated`, `from_route`,
+  `to_route`, `capacity_raised`, the matches). The parent appends an
+  unconfirmed escalation with reason `PATH_FLOOR`. Unlike a lead escalation,
+  its `to_route` may be any route at least as early in the precedence,
+  including the same route for a capacity-only raise. As after any escalation
+  the task starts a new route epoch, its approval and bound worktrees are
+  dropped, and its single-task implicit wave is discarded. The run stays
+  IN_PROGRESS. `integrate_begin` answers
+  `NEXT STEP (CLASSIFICATION_UNDERRATED_BY_DIFF): the run is active and not
+  stopped ...`, and `status` answers `NEXT STEP
+  (PARENT_ROUTE_RECHECK_REQUIRED)` until `route_task` is rerun for the task
+  (the #69/#72 re-route-as-next-step behaviour). A resumed run lists the
+  phase in `reroute_phases`. The rerun's phase event must name `to_route`,
+  otherwise `PARENT_EVENT_CONFLICT`, and `COMPLETED` is refused with
+  `PARENT_ROUTE_RECHECK_REQUIRED` until it does. The lead adds the floored
+  paths to `files_or_areas`, which makes `route_task` select `to_route`, then
+  runs the new route's steps in a fresh bound worktree and integrates again.
+  A check that passed but matched floors is recorded as `status: passed`.
+  Both appear in the phase's `diff_floor_checks` and in `backlog.py trace`.
+- **Not covered.** Content-based detection (secret scanning, SQL parsing) is
+  out of scope: only paths are matched. The check cannot prove that the new
+  route's steps really redid the work. The mandatory independent review of a
+  reviewed route and the per-epoch completion checks still apply. Work merged
+  without the `integrate_begin` bracket is not checked; `COMPLETED` refuses a
+  task whose bound worktree was never integrated through it
+  (`PARENT_WAVE_NOT_INTEGRATED`).
 
 ## Adaptive lead-agent delegation
 
@@ -723,7 +819,11 @@ decision (route + primary intent + assigned capacity tiers) through the shared
 `tools/routing_engine.py`. Gold and predicted classifications must satisfy the
 same escalation-evidence rule as `route_task`; a prediction that does not is
 reported as invalid. The report includes per-field escalation rates
-(predicted vs gold), and cases may pin an `expected_decision`.
+(predicted vs gold), and cases may pin an `expected_decision`. A case may
+carry its repository's `project_routing` (its `path_floors`); the report then
+gives route accuracy and policy under-/over-routing both without and with path
+floors, so path-floor cases (an understated request touching a floored path)
+show how much under-routing the floors recover.
 
 ```sh
 python3 benchmarks/classification/evaluate.py \
@@ -742,9 +842,9 @@ by `tools/validate_routing.py`:
 - `cases` — complete, schema-valid tasks with `expected_matches` (every
   route whose `match` expression is true) and `expected_route` (the route
   selected after precedence/fallback).
-- `override_cases` — a base task plus a `project_routing.risk_overrides`
-  fragment, with expectations for both the unconstrained and the
-  overrides-applied outcome.
+- `override_cases` — a base task plus a `project_routing` fragment
+  (`risk_overrides` and/or `path_floors`), with expectations for both the
+  unconstrained and the overrides-applied outcome.
 - `invalid_project_routing_examples` — project-routing fragments that must
   be rejected by `schemas/project-routing.schema.json`, proving unknown or
   weakening keys fail closed.
@@ -938,8 +1038,10 @@ A schema-valid classification with an unjustified escalating value adds
 escalation evidence").
 
 `classification.base` is the task as classified; `classification.effective`
-is the same task after any `.pi/routing.yaml` `risk_overrides` floors are
-applied. In the Pi tool, these complete fields are always available in
+is the same task after any `.pi/routing.yaml` `risk_overrides` floors, and the
+`path_floors` its `files_or_areas` match, are applied. `path_floor_matches`
+lists those matched path floors (an empty list when none matched; see "Path
+floors and the post-diff check"). In the Pi tool, these complete fields are always available in
 `details.result`; they may be omitted from the LLM-visible text content when
 needed to keep that content bounded. `matches` lists which routes independently matched each
 classification. `fallback_applied` is true when `selected_route` was not

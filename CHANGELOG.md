@@ -6,6 +6,22 @@ All notable changes to PICO are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Path-triggered risk floors (#76). `.pi/routing.yaml` `path_floors` tie the raise-only floors of
+  `risk_overrides` to repository-relative globs. `route_task` applies the rules matched by a task's
+  `files_or_areas` before rule evaluation, records them in `path_floor_matches`, and
+  `validate_route_task_result` recomputes them. Floor-raised values need no `escalation_evidence`.
+  At `integrate_begin` each bound worktree's real changed paths are checked
+  (`tools/diff_floor_check.py`, decided by `routing_engine.check_diff_path_floors`). If the diff's
+  floors need an earlier route in the precedence, or a higher capacity on the same route, the task is
+  not integrated. It is re-routed with `CLASSIFICATION_UNDERRATED_BY_DIFF`: a `PATH_FLOOR`
+  escalation that the run resumes as a required re-route. Unverifiable diffs refuse with
+  `CLASSIFICATION_DIFF_UNVERIFIABLE`. Matched floors appear in the phase's routing summary and
+  `diff_floor_checks` and in `backlog.py trace`. The classification benchmark gained path-floor cases
+  and reports under-routing with and without path floors. `protected_areas` stays free-text prompt
+  context.
+
 ### Documentation
 
 - Added `docs/containment-and-authority.md`: containment acceptance tests for worker sandboxing (#63),

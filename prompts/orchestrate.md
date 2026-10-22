@@ -16,7 +16,10 @@ says the record is ready with `ok: true`. After a saved-session restart or
 escalation, `PARENT_ROUTE_RECHECK_REQUIRED` permits only rerunning `route_task`
 for the unfinished task and its backend preflight; call status again before
 worker dispatch. Its status reply begins `NEXT STEP`: the run is active, not
-stopped, so do this rather than ending the run. If the parent is blocked because multiple GitHub
+stopped, so do this rather than ending the run. `integrate_begin` refusing with `NEXT STEP
+(CLASSIFICATION_UNDERRATED_BY_DIFF)` is the same kind of step: add the floored paths it names to the
+task's `files_or_areas`, rerun `route_task`, and redo the task's steps on the new route in a fresh
+worktree before integrating again. If the parent is blocked because multiple GitHub
 remotes need disambiguation, stop and ask the launcher to be rerun with the
 parent-authorized `--repo owner/repository` option; do not choose a remote by
 name or let a worker choose the target.
@@ -690,7 +693,13 @@ Concretely, a project file may declare:
   booleans (`cross_layer`, `diagnosis_required`,
   `assumptions_must_be_explicit`, `production_feature`,
   `security_sensitive`, `destructive_operation`) may only be forced to
-  `true` and are OR-merged with the task's own value.
+  `true` and are OR-merged with the task's own value;
+- `path_floors`, the same floors applied only to a task that touches one of
+  a rule's repository-relative globs: `route_task` matches them against the
+  task's `files_or_areas`, so list the real paths the task will change there,
+  and `integrate_begin` matches them against the worker's real diff.
+  `protected_areas` stays free-text context for you and the worker contract;
+  no tool enforces it.
 
 A project file may never override `task_type`, `implementation_required`,
 `many_routine_decisions`, routes, precedence, fallback,
@@ -698,9 +707,9 @@ capacity/model/backend policy, execution or worktree isolation, mutation
 permissions, review categories, or completion requirements.
 
 Do not read, parse, or apply `.pi/routing.yaml` yourself, and do not
-compute the effect of `risk_overrides` yourself. `route_task` loads it,
+compute the effect of `risk_overrides` or `path_floors` yourself. `route_task` loads it,
 validates it against `schemas/project-routing.schema.json`, applies its
-`risk_overrides` as floors, and guarantees the result can only escalate or
+`risk_overrides` and matched `path_floors` as floors, and guarantees the result can only escalate or
 preserve the task's unconstrained route, never downgrade it. Use the
 `project_constraints` field of a successful `route_task` result (the
 validated invariants, architecture constraints, protected areas, and
