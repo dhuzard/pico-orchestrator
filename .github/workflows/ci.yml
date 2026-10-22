@@ -29,7 +29,9 @@ jobs:
       - run: npm ci
       # TypeScript tests invoke the Python routing boundary, so Python runtime
       # dependencies must exist before npm run check.
-      - run: python -m pip install -r requirements-dev.txt pytest
+      # pytest-xdist runs the Python suite in parallel (-n auto, one worker per core): it is subprocess-bound,
+      # about 3x faster on four cores. Every test uses its own temporary directories and state.
+      - run: python -m pip install -r requirements-dev.txt pytest pytest-xdist==3.8.0
       # Typecheck + import every extension: an unloadable extension fails here.
       - run: npm run check
       # Policy/schema/prompt/README consistency gate documented in AGENTS.md.
@@ -39,8 +41,8 @@ jobs:
       # regression in orchestration shows up under its own name; the full run below skips these two files
       # instead of running them twice. The real-agent benchmark (benchmarks/synthetic-workspace/run_real.py)
       # is started by hand, needs PICO_REAL_BENCHMARK=1, and is never run or enabled here.
-      - run: python -m pytest -q tests/test_synthetic_pilot.py tests/test_real_benchmark_entry.py
-      - run: python -m pytest -q --ignore=tests/test_synthetic_pilot.py --ignore=tests/test_real_benchmark_entry.py
+      - run: python -m pytest -q -n auto tests/test_synthetic_pilot.py tests/test_real_benchmark_entry.py
+      - run: python -m pytest -q -n auto --ignore=tests/test_synthetic_pilot.py --ignore=tests/test_real_benchmark_entry.py
 
   lint:
     runs-on: ubuntu-latest

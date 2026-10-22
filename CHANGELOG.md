@@ -41,6 +41,9 @@ All notable changes to PICO are recorded here. The format follows
 
 ### Changed
 
+- CI runs the Python suite in parallel with `pytest-xdist` (`-n auto`). The suite is bound by its
+  subprocesses, so on four cores it takes about 2.5 minutes instead of 7.5. Local runs can do the same
+  with `pip install pytest-xdist` and `pytest -n auto`.
 - Behavior change (#58): with the `manual` profile, where every permission is off, backlog sync
   (`github-push`), issue comments, issue edits and closing an issue on backlog completion are
   refused until the repository's default branch enables `create_github_issues`,

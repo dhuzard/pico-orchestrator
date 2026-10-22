@@ -697,14 +697,22 @@ class ExecutionTimeLimitTest(HeadlessFixture):
         self.assertEqual(record["max_duration_seconds"], finished["max_duration_seconds"])
 
     def test_a_waiting_launcher_enforces_the_limit_itself(self):
-        # Pass the deadline only once the child has created its parent run: on a
-        # slow runner a fixed delay can fire before that, leaving no run to settle.
+        # Pass the deadline only once the launcher can see the child's parent run: the run id in the child's
+        # session, which is what the launcher reads. The run file alone is not enough: it is written first, and
+        # under CPU contention (parallel CI) the limit could fire before the session links it, leaving no run.
         stop = threading.Event()
+
+        def linked() -> bool:
+            for sessions in (self.state / "executions").glob("*/sessions"):
+                for file in sessions.glob("*_*.jsonl"):
+                    if hr.discover_run_id(sessions, file.stem.split("_", 1)[1]):
+                        return True
+            return False
 
         def expire():
             deadline = time.monotonic() + 20
             while not stop.is_set() and time.monotonic() < deadline:
-                if list((self.state / "runs").glob("run-*.json")):
+                if linked():
                     self.clock.now += 5
                     return
                 time.sleep(0.05)
