@@ -112,6 +112,12 @@ All notable changes to PICO are recorded here. The format follows
 
 ### Fixed
 
+- A task no longer launches on a parent checkout left dirty by the previous run (#68). In the #4
+  pilot a lead applied its integrated diff to the parent checkout, and the next task in that
+  repository launched on it because only `HEAD` was checked. `workspace launch` and scheduler
+  dispatches now refuse a checkout with uncommitted tracked changes with `WORKSPACE_CHECKOUT_DIRTY`,
+  naming the files and the run that left them. Each execution's `checkout` block records
+  `dirty_files` and `dirty_count`. Nothing is cleaned automatically.
 - A run that ends PARTIAL, BLOCKED, FAILED or settled no longer leaves phases or
   workers `in_progress`. Finishing without COMPLETED sets each still-open phase
   and worker (`not_started` or `in_progress`) to `abandoned` and appends it to

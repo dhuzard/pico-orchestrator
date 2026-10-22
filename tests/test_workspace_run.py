@@ -110,6 +110,35 @@ class WorkspaceRunTest(WorkspaceRunFixture):
                         hr.status(target=path, explicit_repo=f"acme/{name}", execution_id=f"ws--{other[0]}1")
                     self.assertEqual(ctx.exception.code, "EXECUTION_UNKNOWN")
 
+    def test_a_dirty_checkout_refuses_the_launch_and_names_the_run_that_left_it(self):
+        manifest = self.manifest(tasks=[{"id": "a1", "repository": "alpha", "title": "First"},
+                                        {"id": "a2", "repository": "alpha", "title": "Second"}])
+        alpha = self.repos["alpha"][0]
+        # Untracked files (PICO's worktrees, scratch files) do not count.
+        (alpha / "notes.txt").write_text("untracked\n")
+        os.environ["FAKE_PI_MESS"] = "parent-apply"
+        first = self.launch(manifest, "a1")
+        self.assertEqual((first["task"]["checkout"]["dirty_files"], first["task"]["checkout"]["dirty_count"]), (["README.md"], 1))
+        os.environ.pop("FAKE_PI_MESS")
+        with self.assertRaises(wr.WorkspaceRunError) as ctx:
+            self.launch(manifest, "a2")
+        self.assertEqual(ctx.exception.code, "WORKSPACE_CHECKOUT_DIRTY")
+        self.assertIn("README.md", ctx.exception.detail)
+        self.assertIn(f"left by a1 ({first['task']['run_id']})", ctx.exception.detail)
+        self.assertNotIn("a2", json.loads(Path(first["workspace_record"]).read_text())["tasks"])  # nothing started
+        # A repeat of a finished launch still answers (no child would start), and nothing was cleaned.
+        self.assertEqual(self.launch(manifest, "a1")["task"]["outcome"], "already_finished")
+        self.assertIn("applied in the parent checkout", (alpha / "README.md").read_text())
+        # Staged changes count too; once the checkout is clean, the task launches.
+        git("-C", str(alpha), "checkout", "--", "README.md")
+        (alpha / "README.md").write_text("staged\n")
+        git("-C", str(alpha), "add", "README.md")
+        with self.assertRaises(wr.WorkspaceRunError) as ctx:
+            self.launch(manifest, "a2")
+        self.assertEqual(ctx.exception.code, "WORKSPACE_CHECKOUT_DIRTY")
+        git("-C", str(alpha), "reset", "-q", "--hard")
+        self.assertEqual(self.launch(manifest, "a2")["task"]["run_status"], "PARTIAL")
+
     def test_relaunch_is_idempotent_and_crash_resumes_same_run(self):
         manifest = self.manifest()
         first = self.launch(manifest, "a1")

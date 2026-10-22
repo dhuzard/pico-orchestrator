@@ -2057,7 +2057,10 @@ reported), prunes stale entries, and, if the parent checkout moved and has no
 uncommitted tracked changes, switches it back to where it started. Branches
 are never deleted, since they hold the work. The result is recorded as the
 execution's `checkout` block (`restored`, `removed_worktrees`,
-`kept_worktrees`, `left_reason`) and summarised on the workspace task entry.
+`kept_worktrees`, `left_reason`, and `dirty_files`/`dirty_count`: the tracked
+changes the run left uncommitted in the parent checkout itself, `null` when
+Git cannot answer) and summarised on the workspace task entry. Nothing dirty is
+ever cleaned, stashed or reset.
 This keeps the next task in the same repository launchable: the launcher
 requires the checkout to be at its pinned commit. The orchestrate prompt also
 tells the lead to integrate in a dedicated integration worktree and never
@@ -2099,7 +2102,12 @@ plan is recomputed: a repository blocker for the task's repository
 `WORKSPACE_PIN_MISSING`, access) or a task blocker is returned as is; a task
 whose `blocked_by` is not empty is refused with `WORKSPACE_TASK_BLOCKED`; a
 checkout whose `HEAD` is not the pinned commit is refused with
-`WORKSPACE_PIN_MISMATCH` (the launcher never checks anything out). The child's
+`WORKSPACE_PIN_MISMATCH` (the launcher never checks anything out); and, when
+a child would really start or resume, a checkout with uncommitted tracked
+changes (staged or not; untracked files do not count) is refused with
+`WORKSPACE_CHECKOUT_DIRTY`, naming the files and any task whose run left them
+(#68). The cleanliness check also applies to scheduler dispatches, which skip
+only the separately gated budget check. The child's
 objective names the workspace, task, repository, pinned commit and the
 upstream tasks it may consume, and instructs the run to stay inside its
 repository.
@@ -2151,7 +2159,7 @@ consuming unverified branch contents.
 
 **Task states.** `completed`, `partial`, `failed` (child ended `BLOCKED` or
 `FAILED`), `cancelled`, `refused` (dispatch precondition failed, for example
-`WORKSPACE_PIN_MISMATCH`), `needs_reconciliation` (child interrupted or launch
+`WORKSPACE_PIN_MISMATCH` or `WORKSPACE_CHECKOUT_DIRTY`), `needs_reconciliation` (child interrupted or launch
 outcome uncertain), `blocked_by_failure` (a transitive dependency is in one of
 the four failure states), `waiting_for_readiness`, `declared_<readiness>`
 (not scheduled because its readiness is not `planned`), and

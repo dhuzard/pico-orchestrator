@@ -369,12 +369,41 @@ def checkout_state(checkout: Path) -> dict:
     return {"branch": branch, "head": head, "worktrees": sorted(p for p in paths if str(Path(p).resolve()) != main)}
 
 
+DIRTY_FILES_SHOWN = 50
+
+
+def tracked_changes(checkout: Path) -> list[str] | None:
+    """Paths with uncommitted tracked changes (staged or not); None when Git cannot answer.
+
+    Untracked files are not counted: PICO's own worktrees and scratch files live there, and they
+    cannot change what a commit or a check sees.
+    """
+    try:
+        status = _git(checkout, "status", "--porcelain=v1", "-z", "--untracked-files=no")
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if status.returncode:
+        return None
+    entries = status.stdout.split("\0")
+    paths, skip = [], False
+    for entry in entries:
+        if skip:  # the source path of a rename or copy
+            skip = False
+            continue
+        if len(entry) > 3:
+            paths.append(entry[3:])
+            skip = entry[0] in "RC"
+    return sorted(paths)
+
+
 def restore_checkout(checkout: Path, before: dict) -> dict:
     """After a child exits: remove clean worktrees it created and return a clean checkout to its starting point.
 
     Nothing dirty is touched: a worktree with uncommitted or untracked files is
     kept, and a checkout with uncommitted tracked changes is left where it is.
-    Branches are never deleted, because they hold the work.
+    Branches are never deleted, because they hold the work. The tracked changes
+    left in the parent checkout are recorded (`dirty_files`, `dirty_count`;
+    None when Git cannot answer).
     """
     after = checkout_state(checkout)
     result = {"branch_before": before["branch"], "branch_after": after["branch"], "restored": False,
@@ -397,6 +426,11 @@ def restore_checkout(checkout: Path, before: dict) -> dict:
             if not result["restored"]:
                 result["left_reason"] = "git switch failed"
         result["branch_after"] = checkout_state(checkout)["branch"]
+    # What the run left uncommitted in the parent checkout itself, recorded whether or not it moved, so the next
+    # launch's refusal (WORKSPACE_CHECKOUT_DIRTY) can name the run that caused it. Nothing is cleaned.
+    dirty = tracked_changes(checkout)
+    result["dirty_files"] = None if dirty is None else dirty[:DIRTY_FILES_SHOWN]
+    result["dirty_count"] = None if dirty is None else len(dirty)
     return result
 
 

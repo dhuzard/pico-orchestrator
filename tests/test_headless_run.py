@@ -90,7 +90,11 @@ else:
 print(json.dumps({"type": "fake", "run_id": run_id, "behavior": behavior}))
 sys.stdout.flush()
 note("start")
-if os.environ.get("FAKE_PI_MESS"):
+if os.environ.get("FAKE_PI_MESS") == "parent-apply":
+    # What a real lead did in the #4 pilot: `git diff ... | git apply` in the parent checkout itself (#68).
+    with open("README.md", "a") as tracked:
+        tracked.write("applied in the parent checkout\n")
+elif os.environ.get("FAKE_PI_MESS"):
     # What real leads did: switch the parent checkout to a batch branch and leave a worker worktree.
     subprocess.run(["git", "switch", "-q", "-c", "pico/batch-1"], capture_output=True)
     subprocess.run(["git", "worktree", "add", "-q", "-b", "pico/task-1", os.path.join(sdir, "..", "wt-task-1")], capture_output=True)
@@ -469,6 +473,25 @@ class HeadlessRunTest(HeadlessFixture):
                           objective="Inspect", pi_executable=str(self.pi))
         self.assertFalse(record["checkout"]["restored"])
         self.assertEqual(record["checkout"]["left_reason"], "uncommitted changes in the checkout")
+
+    def test_changes_left_in_the_parent_checkout_are_recorded_and_kept(self):
+        os.environ["FAKE_PI_MESS"] = "clean"
+        clean = self.start()
+        self.assertEqual((clean["checkout"]["dirty_files"], clean["checkout"]["dirty_count"]), ([], 0))
+        os.environ["FAKE_PI_MESS"] = "parent-apply"
+        os.environ["FAKE_PI_BEHAVIOR"] = "finish"
+        record = hr.start(target=self.target, explicit_repo="acme/target", execution_id="exec-apply",
+                          objective="Inspect", pi_executable=str(self.pi))
+        self.assertEqual((record["checkout"]["dirty_files"], record["checkout"]["dirty_count"]), (["README.md"], 1))
+        self.assertIn("applied in the parent checkout", (self.target / "README.md").read_text())  # never cleaned
+
+    def test_tracked_changes_ignore_untracked_files_and_name_renames_once(self):
+        self.assertEqual(hr.tracked_changes(self.target), [])
+        (self.target / "scratch.txt").write_text("untracked\n")
+        self.assertEqual(hr.tracked_changes(self.target), [])
+        git("-C", str(self.target), "mv", "README.md", "README.rst")
+        self.assertEqual(hr.tracked_changes(self.target), ["README.rst"])
+        self.assertIsNone(hr.tracked_changes(Path(self._tmp.name) / "not-a-checkout"))
 
     def test_resume_prompt_never_carries_the_run_marker(self):
         self.assertNotIn("PI_ORCHESTRATION_RUN_V1", hr.RESUME_PROMPT)
