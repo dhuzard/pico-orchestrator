@@ -528,7 +528,8 @@ MAX_FAILURE_RETRY_BUDGET = 1000
 FAILURE_BUDGET_SOURCES = ("cli", "task", "manifest", "policy", "default", "env")
 MAX_FAILURE_SIGNATURES = 100
 PREREQUISITE_CODES = frozenset({"APPROVED_PILOT_INPUTS_UNAVAILABLE", "PREREQUISITE_UNMET",
-                                "MODEL_BACKEND_UNAVAILABLE", "MODEL_AUTH_UNAVAILABLE"})
+                                "MODEL_BACKEND_UNAVAILABLE", "MODEL_AUTH_UNAVAILABLE",
+                                "WORKER_SANDBOX_UNAVAILABLE"})
 PREREQUISITE_UNCHANGED_CODE = "PREREQUISITE_UNCHANGED"
 
 
@@ -607,6 +608,44 @@ def _clear_signatures(parent: dict, task_id: str, step_id: str, epoch: int) -> N
                                         if (item["task_id"], item["step_id"], item["route_epoch"]) != (task_id, step_id, epoch)]
         if not parent["failure_signatures"]:
             del parent["failure_signatures"]
+
+
+# Worker sandbox (#63): the posture the lifecycle extension applied to the run's Claude workers. `enabled` is the
+# default; `opted_out` is only ever the user's explicit PI_ORCHESTRATOR_WORKER_SANDBOX=0 and stays on the record.
+WORKER_SANDBOX_STATES = ("enabled", "opted_out")
+WORKER_SANDBOX_SOURCES = ("default", "env")
+WORKER_SANDBOX_POLICY_SOURCES = ("default", "policy", "invalid")
+SANDBOX_DOMAIN_RE = re.compile(r"^(\*\.)?([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]([a-z0-9-]{0,61}[a-z0-9])?(:[0-9]{1,5})?$")
+SANDBOX_CACHE_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]*(/[A-Za-z0-9_][A-Za-z0-9._-]*)*$")
+MAX_WORKER_SANDBOX_ENTRIES = 50
+
+
+def _worker_sandbox_event(parent: dict, event: dict) -> None:
+    """Append the run's worker sandbox posture: state, source, allowlisted hosts, cache directories, policy source.
+
+    Each run start and resume records one entry (consecutive identical postures are kept once), so an opt-out at
+    any point of the run stays visible. Written only by the lifecycle extension.
+    """
+    if event["state"] not in WORKER_SANDBOX_STATES or event["source"] not in WORKER_SANDBOX_SOURCES:
+        raise ParentRunError("invalid worker sandbox posture", error_code="PARENT_EVENT_FIELDS_INVALID")
+    if event["state"] == "opted_out" and event["source"] != "env":
+        raise ParentRunError("a worker sandbox opt-out must be explicit", error_code="PARENT_EVENT_FIELDS_INVALID")
+    policy_source = event.get("policy_source", "default")
+    if policy_source not in WORKER_SANDBOX_POLICY_SOURCES:
+        raise ParentRunError("invalid worker sandbox policy source", error_code="PARENT_EVENT_FIELDS_INVALID")
+    lists = {}
+    for field, pattern, limit in (("allowed_domains", SANDBOX_DOMAIN_RE, 50), ("cache_directories", SANDBOX_CACHE_RE, 20)):
+        value = event.get(field, [])
+        if (not isinstance(value, list) or len(value) > limit
+                or not all(isinstance(item, str) and pattern.fullmatch(item) for item in value)):
+            raise ParentRunError(f"invalid worker sandbox {field}", error_code="PARENT_EVENT_FIELDS_INVALID")
+        lists[field] = list(dict.fromkeys(value))
+    entry = {"state": event["state"], "source": event["source"], **lists, "policy_source": policy_source}
+    history = parent.setdefault("worker_sandbox", [])
+    if history and {key: value for key, value in history[-1].items() if key != "at"} == entry:
+        return
+    history.append({"at": datetime.now(timezone.utc).isoformat(), **entry})
+    del history[:-MAX_WORKER_SANDBOX_ENTRIES]
 
 
 def _failure_event(parent: dict, event: dict) -> None:
@@ -905,6 +944,7 @@ def _record_event_unlocked(run_id: str, event: dict, *, repo_root: Path = ROOT) 
         "lead_call_limit_reached": {"kind", "calls"},
         "failure": {"kind", "phase", "step_id", "code", "head", "inputs_digest", "blocker_kind"},
         "retry_gate": {"kind", "phase", "step_id", "head", "inputs_digest", "retry_budget", "source"},
+        "worker_sandbox": {"kind", "state", "source", "allowed_domains", "cache_directories", "policy_source"},
     }
     required = {
         "phase": {"kind", "phase", "status"},
@@ -926,6 +966,7 @@ def _record_event_unlocked(run_id: str, event: dict, *, repo_root: Path = ROOT) 
         "lead_call_limit_reached": {"kind"},
         "failure": {"kind", "phase", "step_id", "code"},
         "retry_gate": {"kind", "phase", "step_id", "retry_budget", "source"},
+        "worker_sandbox": {"kind", "state", "source"},
     }
     if kind not in allowed or set(event) - allowed[kind]:
         raise ParentRunError("unsupported event or unexpected fields")
@@ -1223,6 +1264,8 @@ def _record_event_unlocked(run_id: str, event: dict, *, repo_root: Path = ROOT) 
         _lead_limit_event(parent, event)
     elif kind == "failure":
         _failure_event(parent, event)
+    elif kind == "worker_sandbox":
+        _worker_sandbox_event(parent, event)
     elif kind == "retry_gate":
         gate = _retry_gate_event(parent, event)
         provenance.update_parent_orchestration(repo_root, run_id, parent)

@@ -94,6 +94,24 @@
             }
           }
         },
+        "worker_sandbox": {
+          "type": "array",
+          "maxItems": 50,
+          "description": "The OS sandbox posture the lifecycle extension applied to this run's Claude workers (#63), one entry per run start or resume (consecutive identical postures are kept once). state enabled is the default; opted_out is only the user's explicit PI_ORCHESTRATOR_WORKER_SANDBOX=0 (source env). allowed_domains and cache_directories are the repository's opt-in widening from .pi/autonomy.yaml (policy_source policy), empty when absent (default) or when the policy could not be read (invalid). Sandbox denials inside a worker are not recorded here: Claude Code reports them to the model, not in its JSON result.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["at", "state", "source", "allowed_domains", "cache_directories", "policy_source"],
+            "properties": {
+              "at": {"type": "string"},
+              "state": {"enum": ["enabled", "opted_out"]},
+              "source": {"enum": ["default", "env"]},
+              "allowed_domains": {"type": "array", "maxItems": 50, "items": {"type": "string"}},
+              "cache_directories": {"type": "array", "maxItems": 20, "items": {"type": "string"}},
+              "policy_source": {"enum": ["default", "policy", "invalid"]}
+            }
+          }
+        },
         "failure_retry_budget": {
           "type": "object",
           "additionalProperties": false,

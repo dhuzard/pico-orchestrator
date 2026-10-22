@@ -9,8 +9,10 @@ import { Value } from "typebox/value";
 import { createOrchestrationLifecycle, leaseOwner, leaseProcessState, runJson, scopesOverlap } from "../extensions/orchestration-lifecycle.ts";
 import { hostname } from "node:os";
 import { classifyClaudeInvocationError, resolveClaudeBackendModel } from "../extensions/claude-backend-adapter.ts";
-import { buildWorkerEnv, claudeWorkerArgs, describeDenials, inGitDirectory, parseClaudeResult, WORKER_ENV_CREDENTIALS, WORKER_ENV_NAMES,
-  WORKER_SANDBOX_SETTINGS, WorkerConfigError, workerSandboxEnabled } from "../extensions/claude-worker.ts";
+import { buildWorkerEnv, claudeWorkerArgs, describeDenials, detectWorkerSandbox, inGitDirectory, parseClaudeResult,
+  runClaudeWorker, SANDBOX_CREDENTIAL_PATHS, WORKER_ENV_CREDENTIALS, WORKER_ENV_NAMES, WorkerConfigError,
+  workerSandboxConfig, workerSandboxEnabled, workerSandboxPosture, workerSandboxSettings } from "../extensions/claude-worker.ts";
+import type { SandboxProbe } from "../extensions/claude-worker.ts";
 
 type Handler = (event: any, context?: any) => Promise<any> | any;
 
@@ -22,7 +24,7 @@ function harness(preflight: Record<string, unknown>, failEvent = false, verifyOk
                    workerRestatementResult?: Record<string, unknown>;
                    escalationWorkerConflict?: boolean; resumeResult?: Record<string, unknown>;
                    heartbeatResult?: Record<string, unknown>; eventResult?: Record<string, unknown>;
-                   clock?: () => number; failKind?: string;
+                   clock?: () => number; failKind?: string; sandboxProbe?: SandboxProbe;
                    gateRefusal?: (input: Record<string, unknown>) => Record<string, unknown> | null } = {}) {
   const handlers = new Map<string, Handler>();
   const tools = new Map<string, any>();
@@ -93,7 +95,9 @@ function harness(preflight: Record<string, unknown>, failEvent = false, verifyOk
     appendEntry(customType: string, data: unknown) { entries.push({ type: "custom", customType, data }); },
     getActiveTools() { return ["route_task", "spawn_subagent", "ClaudeWorker", "orchestration_record"]; },
   } as unknown as ExtensionAPI;
-  createOrchestrationLifecycle(command, options.clock)(pi);
+  // The host's real sandbox prerequisites never decide a test: the probe is the fake's (available unless overridden).
+  createOrchestrationLifecycle(command, options.clock,
+    options.sandboxProbe ?? (() => ({ available: true, detail: "test probe" })))(pi);
   const parentCalls = (operation: string) =>
     calls.filter((call) => call.script.endsWith("parent_orchestration.py") && call.args[0] === operation);
   const leaseCalls = (operation: string) =>
@@ -796,10 +800,10 @@ test("a mutating Claude worker gets the full edit argv with git and GitHub opera
     "Bash(env gh:*)", "Bash(command gh:*)", "Bash(exec gh:*)", "--append-system-prompt",
     "--output-format", "json", "--no-session-persistence"]);
   assert.ok(!args.includes("bypassPermissions") && !args.includes("--dangerously-skip-permissions"));
-  assert.ok(!args.includes("--settings"), "the Claude Code sandbox is opt-in");
-  const sandboxed = claudeWorkerArgs({ executable: "claude", cwd, backendModel: "haiku", effort: "low", mode: "full" }, true);
-  assert.deepEqual(sandboxed.slice(-2), ["--settings", WORKER_SANDBOX_SETTINGS]);
-  assert.deepEqual(JSON.parse(WORKER_SANDBOX_SETTINGS), { sandbox: { enabled: true, failIfUnavailable: true } });
+  assert.ok(!args.includes("--settings"), "settings are passed only when the caller resolves them");
+  const settings = { sandbox: { enabled: true } };
+  const sandboxed = claudeWorkerArgs({ executable: "claude", cwd, backendModel: "haiku", effort: "low", mode: "full" }, settings);
+  assert.deepEqual(sandboxed.slice(-2), ["--settings", JSON.stringify(settings)]);
 });
 
 test("a worker environment keeps only what Claude Code needs and never a GitHub or SSH credential", () => {
@@ -830,10 +834,14 @@ test("a worker environment keeps only what Claude Code needs and never a GitHub 
   for (const bad of ["GH_*", "1ABC", "A-B", "A B", "$(id)"]) {
     assert.throws(() => buildWorkerEnv({ PI_ORCHESTRATOR_WORKER_ENV_ALLOW: bad }), WorkerConfigError, bad);
   }
-  assert.equal(workerSandboxEnabled({}), false);
+  // The sandbox is on by default (#63); `0` is the only way off, and it is an explicit, recorded opt-out.
+  assert.equal(workerSandboxEnabled({}), true);
+  assert.deepEqual(workerSandboxPosture({}), { state: "enabled", source: "default" });
+  assert.deepEqual(workerSandboxPosture({ PI_ORCHESTRATOR_WORKER_SANDBOX: "" }), { state: "enabled", source: "default" });
+  assert.deepEqual(workerSandboxPosture({ PI_ORCHESTRATOR_WORKER_SANDBOX: "1" }), { state: "enabled", source: "env" });
+  assert.deepEqual(workerSandboxPosture({ PI_ORCHESTRATOR_WORKER_SANDBOX: "0" }), { state: "opted_out", source: "env" });
   assert.equal(workerSandboxEnabled({ PI_ORCHESTRATOR_WORKER_SANDBOX: "0" }), false);
-  assert.equal(workerSandboxEnabled({ PI_ORCHESTRATOR_WORKER_SANDBOX: "1" }), true);
-  for (const bad of ["yes", "true", "2"]) {
+  for (const bad of ["yes", "true", "2", "off"]) {
     assert.throws(() => workerSandboxEnabled({ PI_ORCHESTRATOR_WORKER_SANDBOX: bad }), WorkerConfigError, bad);
   }
 });
@@ -860,7 +868,11 @@ test("ClaudeWorker withholds credentials from the worker process and records onl
     for (const name of ["GH_TOKEN", "GITHUB_TOKEN", "SSH_AUTH_SOCK", "PICO_TEST_EXTRA"]) assert.ok(!(name in echoed.env), name);
     assert.equal(echoed.env.PATH, process.env.PATH);
     assert.equal(echoed.env.ANTHROPIC_BASE_URL, "http://127.0.0.1:9");
-    assert.ok(!echoed.args.includes("--settings"));
+    // Default on: the worker gets the sandbox settings without any variable set.
+    const defaults = JSON.parse(echoed.args[echoed.args.indexOf("--settings") + 1]);
+    assert.equal(defaults.sandbox.enabled, true);
+    assert.deepEqual(plain.details.sandbox, { state: "enabled", source: "default", applied: true,
+      allowed_domains: [], cache_directories: [] });
     // The record keeps at most 100 names (CI runners carry more): credentials
     // come first so they are always named; other names are in the full list.
     for (const name of ["GH_TOKEN", "GITHUB_TOKEN", "SSH_AUTH_SOCK"]) {
@@ -876,7 +888,7 @@ test("ClaudeWorker withholds credentials from the worker process and records onl
     const echoedExtended = JSON.parse(extended.content[0].text);
     assert.equal(echoedExtended.env.PICO_TEST_EXTRA, "extra");
     assert.ok(!("GH_TOKEN" in echoedExtended.env));
-    assert.equal(echoedExtended.args[echoedExtended.args.indexOf("--settings") + 1], WORKER_SANDBOX_SETTINGS);
+    assert.equal(JSON.parse(echoedExtended.args[echoedExtended.args.indexOf("--settings") + 1]).sandbox.failIfUnavailable, true);
 
     // An invalid allowlist fails closed before Claude Code starts.
     process.env.PI_ORCHESTRATOR_WORKER_ENV_ALLOW = "GH_*";
@@ -2662,4 +2674,214 @@ test("a prerequisite refusal reads differently from a loop refusal and also bloc
     assert.doesNotMatch(refused.guard.reason, /REPEATED_INEFFECTIVE_ACTION/);
     assert.equal((await h.tools.get("orchestration_record").execute("s", { action: "status" })).details.ok, true);
   });
+});
+
+// Worker sandbox (#63). Deterministic: the settings PICO hands Claude Code, the recorded posture, and the
+// fail-closed check, with the platform probe mocked. No test starts a model or a real sandbox.
+const SANDBOX_HOME = "/home/u";
+const SANDBOX_CWD = "/repo/.pi/worktrees/s1";
+
+test("a sandboxed worker may write only its worktree and declared caches, and reads no state or credentials", () => {
+  const config = workerSandboxConfig({ allowed_domains: ["registry.npmjs.org", "*.pythonhosted.org"],
+    cache_directories: ["pip"] }, {});
+  const settings = workerSandboxSettings({ cwd: SANDBOX_CWD, mode: "full", config, home: SANDBOX_HOME,
+    parentEnv: { PI_ORCHESTRATOR_STATE_DIR: "/state/pico" } }) as any;
+  assert.deepEqual(Object.keys(settings).sort(), ["permissions", "sandbox"]);
+  const { sandbox } = settings;
+  // On, a hard gate, and no unsandboxed retry (dangerouslyDisableSandbox is ignored).
+  assert.deepEqual([sandbox.enabled, sandbox.failIfUnavailable, sandbox.allowUnsandboxedCommands], [true, true, false]);
+  // Writes: the working directory (the bound worktree) is Claude Code's default; only the declared cache is added.
+  assert.deepEqual(sandbox.filesystem.allowWrite, ["/home/u/.cache/pip"]);
+  for (const path of sandbox.filesystem.allowWrite) assert.ok(!path.startsWith("/state/pico") && !path.startsWith(SANDBOX_CWD));
+  assert.deepEqual(sandbox.filesystem.denyWrite, ["/home/u/.cache/pi-coding-orchestrator", "/home/u/.config/pi-coding-orchestrator"]);
+  // Reads: the PICO state directory (Garden/lease/provenance), the default state root, the gh config and the rest.
+  for (const path of ["/state/pico", "/home/u/.local/state/pi-coding-orchestrator", "/home/u/.config/gh", "/home/u/.ssh",
+    "/home/u/.git-credentials", "/home/u/.aws", "/home/u/.claude/.credentials.json"]) {
+    assert.ok(sandbox.filesystem.denyRead.includes(path), path);
+  }
+  assert.equal(sandbox.filesystem.denyRead.length, 2 + SANDBOX_CREDENTIAL_PATHS.length,
+    "the state dir and the XDG state root (no provenance fallback when the state dir is set), then credentials");
+  for (const path of sandbox.filesystem.denyRead) assert.ok(!SANDBOX_CWD.startsWith(path), path);
+  // Network: only the allowlist, denied deterministically instead of a prompt a headless worker cannot answer.
+  assert.deepEqual(sandbox.network, { allowedDomains: ["registry.npmjs.org", "*.pythonhosted.org"], strictAllowlist: true });
+  // The OS sandbox covers Bash only, so Read/Edit/Write get the same reads as deny rules, with `//` absolute paths.
+  for (const rule of ["Read(//state/pico)", "Read(//state/pico/**)", "Read(//home/u/.config/gh/**)", "Read(//home/u/.ssh/**)"]) {
+    assert.ok(settings.permissions.deny.includes(rule), rule);
+  }
+  assert.equal(settings.permissions.deny.length, 2 * sandbox.filesystem.denyRead.length);
+  // XDG overrides move the protected and writable locations with them; GH_CONFIG_DIR is denied too.
+  const moved = workerSandboxSettings({ cwd: SANDBOX_CWD, mode: "full", config, home: SANDBOX_HOME,
+    parentEnv: { XDG_CACHE_HOME: "/xc", XDG_CONFIG_HOME: "/xg", XDG_STATE_HOME: "/xs", GH_CONFIG_DIR: "/ghc",
+      PI_CODING_ORCHESTRATOR_HOME: "/pico-cache", PI_ORCHESTRATOR_STATE_DIR: "/state/pico" } }) as any;
+  assert.deepEqual(moved.sandbox.filesystem.allowWrite, ["/xc/pip"]);
+  assert.deepEqual(moved.sandbox.filesystem.denyWrite, ["/pico-cache", "/xg/pi-coding-orchestrator"]);
+  for (const path of ["/xs/pi-coding-orchestrator", "/xg/gh", "/ghc"]) assert.ok(moved.sandbox.filesystem.denyRead.includes(path), path);
+  // Without PI_ORCHESTRATOR_STATE_DIR, the state directory is this orchestrator checkout's provenance/.
+  const local = workerSandboxSettings({ cwd: SANDBOX_CWD, mode: "full", config, home: SANDBOX_HOME, parentEnv: {} }) as any;
+  assert.ok(local.sandbox.filesystem.denyRead.includes(join(import.meta.dirname, "..", "provenance")), "repo-local provenance");
+});
+
+test("worker network is off by default and the repository allowlist is validated", () => {
+  const config = workerSandboxConfig(null, {});
+  assert.deepEqual(config, { state: "enabled", source: "default", allowedDomains: [], cacheDirectories: [] });
+  const settings = workerSandboxSettings({ cwd: SANDBOX_CWD, mode: "full", config, home: SANDBOX_HOME, parentEnv: {} }) as any;
+  assert.deepEqual(settings.sandbox.network, { allowedDomains: [], strictAllowlist: true });
+  assert.ok(!("allowWrite" in settings.sandbox.filesystem), "no extra writable directory");
+  assert.deepEqual(workerSandboxConfig({ allowed_domains: ["a.example.org", "a.example.org"] }, {}).allowedDomains, ["a.example.org"]);
+  for (const domain of ["*", "*.com", "10.0.0.1", "Example.org", "a.example.org/x", "a..org", "", 7]) {
+    assert.throws(() => workerSandboxConfig({ allowed_domains: [domain] }, {}), WorkerConfigError, String(domain));
+  }
+  for (const cache of ["../x", "/abs", "~/.npm", "a/*", ".", "pi-coding-orchestrator", "pi-coding-orchestrator/runtimes"]) {
+    assert.throws(() => workerSandboxConfig({ cache_directories: [cache] }, {}), WorkerConfigError, cache);
+  }
+  assert.throws(() => workerSandboxConfig({ allowed_domains: "pypi.org" }, {}), WorkerConfigError);
+  assert.throws(() => workerSandboxConfig({ allowed_domains: Array.from({ length: 51 }, (_, i) => `h${i}.example.org`) }, {}),
+    WorkerConfigError);
+  // The posture comes from the environment, never from the repository.
+  assert.equal(workerSandboxConfig({ allowed_domains: [] }, { PI_ORCHESTRATOR_WORKER_SANDBOX: "0" }).state, "opted_out");
+});
+
+test("read-only and opted-out workers get no sandbox block, only the read deny rules", () => {
+  const enabled = workerSandboxConfig(null, {});
+  const read = workerSandboxSettings({ cwd: SANDBOX_CWD, mode: "read", config: enabled, home: SANDBOX_HOME, parentEnv: {} }) as any;
+  assert.deepEqual(Object.keys(read), ["permissions"], "a read-only worker has no Bash for the OS sandbox to wrap");
+  const optedOut = workerSandboxConfig(null, { PI_ORCHESTRATOR_WORKER_SANDBOX: "0" });
+  const full = workerSandboxSettings({ cwd: SANDBOX_CWD, mode: "full", config: optedOut, home: SANDBOX_HOME, parentEnv: {} }) as any;
+  assert.deepEqual(Object.keys(full), ["permissions"]);
+  assert.ok(full.permissions.deny.includes("Read(//home/u/.config/gh/**)"));
+});
+
+test("a boundary that cannot be expressed refuses the worker instead of widening it", () => {
+  const config = workerSandboxConfig({ cache_directories: ["state/sub"] }, {});
+  // The worktree inside a denied path: denying it would deny the worker its own directory.
+  assert.throws(() => workerSandboxSettings({ cwd: "/state/pico/wt", mode: "full", config: workerSandboxConfig(null, {}),
+    home: SANDBOX_HOME, parentEnv: { PI_ORCHESTRATOR_STATE_DIR: "/state/pico" } }), /is inside \/state\/pico/);
+  assert.throws(() => workerSandboxSettings({ cwd: "/home/u/.cache/pi-coding-orchestrator/wt", mode: "full",
+    config: workerSandboxConfig(null, {}), home: SANDBOX_HOME, parentEnv: {} }), WorkerConfigError);
+  // A declared cache that overlaps the state directory.
+  assert.throws(() => workerSandboxSettings({ cwd: SANDBOX_CWD, mode: "full", config, home: SANDBOX_HOME,
+    parentEnv: { PI_ORCHESTRATOR_STATE_DIR: "/home/u/.cache/state" } }), /overlaps \/home\/u\/\.cache\/state/);
+});
+
+test("sandbox prerequisites are detected per platform", () => {
+  const present = (paths: string[]) => (path: string) => paths.includes(path);
+  const env = { PATH: "/usr/bin:relative:/opt/bin" };
+  assert.deepEqual(detectWorkerSandbox(env, "linux", present(["/usr/bin/bwrap", "/opt/bin/socat"])),
+    { available: true, detail: "bubblewrap and socat" });
+  const noSocat = detectWorkerSandbox(env, "linux", present(["/usr/bin/bwrap", "relative/socat"]));
+  assert.equal(noSocat.available, false);
+  assert.match(noSocat.detail, /^socat not found on the worker PATH/);
+  assert.match(detectWorkerSandbox({}, "linux", present(["/usr/bin/bwrap"])).detail, /^bwrap and socat not found/);
+  assert.equal(detectWorkerSandbox({}, "darwin", present(["/usr/bin/sandbox-exec"])).available, true);
+  assert.equal(detectWorkerSandbox({}, "darwin", present([])).available, false);
+  assert.deepEqual(detectWorkerSandbox(env, "win32", present(["/usr/bin/bwrap", "/opt/bin/socat"])),
+    { available: false, detail: "no Claude Code sandbox on platform win32" });
+});
+
+async function sandboxRun(options: { probe?: SandboxProbe; limits?: Record<string, unknown>; env?: Record<string, string>;
+                                     mode?: "allowed" | "forbidden"; prompt?: string } = {}) {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "pico-claude-sandbox-")));
+  const workspace = join(dir, "wt");
+  mkdirSync(workspace);
+  const previous = process.env.PI_ORCHESTRATOR_WORKER_SANDBOX;
+  if (options.env?.PI_ORCHESTRATOR_WORKER_SANDBOX !== undefined) process.env.PI_ORCHESTRATOR_WORKER_SANDBOX = options.env.PI_ORCHESTRATOR_WORKER_SANDBOX;
+  else delete process.env.PI_ORCHESTRATOR_WORKER_SANDBOX;
+  try {
+    const h = harness({ ok: true, status: "READY" }, false, true, { executable: fakeClaude(dir), sandboxProbe: options.probe,
+      limits: options.limits });
+    await h.handlers.get("before_agent_start")!({ prompt: "PI_ORCHESTRATION_RUN_V1" }, { cwd: dir, ui: { notify() {} } });
+    await h.handlers.get("tool_result")!(routeFor("A", { workerMutation: options.mode ?? "allowed" }));
+    if ((options.mode ?? "allowed") === "allowed") {
+      await h.tools.get("orchestration_record").execute("b", { action: "bind_workspace", task_id: "A", step_id: "claude_worker", path: workspace });
+    }
+    const run = await claudeWorkerRun(h, "s", { prompt: options.prompt ?? "[pico-task A:claude_worker] go" });
+    const recorded = h.parentCalls("event").map((call) => call.input!).filter((input) => input.kind === "worker_sandbox");
+    return { h, run, recorded, dir };
+  } finally {
+    if (previous === undefined) delete process.env.PI_ORCHESTRATOR_WORKER_SANDBOX;
+    else process.env.PI_ORCHESTRATOR_WORKER_SANDBOX = previous;
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test("the sandbox is on by default, recorded at run start, and applies the repository allowlist", async () => {
+  const plain = await sandboxRun();
+  assert.deepEqual(plain.recorded, [{ kind: "worker_sandbox", state: "enabled", source: "default", allowed_domains: [],
+    cache_directories: [], policy_source: "default" }]);
+  const echoed = JSON.parse(plain.run.result.content[0].text);
+  const settings = JSON.parse(echoed.args[echoed.args.indexOf("--settings") + 1]);
+  assert.deepEqual(settings.sandbox.network, { allowedDomains: [], strictAllowlist: true });
+  assert.deepEqual(plain.run.result.details.sandbox, { state: "enabled", source: "default", applied: true,
+    allowed_domains: [], cache_directories: [] });
+
+  const allowlisted = await sandboxRun({ limits: { ok: true, source: ".pi/autonomy.yaml", parallel_tasks: 3,
+    worker_sandbox: { allowed_domains: ["registry.npmjs.org"], cache_directories: ["pip"] } } });
+  assert.deepEqual(allowlisted.recorded, [{ kind: "worker_sandbox", state: "enabled", source: "default",
+    allowed_domains: ["registry.npmjs.org"], cache_directories: ["pip"], policy_source: "policy" }]);
+  const args = JSON.parse(allowlisted.run.result.content[0].text).args;
+  const applied = JSON.parse(args[args.indexOf("--settings") + 1]).sandbox;
+  assert.deepEqual(applied.network.allowedDomains, ["registry.npmjs.org"]);
+  assert.equal(applied.filesystem.allowWrite.length, 1);
+  assert.match(applied.filesystem.allowWrite[0], /\/pip$/);
+
+  // An unreadable policy widens nothing: no network, recorded as invalid.
+  const invalid = await sandboxRun({ limits: { ok: false, blocker_code: "AUTONOMY_POLICY_INVALID" } });
+  assert.deepEqual([invalid.recorded[0].allowed_domains, invalid.recorded[0].policy_source], [[], "invalid"]);
+});
+
+test("an explicit opt-out runs the worker unsandboxed and stays on the run and the result", async () => {
+  const { run, recorded } = await sandboxRun({ env: { PI_ORCHESTRATOR_WORKER_SANDBOX: "0" } });
+  assert.deepEqual(recorded, [{ kind: "worker_sandbox", state: "opted_out", source: "env", allowed_domains: [],
+    cache_directories: [], policy_source: "default" }]);
+  assert.equal(run.result.isError, false, run.result.content[0].text);
+  const args = JSON.parse(run.result.content[0].text).args;
+  assert.ok(!("sandbox" in JSON.parse(args[args.indexOf("--settings") + 1])));
+  assert.deepEqual(run.result.details.sandbox, { state: "opted_out", source: "env", applied: false,
+    allowed_domains: [], cache_directories: [] });
+  // An unrecognized value records no posture and refuses every worker.
+  const bad = await sandboxRun({ env: { PI_ORCHESTRATOR_WORKER_SANDBOX: "off" } });
+  assert.deepEqual(bad.recorded, []);
+  assert.equal(bad.run.result.details.blocker_code, "WORKER_CONFIG_INVALID");
+});
+
+test("a mutating worker fails closed with WORKER_SANDBOX_UNAVAILABLE when the sandbox cannot start", async () => {
+  const probe: SandboxProbe = () => ({ available: false, detail: "socat not found on the worker PATH (install bubblewrap and socat)" });
+  const { run, h } = await sandboxRun({ probe });
+  assert.equal(run.result.isError, true);
+  assert.equal(run.result.details.error, "SANDBOX_UNAVAILABLE");
+  assert.equal(run.result.details.blocker_code, "WORKER_SANDBOX_UNAVAILABLE");
+  assert.match(run.result.content[0].text, /not started: the worker sandbox is unavailable: socat not found.*PI_ORCHESTRATOR_WORKER_SANDBOX=0/);
+  assert.equal(run.result.details.exit_code, null, "Claude Code never started");
+  const usage = h.calls.filter((call) => call.input?.kind === "usage").at(-1)!.input!;
+  assert.deepEqual([usage.input_tokens, usage.output_tokens], [null, null]);
+  const failed = h.parentCalls("event").map((call) => call.input!).filter((input) => input.kind === "worker").at(-1)!;
+  assert.deepEqual([failed.status, failed.blocker_code], ["failed", "WORKER_SANDBOX_UNAVAILABLE"]);
+  // With the explicit opt-out the same host runs the worker (and the record says so).
+  const optedOut = await sandboxRun({ probe, env: { PI_ORCHESTRATOR_WORKER_SANDBOX: "0" } });
+  assert.equal(optedOut.run.result.isError, false);
+  // A read-only step has no Bash, so it never needs the sandbox.
+  const read = await sandboxRun({ probe, mode: "forbidden", prompt: "[pico-task A:claude_worker] review" });
+  assert.equal(read.run.result.isError, false, read.run.result.content[0].text);
+  assert.equal(read.run.result.details.sandbox.applied, false);
+});
+
+test("Claude Code's own failIfUnavailable refusal is reported as WORKER_SANDBOX_UNAVAILABLE", async () => {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "pico-claude-refuse-")));
+  try {
+    const executable = join(dir, "claude");
+    writeFileSync(executable, `#!/usr/bin/env node
+process.stdin.resume(); process.stdin.on("end", () => {
+  process.stderr.write("Error: sandbox unavailable detail: bubblewrap failed. Set sandbox.failIfUnavailable=false to allow unsandboxed execution.\\n");
+  process.exit(1);
+});
+`, { mode: 0o755 });
+    const outcome = await runClaudeWorker({ executable, cwd: dir, backendModel: "haiku", effort: "low", mode: "full",
+      sandbox: workerSandboxConfig(null, {}) }, "go", undefined, 10_000, { probe: () => ({ available: true, detail: "test" }) });
+    assert.equal(outcome.error, "SANDBOX_UNAVAILABLE");
+    assert.equal(outcome.sandbox?.applied, true);
+    // The same text without the sandbox applied stays an ordinary malformed result.
+    const unsandboxed = await runClaudeWorker({ executable, cwd: dir, backendModel: "haiku", effort: "low", mode: "full",
+      sandbox: workerSandboxConfig(null, { PI_ORCHESTRATOR_WORKER_SANDBOX: "0" }) }, "go", undefined, 10_000);
+    assert.equal(unsandboxed.error, "MALFORMED_OUTPUT");
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });

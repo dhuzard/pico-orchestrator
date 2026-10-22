@@ -8,18 +8,26 @@
  * chooses them.
  */
 import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
+import { homedir } from "node:os";
+import { delimiter, dirname, isAbsolute, join, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 
 export type ClaudeWorkerPlan = { executable: string; cwd: string; backendModel: string;
-  effort: string; mode: "read" | "full" };
+  effort: string; mode: "read" | "full";
+  /** The run's sandbox posture and repository allowlist, resolved at run start; from the environment when absent. */
+  sandbox?: WorkerSandboxConfig };
 export type ClaudeWorkerUsage = { input_tokens: number | null; output_tokens: number | null;
   cached_tokens: number | null; cache_write_tokens: number | null; cost_usd: number | null };
 export type ClaudeWorkerOutcome = { ok: boolean; text: string; exitCode: number | null;
   error: "TIMEOUT" | "ABORTED" | "OUTPUT_LIMIT" | "SPAWN_FAILED" | "MALFORMED_OUTPUT" | "BACKEND_ERROR"
-    | "CONFIG_INVALID" | null;
+    | "CONFIG_INVALID" | "SANDBOX_UNAVAILABLE" | null;
   usage: ClaudeWorkerUsage; durationMs: number | null; elapsedMs: number; sessionId: string | null;
   permissionDenials: number; deniedCalls: string[];
   /** Names (never values) of parent environment variables withheld from the worker. */
-  envDropped: string[] };
+  envDropped: string[];
+  /** The sandbox this worker ran under, or would have run under when it was not started; null on a config error. */
+  sandbox: WorkerSandboxSummary | null };
 
 /** Built-in tools of a mutating step: edit and run local checks inside the worktree. */
 export const MUTATING_TOOLS: readonly string[] = ["Read", "Edit", "Write", "Glob", "Grep", "Bash", "Agent"];
@@ -33,8 +41,8 @@ export const READ_TOOLS: readonly string[] = ["Read", "Glob", "Grep"];
  * interpreters or the network. The controls that hold are the worker
  * environment allowlist (`buildWorkerEnv`: no GitHub token, SSH agent or Git
  * credential prompt reaches the worker), the parent-checkout snapshot
- * comparison, and an OS sandbox around the worker, which we recommend
- * (`PI_ORCHESTRATOR_WORKER_SANDBOX=1`, a container, or bwrap).
+ * comparison, and the OS sandbox around a mutating worker's Bash commands
+ * (`workerSandboxSettings`, on by default).
  * A worker's cwd is its bound worktree, so it never needs to point git at
  * another repository (`-C`, `--git-dir`, `--work-tree`), override its
  * configuration on the command line (`-c`, for example an alias that pushes),
@@ -71,14 +79,6 @@ export const WORKER_ENV_CREDENTIALS: readonly string[] = ["GH_TOKEN", "GITHUB_TO
   "GITHUB_ENTERPRISE_TOKEN", "GIT_ASKPASS", "SSH_ASKPASS", "SSH_AUTH_SOCK", "NPM_TOKEN", "NODE_AUTH_TOKEN"];
 /** Comma-separated extra variable names to forward to workers. */
 export const WORKER_ENV_ALLOW_VAR = "PI_ORCHESTRATOR_WORKER_ENV_ALLOW";
-/** `1` runs worker Bash commands in Claude Code's sandbox and refuses to start without one. */
-export const WORKER_SANDBOX_VAR = "PI_ORCHESTRATOR_WORKER_SANDBOX";
-/**
- * Claude Code settings (passed with `--settings`) that sandbox Bash and make
- * Claude Code exit at startup when the sandbox cannot start, instead of
- * running commands unconfined.
- */
-export const WORKER_SANDBOX_SETTINGS = JSON.stringify({ sandbox: { enabled: true, failIfUnavailable: true } });
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 /** Invalid worker configuration; the worker is not started. */
@@ -118,12 +118,182 @@ export function buildWorkerEnv(source: NodeJS.ProcessEnv = process.env):
   return { env, dropped };
 }
 
-/** Whether worker Bash runs in Claude Code's sandbox: unset, empty or `0` is off, `1` is on, anything else throws. */
-export function workerSandboxEnabled(source: NodeJS.ProcessEnv = process.env): boolean {
+/**
+ * Worker sandbox (#63). A mutating Claude worker's Bash commands run in Claude
+ * Code's own OS sandbox (bubblewrap and socat on Linux and WSL2, Seatbelt on
+ * macOS) unless the user opts out explicitly with
+ * PI_ORCHESTRATOR_WORKER_SANDBOX=0: unset or empty is the default (on), `1`
+ * is on, `0` is the recorded opt-out, anything else is WORKER_CONFIG_INVALID.
+ * Every settings key below was read from the settings schema bundled in Claude
+ * Code 2.1.287 and from code.claude.com/docs/en/sandboxing and
+ * /settings-reference; see docs/technical-reference.md, "Worker sandbox".
+ */
+export const WORKER_SANDBOX_VAR = "PI_ORCHESTRATOR_WORKER_SANDBOX";
+export type WorkerSandboxPosture = { state: "enabled" | "opted_out"; source: "default" | "env" };
+/** What a run's workers are sandboxed with: the posture plus the repository's opt-in allowlist. */
+export type WorkerSandboxConfig = WorkerSandboxPosture & { allowedDomains: string[]; cacheDirectories: string[] };
+/** What a worker result records about its sandbox (names and hosts only, never file contents). */
+export type WorkerSandboxSummary = { state: "enabled" | "opted_out"; source: "default" | "env"; applied: boolean;
+  allowed_domains: string[]; cache_directories: string[] };
+/** Result of checking that the platform can run Claude Code's sandbox. */
+export type SandboxSupport = { available: boolean; detail: string };
+export type SandboxProbe = (env: Record<string, string>) => SandboxSupport;
+
+/** Host allowlist entry: a DNS name or `*.` wildcard of at least two labels, optional `:port`; no bare `*`, no IP. */
+export const SANDBOX_DOMAIN = /^(\*\.)?([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]([a-z0-9-]{0,61}[a-z0-9])?(:[0-9]{1,5})?$/;
+/** Cache directory entry: a relative path under the user cache directory, no `.`/`..` segments, no globs. */
+export const SANDBOX_CACHE_DIRECTORY = /^[A-Za-z0-9_][A-Za-z0-9._-]*(\/[A-Za-z0-9_][A-Za-z0-9._-]*)*$/;
+const MAX_ALLOWED_DOMAINS = 50;
+const MAX_CACHE_DIRECTORIES = 20;
+/** Directory name PICO's launcher uses under the cache, config and state roots. */
+const PICO_DIR_NAME = "pi-coding-orchestrator";
+/** This orchestrator checkout; its `provenance/` is the state directory when PI_ORCHESTRATOR_STATE_DIR is unset. */
+const ORCHESTRATOR_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
+/**
+ * Credential locations relative to `$HOME` that sandboxed worker commands and
+ * the Read tool must not read: GitHub CLI, SSH, Git credential stores, cloud
+ * CLIs, container and package registries, and Claude Code's own stored login
+ * (Claude Code reads it from its own process, outside the sandbox).
+ */
+export const SANDBOX_CREDENTIAL_PATHS: readonly string[] = [".config/gh", ".ssh", ".gnupg", ".netrc", ".git-credentials",
+  ".config/git/credentials", ".aws", ".azure", ".config/gcloud", ".kube", ".docker/config.json", ".npmrc", ".pypirc",
+  ".cargo/credentials.toml", ".config/hub", ".claude/.credentials.json"];
+
+/** The posture from PI_ORCHESTRATOR_WORKER_SANDBOX; an unrecognized value throws WorkerConfigError. */
+export function workerSandboxPosture(source: NodeJS.ProcessEnv = process.env): WorkerSandboxPosture {
   const value = (source[WORKER_SANDBOX_VAR] ?? "").trim();
-  if (value === "" || value === "0") return false;
-  if (value === "1") return true;
-  throw new WorkerConfigError(`${WORKER_SANDBOX_VAR} must be 0 or 1.`);
+  if (value === "") return { state: "enabled", source: "default" };
+  if (value === "1") return { state: "enabled", source: "env" };
+  if (value === "0") return { state: "opted_out", source: "env" };
+  throw new WorkerConfigError(`${WORKER_SANDBOX_VAR} must be 0 (explicit opt-out) or 1; unset means on.`);
+}
+
+/** Whether worker Bash runs in Claude Code's sandbox (on unless PI_ORCHESTRATOR_WORKER_SANDBOX=0). */
+export function workerSandboxEnabled(source: NodeJS.ProcessEnv = process.env): boolean {
+  return workerSandboxPosture(source).state === "enabled";
+}
+
+/**
+ * The run's sandbox configuration: the posture plus the repository's allowlist
+ * (`worker_sandbox` in `.pi/autonomy.yaml`, already schema-validated by
+ * tools/autonomy_policy.py). Entries are checked again here; an invalid one throws.
+ */
+export function workerSandboxConfig(policy: { allowed_domains?: unknown; cache_directories?: unknown } | null,
+                                    source: NodeJS.ProcessEnv = process.env): WorkerSandboxConfig {
+  const posture = workerSandboxPosture(source);
+  const list = (value: unknown, pattern: RegExp, max: number, label: string): string[] => {
+    if (value === undefined || value === null) return [];
+    if (!Array.isArray(value) || value.length > max) {
+      throw new WorkerConfigError(`worker_sandbox ${label} must be a list of at most ${max} entries.`);
+    }
+    for (const entry of value) {
+      if (typeof entry !== "string" || !pattern.test(entry)) {
+        throw new WorkerConfigError(`worker_sandbox ${label} entry ${JSON.stringify(String(entry).slice(0, 80))} is invalid.`);
+      }
+    }
+    return [...new Set(value as string[])];
+  };
+  const cacheDirectories = list(policy?.cache_directories, SANDBOX_CACHE_DIRECTORY, MAX_CACHE_DIRECTORIES, "cache_directories");
+  if (cacheDirectories.some((entry) => entry === PICO_DIR_NAME || entry.startsWith(`${PICO_DIR_NAME}/`))) {
+    throw new WorkerConfigError(`worker_sandbox cache_directories may not include PICO's own ${PICO_DIR_NAME} cache.`);
+  }
+  return { ...posture, cacheDirectories,
+    allowedDomains: list(policy?.allowed_domains, SANDBOX_DOMAIN, MAX_ALLOWED_DOMAINS, "network.allowed_domains") };
+}
+
+/**
+ * Whether Claude Code's sandbox can start here, from what its documentation
+ * names as requirements: Seatbelt (`sandbox-exec`) on macOS, `bwrap` and
+ * `socat` on the worker's PATH on Linux (WSL2 included). Other platforms,
+ * native Windows among them, have no sandbox. Claude Code's own
+ * `failIfUnavailable` check stays the final word; this one only lets PICO
+ * fail closed before starting a process, with a stable code.
+ */
+export function detectWorkerSandbox(env: Record<string, string>, platform: NodeJS.Platform = process.platform,
+                                    exists: (path: string) => boolean = existsSync): SandboxSupport {
+  if (platform === "darwin") {
+    return exists("/usr/bin/sandbox-exec") ? { available: true, detail: "Seatbelt (sandbox-exec)" }
+      : { available: false, detail: "macOS without /usr/bin/sandbox-exec" };
+  }
+  if (platform !== "linux") return { available: false, detail: `no Claude Code sandbox on platform ${platform}` };
+  const onPath = (name: string) => (env.PATH ?? "").split(delimiter)
+    .some((dir) => dir !== "" && isAbsolute(dir) && exists(join(dir, name)));
+  const missing = ["bwrap", "socat"].filter((name) => !onPath(name));
+  return missing.length === 0 ? { available: true, detail: "bubblewrap and socat" }
+    : { available: false, detail: `${missing.join(" and ")} not found on the worker PATH (install bubblewrap and socat)` };
+}
+
+function absoluteOrNull(value: string | undefined): string | null {
+  return value && isAbsolute(value) ? resolve(value) : null;
+}
+
+/** Paths a worker must not read: PICO state directories (provenance, leases) and credential locations. */
+export function sandboxDeniedReads(parentEnv: NodeJS.ProcessEnv, home: string): string[] {
+  const xdgState = absoluteOrNull(parentEnv.XDG_STATE_HOME) ?? join(home, ".local", "state");
+  const xdgConfig = absoluteOrNull(parentEnv.XDG_CONFIG_HOME);
+  const state = [absoluteOrNull(parentEnv.PI_ORCHESTRATOR_STATE_DIR) ?? join(ORCHESTRATOR_ROOT, "provenance"),
+    absoluteOrNull(parentEnv.PI_CODING_ORCHESTRATOR_STATE_DIR), join(xdgState, PICO_DIR_NAME)];
+  const credentials = [...SANDBOX_CREDENTIAL_PATHS.map((path) => join(home, path)),
+    xdgConfig ? join(xdgConfig, "gh") : null, absoluteOrNull(parentEnv.GH_CONFIG_DIR)];
+  return [...new Set([...state, ...credentials].filter((path): path is string => path !== null))];
+}
+
+/** PICO's launcher cache (it holds the code PICO runs) and user configuration: never writable by a worker. */
+export function sandboxProtectedWrites(parentEnv: NodeJS.ProcessEnv, home: string): string[] {
+  const cache = absoluteOrNull(parentEnv.XDG_CACHE_HOME) ?? join(home, ".cache");
+  const config = absoluteOrNull(parentEnv.XDG_CONFIG_HOME) ?? join(home, ".config");
+  return [...new Set([absoluteOrNull(parentEnv.PI_CODING_ORCHESTRATOR_HOME) ?? join(cache, PICO_DIR_NAME),
+    join(config, PICO_DIR_NAME)])];
+}
+
+function within(path: string, root: string): boolean {
+  return path === root || path.startsWith(root.endsWith(sep) ? root : root + sep);
+}
+
+/**
+ * The `--settings` object of one worker. Always: `permissions.deny` Read rules
+ * for the PICO state directory and credential locations (they bind Claude's
+ * Read, Edit and Write tools, which the OS sandbox does not cover). For a
+ * mutating worker with the sandbox on, also `sandbox`: enabled, exit at
+ * startup when it cannot start, no unsandboxed retry (which also makes Claude
+ * Code ignore a repository's own `.claude/settings.json` widening entries),
+ * the same reads denied at the OS level, writes beyond the working directory
+ * (the bound worktree; Claude Code adds the shared `.git` of a linked worktree,
+ * except its hooks and config) only to the declared cache directories, and
+ * network only to the allowlisted hosts, refused deterministically
+ * (`strictAllowlist`) instead of prompting. Throws WorkerConfigError when a
+ * denied path or PICO directory would contain the worktree, or overlaps a cache
+ * directory, since the boundary could then not be expressed.
+ */
+export function workerSandboxSettings(input: { cwd: string; mode: "read" | "full"; config: WorkerSandboxConfig;
+                                               home: string; parentEnv?: NodeJS.ProcessEnv }): Record<string, unknown> {
+  const parentEnv = input.parentEnv ?? process.env;
+  const cwd = resolve(input.cwd);
+  const deniedReads = sandboxDeniedReads(parentEnv, input.home);
+  const protectedWrites = sandboxProtectedWrites(parentEnv, input.home);
+  const guarded = [...deniedReads, ...protectedWrites];
+  const inside = guarded.find((path) => within(cwd, path));
+  if (inside) throw new WorkerConfigError(`the worker directory ${cwd} is inside ${inside}, which the worker sandbox protects.`);
+  const cacheRoot = absoluteOrNull(parentEnv.XDG_CACHE_HOME) ?? join(input.home, ".cache");
+  const caches = input.config.cacheDirectories.map((entry) => join(cacheRoot, entry));
+  for (const cache of caches) {
+    const clash = guarded.find((path) => within(cache, path) || within(path, cache));
+    if (clash) throw new WorkerConfigError(`worker_sandbox cache directory ${cache} overlaps ${clash}, which the worker sandbox protects.`);
+  }
+  // Permission rules take `//` for an absolute path; sandbox paths take a plain absolute path.
+  const deny = deniedReads.flatMap((path) => [`Read(/${path})`, `Read(/${path}/**)`]);
+  const settings: Record<string, unknown> = { permissions: { deny } };
+  if (input.mode === "full" && input.config.state === "enabled") {
+    settings.sandbox = { enabled: true, failIfUnavailable: true, allowUnsandboxedCommands: false,
+      filesystem: { ...(caches.length ? { allowWrite: caches } : {}), denyRead: deniedReads, denyWrite: protectedWrites },
+      network: { allowedDomains: input.config.allowedDomains, strictAllowlist: true } };
+  }
+  return settings;
+}
+
+/** Claude Code's own startup refusal when `failIfUnavailable` is set and its sandbox cannot start. */
+export function sandboxUnavailableText(text: string): boolean {
+  return /sandbox/i.test(text) && /failIfUnavailable/.test(text);
 }
 export const DEFAULT_TIMEOUT_MS = 30 * 60_000;
 const MAX_STDOUT = 8 * 1024 * 1024;
@@ -160,8 +330,11 @@ export function workerTimeoutMs(): number {
   return Number.isInteger(value) && value > 0 ? value : DEFAULT_TIMEOUT_MS;
 }
 
-/** Command-line arguments of one worker run; the prompt goes to stdin. */
-export function claudeWorkerArgs(plan: ClaudeWorkerPlan, sandbox = false): string[] {
+/**
+ * Command-line arguments of one worker run; the prompt goes to stdin. `settings`
+ * (from `workerSandboxSettings`) is passed as one `--settings` JSON argument.
+ */
+export function claudeWorkerArgs(plan: ClaudeWorkerPlan, settings?: Record<string, unknown>): string[] {
   const tools = plan.mode === "full" ? MUTATING_TOOLS : READ_TOOLS;
   const contract = plan.mode === "full"
     ? `You are a pico-coding-orchestrator worker. Your working directory ${plan.cwd} is the git worktree bound to your step: edit only inside it. Never push, merge, create or remove worktrees or branches, or call GitHub; report what the parent must do instead.`
@@ -170,7 +343,7 @@ export function claudeWorkerArgs(plan: ClaudeWorkerPlan, sandbox = false): strin
     "--permission-mode", plan.mode === "full" ? "acceptEdits" : "default",
     "--tools", tools.join(","), "--allowedTools", ...tools, "--disallowedTools", ...FORBIDDEN_TOOLS,
     "--append-system-prompt", contract, "--output-format", "json", "--no-session-persistence",
-    ...(sandbox ? ["--settings", WORKER_SANDBOX_SETTINGS] : [])];
+    ...(settings ? ["--settings", JSON.stringify(settings)] : [])];
 }
 
 function count(value: unknown): number | null {
@@ -196,25 +369,44 @@ export function parseClaudeResult(stdout: string): { result: Record<string, unkn
 
 /** Run one worker to completion, honoring the abort signal, a timeout, and an output cap. */
 export function runClaudeWorker(plan: ClaudeWorkerPlan, prompt: string, signal?: AbortSignal,
-                                timeoutMs = workerTimeoutMs()): Promise<ClaudeWorkerOutcome> {
+                                timeoutMs = workerTimeoutMs(),
+                                options: { probe?: SandboxProbe; parentEnv?: NodeJS.ProcessEnv } = {}): Promise<ClaudeWorkerOutcome> {
   const started = Date.now();
   const empty: ClaudeWorkerUsage = { input_tokens: null, output_tokens: null, cached_tokens: null, cache_write_tokens: null, cost_usd: null };
-  let prepared: { env: Record<string, string>; dropped: string[]; sandbox: boolean };
+  const parentEnv = options.parentEnv ?? process.env;
+  const notStarted = (error: "CONFIG_INVALID" | "SANDBOX_UNAVAILABLE", text: string, dropped: string[],
+                      sandbox: WorkerSandboxSummary | null): Promise<ClaudeWorkerOutcome> =>
+    Promise.resolve({ ok: false, text: `Claude worker not started: ${text}`, error,
+      usage: empty, durationMs: null, exitCode: null, elapsedMs: Date.now() - started, sessionId: null,
+      permissionDenials: 0, deniedCalls: [], envDropped: dropped, sandbox });
+  let prepared: { env: Record<string, string>; dropped: string[]; settings: Record<string, unknown>;
+    summary: WorkerSandboxSummary };
   try {
-    prepared = { ...buildWorkerEnv(), sandbox: workerSandboxEnabled() };
+    const config = plan.sandbox ?? workerSandboxConfig(null, parentEnv);
+    const { env, dropped } = buildWorkerEnv(parentEnv);
+    const settings = workerSandboxSettings({ cwd: plan.cwd, mode: plan.mode, config, parentEnv,
+      home: env.HOME && isAbsolute(env.HOME) ? env.HOME : homedir() });
+    prepared = { env, dropped, settings, summary: { state: config.state, source: config.source,
+      applied: "sandbox" in settings, allowed_domains: config.allowedDomains, cache_directories: config.cacheDirectories } };
   } catch (error) {
     if (!(error instanceof WorkerConfigError)) throw error;
-    return Promise.resolve({ ok: false, text: `Claude worker not started: ${error.message}`, error: "CONFIG_INVALID",
-      usage: empty, durationMs: null, exitCode: null, elapsedMs: Date.now() - started, sessionId: null,
-      permissionDenials: 0, deniedCalls: [], envDropped: [] });
+    return notStarted("CONFIG_INVALID", error.message, [], null);
   }
-  const { env, dropped, sandbox } = prepared;
+  const { env, dropped, settings, summary } = prepared;
+  if (summary.applied) {
+    // A mutating worker that should be sandboxed and cannot be never starts unconfined.
+    const support = (options.probe ?? detectWorkerSandbox)(env);
+    if (!support.available) {
+      return notStarted("SANDBOX_UNAVAILABLE", `the worker sandbox is unavailable: ${support.detail}. ` +
+        `Install its prerequisites, or opt out explicitly with ${WORKER_SANDBOX_VAR}=0 (recorded on the run).`, dropped, summary);
+    }
+  }
   return new Promise((resolve) => {
     let stdout = "";
     let stderr = "";
     let failure: ClaudeWorkerOutcome["error"] = null;
     let settled = false;
-    const child = spawn(plan.executable, claudeWorkerArgs(plan, sandbox), { cwd: plan.cwd, shell: false,
+    const child = spawn(plan.executable, claudeWorkerArgs(plan, settings), { cwd: plan.cwd, shell: false,
       stdio: ["pipe", "pipe", "pipe"], env });
     const stop = (reason: NonNullable<ClaudeWorkerOutcome["error"]>) => {
       if (failure || settled) return;
@@ -234,7 +426,9 @@ export function runClaudeWorker(plan: ClaudeWorkerPlan, prompt: string, signal?:
       signal?.removeEventListener("abort", onAbort);
       const elapsedMs = Date.now() - started;
       const base = { exitCode, elapsedMs, sessionId: null, permissionDenials: 0, deniedCalls: [] as string[],
-        envDropped: dropped };
+        envDropped: dropped, sandbox: summary };
+      // Claude Code's own failIfUnavailable refusal: the sandbox could not start, so nothing ran.
+      const refusedSandbox = (text: string) => summary.applied && exitCode !== 0 && sandboxUnavailableText(text);
       if (failure) {
         const detail = failure === "TIMEOUT" ? `timed out after ${timeoutMs} ms`
           : failure === "ABORTED" ? "aborted" : failure === "OUTPUT_LIMIT" ? `exceeded ${MAX_STDOUT} bytes of output`
@@ -244,8 +438,9 @@ export function runClaudeWorker(plan: ClaudeWorkerPlan, prompt: string, signal?:
       }
       const parsed = parseClaudeResult(stdout);
       if (!parsed) {
-        resolve({ ok: false, text: stderr.trim().slice(0, 2000) || "Claude worker returned no JSON result.",
-          error: "MALFORMED_OUTPUT", usage: empty, durationMs: null, ...base });
+        const text = stderr.trim().slice(0, 2000) || "Claude worker returned no JSON result.";
+        resolve({ ok: false, text, error: refusedSandbox(`${stderr}\n${stdout}`) ? "SANDBOX_UNAVAILABLE" : "MALFORMED_OUTPUT",
+          usage: empty, durationMs: null, ...base });
         return;
       }
       const { result, usage } = parsed;
@@ -253,10 +448,10 @@ export function runClaudeWorker(plan: ClaudeWorkerPlan, prompt: string, signal?:
         : typeof result.subtype === "string" ? `Claude worker ended with ${result.subtype}.` : "";
       const failed = result.is_error === true || exitCode !== 0;
       resolve({ ok: !failed, text: text.length > MAX_TEXT ? `${text.slice(0, MAX_TEXT)}\n[truncated]` : text,
-        error: failed ? "BACKEND_ERROR" : null, usage, durationMs: count(result.duration_ms), exitCode, elapsedMs,
+        error: !failed ? null : refusedSandbox(`${text}\n${stderr}`) ? "SANDBOX_UNAVAILABLE" : "BACKEND_ERROR", usage, durationMs: count(result.duration_ms), exitCode, elapsedMs,
         sessionId: typeof result.session_id === "string" ? result.session_id : null,
         permissionDenials: Array.isArray(result.permission_denials) ? result.permission_denials.length : 0,
-        deniedCalls: describeDenials(result.permission_denials), envDropped: dropped });
+        deniedCalls: describeDenials(result.permission_denials), envDropped: dropped, sandbox: summary });
     };
     child.stdout.on("data", (part: Buffer) => {
       stdout += part.toString("utf8");

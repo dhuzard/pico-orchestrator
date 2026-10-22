@@ -33,6 +33,16 @@ permissions:
 
   deploy: false
 
+# Mutating Claude workers run their shell commands in Claude Code's OS sandbox
+# by default: writes only in their bound worktree (and its git metadata), no
+# reads of PICO's state directory or credential files such as ~/.config/gh, and
+# no network. Only the user can opt out (PI_ORCHESTRATOR_WORKER_SANDBOX=0). A
+# repository may widen it for its own checks, for example:
+# worker_sandbox:
+#   network:
+#     allowed_domains: [registry.npmjs.org, pypi.org, files.pythonhosted.org]
+#   cache_directories: [pip]   # under $XDG_CACHE_HOME, else ~/.cache
+
 limits:
   parallel_tasks: 3     # most routed tasks per wave (declare_wave enforces it)
   open_prs: 2           # at the limit, new batches stack on the newest batch branch

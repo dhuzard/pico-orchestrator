@@ -8,8 +8,8 @@ import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { classifyClaudeInvocationError, resolveClaudeBackendModel } from "./claude-backend-adapter.ts";
-import { inGitDirectory, runClaudeWorker } from "./claude-worker.ts";
-import type { ClaudeWorkerOutcome, ClaudeWorkerPlan } from "./claude-worker.ts";
+import { detectWorkerSandbox, inGitDirectory, runClaudeWorker, WorkerConfigError, workerSandboxConfig } from "./claude-worker.ts";
+import type { ClaudeWorkerOutcome, ClaudeWorkerPlan, SandboxProbe, WorkerSandboxConfig } from "./claude-worker.ts";
 import { initialBudgetState, observeContext } from "./context-budget.ts";
 import type { BudgetState } from "./context-budget.ts";
 
@@ -289,6 +289,7 @@ function workerBlocker(outcome: ClaudeWorkerOutcome): string {
     case "OUTPUT_LIMIT": return "WORKER_OUTPUT_LIMIT";
     case "SPAWN_FAILED": return "MODEL_BACKEND_UNAVAILABLE";
     case "CONFIG_INVALID": return "WORKER_CONFIG_INVALID";
+    case "SANDBOX_UNAVAILABLE": return "WORKER_SANDBOX_UNAVAILABLE";
     default: return classifyClaudeInvocationError(outcome.text);
   }
 }
@@ -363,7 +364,8 @@ export function runJson(script: string, args: string[], input?: Json, timeoutMs 
   });
 }
 
-export function createOrchestrationLifecycle(command: typeof runJson = runJson, clock: () => number = Date.now) {
+export function createOrchestrationLifecycle(command: typeof runJson = runJson, clock: () => number = Date.now,
+                                            sandboxProbe: SandboxProbe = detectWorkerSandbox) {
 return function orchestrationLifecycle(pi: ExtensionAPI) {
   let runId: string | null = null;
   let lastRunId: string | null = null;
@@ -388,6 +390,8 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
   const inFlight = new Map<string, { taskId: string | null; stepId: string | null; tool: string; phase?: string }>();
   // toolCallId -> ClaudeWorker run the guard resolved; consumed by the tool's execute.
   const workerPlans = new Map<string, WorkerPlan>();
+  // The run's worker sandbox posture and repository allowlist, resolved and recorded at run start or resume.
+  let workerSandbox: WorkerSandboxConfig | null = null;
   let scopeViolation: string | null = null;
   let lastPhase = "routing";
   let currentTurn: number | null = null;
@@ -545,6 +549,7 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
     // A resumed run is bound by the effective limit too, counting from the calls already made.
     await configureLeadLimit();
     await configureFailureBudget();
+    await configureWorkerSandbox();
   }
 
   function diagnose(operation: string, result: Json): void {
@@ -579,7 +584,7 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
     approvals.clear(); pendingRoutes.clear(); workspaces.clear(); snapshots.clear();
     subagentTasks.clear(); inFlight.clear(); claudeCalls.clear(); workerPlans.clear();
     scopeViolation = null; activeWave = null; integrating = null; implicitOpen.clear(); routeEpochs.clear(); implicitEpoch.clear(); autoWorkers.clear(); lastPhase = "routing";
-    currentTurn = null; messageStarts.clear(); leadLimit = null; failureBudget = null;
+    currentTurn = null; messageStarts.clear(); leadLimit = null; failureBudget = null; workerSandbox = null;
     batchStart = 0; batchPeak = 0;
     pendingReroutes.clear();
   }
@@ -667,6 +672,39 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
       return;
     }
     failureBudget = { value: DEFAULT_FAILURE_RETRY_BUDGET, source: "default" };
+  }
+  /**
+   * Resolve the run's worker sandbox (#63) and record it on the run: on by default, `opted_out` only through an
+   * explicit PI_ORCHESTRATOR_WORKER_SANDBOX=0, plus the repository's opt-in network allowlist and cache directories
+   * (`worker_sandbox` in the target checkout's `.pi/autonomy.yaml`, never a worker's worktree). An unreadable or
+   * invalid policy contributes nothing: workers then get no network and no extra writable directory. An invalid
+   * PI_ORCHESTRATOR_WORKER_SANDBOX value records nothing; each ClaudeWorker call then fails WORKER_CONFIG_INVALID.
+   */
+  async function configureWorkerSandbox(): Promise<void> {
+    workerSandbox = null;
+    if (!runId) return;
+    const limits = await command(AUTONOMY, ["limits", "--worktree", targetCwd ?? "."]);
+    const declared = limits.ok === false ? null : limits.worker_sandbox;
+    const policy = declared && typeof declared === "object" && !Array.isArray(declared) ? declared as Json : null;
+    let policySource = limits.ok === false ? "invalid"
+      : typeof limits.source === "string" && limits.source !== "default" ? "policy" : "default";
+    try {
+      try {
+        workerSandbox = workerSandboxConfig(policy);
+      } catch (error) {
+        if (!(error instanceof WorkerConfigError) || policy === null) throw error;
+        policySource = "invalid";
+        workerSandbox = workerSandboxConfig(null);
+      }
+    } catch (error) {
+      if (!(error instanceof WorkerConfigError)) throw error;
+      diagnose("worker_sandbox", { ok: false, error_code: "WORKER_CONFIG_INVALID", error_category: "InvalidWorkerSandbox",
+        error: error.message });
+      return;
+    }
+    await observe({ kind: "worker_sandbox", state: workerSandbox.state, source: workerSandbox.source,
+      allowed_domains: workerSandbox.allowedDomains, cache_directories: workerSandbox.cacheDirectories,
+      policy_source: policySource });
   }
   /**
    * The HEAD a step's state is measured at: its own bound worktree; for an unbound step (a read-only reviewer) the
@@ -967,6 +1005,7 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
     if (started.ok === false) diagnose("context_start", started);
     await configureLeadLimit();
     await configureFailureBudget();
+    await configureWorkerSandbox();
     budget = initialBudgetState();
     startHeartbeat(result);
   });
@@ -1068,7 +1107,7 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
     call.input.model = route.canonical;
     call.input.thinking = route.effort;
     workerPlans.set(call.toolCallId, { executable, cwd, backendModel: route.backendModel, effort: route.effort,
-      mode: route.step.mode, taskId, stepId: route.step.id, phase: route.approval.phase, canonical: route.canonical });
+      mode: route.step.mode, ...(workerSandbox ? { sandbox: workerSandbox } : {}), taskId, stepId: route.step.id, phase: route.approval.phase, canonical: route.canonical });
     return undefined;
   }
 
@@ -1687,7 +1726,7 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
       let outcome: ClaudeWorkerOutcome;
       try {
         outcome = await runClaudeWorker(plan, params.prompt,
-          signal ? AbortSignal.any([signal, controller.signal]) : controller.signal);
+          signal ? AbortSignal.any([signal, controller.signal]) : controller.signal, undefined, { probe: sandboxProbe });
       } finally {
         workerAborts.delete(toolCallId);
       }
@@ -1707,7 +1746,9 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
           duration_ms: outcome.durationMs, elapsed_ms: outcome.elapsedMs, session_id: outcome.sessionId,
           permission_denials: outcome.permissionDenials, denied_calls: outcome.deniedCalls,
           // Names only, never values, of parent environment variables withheld from the worker.
-          env_dropped_count: outcome.envDropped.length, env_dropped: outcome.envDropped.slice(0, 100) } as Json };
+          env_dropped_count: outcome.envDropped.length, env_dropped: outcome.envDropped.slice(0, 100),
+          // The worker's sandbox posture: on (applied to a mutating worker), or the user's explicit opt-out.
+          sandbox: outcome.sandbox } as Json };
     },
   });
 

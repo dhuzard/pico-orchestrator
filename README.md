@@ -806,7 +806,8 @@ checkpoints. Backend conversation history is never reused.
 | `WORKER_TASK_UNATTRIBUTED` / `WORKER_TASK_UNROUTED` / `WORKER_STEP_UNKNOWN` | Several tasks are routed and the worker call names none, names an unrouted task, or names a step outside its plan. |
 | `WAVE_UNDECLARED` | Workers of different tasks would overlap outside one declared wave. |
 | `INTEGRATION_IN_PROGRESS` | A worker launch while the parent integrates a wave. |
-| `WORKER_CONFIG_INVALID` | `PI_ORCHESTRATOR_WORKER_ENV_ALLOW` names an invalid variable, or `PI_ORCHESTRATOR_WORKER_SANDBOX` is not `0` or `1`. The worker is not started. |
+| `WORKER_CONFIG_INVALID` | `PI_ORCHESTRATOR_WORKER_ENV_ALLOW` names an invalid variable, `PI_ORCHESTRATOR_WORKER_SANDBOX` is not unset, `0` or `1`, or the worker sandbox cannot be expressed (the worktree, or a declared cache directory, overlaps a protected path). The worker is not started. |
+| `WORKER_SANDBOX_UNAVAILABLE` | A mutating Claude worker needs the OS sandbox (on by default) and it cannot start: no bubblewrap or socat on Linux, an unsupported platform, or Claude Code's own `failIfUnavailable` refusal. The worker is not started. Install the prerequisites, or opt out explicitly with `PI_ORCHESTRATOR_WORKER_SANDBOX=0` (recorded on the run). |
 | `WORKER_SCOPE_VIOLATION` | The parent checkout changed during a worker call. Further workers are blocked; nothing is reverted. |
 | `MUTATION_MODE_MISMATCH` | The `AskClaude` `mode` differs from the routed step's mutation permission. |
 | `WORKER_TIMEOUT` / `WORKER_ABORTED` / `WORKER_OUTPUT_LIMIT` | A `ClaudeWorker` run exceeded `PI_CLAUDE_WORKER_TIMEOUT_MS` (default 30 min), was aborted, or exceeded its output cap; its Claude Code process is killed. |
@@ -823,6 +824,16 @@ Code model, and `--effort` from the route. A mutating step gets
 Agent. A read-only step gets only Read, Glob, and Grep. `git push`, `gh`,
 `git worktree`, and branch deletion are denied tools; other out-of-scope
 actions rely on the worker contract and the parent-checkout snapshot.
+A mutating Claude worker's shell commands also run in Claude Code's OS sandbox
+by default (bubblewrap and socat on Linux and WSL2, Seatbelt on macOS): they
+may write only in the bound worktree, its git metadata, the temp directory and
+cache directories the repository declares; they cannot read PICO's state
+directory, `~/.config/gh` or other credential files; and they have no network
+unless `.pi/autonomy.yaml` allowlists hosts under `worker_sandbox`. Without the
+prerequisites the worker fails closed with `WORKER_SANDBOX_UNAVAILABLE`;
+`PI_ORCHESTRATOR_WORKER_SANDBOX=0` is the explicit opt-out and is recorded on
+the run. Codex workers and the lead are not sandboxed by PICO. Details and
+limits: "Worker sandbox" in [the technical reference](docs/technical-reference.md).
 Because every call has its own process directory, mutating Claude workers of
 one wave run concurrently. `AskClaude` remains accepted for read-only routed
 steps and outside parent runs. Its isolation and the repository check also
