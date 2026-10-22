@@ -6,6 +6,12 @@ All notable changes to PICO are recorded here. The format follows
 
 ## [Unreleased]
 
+### Documentation
+
+- Added `docs/containment-and-authority.md`: containment acceptance tests for worker sandboxing (#63),
+  the OS sandbox versus command filter distinction, and planning, execution, publication and
+  promotion authority for the issue dispatcher (#34).
+
 ### Security
 
 - Issue and comment writes are enforced (#58). `github_integration.execute` and
