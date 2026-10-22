@@ -361,14 +361,29 @@ def _git(checkout: Path, *args: str) -> subprocess.CompletedProcess:
     return subprocess.run(["git", "-C", str(checkout), *args], shell=False, capture_output=True, text=True, timeout=60)
 
 
+def untracked_entries(checkout: Path) -> list[str] | None:
+    """Untracked, not ignored entries of a checkout (an untracked directory is one entry), without PICO's own
+    `.pi/worktrees/`; None when Git cannot answer."""
+    try:
+        listing = _git(checkout, "ls-files", "-z", "--others", "--exclude-standard", "--directory",
+                       "--no-empty-directory", "--exclude=/.pi/worktrees/")
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if listing.returncode:
+        return None
+    return sorted(p for p in listing.stdout.split("\0") if p)
+
+
 def checkout_state(checkout: Path) -> dict:
-    """Branch (or detached HEAD) and linked worktrees of a checkout, to undo what a run left behind."""
+    """Branch (or detached HEAD), linked worktrees and untracked entries of a checkout, to undo or report
+    what a run left behind."""
     branch = _git(checkout, "symbolic-ref", "--quiet", "--short", "HEAD").stdout.strip() or None
     head = _git(checkout, "rev-parse", "HEAD").stdout.strip() or None
     listing = _git(checkout, "worktree", "list", "--porcelain").stdout.splitlines()
     paths = [line[len("worktree "):] for line in listing if line.startswith("worktree ")]
     main = str(checkout.resolve())
-    return {"branch": branch, "head": head, "worktrees": sorted(p for p in paths if str(Path(p).resolve()) != main)}
+    return {"branch": branch, "head": head, "worktrees": sorted(p for p in paths if str(Path(p).resolve()) != main),
+            "untracked": untracked_entries(checkout)}
 
 
 DIRTY_FILES_SHOWN = 50
@@ -405,7 +420,8 @@ def restore_checkout(checkout: Path, before: dict) -> dict:
     kept, and a checkout with uncommitted tracked changes is left where it is.
     Branches are never deleted, because they hold the work. The tracked changes
     left in the parent checkout are recorded (`dirty_files`, `dirty_count`;
-    None when Git cannot answer).
+    None when Git cannot answer), and so are untracked entries that appeared
+    during the run (`new_untracked`, `new_untracked_count`), as a report only.
     """
     after = checkout_state(checkout)
     result = {"branch_before": before["branch"], "branch_after": after["branch"], "restored": False,
@@ -433,6 +449,12 @@ def restore_checkout(checkout: Path, before: dict) -> dict:
     dirty = tracked_changes(checkout)
     result["dirty_files"] = None if dirty is None else dirty[:DIRTY_FILES_SHOWN]
     result["dirty_count"] = None if dirty is None else len(dirty)
+    # Untracked entries that appeared during the run: reported only, never refused or removed. They cannot change
+    # a commit or a check at the recorded commits, but they show a write outside the run's worktrees (#63).
+    untracked, earlier = untracked_entries(checkout), before.get("untracked")
+    new = None if untracked is None or earlier is None else sorted(set(untracked) - set(earlier))
+    result["new_untracked"] = None if new is None else new[:DIRTY_FILES_SHOWN]
+    result["new_untracked_count"] = None if new is None else len(new)
     return result
 
 
