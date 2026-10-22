@@ -689,8 +689,9 @@ def _local_branch_exists(worktree: Path, branch: str) -> bool:
 def republication_branch(worktree: Path, repo: str, base: str, head: str, adapter=gh, *,
                          recorded_pr: dict | None = None, reserved: frozenset[str] = frozenset()) -> dict:
     """Where a head whose PR was closed unmerged is published again (#67): the first `<head>-<n>` (n >= 2) that
-    holds this task's earlier republication (its open PR, reused) or is free: no PR, no other commit on the
-    remote, no local branch, and not `reserved` (the head of another task).
+    holds this task's earlier republication (its open PR, or a push whose PR was not created yet; reused) or
+    is free: no PR, not on the remote, no local branch, and not `reserved` (the head of another task). An open
+    PR the task does not record, already at the validated commit, refuses rather than opening a second one.
 
     Only for a head whose every PR was closed without merging: an open PR is published normally, a merged one
     is never superseded, and a head with no PR needs no new branch. A closed PR's branch is never reused,
@@ -714,8 +715,18 @@ def republication_branch(worktree: Path, repo: str, base: str, head: str, adapte
     for n in range(2, REPUBLICATION_LIMIT + 1):
         candidate = f"{head}-{n}"
         found = adapter.list_prs(base=base, head=candidate, repo=repo)
-        if any(pr["number"] not in own for pr in found):
-            continue  # someone else's PR: never taken over, never listed as superseded
+        foreign = [pr for pr in found if pr["number"] not in own]
+        if foreign:
+            # Someone else's PR: never taken over, never listed as superseded. An open one already at the
+            # validated commit is most likely this task's own PR from a creation whose answer was lost;
+            # skipping it would open a second PR for the same commit, so refuse instead.
+            unrecorded = [pr["number"] for pr in foreign if str(pr["state"]).lower() == "open"]
+            if unrecorded and _remote_head_commit(worktree, remote, candidate) == commit:
+                raise IntegrationError("PUBLICATION_PR_CONFLICT",
+                                       f"{candidate} has open PR #{unrecorded[0]} at the validated commit, but the "
+                                       "task does not record it; check whether it is this task's PR and close it "
+                                       "or record it before publishing again")
+            continue
         states = {str(pr["state"]).lower() for pr in found}
         if "merged" in states:
             raise IntegrationError("PUBLICATION_PR_CONFLICT", f"{candidate} already has a merged PR")
@@ -730,9 +741,12 @@ def republication_branch(worktree: Path, repo: str, base: str, head: str, adapte
         if found:  # this task's earlier republication, closed as well: superseded too, never reused
             supersedes = sorted(supersedes + [pr["number"] for pr in found])
             continue
-        if candidate in reserved or _local_branch_exists(worktree, candidate):
+        if candidate in reserved:
             continue
-        if _remote_head_commit(worktree, remote, candidate) in (None, commit):
+        remote_commit = _remote_head_commit(worktree, remote, candidate)
+        if remote_commit == commit:  # this task's earlier push whose PR was not created yet
+            return {"remote_head": candidate, "supersedes": supersedes}
+        if remote_commit is None and not _local_branch_exists(worktree, candidate):
             return {"remote_head": candidate, "supersedes": supersedes}
     raise IntegrationError("PUBLICATION_PR_CONFLICT", f"no free republication branch up to {head}-{REPUBLICATION_LIMIT}")
 

@@ -275,7 +275,7 @@ def publish(*, manifest: Path, task_id: str, apply: bool = False, plan_hash: str
                                                                   observed["head_branch"], adapter, **republication)
         except github_integration.IntegrationError as exc:
             raise WorkspaceRunError(exc.code, exc.detail) from exc
-        except (gh.GithubSyncError, OSError, subprocess.TimeoutExpired) as exc:
+        except (gh.GithubSyncError, OSError, ValueError, subprocess.TimeoutExpired) as exc:
             raise WorkspaceRunError("PUBLICATION_FAILED",
                                     f"could not inspect the republication branches: {type(exc).__name__}") from exc
     body = pr_body(plan, task, repo, observed, decision, supersedes=(republished or {}).get("supersedes"))
@@ -291,10 +291,14 @@ def publish(*, manifest: Path, task_id: str, apply: bool = False, plan_hash: str
                                         remote_head=(republished or {}).get("remote_head"), **republication)
     if result["status"] == "COMPLETED" and result.get("pr"):
         def mutate(obs: dict) -> None:
+            previous = (obs.get("pr") or {}).get("number")
+            if previous == result["pr"] and not result["mutations_applied"]:
+                return  # a rerun that changed nothing keeps the run that published the PR, and its promotion
             obs["pr"] = {"number": result["pr"], "repository": repo["repository"],
                          "publication_run_id": result["run_id"], "published_at": _now()}
             if republished:
                 obs["pr"].update({"branch": republished["remote_head"], "supersedes": republished["supersedes"]})
+            if republished and previous != result["pr"]:
                 # CI and promotion were observed on the superseded PR: promote again on the new one.
                 obs.pop("ci", None)
                 obs.pop("promoted_at", None)

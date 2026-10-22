@@ -7,6 +7,7 @@ non-force publication path runs without network access.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import os
 import subprocess
@@ -410,10 +411,67 @@ class ContractLifecycleTest(unittest.TestCase):
         manifest = self.manifest()
         self._closed_and_published(manifest)
         self.fake.states[101] = "CLOSED"
-        with mock.patch.object(self.fake, "list_prs", side_effect=github_sync.GithubSyncError("auth expired")):
-            with self.assertRaises(wr.WorkspaceRunError) as ctx:
-                wc.publish(manifest=manifest, task_id="a1", adapter=self.fake, new_branch=True)
-        self.assertEqual(ctx.exception.code, "PUBLICATION_FAILED")
+        for error in (github_sync.GithubSyncError("auth expired"), ValueError("unexpected gh output")):
+            with self.subTest(error=type(error).__name__):
+                with mock.patch.object(self.fake, "list_prs", side_effect=error):
+                    with self.assertRaises(wr.WorkspaceRunError) as ctx:
+                        wc.publish(manifest=manifest, task_id="a1", adapter=self.fake, new_branch=True)
+                self.assertEqual(ctx.exception.code, "PUBLICATION_FAILED")
+
+    def _republish(self, manifest, **patches):
+        preview = wc.publish(manifest=manifest, task_id="a1", adapter=self.fake, new_branch=True)
+        self.assertEqual(preview["status"], "DRY_RUN", preview)
+        with mock.patch.multiple(self.fake, **patches) if patches else contextlib.nullcontext():
+            return wc.publish(manifest=manifest, task_id="a1", apply=True, plan_hash=preview["plan_hash"],
+                              adapter=self.fake, new_branch=True)
+
+    def test_republication_refuses_an_unrecorded_open_pr_at_the_validated_commit(self):
+        # `gh pr create` made the PR but its answer was lost: the run ends PARTIAL and the PR is not recorded.
+        manifest = self.manifest()
+        self._closed_and_published(manifest)
+        self.fake.states[101] = "CLOSED"
+        create = self.fake.create_pr
+
+        def created_then_failed(*args, **kwargs):
+            create(*args, **kwargs)
+            raise github_sync.GithubSyncError("timed out after creating")
+        first = self._republish(manifest, create_pr=mock.Mock(side_effect=created_then_failed))
+        self.assertEqual(first["status"], "PARTIAL", first)
+        orphan = self.fake.created[-1]["number"]
+        with self.assertRaises(wr.WorkspaceRunError) as ctx:
+            wc.publish(manifest=manifest, task_id="a1", adapter=self.fake, new_branch=True)
+        self.assertEqual(ctx.exception.code, "PUBLICATION_PR_CONFLICT")
+        self.assertIn(f"#{orphan}", ctx.exception.detail)
+        self.assertEqual([c["head"] for c in self.fake.created].count("pico/a1-3"), 0)
+
+    def test_republication_resumes_a_push_whose_pr_was_not_created(self):
+        manifest = self.manifest()
+        a1_commit = self._closed_and_published(manifest)
+        self.fake.states[101] = "CLOSED"
+        first = self._republish(manifest, create_pr=mock.Mock(side_effect=github_sync.GithubSyncError("down")))
+        self.assertEqual(first["status"], "PARTIAL", first)
+        # Even with a local branch of the same name (someone checked it out), the pushed branch is reused.
+        git("-C", str(self.repos["alpha"][0]), "branch", "pico/a1-2", "pico/a1")
+        again = self._republish(manifest)
+        self.assertEqual((again["status"], again["plan"]["remote_head"], again["mutations_applied"]),
+                         ("COMPLETED", "pico/a1-2", 1), again)
+        self.assertEqual(git("--git-dir", str(self.bare["alpha"]), "rev-parse", "refs/heads/pico/a1-2"), a1_commit)
+        self.assertEqual([c["head"] for c in self.fake.created], ["pico/a1", "pico/a1-2"])
+
+    def test_a_republication_rerun_that_changes_nothing_keeps_the_promotion(self):
+        manifest = self.manifest()
+        a1_commit = self._closed_and_published(manifest)
+        self.fake.states[101] = "CLOSED"
+        applied = self._republish(manifest)
+        self.fake.checks[applied["pr"]] = ("OPEN", a1_commit, GREEN)
+        self.assertTrue(wc.promote(manifest=manifest, task_id="a1", adapter=self.fake)["ok"])
+        before = wr.load_workspace(wr.workspace_record_path("ws"))["tasks"]["a1"]["observed"]
+        rerun = self._republish(manifest)
+        self.assertEqual((rerun["status"], rerun["pr"], rerun["mutations_applied"]), ("COMPLETED", applied["pr"], 0))
+        after = wr.load_workspace(wr.workspace_record_path("ws"))["tasks"]["a1"]["observed"]
+        self.assertEqual(after["readiness"], "ready_for_downstream")
+        self.assertEqual((after["pr"], after["promoted_at"], after["ci"]), (before["pr"], before["promoted_at"], before["ci"]))
+        self.assertEqual(self.plan_task(manifest, "b1")["blocked_by"], [])
 
     def test_cli_passes_new_branch(self):
         with mock.patch.object(wc, "publish", return_value={"ok": True}) as publish:
