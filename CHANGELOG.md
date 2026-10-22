@@ -14,6 +14,32 @@ All notable changes to PICO are recorded here. The format follows
 
 ### Security
 
+- Mutating Claude workers run in Claude Code's OS sandbox by default (#63, slices 2 to 4).
+  Their shell commands may write only in the bound worktree, its git metadata, the temp
+  directory and cache directories the repository declares; cannot read PICO's state directory
+  (run records, leases), `~/.config/gh`, `~/.ssh` or other credential files; and have no
+  network. Claude's Read, Edit and Write tools get `permissions.deny` rules for the same paths.
+  `sandbox.allowUnsandboxedCommands: false` stops unsandboxed retries and a repository's
+  `.claude/settings.json` from widening the sandbox. A repository can allowlist hosts and cache
+  directories in a new, schema-validated `worker_sandbox` section of `.pi/autonomy.yaml`; it
+  cannot turn the sandbox off. The posture is recorded on every run in
+  `parent_orchestration.worker_sandbox` and on each `ClaudeWorker` result (`sandbox`).
+  Not covered: Codex workers and the lead (slices 5 and 6), Claude Code's hooks and MCP
+  servers, platforms without the sandbox, and per-attempt denial records (Claude Code reports
+  sandbox denials to the model, not in the JSON result PICO reads). Not yet measured with real
+  agents (slice 1).
+
+  **Migration.** `PI_ORCHESTRATOR_WORKER_SANDBOX` changes meaning: unset now means on (it was
+  off), `1` stays on, and `0` is the explicit opt-out, recorded on the run as
+  `state: opted_out`. On Linux and WSL2 install `bubblewrap` and `socat` (on Ubuntu 24.04 and
+  later bubblewrap may also need an AppArmor profile; see Claude Code's sandboxing docs); without
+  them a mutating Claude worker is not started and fails with the new prerequisite code
+  `WORKER_SANDBOX_UNAVAILABLE`. Native Windows has no sandbox; use WSL2 or opt out. Checks that
+  need the network (installs, registries) need `worker_sandbox.network.allowed_domains`, or
+  dependencies installed before the worker starts. Read-only Claude steps are unaffected apart
+  from the Read deny rules. Requires Claude Code 2.1.285 or later for the documented behaviour
+  of these settings. Run records now carry `parent_orchestration.worker_sandbox`, which older
+  PICO versions (closed schema) reject.
 - Issue and comment writes are enforced (#58). `github_integration.execute` and
   `backlog github-push` read `create_github_issues`, `comment_on_issue` and `comment_on_pr`
   (and `create_pr` for `update_pr`) from `.pi/autonomy.yaml` on the default branch on GitHub,
