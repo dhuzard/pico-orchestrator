@@ -1272,7 +1272,7 @@
           }
         },
         "authorization": {
-          "description": "How publication was authorized: the target's autonomy policy, or a one-shot grant confirmed in the Garden for this single reviewed plan.",
+          "description": "How a GitHub write (publication, or an issue/comment batch) was authorized: the autonomy policy on the default branch on GitHub. one_shot_grant, granted_by and granted appear only in records written before the Garden one-shot grant was removed (#59).",
           "type": [
             "object",
             "null"
@@ -1304,6 +1304,28 @@
                 ]
               },
               "uniqueItems": true
+            },
+            "permissions": {
+              "description": "The policy permissions this write required; all were granted.",
+              "type": "array",
+              "items": {
+                "enum": [
+                  "push_branch",
+                  "create_pr",
+                  "create_github_issues",
+                  "comment_on_issue",
+                  "comment_on_pr"
+                ]
+              },
+              "uniqueItems": true
+            },
+            "policy_commit": {
+              "description": "The default-branch commit whose .pi/autonomy.yaml authorized the write.",
+              "type": [
+                "string",
+                "null"
+              ],
+              "pattern": "^[0-9a-f]{40}$"
             }
           }
         }

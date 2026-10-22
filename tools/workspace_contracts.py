@@ -239,8 +239,7 @@ def pr_body(plan: dict, task: dict, repo: dict, observed: dict, decision: dict |
     return body
 
 
-def publish(*, manifest: Path, task_id: str, apply: bool = False, plan_hash: str | None = None, adapter=gh,
-            grant: dict | None = None) -> dict:
+def publish(*, manifest: Path, task_id: str, apply: bool = False, plan_hash: str | None = None, adapter=gh) -> dict:
     plan, task, repo = _context(manifest, task_id)
     if task["kind"] == "qualification":
         raise WorkspaceRunError("WORKSPACE_TASK_NOT_PUBLISHABLE", "qualification tasks have no pull request")
@@ -261,7 +260,7 @@ def publish(*, manifest: Path, task_id: str, apply: bool = False, plan_hash: str
     result = github_integration.publish(worktree=checkout, base=repo["base_branch"], head=observed["head_branch"],
                                         title=task["title"], body_file=body_file, explicit_repo=repo["repository"],
                                         apply=apply, expected_plan_hash=plan_hash, adapter=adapter,
-                                        provenance_root=headless_run.ROOT, grant=grant,
+                                        provenance_root=headless_run.ROOT,
                                         closes_issue=task["issue"] if task.get("closes_issue") is True else None)
     if result["status"] == "COMPLETED" and result.get("pr"):
         def mutate(obs: dict) -> None:

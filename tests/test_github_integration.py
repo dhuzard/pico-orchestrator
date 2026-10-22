@@ -1,6 +1,8 @@
 """External target integration and trust-boundary regression tests; no live GitHub."""
 import hashlib
+import inspect
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -14,6 +16,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 import github_integration as gi
 import github_sync as gh
 import provenance
+import workspace_contracts
 
 
 class FakeGithub:
@@ -30,6 +33,24 @@ class FakeGithub:
         self.calls = []
         self.change_before_second_read = False
         self.reads = 0
+        # The default branch's .pi/autonomy.yaml on GitHub grants every write unless a test withholds one.
+        self.withheld: set[str] = set()
+        self.policy_present = True
+
+    def default_branch(self, *, repo):
+        return "main"
+
+    def branch_head(self, branch, *, repo):
+        return "d" * 40
+
+    def policy_file_at(self, commit, *, repo):
+        if not self.policy_present:
+            return None
+        text = (ROOT / "templates/autonomy.yaml").read_text()
+        for name in ("create_github_issues", "comment_on_issue", "comment_on_pr", "create_pr"):
+            text = re.sub(rf"(?m)^(  {name}): (true|false)$", rf"\1: {str(name not in self.withheld).lower()}", text)
+        return {"type": "file", "path": ".pi/autonomy.yaml", "sha": hashlib.sha1(text.encode()).hexdigest(),
+                "text": text}
 
     def view_issue(self, number, *, repo):
         self.calls.append(("view", repo, number))
@@ -391,6 +412,72 @@ class IntegrationTest(unittest.TestCase):
         self.assertEqual(self.fake.issues[401]["state"], "OPEN")
         self.assertEqual(self.run_batch(apply=True, allow_destructive=True)["status"], "COMPLETED")
 
+    MUTATING_CALLS = {"edit", "comment_issue", "edit_pr", "comment_pr", "close", "reopen", "create_label",
+                      "create_issue"}
+
+    def mutated(self):
+        return [call for call in self.fake.calls if call[0] in self.MUTATING_CALLS]
+
+    def test_each_write_needs_its_permission_in_the_default_branch_policy(self):
+        # #58: the permission is read from .pi/autonomy.yaml on the default branch on GitHub.
+        self.remote("https://github.com/Examplecorp/examplelab")
+        repo = "Examplecorp/examplelab"
+        cases = [
+            ("create_github_issues", {"operation": "create_issue", "title": "New", "body": "b"}),
+            ("create_github_issues", {"operation": "update_issue", "issue": 401, "title": "Renamed"}),
+            ("create_github_issues", {"operation": "close_issue", "issue": 401}),
+            ("create_github_issues", {"operation": "create_label", "label": "triage"}),
+            ("create_github_issues", {"operation": "add_label", "issue": 401, "label": "triage"}),
+            ("comment_on_issue", {"operation": "comment_issue", "issue": 401, "body": "Done."}),
+            ("comment_on_pr", {"operation": "comment_pr", "pr": 24, "body": "Reviewed."}),
+            ("create_pr", {"operation": "update_pr", "pr": 24, "title": "Better title"}),
+        ]
+        for permission, proposal in cases:
+            with self.subTest(operation=proposal["operation"]):
+                self.fake = FakeGithub()
+                self.fake.labels = [{"name": "triage"}] if proposal["operation"] == "add_label" else []
+                self.write([{**proposal, "repository": repo, "rationale": "test"}])
+                self.fake.withheld = {permission}
+                dry = self.run_batch()
+                self.assertEqual((dry["status"], dry["blocker_code"]), ("BLOCKED", "GITHUB_WRITE_NOT_AUTHORIZED"))
+                reason = provenance.get_run(self.records, dry["run_id"])["github_integration"]["reason"]
+                self.assertTrue(reason.startswith(f"{permission} must be granted"), reason)
+                applied = self.run_batch(apply=True, allow_destructive=True, expected_plan_hash="0" * 64)
+                self.assertEqual(applied["blocker_code"], "GITHUB_WRITE_NOT_AUTHORIZED")
+                self.assertEqual(self.mutated(), [])
+                # Withholding every other permission changes nothing: only the one the write needs counts.
+                self.fake.withheld = {"create_github_issues", "comment_on_issue", "comment_on_pr", "create_pr"} - {permission}
+                done = self.run_batch(apply=True, allow_destructive=True)
+                self.assertEqual((done["status"], done["mutations_applied"]), ("COMPLETED", 1))
+                self.assertEqual(provenance.get_run(self.records, done["run_id"])["github_integration"]["authorization"],
+                                 {"source": "policy", "permissions": [permission], "policy_commit": "d" * 40})
+
+    def test_missing_default_branch_policy_refuses_writes(self):
+        self.remote("https://github.com/Examplecorp/examplelab")
+        self.write([{"operation": "comment_issue", "repository": "Examplecorp/examplelab", "issue": 401,
+                     "body": "Done.", "rationale": "report"}])
+        self.fake.policy_present = False
+        self.assertEqual(self.run_batch()["blocker_code"], "GITHUB_WRITE_NOT_AUTHORIZED")
+        self.assertEqual(self.mutated(), [])
+
+    def test_checkout_policy_never_authorizes_writes(self):
+        self.remote("https://github.com/Examplecorp/examplelab")
+        (self.worktree / ".pi").mkdir()
+        (self.worktree / ".pi/autonomy.yaml").write_text((ROOT / "templates/autonomy.yaml").read_text())  # grants comments
+        self.write([{"operation": "comment_issue", "repository": "Examplecorp/examplelab", "issue": 401,
+                     "body": "Done.", "rationale": "report"}])
+        self.fake.withheld = {"comment_on_issue"}
+        self.assertEqual(self.run_batch()["blocker_code"], "GITHUB_WRITE_NOT_AUTHORIZED")
+
+    def test_noop_batch_needs_no_permission(self):
+        self.remote("https://github.com/Examplecorp/examplelab")
+        self.write([{"operation": "update_issue", "repository": "Examplecorp/examplelab", "issue": 401,
+                     "title": "Issue 401", "rationale": "already so"}])
+        self.fake.withheld = {"create_github_issues", "comment_on_issue", "comment_on_pr", "create_pr"}
+        result = self.run_batch(apply=True)
+        self.assertEqual((result["status"], result["mutations_applied"]), ("COMPLETED", 0))
+        self.assertNotIn("authorization", provenance.get_run(self.records, result["run_id"])["github_integration"])
+
     def test_partial_mutation_failure_is_audited(self):
         self.remote("https://github.com/Examplecorp/examplelab")
         self.write([{"operation": "close_issue", "repository": "Examplecorp/examplelab", "issue": 401, "rationale": "done"},
@@ -720,15 +807,12 @@ class IssueClosingGateTest(unittest.TestCase):
                 self.assertRefused("Closes #401\n", "AUTONOMY_POLICY_INVALID")
 
     def test_github_without_the_base_branch_or_policy_defaults_to_refs(self):
-        grant = {"one_shot": True, "granted_by": "garden"}  # without one, a missing policy is not authorized
+        # Publication itself is refused then (test_missing_base_policy_or_branch_is_not_authorized).
         with self.subTest("no policy at the base commit"):
-            self.api.merge(self.REPO)
-            self.assertRefused("Closes #401\n", grant=grant)
+            commit = self.api.merge(self.REPO)
+            self.assertEqual(gi.remote_issue_reference(self.REPO, commit, self.api), ("refs", None))
         with self.subTest("no base branch on GitHub"):
-            self.api.heads.clear()
-            self.assertRefused("Closes #401\n", grant=grant)
-            result = self.dry_run("Refs #401\n", grant=grant)
-            self.assertEqual((result["status"], result["plan"]["base_commit"]), ("DRY_RUN", None))
+            self.assertEqual(gi.remote_issue_reference(self.REPO, None, self.api), ("refs", None))
 
     def test_base_branch_name_outside_the_api_charset_is_refused(self):
         self.git("branch", "rel@1")
@@ -744,7 +828,6 @@ class IssueClosingGateTest(unittest.TestCase):
     # --- publication permissions (push_branch, create_pr) come from the base policy on GitHub only ---
 
     NOT_AUTHORIZED = "PUBLICATION_NOT_AUTHORIZED"
-    GRANT = {"one_shot": True, "granted_by": "garden"}
 
     def withhold_on_github(self):
         """The base branch on GitHub withholds push_branch and create_pr (the template default)."""
@@ -810,7 +893,7 @@ class IssueClosingGateTest(unittest.TestCase):
         self.api.heads.clear()  # and no base branch on GitHub at all
         self.assertRefused("Refs #401\n", self.NOT_AUTHORIZED)
 
-    def test_invalid_or_symlinked_base_policy_fails_closed_even_with_a_grant(self):
+    def test_invalid_or_symlinked_base_policy_fails_closed(self):
         sha = "c" * 40
         for code, entry in (("AUTONOMY_POLICY_INVALID", {"type": "file", "path": ".pi/autonomy.yaml", "sha": sha,
                                                          "text": "profile: yolo\n"}),
@@ -821,23 +904,16 @@ class IssueClosingGateTest(unittest.TestCase):
             with self.subTest(code=code, path=entry["path"]):
                 self.api.merge(self.REPO, entry=entry)
                 self.assertRefused("Refs #401\n", code)
-                self.assertRefused("Refs #401\n", code, grant=self.GRANT)
 
     def test_caller_base_cannot_supply_authority(self):
-        # The reviewer's probe: main withholds, but a branch on GitHub (reachable through one grant) grants.
+        # The reviewer's probe: main withholds, but a branch on GitHub (reachable through one push) grants.
         self.withhold_on_github()
-        main_commit = self.api.heads[(self.REPO.casefold(), "main")]
         self.api.merge(self.REPO, self.template + "# evil\n", branch="pico/evil-base")
         self.git("branch", "pico/evil-base")
         for text in ("Refs #401\n", "Closes #401\n"):
             with self.subTest(text=text):
-                self.assertRefused(text, self.NOT_AUTHORIZED, base="pico/evil-base")
-        # Granting through the grant is the only way, and the plan shows where authority came from.
-        granted = self.dry_run("Refs #401\n", base="pico/evil-base", grant=self.GRANT)
-        self.assertEqual((granted["plan"]["authorization"], granted["plan"]["policy_branch"],
-                          granted["plan"]["policy_commit"], granted["plan"]["base"]),
-                         ("one_shot_grant", "main", main_commit, "pico/evil-base"))
-        self.assertEqual(granted["plan"]["base_commit"], self.api.heads[(self.REPO.casefold(), "pico/evil-base")])
+                refused = self.assertRefused(text, self.NOT_AUTHORIZED, base="pico/evil-base")
+                self.assertIsNone(refused["plan"])
         self.assertIn(("default_branch", self.REPO), self.api.reads)
 
     def test_default_branch_policy_authorizes_a_different_pr_base(self):
@@ -875,17 +951,24 @@ class IssueClosingGateTest(unittest.TestCase):
         revoked = self.dry_run("Refs #401\n", apply=True, expected_plan_hash=fresh["plan_hash"])
         self.assertEqual((revoked["blocker_code"], revoked["mutations_applied"]), (self.NOT_AUTHORIZED, 0))
 
-    def test_one_shot_grant_covers_a_base_policy_that_withholds(self):
+    def test_publication_has_no_override_for_a_withholding_base_policy(self):
+        # The one-shot grant was removed (#59): anyone holding the Garden token, an agent included, could confirm it.
+        self.assertNotIn("grant", inspect.signature(gi.publish).parameters)
+        self.assertNotIn("grant", inspect.signature(workspace_contracts.publish).parameters)
         self.withhold_on_github()
-        granted = self.dry_run("Refs #401\n", grant=self.GRANT)
-        self.assertEqual((granted["status"], granted["plan"]["authorization"]), ("DRY_RUN", "one_shot_grant"))
-        self.assertEqual(granted["plan"]["publication_permissions"], {"push_branch": False, "create_pr": False})
-        self.assertEqual(granted["plan"]["policy_blob"],
-                         self.api.policies[(self.REPO.casefold(), granted["plan"]["base_commit"])]["sha"])
-        self.assertRefused("Refs #401\n", self.NOT_AUTHORIZED, grant={"one_shot": False, "granted_by": "garden"})
-        # The reviewed plan cannot be applied without the grant.
-        plain = self.dry_run("Refs #401\n", apply=True, expected_plan_hash=granted["plan_hash"])
-        self.assertEqual(plain["blocker_code"], self.NOT_AUTHORIZED)
+        refused = self.assertRefused("Refs #401\n", self.NOT_AUTHORIZED)
+        self.assertNotIn("authorization", provenance.get_run(self.records, refused["run_id"])["github_integration"])
+        # Withholding one permission is enough to refuse, and the reason names it.
+        self.api.merge(self.REPO, self.template.replace("create_pr: true", "create_pr: false"))
+        refused = self.assertRefused("Refs #401\n", self.NOT_AUTHORIZED)
+        reason = provenance.get_run(self.records, refused["run_id"])["github_integration"]["reason"]
+        self.assertTrue(reason.startswith("create_pr must be granted"), reason)
+
+    def test_authorized_publication_records_policy_permissions_and_commit(self):
+        result = self.dry_run("Refs #401\n")
+        self.assertEqual(provenance.get_run(self.records, result["run_id"])["github_integration"]["authorization"],
+                         {"source": "policy", "permissions": ["push_branch", "create_pr"],
+                          "policy_commit": self.api.heads[(self.REPO.casefold(), "main")]})
 
     def test_policy_drift_is_reported_but_never_grants(self):
         self.commit(self.template.replace("create_pr: true", "create_pr: false"), "local copy withholds more")
@@ -895,10 +978,7 @@ class IssueClosingGateTest(unittest.TestCase):
         self.assertEqual(self.dry_run("Refs #401\n")["plan_hash"], result["plan_hash"])  # drift is not in the plan
         self.withhold_on_github()
         self.commit(self.template, "local copy grants more")
-        self.assertRefused("Refs #401\n", self.NOT_AUTHORIZED)
-        granted = self.dry_run("Refs #401\n", grant=self.GRANT)
-        self.assertEqual(granted["policy_drift"], ["create_pr", "push_branch"])
-        self.assertEqual(granted["plan"]["authorization"], "one_shot_grant")
+        self.assertRefused("Refs #401\n", self.NOT_AUTHORIZED)  # a local copy that grants more never authorizes
 
 
 if __name__ == "__main__":

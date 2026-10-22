@@ -1001,7 +1001,11 @@ The parent validates and dry-runs the proposals with `--proposals <file>`;
 after checking the plan against the user's authorization and policy, only the
 parent may add `--apply --plan-hash <dry-run plan_hash>` (and
 `--allow-destructive` for close/remove). If GitHub state changes, the hash
-check blocks the batch and the parent must review a new dry-run. This
+check blocks the batch and the parent must review a new dry-run. Each write
+also needs its permission in `.pi/autonomy.yaml` on the default branch on
+GitHub (`create_github_issues`, `comment_on_issue`, `comment_on_pr`, and
+`create_pr` for `update_pr`; `github-push` needs `create_github_issues`);
+report `GITHUB_WRITE_NOT_AUTHORIZED` to the user and never work around it. This
 constrained adapter owns every external GitHub write. It writes a provenance
 record for completed, blocked, failed, partial, and dry-run batches in the
 orchestrator's `provenance/runs/`, even when no issue changed. Continue with

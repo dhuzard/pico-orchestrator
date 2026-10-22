@@ -619,8 +619,12 @@ class BacklogGithubCompositionTest(unittest.TestCase):
         self.repo_root = make_repo_root(Path(self._tmp.name))
         self._repo_patch = patch.object(backlog_cli, "_repo_name", return_value="acme/repo")
         self._repo_patch.start()
+        # Issue writes are authorized by the default branch's policy on GitHub (#58); tested separately below.
+        self._authority_patch = patch.object(backlog_cli, "_require_issue_writes")
+        self.require_issue_writes = self._authority_patch.start()
 
     def tearDown(self):
+        self._authority_patch.stop()
         self._repo_patch.stop()
         self._tmp.cleanup()
 
@@ -659,6 +663,66 @@ class BacklogGithubCompositionTest(unittest.TestCase):
         item = store.backlog_get("ORCH-001", self.repo_root)
         self.assertEqual(item["github_issue"], 99)
         self.assertEqual(item["github_sync"]["remote_state"], "open")
+
+    def test_github_push_task_checks_issue_permission_before_every_write(self):
+        store.backlog_add(
+            title="Fix bug", description="Fix the bug.", version="v1", id="ORCH-001",
+            acceptance_criteria=["bug is fixed"], repo_root=self.repo_root,
+        )
+        refusal = backlog_cli.github_integration.IntegrationError(
+            "GITHUB_WRITE_NOT_AUTHORIZED", "create_github_issues must be granted")
+        self.require_issue_writes.side_effect = refusal
+        with patch.object(backlog_cli.gh, "create_issue") as mock_create:
+            with self.assertRaises(backlog_cli.github_integration.IntegrationError):
+                backlog_cli.github_push_task("ORCH-001", self.repo_root)
+        mock_create.assert_not_called()
+        self.require_issue_writes.assert_called_once_with("acme/repo")
+        self.assertIsNone(store.backlog_get("ORCH-001", self.repo_root).get("github_issue"))
+
+        # A linked item whose push would edit or close the issue is refused before either call.
+        store.backlog_update("ORCH-001", github_issue=5, repo_root=self.repo_root)
+        for target in ("planned", "ready", "in_progress", "review", "completed"):
+            store.backlog_update("ORCH-001", status=target, repo_root=self.repo_root)
+        remote = {"number": 5, "title": "Old title", "state": "open", "labels": [], "body": "", "url": "u"}
+        with patch.object(backlog_cli.gh, "view_issue", return_value=remote), \
+             patch.object(backlog_cli.gh, "edit_issue") as mock_edit, \
+             patch.object(backlog_cli.gh, "close_issue") as mock_close:
+            with self.assertRaises(backlog_cli.github_integration.IntegrationError):
+                backlog_cli.github_push_task("ORCH-001", self.repo_root, establish_baseline=True)
+        mock_edit.assert_not_called()
+        mock_close.assert_not_called()
+
+    def test_github_push_task_in_sync_needs_no_issue_permission(self):
+        store.backlog_add(
+            title="Fix bug", description="Fix the bug.", version="v1", id="ORCH-001",
+            github_issue=5, repo_root=self.repo_root,
+        )
+        self.require_issue_writes.side_effect = AssertionError("a push that writes nothing must not need permission")
+        remote = {"number": 5, "title": "Fix bug", "state": "open", "labels": [], "body": "", "url": "u"}
+        with patch.object(backlog_cli.gh, "view_issue", return_value=remote):
+            self.assertEqual(backlog_cli.github_push_task("ORCH-001", self.repo_root)["action"], ["no_change"])
+
+    def test_require_issue_writes_reads_the_default_branch_policy_on_github(self):
+        self._authority_patch.stop()
+        try:
+            template = (REPO_ROOT / "templates/autonomy.yaml").read_text()
+            for granted in (True, False):
+                text = template.replace("create_github_issues: true", f"create_github_issues: {str(granted).lower()}")
+                entry = {"type": "file", "path": ".pi/autonomy.yaml", "sha": "e" * 40, "text": text}
+                with self.subTest(granted=granted), \
+                     patch.object(backlog_cli.gh, "default_branch", return_value="main") as branch, \
+                     patch.object(backlog_cli.gh, "branch_head", return_value="f" * 40), \
+                     patch.object(backlog_cli.gh, "policy_file_at", return_value=entry) as policy:
+                    if granted:
+                        backlog_cli._require_issue_writes("acme/repo")
+                    else:
+                        with self.assertRaises(backlog_cli.github_integration.IntegrationError) as caught:
+                            backlog_cli._require_issue_writes("acme/repo")
+                        self.assertEqual(caught.exception.code, "GITHUB_WRITE_NOT_AUTHORIZED")
+                    branch.assert_called_once_with(repo="acme/repo")
+                    policy.assert_called_once_with("f" * 40, repo="acme/repo")
+        finally:
+            self._authority_patch.start()
 
     def test_github_push_task_close_guard_blocks_close_when_not_completed(self):
         store.backlog_add(

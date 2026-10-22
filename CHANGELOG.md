@@ -8,6 +8,17 @@ All notable changes to PICO are recorded here. The format follows
 
 ### Security
 
+- Issue and comment writes are enforced (#58). `github_integration.execute` and
+  `backlog github-push` read `create_github_issues`, `comment_on_issue` and `comment_on_pr`
+  (and `create_pr` for `update_pr`) from `.pi/autonomy.yaml` on the default branch on GitHub,
+  through the same API path as publication, and refuse with `GITHUB_WRITE_NOT_AUTHORIZED`
+  before any write; `execute` refuses the dry run too. No override exists.
+- Removed the Garden one-shot publication grant (#59). Whoever held the session token, an agent
+  included, could start its own `pico watch`, read the token and confirm a grant that the record
+  showed as `granted_by: garden`. Publication now needs `push_branch` and `create_pr` in the
+  default branch's policy. A Garden request that still sends `grant_once` is refused with
+  `CONTROL_BODY_INVALID`. Worker sandboxing, which would stop an agent going around PICO, is #63.
+
 - Publication permissions come from the default branch's policy on GitHub (issue #39).
   `github_integration.publish` took `push_branch` and `create_pr` from the checkout's own
   `.pi/autonomy.yaml`, which a worker can edit, commit on its `pico/` branch (it reaches the
@@ -21,16 +32,20 @@ All notable changes to PICO are recorded here. The format follows
 - Removed `backlog github-pr-create`: it ran `gh pr create` for any base and head with no
   permission check, dry run or plan hash. Open PRs with `github_integration --publish` (or
   `pico workspace publish`) and link them with `github-pr-link`.
-- Documented, not changed: `create_github_issues`, `comment_on_issue` and `comment_on_pr` are
-  not enforced by `github_integration.execute` or `backlog github-push` (#58); the Garden
-  one-shot grant trusts whoever holds the session token (#59).
 
 ### Changed
 
+- Behavior change (#58): with the `manual` profile, where every permission is off, backlog sync
+  (`github-push`), issue comments, issue edits and closing an issue on backlog completion are
+  refused until the repository's default branch enables `create_github_issues`,
+  `comment_on_issue` or `comment_on_pr`. Set them in `.pi/autonomy.yaml`, commit it and merge it.
+- Behavior change (#59): the Garden no longer offers "Allow push and PR for this PR only".
+  Publication records carry `authorization: {source: policy, permissions, policy_commit}`;
+  `one_shot_grant` appears only in older records.
 - Behavior change: a local-only permission edit no longer authorizes publication. Uncommitted,
   locally committed or `pico/`-branch changes to `.pi/autonomy.yaml` are ignored for
   `push_branch`/`create_pr`; the policy must be on the default branch on GitHub. A missing
-  policy is `PUBLICATION_NOT_AUTHORIZED` (the Garden one-shot grant is unchanged). A symlinked
+  policy is `PUBLICATION_NOT_AUTHORIZED`. A symlinked
   `.pi` or policy in the checkout is refused with `AUTONOMY_POLICY_PATH_UNSAFE`; a dirty copy is
   ignored. The plan records `policy_branch`, `policy_commit`, `policy_blob` (always; replaces
   `issue_policy_blob`), `publication_permissions` and `base_commit`, all bound by the plan hash.

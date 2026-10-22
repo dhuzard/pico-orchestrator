@@ -27,6 +27,15 @@ OPERATIONS = {
     "update_pr", "comment_pr", "create_label", "add_label", "remove_label",
 }
 DESTRUCTIVE = {"close_issue", "remove_label"}
+# The `.pi/autonomy.yaml` permission each operation needs (#58). Labels count as issue
+# management; editing a PR's title or body needs the PR permission.
+WRITE_PERMISSIONS = {
+    "create_issue": "create_github_issues", "update_issue": "create_github_issues",
+    "close_issue": "create_github_issues", "reopen_issue": "create_github_issues",
+    "create_label": "create_github_issues", "add_label": "create_github_issues",
+    "remove_label": "create_github_issues", "comment_issue": "comment_on_issue",
+    "comment_pr": "comment_on_pr", "update_pr": "create_pr",
+}
 FIELDS = {
     "create_issue": {"title", "body"},
     "update_issue": {"issue", "title", "body"},
@@ -313,6 +322,14 @@ def execute(*, worktree: Path, proposal_file: Path, explicit_repo: str | None = 
         proposals = validate_proposals(raw, repo)
         plan = build_plan(proposals, repo, adapter)
         meta["mutations_planned"] = sum(not x["noop"] for x in plan)
+        # Every write the plan would make needs its permission in the default branch's policy on
+        # GitHub; the dry run is refused too, so a reviewer never approves a batch that cannot run.
+        needed = [WRITE_PERMISSIONS[x["operation"]] for x in plan if not x["noop"]]
+        if needed:
+            authority = authority_policy(repo, adapter)
+            authorize(authority["policy"], needed, "GITHUB_WRITE_NOT_AUTHORIZED")
+            meta["authorization"] = {"source": "policy", "permissions": sorted(set(needed)),
+                                     "policy_commit": authority["commit"]}
         if not apply:
             outcome = "dry_run"
         else:
@@ -410,33 +427,28 @@ def read_with_provenance(*, worktree: Path, explicit_repo: str | None = None,
             "target_repository": meta["target_repository"], "data": data}
 
 
-ONE_SHOT_PERMISSIONS = ("push_branch", "create_pr")
+PUBLICATION_PERMISSIONS = ("push_branch", "create_pr")
 
 
-def _publication_authority(policy: dict | None, grant: dict | None = None) -> dict:
-    """Authorize publication from the base-branch autonomy policy, or from a one-shot grant.
+def authorize(policy: dict | None, required, code: str) -> dict:
+    """Authorize a GitHub write from the default-branch autonomy policy alone.
 
     `policy` is the schema-valid `.pi/autonomy.yaml` GitHub reports at the
-    verified base commit (`_remote_policy`), or None when the base has none.
-    The working tree is never consulted: a worker can edit, commit or
-    symlink its own copy. A grant is passed in process only (never from the
-    command line) by a caller that has shown the exact reviewed plan and
-    obtained an explicit confirmation for it, such as the Garden. It covers
-    only the permissions the authorizing policy withholds for this single
-    publication; an unreadable or invalid authorizing policy is never overridden.
+    repository's default branch (`authority_policy`), or None when it has
+    none. The working tree is never consulted: a worker can edit, commit or
+    symlink its own copy. There is no override: the Garden one-shot grant was
+    removed (#59) because whoever holds the session token, an agent included,
+    could confirm it. Raises `code` naming every missing permission.
     """
     permissions = (policy or {}).get("permissions") or {}
-    evaluated = {name: permissions.get(name) is True for name in ONE_SHOT_PERMISSIONS}
-    missing = [name for name in ONE_SHOT_PERMISSIONS if not evaluated[name]]
-    if not missing:
-        return {"source": "policy", "granted_by": None, "granted": [], "permissions": evaluated}
-    if not (isinstance(grant, dict) and grant.get("one_shot") is True
-            and isinstance(grant.get("granted_by"), str) and re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", grant["granted_by"])):
-        detail = ".pi/autonomy.yaml on the default branch on GitHub is required for publication" if policy is None \
-            else "push_branch and create_pr must be granted by .pi/autonomy.yaml on the default branch on GitHub"
-        raise IntegrationError("PUBLICATION_NOT_AUTHORIZED", detail)
-    return {"source": "one_shot_grant", "granted_by": grant["granted_by"], "granted": missing,
-            "permissions": evaluated}
+    names = list(dict.fromkeys(required))
+    evaluated = {name: permissions.get(name) is True for name in names}
+    missing = [name for name in names if not evaluated[name]]
+    if missing:
+        detail = ".pi/autonomy.yaml on the default branch on GitHub is required" if policy is None \
+            else f"{' and '.join(missing)} must be granted by .pi/autonomy.yaml on the default branch on GitHub"
+        raise IntegrationError(code, detail)
+    return evaluated
 
 
 def _policy_drift(worktree: Path, policy: dict | None) -> list[str]:
@@ -678,7 +690,7 @@ def _publication_state(worktree: Path, repo: str, base: str, head: str, adapter=
 def publish(*, worktree: Path, base: str, head: str, title: str, body_file: Path,
             explicit_repo: str | None = None, apply: bool = False,
             expected_plan_hash: str | None = None, adapter=gh,
-            provenance_root: Path = ORCHESTRATOR_ROOT, grant: dict | None = None,
+            provenance_root: Path = ORCHESTRATOR_ROOT,
             closes_issue: int | None = None) -> dict:
     """Dry-run and publish one reviewed pico branch through a fixed, non-force path.
 
@@ -716,8 +728,9 @@ def publish(*, worktree: Path, base: str, head: str, title: str, body_file: Path
         authority = authority_policy(repo, adapter)
         policy, policy_blob = authority["policy"], authority["blob"]
         base_commit = authority["commit"] if base == authority["branch"] else _remote_base_commit(repo, base, adapter)
-        authorization = _publication_authority(policy, grant)
-        meta["authorization"] = {k: v for k, v in authorization.items() if k != "permissions"}
+        permissions = authorize(policy, PUBLICATION_PERMISSIONS, "PUBLICATION_NOT_AUTHORIZED")
+        meta["authorization"] = {"source": "policy", "permissions": list(PUBLICATION_PERMISSIONS),
+                                 "policy_commit": authority["commit"]}
         drift = _policy_drift(worktree, policy)
         head = _branch(worktree, head, head=True)
         if base == head:
@@ -734,9 +747,9 @@ def publish(*, worktree: Path, base: str, head: str, title: str, body_file: Path
                                            closes_issue=closes_issue)
         plan = {"repository": repo, "base": base, "head": head, **state,
                 "title": title, "body_sha256": hashlib.sha256(body.encode()).hexdigest(), "draft": True,
-                "authorization": authorization["source"], **reference, "policy_branch": authority["branch"],
+                "authorization": "policy", **reference, "policy_branch": authority["branch"],
                 "policy_commit": authority["commit"], "policy_blob": policy_blob,
-                "publication_permissions": authorization["permissions"]}
+                "publication_permissions": permissions}
         digest = hashlib.sha256(json.dumps(plan, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         meta["mutations_planned"] = int(state["remote_commit"] != state["commit"]) + int(state["existing_pr"] is None)
         if not apply:

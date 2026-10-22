@@ -288,25 +288,36 @@ class GardenControlsTest(unittest.TestCase):
         self.act(action="validate", task="a1", head="pico/a1", confirm=preview["confirm"])
         return commit
 
-    def test_one_shot_grant_publishes_without_changing_the_policy(self):
-        commit = self.validated_a1()
+    def test_publication_has_no_one_shot_grant(self):
+        # Removed (#59): whoever holds the session token, an agent included, could confirm a grant.
+        self.validated_a1()
         _, refused = self.act(action="publish", task="a1")
-        self.assertEqual((refused["error_code"], refused["grantable"]), ("PUBLICATION_NOT_AUTHORIZED", True))
-        _, plain = self.act(action="publish", task="a1", grant_once=True)
-        self.assertEqual((plain["stage"], plain["preview"]["authorization"]), ("preview", "one_shot_grant"))
-        # A confirmation for the granted plan cannot be replayed without the grant, and vice versa.
-        _, mismatch = self.act(action="publish", task="a1", confirm=plain["confirm"])
-        self.assertEqual(mismatch["error_code"], "PUBLICATION_NOT_AUTHORIZED")
-        _, done = self.act(action="publish", task="a1", grant_once=True, confirm=plain["confirm"])
+        self.assertEqual((refused["stage"], refused["error_code"]), ("refused", "PUBLICATION_NOT_AUTHORIZED"))
+        self.assertNotIn("grantable", refused)
+        self.assertIn("merge it into the default branch", refused["error"])
+        for confirm in (None, "0" * 64):
+            with self.subTest(confirm=confirm):
+                _, granted = self.act(action="publish", task="a1", grant_once=True, confirm=confirm)
+                self.assertEqual((granted["stage"], granted["error_code"]), ("refused", "CONTROL_BODY_INVALID"))
+        self.assertEqual(self.fake.created, [])
+        self.assertFalse((self.repos["alpha"][0] / ".pi" / "autonomy.yaml").exists())
+
+    def test_policy_publication_records_policy_authorization(self):
+        commit = self.validated_a1()
+        policy = (REPO_ROOT / "templates/autonomy.yaml").read_text().replace(
+            "push_branch: false", "push_branch: true").replace("create_pr: false", "create_pr: true")
+        self.fake.merge_policy("acme/alpha", policy)
+        _, preview = self.act(action="publish", task="a1")
+        self.assertEqual((preview["stage"], preview["preview"]["authorization"]), ("preview", "policy"))
+        _, done = self.act(action="publish", task="a1", confirm=preview["confirm"])
         self.assertEqual((done["status"], done["pr"]), ("COMPLETED", 101))
         self.assertEqual(git("--git-dir", str(self.bare["alpha"]), "rev-parse", "refs/heads/pico/a1"), commit)
-        self.assertFalse((self.repos["alpha"][0] / ".pi" / "autonomy.yaml").exists())
         record = wr.load_workspace(wr.workspace_record_path("ws"))
         run_id = record["tasks"]["a1"]["observed"]["pr"]["publication_run_id"]
         publication = json.loads((self.state / "runs" / f"{run_id}.json").read_text())
-        self.assertEqual(publication["github_integration"]["authorization"],
-                         {"source": "one_shot_grant", "granted_by": "garden", "granted": ["push_branch", "create_pr"]})
-        self.assertEqual(record["garden_actions"][-1]["authorization"], "one_shot_grant")
+        authorization = publication["github_integration"]["authorization"]
+        self.assertEqual((authorization["source"], authorization["permissions"]), ("policy", ["push_branch", "create_pr"]))
+        self.assertEqual(record["garden_actions"][-1]["authorization"], "policy")
 
     def test_garden_toggle_does_not_authorize_publication_until_it_reaches_the_base(self):
         self.validated_a1()
@@ -315,7 +326,7 @@ class GardenControlsTest(unittest.TestCase):
         git("-C", str(alpha), "config", "user.email", "t@example.com")
         for permission in ("push_branch", "create_pr"):
             _, preview = self.act(action="set_permission", repository="alpha", permission=permission, value=True)
-            self.assertIn("no effect on publication until it is committed and pushed", preview["preview"]["note"])
+            self.assertIn("no effect on them until it is committed and pushed", preview["preview"]["note"])
             self.act(action="set_permission", repository="alpha", permission=permission, value=True,
                      confirm=preview["confirm"])
         _, refused = self.act(action="publish", task="a1")  # the toggled copy is uncommitted

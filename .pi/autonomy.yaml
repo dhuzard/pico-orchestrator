@@ -1,6 +1,8 @@
 # PICO's own execution authority policy, read when PICO orchestrates work in
 # this repository. Every permission stays off, as when this file did not exist;
-# grant one deliberately (for example from the Garden) when it is needed.
+# grant one deliberately when it is needed. GitHub writes (push, PR, issues,
+# comments) read this file from the default branch on GitHub only, so a change
+# takes effect once it is merged.
 profile: manual
 
 pr_granularity: batch
