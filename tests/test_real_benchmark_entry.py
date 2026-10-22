@@ -39,6 +39,18 @@ else:
 os.execv(sys.executable, [sys.executable, *argv])
 '''
 
+RECORDING_PICO = '''#!{python}
+"""Records each `pico` argv and answers `schedule` with an empty plan: enough to check what run_real asks for."""
+import json, os, sys
+with open(os.environ["ARGV_LOG"], "a") as log:
+    log.write(json.dumps(sys.argv[1:]) + "\\n")
+records = os.path.join(os.environ["PI_CODING_ORCHESTRATOR_STATE_DIR"], "workspaces")
+os.makedirs(records, exist_ok=True)
+with open(os.path.join(records, "pico-bench.json"), "w") as record:
+    json.dump({{"record_version": 1, "workspace_id": "pico-bench", "tasks": {{}}}}, record)
+print(json.dumps({{"status": "NOTHING_DISPATCHABLE", "tasks": []}}))
+'''
+
 
 def clean_env() -> dict:
     return {k: v for k, v in os.environ.items() if not k.startswith(("PICO_REAL", "PI_ORCHESTRAT", "PI_CODING", "FAKE_"))}
@@ -140,6 +152,48 @@ class EntryPointRunTest(unittest.TestCase):
             self.assertEqual(resumed.returncode, 0, resumed.stderr)
             self.assertTrue(json.loads((out / "report.json").read_text())["continued"])
             self.assertEqual(json.loads((out / "report.json").read_text())["metrics"]["totals"]["tasks"]["completed"], 1)
+
+    def test_sandbox_mode_commits_the_policy_bounds_the_budget_and_keeps_the_access_check(self):
+        head = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            bin_dir = base / "bin"
+            bin_dir.mkdir()
+            (bin_dir / "pi").write_text("#!/bin/sh\nexit 0\n")
+            (bin_dir / "pico").write_text(RECORDING_PICO.format(python=sys.executable))
+            for tool in bin_dir.iterdir():
+                tool.chmod(0o755)
+            log = base / "argv.jsonl"
+            env = {**clean_env(), "PICO_REAL_BENCHMARK": "1", "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+                   "HOME": str(base), "ARGV_LOG": str(log)}
+            out = base / "run"
+            sandbox = ["--owner", "someone", "--publication", "--max-tokens", "120000", "--issue", "lib-slugify=3"]
+            # Publication for an owner other than the default needs the explicit ownership confirmation.
+            refused = subprocess.run([sys.executable, str(RUN_REAL), head, "sandbox", "--output-dir", str(out), *sandbox],
+                                     env=env, capture_output=True, text=True, check=False)
+            self.assertEqual(refused.returncode, 2, refused.stderr)
+            self.assertFalse(out.exists())
+            done = subprocess.run([sys.executable, str(RUN_REAL), head, "sandbox", "--output-dir", str(out), *sandbox,
+                                   "--i-own-these-repos"], env=env, capture_output=True, text=True, check=False)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            import yaml
+            manifest = yaml.safe_load((out / "work" / "workspace.yaml").read_text())
+            self.assertEqual(manifest["budget"], {"max_tokens": 120000})
+            self.assertEqual(manifest["repositories"][0]["repository"], "someone/synth-lib")
+            self.assertEqual({t["id"]: t.get("issue") for t in manifest["tasks"]}["lib-slugify"], 3)
+            self.assertTrue((out / "work" / "synth-lib" / ".pi" / "autonomy.yaml").is_file())
+            marker = json.loads((out / "run.json").read_text())
+            self.assertEqual((marker["publication"], marker["max_tokens"], marker["issues"]), (True, 120000, {"lib-slugify": 3}))
+            report = json.loads((out / "report.json").read_text())
+            self.assertEqual((report["publication"], report["access_check"]), (True, True))
+            # --continue reuses the recorded mode: the access check stays on.
+            again = subprocess.run([sys.executable, str(RUN_REAL), head, "sandbox", "--output-dir", str(out), "--continue"],
+                                   env=env, capture_output=True, text=True, check=False)
+            self.assertEqual(again.returncode, 0, again.stderr)
+            schedules = [json.loads(line) for line in log.read_text().splitlines() if json.loads(line)[:2] == ["workspace", "schedule"]]
+            self.assertEqual(len(schedules), 2)
+            for argv in schedules:
+                self.assertNotIn("--no-access-check", argv)
 
 
 if __name__ == "__main__":

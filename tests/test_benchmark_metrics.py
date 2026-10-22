@@ -513,8 +513,10 @@ class SyntheticWorkspace(unittest.TestCase):
             check = tasks[task]["checks"][0]
             cwd = {"synth-lib": lib, "synth-app": app}[check["repository"]]
             self.assertEqual(run_check(check["argv"], cwd), 0, f"{task} must pass with the reference solution")
-        qualify = tasks["qualify-integration"]["checks"][0]
-        self.assertEqual(run_check(qualify["argv"], app), 0)
+        qualify = tasks["qualify-integration"]["checks"]
+        self.assertEqual([c["repository"] for c in qualify], ["synth-app", "synth-lib"])
+        for check in qualify:
+            self.assertEqual(run_check(check["argv"], {"synth-lib": lib, "synth-app": app}[check["repository"]]), 0)
         # The PARTIAL task cannot be satisfied without the missing input.
         self.assertNotEqual(run_check(tasks["lib-stopwords"]["checks"][0]["argv"], lib), 0)
         self.assertFalse((lib / "data" / "approved-stopwords.txt").exists())
@@ -528,6 +530,14 @@ class SyntheticWorkspace(unittest.TestCase):
         self.assertTrue(policy["permissions"]["push_branch"] and policy["permissions"]["create_pr"])
         self.assertFalse(policy["permissions"]["merge"]["enabled"])
         self.assertEqual({t["id"]: t.get("issue") for t in yaml.safe_load(on.read_text())["tasks"]}["lib-slugify"], 7)
+
+    def test_max_tokens_bounds_the_budget(self):
+        self.assertEqual(yaml.safe_load(self.manifest("default").read_text())["budget"], {"max_tokens": 5_000_000})
+        bounded = self.manifest("bounded", max_tokens=120_000)
+        self.assertEqual(yaml.safe_load(bounded.read_text())["budget"], {"max_tokens": 120_000})
+        for bad in (0, -1, True):
+            with self.assertRaises(self.setup.SetupError):
+                self.setup.create(self.base / f"bad-{bad}", max_tokens=bad)
         with self.assertRaises(self.setup.SetupError):
             self.setup.create(self.base / "bad", issues={"nope": 1})
 

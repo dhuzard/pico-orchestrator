@@ -72,7 +72,11 @@ class HappyMultiRepoTest(SyntheticPilot):
         self.assertEqual(self.states(third), {"lib-slugify": "ready_for_downstream", "lib-stopwords": "partial",
                                               "app-post-url": "ready_for_downstream", "qualify-integration": "validated"})
         qualification = self.workspace()["tasks"]["qualify-integration"]["observed"]["validation"]
-        self.assertEqual((qualification["status"], sorted(qualification["commits"])), ("passed", ["synth-app"]))
+        # Both repositories, each at the commit its dependency was validated at.
+        observed = self.workspace()["tasks"]
+        self.assertEqual((qualification["status"], qualification["commits"]),
+                         ("passed", {"synth-app": observed["app-post-url"]["observed"]["validated_commit"],
+                                     "synth-lib": observed["lib-slugify"]["observed"]["validated_commit"]}))
         # Draft PRs only; nothing merges.
         self.assertEqual([(pr["repo"], pr["draft"]) for pr in self.fake.created],
                          [("pico-bench-sandbox/synth-lib", True), ("pico-bench-sandbox/synth-app", True)])

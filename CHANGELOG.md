@@ -132,6 +132,11 @@ All notable changes to PICO are recorded here. The format follows
 
 ### Added
 
+- The synthetic benchmark kit can drive the sandbox run of #4. `run_real.py` passes
+  `--publication`, `--i-own-these-repos` and `--issue` to setup and, in that mode, keeps the
+  repository access check of `pico workspace schedule` (a missing repository fails closed);
+  `--continue` reuses the recorded mode. `setup.py` and `run_real.py` take `--max-tokens` for a
+  bounded budget. The qualification task now checks both repositories at their validated commits.
 - The synthetic pilot as the main regression benchmark (issue #49), in two separate parts.
   `tests/test_synthetic_pilot.py` is a deterministic integration suite that runs in CI on every
   pull request, with no model, network or tokens: the synthetic workspace goes through the real
