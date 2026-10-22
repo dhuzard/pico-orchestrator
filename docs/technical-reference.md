@@ -675,6 +675,9 @@ and confirm a grant that the record then showed as `granted_by: garden`.
 Agent-side tool denylists do not fully stop a same-user process: one can still
 call `gh` directly, so they are not a substitute for branch protection.
 Running workers in a sandbox limited to their worktree is tracked in #63.
+The containment tests this needs, and the separation of planning, execution, publication
+and promotion authority for the queue dispatcher (#34), are in
+[`docs/containment-and-authority.md`](containment-and-authority.md).
 
 The trust boundary stops at the push. The branch push itself still runs
 through local git (`git push` with the checkout's remote and config), so a
