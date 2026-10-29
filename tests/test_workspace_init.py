@@ -852,7 +852,7 @@ class DisplayEscapingTest(_Fixture):
         self.assertEqual(raw_controls(out + err), [])
         shown_root = wi.display(root)
         self.assertIn("\\x1b[2J\\n[*] spoof\\u202e", shown_root)
-        for needle in (f"Discovery root [{shown_root}]: ", f"Searched ", f"below {shown_root} ",
+        for needle in (f"Discovery root [{shown_root}]: ", "Searched ", f"below {shown_root} ",
                        "1esc\\x1b[31mred\\x1b]0;title\\x07  acme/alpha", "2nl\\n  [*]   7. fake  acme/fake  acme/beta",
                        "3c1\\u009b2J\\u2066x\\u2028y\\u2029z\\rcr\\ttab\\x7f  acme/remote",
                        f"  not selectable: 4bytes\\xff: {wi.NOT_UTF8_PATH}",
@@ -882,7 +882,7 @@ class DisplayEscapingTest(_Fixture):
         self.assertEqual(raw_controls(out), [])
         self.assertIn(f"remote-only at {shown_root}/later\\x1b[1m\\u202e (not cloned)", out)
         # The search matches the raw name ("red" follows an ESC) and the escape the user sees.
-        for search, expected in zip(out.split("Select> ")[2:4], ("1esc", "5amb")):
+        for search, expected in zip(out.split("Select> ")[2:4], ("1esc", "5amb"), strict=True):
             rows = [line for line in search.split("\n") if line.startswith("  [")]
             self.assertEqual(len(rows), 1, search)
             self.assertIn(expected, rows[0])
@@ -991,7 +991,7 @@ class DisplayEscapingTest(_Fixture):
         for needle in (f"remote-only, expected at {shown} (absent, not cloned)",
                        f"  later is not cloned: the planner reports WORKSPACE_REPOSITORY_PATH_MISSING until it is "
                        f"checked out at {shown} with commit {REMOTE_HEAD}",
-                       f"    WORKSPACE_REPOSITORY_PATH_MISSING (repository later): ", shown,
+                       "    WORKSPACE_REPOSITORY_PATH_MISSING (repository later): ", shown,
                        "Preview only: nothing was written"):
             self.assertIn(needle, out)
 

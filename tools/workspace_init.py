@@ -1067,7 +1067,7 @@ def run_interactive(p: Prompter, *, root_default: Path, output: str | None, cwd:
         p.say("Enter a whole number from 1 to 64.")
     entries: list[Entry] = []
     taken: set[str] = set()
-    for cand, identity in zip(chosen, identities):
+    for cand, identity in zip(chosen, identities, strict=True):
         default = slugify(cand.path.name if not cand.remote else identity.split("/", 1)[1], taken)
         entry_id = _ask_slug(p, f"Repository id for {display(identity)} [{default}]: ", default, taken)
         taken.add(entry_id)
