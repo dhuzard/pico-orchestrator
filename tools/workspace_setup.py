@@ -31,8 +31,8 @@ class SetupControls(garden_controls.Controls):
         candidates = []
         for candidate in found.candidates:
             path = candidate.path
-            def git(*args: str) -> str | None:
-                result = subprocess.run(["git", "-C", str(path), *args], capture_output=True, text=True,
+            def git(*args: str, checkout: Path = path) -> str | None:
+                result = subprocess.run(["git", "-C", str(checkout), *args], capture_output=True, text=True,
                                         timeout=10, shell=False)
                 return result.stdout.strip() if result.returncode == 0 else None
             dirty = git("status", "--porcelain")
