@@ -102,6 +102,9 @@ class GardenControlsTest(unittest.TestCase):
                 self.assertNotIn("branches", data)
         status, data = self.request("GET", "/api/controls")
         self.assertEqual((status, data["enabled"]), (200, True))
+        self.assertEqual(data["action_view"]["schema_version"], 1)
+        self.assertEqual(len(data["action_view"]["state_id"]), 64)
+        self.assertIn("required_permissions", data["action_view"]["actions"][0])
         status, data = self.request("GET", "/api/branches?task=a1")
         self.assertEqual(status, 200)
         # With controls on, the polled views need the token too (audit S4).

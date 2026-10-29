@@ -518,7 +518,8 @@ function workspaceTaskCard(task) {
   if (task.readiness) meta.push(cap(task.readiness));
   if (task.launches) meta.push(`${task.launches} ${task.launches === 1 ? "launch" : "launches"}`);
   name.append(el("strong", "", task.id), el("small", "", meta.join(" · ")));
-  head.append(name, el("span", `ws-state ${tone}`, wsLabel(task.state)));
+  const display = controlState.panels?.action_view?.states?.find((row) => row.id === task.id)?.display;
+  head.append(name, el("span", `ws-state ${tone}`, display?.native === task.state ? display.label : wsLabel(task.state)));
   card.append(head);
   const facts = el("div", "ws-task-facts");
   if (task.blocked_by?.length) facts.append(el("p", "ws-chip blocked", `Blocked by ${task.blocked_by.join(", ")}`));
@@ -730,6 +731,8 @@ function renderActionsBar() {
   const button = el("button", "ws-action", scheduler.running ? "Scheduler running…" : "Schedule now…"); button.type = "button"; button.disabled = Boolean(scheduler.running);
   button.addEventListener("click", () => scheduleDialog(false));
   bar.append(button);
+  const schedule = controlState.panels?.action_view?.actions?.find((item) => item.action === "schedule");
+  if (schedule && !schedule.available) bar.append(el("small", "", `${schedule.refusal_code}: ${schedule.explanation}`));
   const tasks = state.workspace?.ok ? state.workspace.repositories.flatMap((repo) => repo.tasks) : [];
   if (tasks.some((task) => task.state === "needs_reconciliation")) {
     const resume = el("button", "ws-action", "Resume interrupted…"); resume.type = "button";
