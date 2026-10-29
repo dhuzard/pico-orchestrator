@@ -8,6 +8,7 @@ log any invocation, which the launcher tests assert never happens.
 from __future__ import annotations
 
 import contextlib
+import errno
 import io
 import json
 import os
@@ -826,9 +827,13 @@ class DisplayEscapingTest(_Fixture):
         heads = {ESC_NAME: make_repo(root / ESC_NAME, {"origin": "https://github.com/acme/alpha"}),
                  NEWLINE_NAME: make_repo(root / NEWLINE_NAME, {"origin": "https://github.com/acme/beta"}),
                  MIXED_NAME: make_repo(root / MIXED_NAME, {"origin": "https://github.com/acme/remote"}),
-                 BYTES_NAME: make_repo(root / BYTES_NAME, {"origin": "https://github.com/acme/bytes"}),
                  BIDI_NAME: make_repo(root / BIDI_NAME, {"origin": "https://github.com/acme/fork",
                                                          "upstream": "https://github.com/other/multi"})}
+        try:
+            heads[BYTES_NAME] = make_repo(root / BYTES_NAME, {"origin": "https://github.com/acme/bytes"})
+        except OSError as exc:  # macOS file systems refuse names that are not UTF-8
+            if exc.errno != errno.EILSEQ:
+                raise
         self.repos["acme/bytes"] = {"name": "acme/bytes", "heads": {"main": "e" * 40}}
         self.repos["other/multi"] = {"name": "other/multi", "heads": {"main": "d" * 40}}
         self.write_gh()
@@ -845,7 +850,7 @@ class DisplayEscapingTest(_Fixture):
         selectable = [name for name in heads if name != BYTES_NAME]  # github_integration cannot read its path
         self.assertEqual([c.path for c in found.candidates], [root / name for name in selectable])
         self.assertEqual([c.label for c in found.candidates], selectable)
-        self.assertEqual(found.skipped, [(BYTES_NAME, wi.NOT_UTF8_PATH)])
+        self.assertEqual(found.skipped, [(BYTES_NAME, wi.NOT_UTF8_PATH)] if BYTES_NAME in heads else [])
         answers = ["", "1-4", "d", "2", "ws-e", "Ship it", ""] + ["", "", ""] * 4 + ["", "yes"]
         rc, out, err = self.interact_in(root, answers)
         self.assertEqual(rc, 0, out + err)
@@ -855,7 +860,6 @@ class DisplayEscapingTest(_Fixture):
         for needle in (f"Discovery root [{shown_root}]: ", "Searched ", f"below {shown_root} ",
                        "1esc\\x1b[31mred\\x1b]0;title\\x07  acme/alpha", "2nl\\n  [*]   7. fake  acme/fake  acme/beta",
                        "3c1\\u009b2J\\u2066x\\u2028y\\u2029z\\rcr\\ttab\\x7f  acme/remote",
-                       f"  not selectable: 4bytes\\xff: {wi.NOT_UTF8_PATH}",
                        "5amb\\u202ecod.exe  ambiguous: acme/fork, other/multi",
                        "5amb\\u202ecod.exe has several GitHub remotes",
                        f"Save to [{shown_root}/ws-e.workspace.yaml]: ", f"Destination: {shown_root}/ws-e.workspace.yaml",
@@ -863,6 +867,8 @@ class DisplayEscapingTest(_Fixture):
                        f"Write {shown_root}/ws-e.workspace.yaml? Type yes", f"Saved {shown_root}/ws-e.workspace.yaml.",
                        "shown as escapes above; the file saves them unchanged"):
             self.assertIn(needle, out)
+        if BYTES_NAME in heads:
+            self.assertIn(f"  not selectable: 4bytes\\xff: {wi.NOT_UTF8_PATH}", out)
         lines = out.split("\n")
         self.assertFalse([line for line in lines if line.startswith(("[*] spoof", "  [*]   7. fake"))], lines)
         for heading in ("Repository resolution (verified by the builder, read-only):", "Warnings:",
