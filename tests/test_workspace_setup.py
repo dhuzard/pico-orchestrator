@@ -19,7 +19,7 @@ import workspace_setup  # noqa: E402
 class SetupTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         self.a = self.root / "alpha"
         self.b = self.root / "beta"
         self.head_a = make_repo(self.a, {"origin": "https://github.com/example/alpha.git"})
