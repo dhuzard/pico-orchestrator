@@ -52,6 +52,7 @@ import workspace_authorization  # noqa: E402
 import workspace_contracts  # noqa: E402
 import workspace_run  # noqa: E402
 import workspace_scheduler  # noqa: E402
+import workspace_action_view  # noqa: E402
 
 TASK_ACTIONS = ("validate", "publish", "ci", "promote", "cancel")
 WORKSPACE_ACTIONS = ("schedule", "set_permission", "approve_mutation", "commit_policy", "set_model", "reset_model")
@@ -191,9 +192,14 @@ class Controls:
         except Exception:  # model config problems are reported, never served in detail
             models = {"configured": None, "models": {}, "error_code": "MODEL_CONFIG_INVALID"}
         running = self._scheduler is not None and self._scheduler.is_alive()
+        record = workspace_run.load_workspace(workspace_run.workspace_record_path(plan["workspace_id"])) or {"tasks": {}}
+        entries = workspace_run.status(manifest=self.manifest, access_check=None)["tasks"]
+        budget = workspace_scheduler.budget_state(plan, record)
+        action_view = workspace_action_view.snapshot(plan, entries, budget=budget, scheduler_running=running)
         return {"repositories": repositories, "models": models,
                 "editable_permissions": list(EDITABLE_PERMISSIONS),
-                "scheduler": {"running": running, "last": self.last_schedule}}
+                "scheduler": {"running": running, "last": self.last_schedule},
+                "action_view": action_view}
 
     @staticmethod
     def _model_choices(summary: dict) -> dict:
