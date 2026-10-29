@@ -82,6 +82,8 @@ PICO runs on Linux and macOS, and on Windows through WSL2. You need:
 - [Task ambiguity and model capacity](docs/ambiguity.md) and
   [evaluating model capacity](docs/model-ambiguity-evaluation.md).
 - [Work modes](docs/work-modes.md): how the lead decomposes mixed work.
+- [Workspace manifest builder](docs/workspace-interactive-design.md):
+  `pico workspace init`, its builder spec and its safety rules.
 - [Orchestration guidance](docs/orchestration-guidance.md): how the policy
   maps to published orchestration guidance.
 - [Release checklist](docs/release-checklist.md) and
@@ -216,6 +218,23 @@ prompts or logs, and it never opens execution records.
 
 **Advanced: multi-repository workspaces.** The next sections plan, schedule
 and publish work across several repositories; skip them if you work in one.
+
+### Build a workspace manifest (`pico workspace init`)
+
+`pico workspace init` lists the Git checkouts below the current directory (or
+`--root DIR`), lets you search and select 2 to 64 of them by number, add a
+GitHub repository that is not cloned yet, and choose the identity of a
+checkout with several GitHub remotes (there is no default). It then verifies
+every repository read-only on GitHub, pins each local checkout at its `HEAD`
+(a repository that is not cloned yet at its default branch head) and previews
+the manifest, with one placeholder-titled task per repository unless you give
+a title, together with the planner's waves and blockers. The file
+(`<root>/<id>.workspace.yaml` or `--output`) is written only after you type
+`yes`, and never over an existing path. Nothing is cloned, fetched or
+launched, and the discovery root grants no permission. Without a terminal,
+use a builder spec: `pico workspace init --spec spec.yaml` previews and
+`--approve` saves. See [docs/workspace-interactive-design.md](docs/workspace-interactive-design.md)
+for the spec format, discovery bounds and exit codes.
 
 ### Plan a mission across several repositories (read-only)
 
@@ -823,7 +842,8 @@ checkpoints. Backend conversation history is never reused.
 | `WORKER_TASK_UNATTRIBUTED` / `WORKER_TASK_UNROUTED` / `WORKER_STEP_UNKNOWN` | Several tasks are routed and the worker call names none, names an unrouted task, or names a step outside its plan. |
 | `WAVE_UNDECLARED` | Workers of different tasks would overlap outside one declared wave. |
 | `INTEGRATION_IN_PROGRESS` | A worker launch while the parent integrates a wave. |
-| `WORKER_CONFIG_INVALID` | `PI_ORCHESTRATOR_WORKER_ENV_ALLOW` names an invalid variable, or `PI_ORCHESTRATOR_WORKER_SANDBOX` is not `0` or `1`. The worker is not started. |
+| `WORKER_CONFIG_INVALID` | `PI_ORCHESTRATOR_WORKER_ENV_ALLOW` names an invalid variable, `PI_ORCHESTRATOR_WORKER_SANDBOX` is not unset, `0` or `1`, or the worker sandbox cannot be expressed (the worktree, or a declared cache directory, overlaps a protected path). The worker is not started. |
+| `WORKER_SANDBOX_UNAVAILABLE` | A mutating Claude worker needs the OS sandbox (on by default) and it cannot start: no bubblewrap or socat on Linux, a bubblewrap that cannot create namespaces (for example AppArmor on Ubuntu 24.04+), an unsupported platform, or Claude Code's own `failIfUnavailable` refusal. The worker is not started. Install the prerequisites, or opt out explicitly with `PI_ORCHESTRATOR_WORKER_SANDBOX=0` (recorded on the run). |
 | `WORKER_SCOPE_VIOLATION` | The parent checkout changed during a worker call. Further workers are blocked; nothing is reverted. |
 | `MUTATION_MODE_MISMATCH` | The `AskClaude` `mode` differs from the routed step's mutation permission. |
 | `WORKER_TIMEOUT` / `WORKER_ABORTED` / `WORKER_OUTPUT_LIMIT` | A `ClaudeWorker` run exceeded `PI_CLAUDE_WORKER_TIMEOUT_MS` (default 30 min), was aborted, or exceeded its output cap; its Claude Code process is killed. |
@@ -840,6 +860,23 @@ Code model, and `--effort` from the route. A mutating step gets
 Agent. A read-only step gets only Read, Glob, and Grep. `git push`, `gh`,
 `git worktree`, and branch deletion are denied tools; other out-of-scope
 actions rely on the worker contract and the parent-checkout snapshot.
+A mutating Claude worker's shell commands also run in Claude Code's OS sandbox
+by default (bubblewrap and socat on Linux and WSL2, Seatbelt on macOS): they
+may write only in the bound worktree, its git metadata, the temp directory and
+cache directories the repository declares; they cannot read PICO's state
+directory, `~/.config/gh` or other credential files; and they have no network
+unless `.pi/autonomy.yaml` on the repository's default branch on GitHub
+allowlists hosts under `worker_sandbox` (pinned at run start; the checkout's
+copy is never used). Every Claude worker runs with hooks and MCP servers off.
+The user's own `~/.claude/settings.json` (`excludedCommands`, `allowWrite`,
+`allowedDomains`) still merges in and can widen the sandbox; PICO records
+which of those keys it sets. Declared cache directories are the user's real
+caches, so a worker can poison them. Without the prerequisites (bubblewrap
+that can create namespaces, socat, Claude Code 2.1.285 or later) the worker
+fails closed with `WORKER_SANDBOX_UNAVAILABLE`;
+`PI_ORCHESTRATOR_WORKER_SANDBOX=0` is the explicit opt-out and is recorded on
+the run. Codex workers and the lead are not sandboxed by PICO. Details and
+limits: "Worker sandbox" in [the technical reference](docs/technical-reference.md).
 Because every call has its own process directory, mutating Claude workers of
 one wave run concurrently. `AskClaude` remains accepted for read-only routed
 steps and outside parent runs. Its isolation and the repository check also

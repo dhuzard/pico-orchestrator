@@ -19,7 +19,15 @@ The parent orchestrator reads these values from it:
 - `pr_granularity`: `batch` (one push and one PR per integrated wave batch) or
   `task` (one PR per task);
 - `issue_reference`: `refs` (PR bodies say `Refs #N`, which never closes the
-  issue) or `closes` (`Closes #N`, so the issue closes when the PR merges).
+  issue) or `closes` (`Closes #N`, so the issue closes when the PR merges);
+- `worker_sandbox` (optional): what the OS sandbox around mutating Claude
+  workers may additionally reach, `network.allowed_domains` and
+  `cache_directories` (#63). The verdict always carries `worker_sandbox` with
+  both lists, empty by default (no network, no extra writable directory). The
+  sandbox itself is on unless the user sets PI_ORCHESTRATOR_WORKER_SANDBOX=0;
+  a repository cannot turn it off. The lifecycle never takes this section from
+  the working tree: tools/worker_sandbox_policy.py reads it from the default
+  branch on GitHub, like publication permissions.
 
 A repository without the file gets the defaults below. A file that exists but
 does not validate against `schemas/autonomy.schema.json` fails closed with
@@ -68,7 +76,7 @@ def validate(data: object) -> list[str]:
 def limits(worktree: Path) -> dict:
     path = policy_path(worktree)
     if not path.is_file():
-        return {"ok": True, "source": "default", **DEFAULTS}
+        return {"ok": True, "source": "default", **DEFAULTS, "worker_sandbox": worker_sandbox(None)}
     try:
         data = yaml.safe_load(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:
@@ -82,7 +90,15 @@ def limits(worktree: Path) -> dict:
             "parallel_tasks": configured.get("parallel_tasks", DEFAULTS["parallel_tasks"]),
             "open_prs": configured.get("open_prs", DEFAULTS["open_prs"]),
             "pr_granularity": data.get("pr_granularity", DEFAULTS["pr_granularity"]),
-            "issue_reference": data.get("issue_reference", DEFAULTS["issue_reference"])}
+            "issue_reference": data.get("issue_reference", DEFAULTS["issue_reference"]),
+            "worker_sandbox": worker_sandbox(data.get("worker_sandbox"))}
+
+
+def worker_sandbox(section: dict | None) -> dict:
+    """The validated `worker_sandbox` section as two lists; absent entries are empty (nothing widened)."""
+    section = section or {}
+    return {"allowed_domains": list((section.get("network") or {}).get("allowed_domains") or []),
+            "cache_directories": list(section.get("cache_directories") or [])}
 
 
 def main() -> int:

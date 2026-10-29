@@ -7,5 +7,6 @@
     "haiku": "haiku",
     "sonnet": "sonnet",
     "anthropic/claude-opus-5-5": "claude-opus-5-5"
-  }
+  },
+  "claude_code_worker_sandbox_minimum_version": "2.1.285"
 }

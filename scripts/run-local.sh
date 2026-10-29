@@ -1,6 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 ORCH_REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# `run-local.sh workspace init [...]` builds a workspace manifest in the
+# caller's directory; nothing below (target, model config, backend, Pi) applies.
+# A target directory literally named `workspace` followed by a Pi argument
+# `init` is written ./workspace.
+if [[ "${1:-}" == "workspace" && "${2:-}" == "init" ]]; then
+  shift 2
+  export PYTHONDONTWRITEBYTECODE=1
+  exec python3 "$ORCH_REPO/tools/workspace_init.py" "$@"
+fi
 target="${1:-.}"
 if [[ $# -gt 0 ]]; then shift; fi
 if [[ "${1:-}" == "--repo" ]]; then

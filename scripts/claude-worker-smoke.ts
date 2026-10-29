@@ -49,6 +49,8 @@ try {
   check(outcome.permissionDenials === 0, `no permission denials ${JSON.stringify(outcome.deniedCalls)}`);
   check(existsSync(join(worktree, "SMOKE.md")), "the worker wrote inside its bound worktree");
   check(git("status", "--porcelain") === parentBefore, "the parent checkout is unchanged");
+  // The worker sandbox is on unless PI_ORCHESTRATOR_WORKER_SANDBOX=0 (#63); say which posture this call ran under.
+  console.log(`sandbox=${JSON.stringify(outcome.sandbox)}`);
   console.log(`cost_usd=${outcome.usage.cost_usd ?? "unknown"}`);
 } finally {
   rmSync(base, { recursive: true, force: true });

@@ -55,6 +55,7 @@ Usage:
   use-latest.sh run [target-repo] [--repo owner/repository] [-- pi-args...]
   use-latest.sh watch [target-repo] [--repo owner/repository | --all | --workspace <id|manifest> [--controls]] [--port 8765]
   use-latest.sh plan <workspace-manifest> [--json] [--no-access-check]
+  use-latest.sh workspace init [--root DIR] [--output FILE] | --spec FILE [--output FILE] [--approve]
   use-latest.sh workspace validate|publish|ci|promote <workspace-manifest> --task <id> [--head pico/<branch>] [--apply --plan-hash <hash>] [--new-branch]
   use-latest.sh workspace schedule <workspace-manifest> [--max-parallel N] [--allow-mutation] [--resume-interrupted] [--json] [--no-access-check]
   use-latest.sh workspace launch|status|cancel <workspace-manifest> [--task <id>] [--allow-mutation] [--resume] [--no-wait] [--ignore-budget] [--no-access-check]
@@ -84,6 +85,7 @@ Examples:
   pico run .
   pico doctor .
   pico doctor . --json
+  pico workspace init               # pick repositories, preview, save a new manifest on approval
   pico plan workspace.yaml          # read-only multi-repository plan
   pico watch . --workspace workspace.yaml   # browser view of one workspace across repositories
   pico watch . --workspace workspace.yaml --controls   # plus confirmed actions: validate, request PR, CI, promote
@@ -681,9 +683,17 @@ EOF
     exec python3 "$RUNTIME/tools/workspace_plan.py" "$manifest" "$@"
     ;;
   workspace)
+    # `workspace init` builds a new manifest, so it takes none: dispatch it
+    # before the manifest check. It reads no project pin and activates no model
+    # config or backend; it runs in the caller's directory.
+    if [[ "${1:-}" == "init" ]]; then
+      shift
+      ensure_repo
+      exec python3 "$RUNTIME/tools/workspace_init.py" "$@"
+    fi
     # One workspace task -> one repository-scoped headless child run.
     if [[ $# -lt 2 || "$1" == --* ]]; then
-      echo "workspace requires schedule|preflight|launch|status|cancel|validate|publish|ci|promote and a manifest path" >&2
+      echo "workspace requires init, or schedule|preflight|launch|status|cancel|validate|publish|ci|promote and a manifest path" >&2
       exit 2
     fi
     op="$1"; manifest="$2"; shift 2
