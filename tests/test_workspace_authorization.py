@@ -231,8 +231,12 @@ class RecoveryTest(AuthorizationFixture):
         self.assertEqual(done["status"], "POLICY_UPDATED")
         pending = {r["id"]: r for r in wr.preflight(manifest=manifest, allow_mutation=True)["tasks"]}
         self.assertEqual(pending["dp-handoff-controls"]["status"], "awaiting", "an uncommitted approval authorizes nothing")
+        beta = str(self.repos["beta"][0])
+        git("-C", beta, "config", "user.name", "t")  # CI runners have no global identity
+        git("-C", beta, "config", "user.email", "t@example.com")
         commit = controls.act({"action": "commit_policy", "repository": "beta"})
-        controls.act({"action": "commit_policy", "repository": "beta", "confirm": commit["confirm"]})
+        committed = controls.act({"action": "commit_policy", "repository": "beta", "confirm": commit["confirm"]})
+        self.assertEqual(committed.get("status"), "POLICY_COMMITTED", committed)
         self.repos["beta"] = (self.repos["beta"][0], git("-C", str(self.repos["beta"][0]), "rev-parse", "HEAD"))
         manifest = self.scientific_review()
 
