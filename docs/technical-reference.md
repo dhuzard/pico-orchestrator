@@ -2678,6 +2678,18 @@ off mode, the panels, a tampered confirmation, a branch moved after its
 preview, CI changing between preview and confirmation, the full validate,
 request PR, CI and promote flow with its audit log, and the busy lock.
 
+**Action availability snapshot.** `GET /api/controls` includes `action_view`
+(`schema_version: 1`) when a manifest is watched. It reports scheduler-native
+task states with a tested display mapping, repository authorization requests,
+and action verdicts with target, required permissions, refusal code, explanation,
+effective pins/configuration and a digest of the state used for the snapshot.
+It is read-only. A verdict does not authorize a later write: the existing
+action preview, confirmation and dispatch gates recheck the current state.
+`resume_interrupted` refers to reconciliation of one interrupted execution;
+`create_new_attempt` refers to an authorization stop whose committed authority
+has changed. The latter retains the earlier run record. The snapshot does not
+invent either transition from a browser label.
+
 **Workspace-level and editing actions.** All follow the same preview and
 HMAC confirmation and are audited:
 
