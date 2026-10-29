@@ -11,6 +11,14 @@ import workspace_action_view as view  # noqa: E402
 
 
 class ActionViewTest(unittest.TestCase):
+    def test_repository_checkout_gate_matches_launcher(self):
+        repo = {"id": "repo", "resolved_path": "/tmp/example", "pinned_commit": "b" * 40}
+        with patch.object(view.workspace_run, "_head", return_value="a" * 40):
+            self.assertEqual(view._repository_blocker(repo), "WORKSPACE_PIN_MISMATCH")
+        with patch.object(view.workspace_run, "_head", return_value="b" * 40), \
+             patch.object(view.workspace_run.headless_run, "tracked_changes", return_value=["README.md"]):
+            self.assertEqual(view._repository_blocker(repo), "WORKSPACE_CHECKOUT_DIRTY")
+
     def test_native_states_are_distinct(self):
         states = ("awaiting_authorization", "waiting_for_authorization", "waiting_for_readiness",
                   "held_by_budget", "needs_reconciliation", "cancelled", "failed")

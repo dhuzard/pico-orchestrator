@@ -2683,6 +2683,9 @@ request PR, CI and promote flow with its audit log, and the busy lock.
 task states with a tested display mapping, repository authorization requests,
 and action verdicts with target, required permissions, refusal code, explanation,
 effective pins/configuration and a digest of the state used for the snapshot.
+Dispatch availability also reads the launcher's checkout HEAD and tracked
+changes; a stale pin or dirty parent checkout is shown as unavailable before
+an action preview is attempted.
 It is read-only. A verdict does not authorize a later write: the existing
 action preview, confirmation and dispatch gates recheck the current state.
 `resume_interrupted` refers to reconciliation of one interrupted execution;

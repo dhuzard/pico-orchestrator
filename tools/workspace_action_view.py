@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from pathlib import Path
 
 import workspace_run
 import workspace_scheduler
@@ -38,6 +39,19 @@ def display_state(native: str) -> dict:
     return {"native": native, "category": category, "label": label}
 
 
+def _repository_blocker(repo: dict) -> str | None:
+    """Use the launcher's own HEAD and tracked-change checks before offering dispatch."""
+    if repo.get("blocker_code") or not repo.get("resolved_path"):
+        return repo.get("blocker_code") or "WORKSPACE_REPOSITORY_PATH_MISSING"
+    checkout = Path(repo["resolved_path"])
+    if workspace_run._head(checkout) != repo.get("pinned_commit"):
+        return "WORKSPACE_PIN_MISMATCH"
+    dirty = workspace_run.headless_run.tracked_changes(checkout)
+    if dirty is None or dirty:
+        return "WORKSPACE_CHECKOUT_DIRTY"
+    return None
+
+
 def _action(name: str, target: str, available: bool, code: str | None, explanation: str,
             required: list[str], state_id: str, configuration: dict) -> dict:
     invocation = ({"action": "schedule", "resume_interrupted": True} if name == "resume_interrupted" else
@@ -55,8 +69,10 @@ def snapshot(plan: dict, entries: dict, *, allow_mutation: bool = False,
     """Explain next actions from the scheduler's native states and authorization verdicts."""
     verdicts = workspace_run.authorization_verdicts(plan, allow_mutation=allow_mutation)
     report = workspace_scheduler.report(plan, entries, {}, verdicts=verdicts)
+    repo_blockers = {repo["id"]: _repository_blocker(repo) for repo in plan["repositories"]}
     state_basis = {"workspace": plan["workspace_id"], "pin": plan.get("orchestrator_revision"),
                    "goal": plan.get("goal"), "plan_tasks": plan["tasks"], "blockers": plan.get("blockers"),
+                   "repository_readiness": repo_blockers,
                    "repos": [(r["id"], r.get("pinned_commit")) for r in plan["repositories"]],
                    "tasks": [(r["id"], r["state"], r.get("run_id"), r.get("attempt")) for r in report["tasks"]],
                    "authorization": [(key, value.get("policy_blob"), value.get("status"))
@@ -73,7 +89,7 @@ def snapshot(plan: dict, entries: dict, *, allow_mutation: bool = False,
     for row in report["tasks"]:
         task = next(t for t in plan["tasks"] if t["id"] == row["id"])
         repo = next(r for r in plan["repositories"] if r["id"] == task["repository"])
-        repo_ready = bool(repo.get("resolved_path")) and not repo.get("blocker_code")
+        repo_ready = repo_blockers[repo["id"]] is None
         native = row["state"]
         verdict = verdicts[task["id"]]
         rows.append({"id": task["id"], "display": display_state(native)})
@@ -95,7 +111,7 @@ def snapshot(plan: dict, entries: dict, *, allow_mutation: bool = False,
                 runnable = True
                 schedule_permissions.update(verdict["required"])
             else:
-                actions.append(_action("dispatch", task["id"], False, repo.get("blocker_code") or verdict["code"],
+                actions.append(_action("dispatch", task["id"], False, repo_blockers[repo["id"]] or verdict["code"],
                                        "Resolve the repository and its authorization before dispatch.",
                                        verdict["required"], state_id, config))
         if native == "running":
