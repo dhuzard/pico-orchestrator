@@ -6,6 +6,18 @@ All notable changes to PICO are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `pico workspace init` builds a workspace manifest: it discovers the Git checkouts below a root, lets
+  you select 2 to 64 of them, verifies each read-only on GitHub, previews the manifest with the planner's
+  waves and blockers, and writes a new file only after `yes` (or `--spec FILE --approve`). It never
+  overwrites, clones, fetches or launches. Directory names, Git and GitHub answers and errors are shown
+  with control, bidirectional and other invisible characters escaped, so a crafted directory name cannot
+  inject terminal sequences or fake lines; raw paths still reach Git and the saved YAML. Command-line
+  errors escape the arguments they quote, a malformed Git remote URL is reported for its repository
+  (`WORKSPACE_INIT_REMOTE_MALFORMED`) without stopping the others, and numeric answers such as `²` are
+  re-asked. See `docs/workspace-interactive-design.md`.
+
 ### Documentation
 
 - Added `docs/containment-and-authority.md`: containment acceptance tests for worker sandboxing (#63),
