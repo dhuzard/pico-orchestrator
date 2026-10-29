@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pico Garden · workspace setup</title><link rel="stylesheet" href="/style.css"><script src="/setup.js" defer></script></head>
+<body><main class="setup-page"><header><p class="eyebrow">PICO GARDEN</p><h1>Prepare a workspace</h1>
+<p>Choose Git checkouts or explicit GitHub repositories. Review the verified identities and pins before saving a new manifest.</p></header>
+<section class="panel"><h2>1. Select repositories</h2><p id="root" role="status">Discovering…</p>
+<div id="candidates"></div><button id="add-remote" type="button" class="quiet-button">Add a repository without a checkout</button>
+<p id="discovery-note" class="detail-note"></p></section>
+<section class="panel"><h2>2. Name the workspace</h2><div class="setup-fields">
+<label>Workspace ID <input id="workspace-id" required pattern="[A-Za-z0-9][A-Za-z0-9_-]{0,63}" maxlength="64"></label>
+<label>Goal <input id="goal" required maxlength="2000"></label>
+<label>Maximum parallel tasks <input id="parallel" type="number" min="1" max="64" value="1"></label>
+</div><button id="preview" class="primary-button" type="button">Preview manifest</button></section>
+<section id="result" class="panel" hidden><h2>3. Review and save</h2><p id="message" role="status"></p>
+<div id="evidence"></div><h3>Exact manifest</h3><pre id="manifest" class="action-pre"></pre>
+<button id="save" class="primary-button" type="button">Save this new manifest</button>
+<p class="detail-note">Saving creates one new file. It does not clone, fetch, pull, launch or grant permissions. Missing checkouts need an explicit checkout and pin verification before work can run.</p></section>
+<footer><span>✿ Pico Garden</span><span>Local setup · read-only until save</span></footer></main></body></html>
