@@ -17,6 +17,7 @@ import github_integration
 import workspace_plan
 import workspace_run
 import garden_controls  # noqa: E402
+import workspace_setup  # noqa: E402
 import garden_issues  # noqa: E402
 import run_lease  # noqa: E402
 from usage import TOKEN_FIELDS, cost_coverage, run_tokens, sum_tokens  # noqa: E402,F401
@@ -30,6 +31,8 @@ CODE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,79}$")
 STAMP = re.compile(r"^[0-9T:.Z+-]{1,40}$")
 SESSION_ID = re.compile(r"^[0-9TZ:-]{1,40}-[0-9]{1,10}$")
 ASSETS = {"/": ("index.html", "text/html; charset=utf-8"),
+          "/setup": ("setup.html", "text/html; charset=utf-8"),
+          "/setup.js": ("setup.js", "text/javascript; charset=utf-8"),
           "/app.js": ("app.js", "text/javascript; charset=utf-8"),
           "/issues.js": ("issues.js", "text/javascript; charset=utf-8"),
           "/style.css": ("style.css", "text/css; charset=utf-8")}
@@ -468,7 +471,8 @@ TOKEN_ENDPOINTS = frozenset({"/api/controls", "/api/branches", "/api/runs", "/ap
 
 
 def make_handler(directory: Path, repository: str | None, workspace: WorkspaceSource | None = None,
-                 controls=None, port: int | None = None, issues: garden_issues.IssuesSource | None = None):
+                 controls=None, port: int | None = None, issues: garden_issues.IssuesSource | None = None,
+                 setup: workspace_setup.SetupControls | None = None):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, format, *args):
             if not self.path.startswith("/api/"):
@@ -501,6 +505,22 @@ def make_handler(directory: Path, repository: str | None, workspace: WorkspaceSo
             if not self._host_ok():
                 return
             path = urlsplit(self.path).path
+            if path == "/api/setup" and setup is not None:
+                try:
+                    length = int(self.headers.get("Content-Length") or 0)
+                except ValueError:
+                    length = -1
+                if length < 0:
+                    self._send(self._json(400, {"ok": False, "error_code": "CONTROL_BODY_INVALID"}))
+                    return
+                body = self.rfile.read(min(length, garden_controls.MAX_BODY + 1)) if length else b""
+                try:
+                    data = setup.authorize(self.headers, body)
+                    payload = self._json(200, setup.act_setup(data))
+                except garden_controls.ControlError as exc:
+                    payload = self._json(exc.status, {"ok": False, "error_code": exc.code, "error": exc.detail})
+                self._send(payload)
+                return
             if path != "/api/action" or controls is None:
                 self._send(self._json(404, {"ok": False, "error_code": "CONTROLS_OFF",
                                             "error": "start pico watch with --workspace <manifest> --controls"}))
@@ -526,10 +546,11 @@ def make_handler(directory: Path, repository: str | None, workspace: WorkspaceSo
 
         def _token_ok(self) -> bool:
             # With controls on, every data endpoint needs the session token too (TOKEN_ENDPOINTS).
-            if controls is None:
+            auth = controls or setup
+            if auth is None:
                 return True
             try:
-                controls.check_token(self.headers)
+                auth.check_token(self.headers)
                 return True
             except garden_controls.ControlError as exc:
                 self._send(self._json(exc.status, {"ok": False, "error_code": exc.code, "error": exc.detail}))
@@ -540,6 +561,14 @@ def make_handler(directory: Path, repository: str | None, workspace: WorkspaceSo
                 return
             parts = urlsplit(self.path)
             path = parts.path
+            if path == "/api/setup" and setup is not None:
+                try:
+                    setup.check_token(self.headers)
+                    payload = self._json(200, setup.discovery())
+                except garden_controls.ControlError as exc:
+                    payload = self._json(exc.status, {"ok": False, "error_code": exc.code, "error": exc.detail})
+                self._send(payload)
+                return
             if path in TOKEN_ENDPOINTS and not self._token_ok():
                 return
             if path == "/api/controls":
@@ -624,11 +653,14 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--controls", action="store_true",
                         help="with --workspace <manifest>: enable validate, request PR, CI and promote actions")
+    parser.add_argument("--setup-root", type=Path, help="Open the workspace setup page for this directory")
     args = parser.parse_args()
     if args.all and args.repo:
         parser.error("--all and --repo cannot be combined")
     if args.workspace and (args.all or args.repo):
         parser.error("--workspace cannot be combined with --all or --repo")
+    if args.setup_root and (args.workspace or args.all or args.repo or args.controls):
+        parser.error("--setup-root cannot be combined with workspace, repository or control options")
     if not 0 <= args.port <= 65535:
         parser.error("--port must be between 0 and 65535")
     default_state = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "pi-coding-orchestrator"
@@ -647,7 +679,7 @@ def main() -> None:
             if exc.code != "WORKSPACE_UNKNOWN":
                 parser.error(f"{exc.code}: {exc.detail}")
             print(f"Note: {exc.detail}; the page will show it once the workspace is scheduled.", flush=True)
-    elif not args.all:
+    elif not args.all and not args.setup_root:
         try:
             repository = github_integration.resolve_target(Path(args.target).resolve(), args.repo)
         except github_integration.IntegrationError as exc:
@@ -664,13 +696,21 @@ def main() -> None:
             parser.error("--controls needs --workspace <manifest path>")
         # The contract tools resolve state through the environment; align it with this viewer.
         os.environ["PI_ORCHESTRATOR_STATE_DIR"] = str(state)
+    if args.setup_root and not args.setup_root.is_dir():
+        parser.error("--setup-root must be an existing directory")
     server = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(directory, repository, workspace, issues=issues))
+    setup = workspace_setup.SetupControls(args.setup_root, server.server_port) if args.setup_root else None
+    if setup:
+        server.RequestHandlerClass = make_handler(directory, repository, port=server.server_port, setup=setup)
     if args.controls:
         controls = garden_controls.Controls(workspace.manifest, server.server_port)
         server.RequestHandlerClass = make_handler(directory, repository, workspace, controls, server.server_port,
                                                   issues=issues)
     label = f"workspace {workspace.workspace_id}" if workspace else repository or "all repositories"
-    if controls:
+    if setup:
+        print(f"Pico setup: http://127.0.0.1:{server.server_port}/setup#token={setup.token}  (root {setup.root})", flush=True)
+        print("Keep this URL private: it authorizes saving a new manifest under this root.", flush=True)
+    elif controls:
         print(f"Pico watch: http://127.0.0.1:{server.server_port}/#token={controls.token}  ({label}, controls on)", flush=True)
         print("Keep this URL private: it authorizes actions for this session only.", flush=True)
     else:
