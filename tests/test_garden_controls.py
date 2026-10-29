@@ -138,6 +138,14 @@ class GardenControlsTest(unittest.TestCase):
                 continue
             self.assertEqual((status, data["ok"], data["error_code"]), (400, False, "CONTROL_BODY_INVALID"), value)
 
+    def drop_policy(self, name: str) -> None:
+        """Start a repository from the default policy (no committed .pi/autonomy.yaml), re-pinned."""
+        path = self.repos[name][0]
+        git("-C", str(path), "rm", "-q", "-r", ".pi")
+        git("-C", str(path), *COMMIT, "no autonomy policy")
+        self.repos[name] = (path, git("-C", str(path), "rev-parse", "HEAD"))
+        self.manifest()
+
     def _victim(self):
         outside = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, outside, True)
@@ -147,6 +155,7 @@ class GardenControlsTest(unittest.TestCase):
 
     def test_permission_write_ignores_a_planted_temp_symlink(self):
         _, victim = self._victim()
+        self.drop_policy("alpha")
         checkout = self.repos["alpha"][0]
         (checkout / ".pi").mkdir()
         (checkout / ".pi" / "autonomy.yaml.garden-tmp").symlink_to(victim)
@@ -162,6 +171,7 @@ class GardenControlsTest(unittest.TestCase):
 
     def test_permission_write_refuses_symlinked_policy_paths(self):
         outside, victim = self._victim()
+        self.drop_policy("alpha")
         checkout = self.repos["alpha"][0]
         # A symlinked .pi directory: refused at preview (nothing read from outside) and at confirm.
         (checkout / ".pi").mkdir()
@@ -201,6 +211,7 @@ class GardenControlsTest(unittest.TestCase):
             server.server_close()
 
     def test_panels_show_policy_and_models_read_only(self):
+        self.drop_policy("alpha")
         self.allow_publication("beta")
         status, data = self.request("GET", "/api/controls")
         self.assertEqual((status, data["enabled"]), (200, True))
@@ -291,6 +302,7 @@ class GardenControlsTest(unittest.TestCase):
     def test_publication_has_no_one_shot_grant(self):
         # Removed (#59): whoever holds the session token, an agent included, could confirm a grant.
         self.validated_a1()
+        policy = (self.repos["alpha"][0] / ".pi" / "autonomy.yaml").read_text()
         _, refused = self.act(action="publish", task="a1")
         self.assertEqual((refused["stage"], refused["error_code"]), ("refused", "PUBLICATION_NOT_AUTHORIZED"))
         self.assertNotIn("grantable", refused)
@@ -300,7 +312,7 @@ class GardenControlsTest(unittest.TestCase):
                 _, granted = self.act(action="publish", task="a1", grant_once=True, confirm=confirm)
                 self.assertEqual((granted["stage"], granted["error_code"]), ("refused", "CONTROL_BODY_INVALID"))
         self.assertEqual(self.fake.created, [])
-        self.assertFalse((self.repos["alpha"][0] / ".pi" / "autonomy.yaml").exists())
+        self.assertEqual((self.repos["alpha"][0] / ".pi" / "autonomy.yaml").read_text(), policy)
 
     def test_policy_publication_records_policy_authorization(self):
         commit = self.validated_a1()
@@ -343,6 +355,7 @@ class GardenControlsTest(unittest.TestCase):
         self.assertEqual((preview["stage"], preview["preview"]["authorization"]), ("preview", "policy"))
 
     def test_permission_toggle_writes_a_reviewed_policy_diff(self):
+        self.drop_policy("alpha")
         _, preview = self.act(action="set_permission", repository="alpha", permission="push_branch", value=True)
         self.assertEqual((preview["stage"], preview["preview"]["creates_file"]), ("preview", True))
         self.assertIn("+  push_branch: true", preview["preview"]["diff"])
@@ -370,18 +383,18 @@ class GardenControlsTest(unittest.TestCase):
 
     def test_schedule_runs_in_the_background_and_cancel_stops_a_child(self):
         self.controls.pi_executable = str(self.pi)
-        _, preview = self.act(action="schedule", allow_mutation=False)
+        _, preview = self.act(action="schedule", allow_mutation=True)
         self.assertEqual((preview["preview"]["dispatch"], preview["preview"]["cap"]), (["a1"], 2))
-        _, started = self.act(action="schedule", allow_mutation=False, confirm=preview["confirm"])
+        _, started = self.act(action="schedule", allow_mutation=True, confirm=preview["confirm"])
         self.assertEqual(started["status"], "SCHEDULER_STARTED")
-        _, busy = self.act(action="schedule", allow_mutation=False)
+        _, busy = self.act(action="schedule", allow_mutation=True)
         self.assertIn(busy.get("error_code"), {"CONTROL_BUSY", None})
         self.controls._scheduler.join(timeout=60)
         self.assertEqual(self.controls.last_schedule["status"], "finished")
         record = wr.load_workspace(wr.workspace_record_path("ws"))
         self.assertEqual(record["tasks"]["a1"]["run_status"], "PARTIAL")
         started_entry = next(e for e in record["garden_actions"] if e["stage"] == "started")
-        self.assertEqual((started_entry["dispatch"], started_entry["allow_mutation"]), (["a1"], False))
+        self.assertEqual((started_entry["dispatch"], started_entry["allow_mutation"]), (["a1"], True))
         _, nothing = self.act(action="cancel", task="a1")
         self.assertEqual(nothing["error_code"], "CONTROL_NOTHING_TO_CANCEL")
 
@@ -391,7 +404,8 @@ class GardenControlsTest(unittest.TestCase):
         record["tasks"]["a1"]["observed"] = {"readiness": "ready_for_downstream", "validated_contracts": {"claims": "1.0"}}
         with wr.locked_workspace("ws"):
             wr.save_workspace(wr.workspace_record_path("ws"), record)
-        wr.launch(manifest=self.path, task_id="b1", access_check=None, pi_executable=str(self.pi), wait=False)
+        wr.launch(manifest=self.path, task_id="b1", access_check=None, pi_executable=str(self.pi), wait=False,
+                  allow_mutation=True)
         import time
         deadline = time.monotonic() + 10
         while wr.status(manifest=self.path, task_id="b1", access_check=None)["tasks"]["b1"].get("run_id") is None \
@@ -468,7 +482,7 @@ class GardenControlsTest(unittest.TestCase):
         record["tasks"]["a1"]["observed"] = {"readiness": "ready_for_downstream", "validated_contracts": {"claims": "1.0"}}
         with wr.locked_workspace("ws"):
             wr.save_workspace(wr.workspace_record_path("ws"), record)
-        _, preview = self.act(action="schedule", allow_mutation=False)
+        _, preview = self.act(action="schedule", allow_mutation=True)
         self.assertEqual(preview["preview"]["dispatch"], ["b1"])
         self.assertTrue(preview["preview"]["budget"]["exhausted"])
         self.assertFalse(preview["ok"])  # nothing may launch while the budget is exhausted

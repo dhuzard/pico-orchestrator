@@ -18,6 +18,34 @@ All notable changes to PICO are recorded here. The format follows
   (`WORKSPACE_INIT_REMOTE_MALFORMED`) without stopping the others, and numeric answers such as `²` are
   re-asked. See `docs/workspace-interactive-design.md`.
 
+### Changed
+
+- Workspace tasks are checked for mutation authorization before launch, and waiting for a human's
+  approval is no longer reported as a failure. On scientific-review-four-repo-proposal-v1, two
+  upstream tasks in repositories without `.pi/autonomy.yaml` spent lead tokens, then stopped `BLOCKED`
+  with `HUMAN_MUTATION_APPROVAL_REQUIRED`. They had no worker and made no mutation. Their five
+  downstream tasks were shown as `blocked_by_failure`. Now:
+  - An implementation task needs `create_worktrees` and `commit` from the policy committed at its
+    pinned commit, plus `--allow-mutation`, or it is not launched. An untracked policy does not count,
+    and a launch with `--allow-mutation` is refused (`AUTONOMY_POLICY_UNCOMMITTED`) while the
+    checkout's policy file differs from the committed one, also for a `mutation: none` task.
+  - Such a task is `awaiting_authorization` and its dependents are `waiting_for_authorization`. The
+    scheduler prints one approval request per repository and exits 3. The Garden shows the same
+    requests.
+  - A child that stopped asking for approval counts the same way, but only when its run shows no
+    mutation, worker, spawned agent, child run or bound worktree, and its recorded checkout is clean,
+    at its starting `HEAD` and branch, with no local branch moved (the execution's `checkout` block
+    now records `head_before`, `head_after` and `branches_changed`). A refused resume of an interrupted
+    execution stays a refusal.
+  - The Garden's guarded `approve_mutation` action grants only those two permissions, after an exact
+    diff preview. It never grants push, PR, merge or deploy.
+  - After the policy is committed and re-pinned, the next schedule starts a new attempt
+    (`<workspace>--<task>--attempt-<n>`) linked to the blocked one, whose records are left as they
+    were. A run that asks again under the same authorization is not retried.
+  - New: `pico workspace preflight` and the manifest field `mutation: none` for read-only tasks.
+  - Breaking: a workspace whose repositories have no committed policy granting local mutation no
+    longer launches anything. The synthetic benchmark setup now always commits one.
+
 ### Documentation
 
 - Added `docs/containment-and-authority.md`: containment acceptance tests for worker sandboxing (#63),

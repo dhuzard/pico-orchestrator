@@ -313,6 +313,7 @@ def plan_tasks(tasks: list[dict], repository_ids: set[str],
         blocked_by = [dep for dep in deps[task_id] if readiness[dep] not in enough or not contract_ready(task_id, dep)]
         planned.append({"id": task_id, "repository": task["repository"], "title": task["title"],
                         "objective": task.get("objective"), "kind": kind,
+                        "mutation": "none" if kind == "qualification" else task.get("mutation") or "local",
                         "issue": task.get("issue"), "closes_issue": task.get("closes_issue"),
                         "max_duration_seconds": task.get("max_duration_seconds"),
                         "max_lead_calls": task.get("max_lead_calls"),

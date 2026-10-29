@@ -158,6 +158,15 @@ cannot finish `COMPLETED` while an integration was begun and never ended, or
 while a wave with a mutating task (a bound worktree) was never integrated;
 finish `PARTIAL` if it cannot be completed.
 
+Mutation authorization: an objective that says PICO checked mutation
+authorization before launch is the approval for repository-local worktrees and
+commits; do not stop to ask for it again. It never authorizes push, pull
+requests, merge or deployment. When the work needs a mutation the target's
+`.pi/autonomy.yaml` does not grant, finish `BLOCKED` with `blocker_code`
+`MUTATION_AUTHORIZATION_REQUIRED` before routing or launching any worker,
+never with a code of your own: the workspace scheduler then reports the task as
+awaiting authorization instead of failed.
+
 ## Classification
 
 For every meaningful executable task, determine exactly the fields required by

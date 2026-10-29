@@ -407,10 +407,10 @@ const wsTone = (value) => {
   if (s === "running") return "active";
   if (["completed", "validated", "ready_for_downstream", "merged", "declared_merged", "declared_ready_for_downstream"].includes(s)) return "completed";
   if (["failed", "cancelled", "refused"].includes(s)) return "failed";
-  if (["partial", "needs_reconciliation", "blocked_by_failure", "not_dispatchable", "held_by_budget"].includes(s)) return "blocked";
+  if (["partial", "needs_reconciliation", "blocked_by_failure", "not_dispatchable", "held_by_budget", "awaiting_authorization"].includes(s)) return "blocked";
   return "waiting";
 };
-const wsLabel = (value) => ({ running: "Running", completed: "Completed", partial: "Partial", failed: "Failed", cancelled: "Cancelled", refused: "Refused at dispatch", needs_reconciliation: "Needs reconciliation", blocked_by_failure: "Blocked by failure", waiting_for_readiness: "Waiting for readiness", not_dispatchable: "Not dispatchable", not_launched: "Not launched", validated: "Validated", ready_for_downstream: "Ready for downstream", merged: "Merged", held_by_budget: "Held by budget" })[value] || (String(value || "").startsWith("declared_") ? `Declared ${cap(value.slice(9))}` : cap(value));
+const wsLabel = (value) => ({ running: "Running", completed: "Completed", partial: "Partial", failed: "Failed", cancelled: "Cancelled", refused: "Refused at dispatch", needs_reconciliation: "Needs reconciliation", blocked_by_failure: "Blocked by failure", waiting_for_readiness: "Waiting for readiness", not_dispatchable: "Not dispatchable", not_launched: "Not launched", validated: "Validated", ready_for_downstream: "Ready for downstream", merged: "Merged", held_by_budget: "Held by budget", awaiting_authorization: "Awaiting authorization", waiting_for_authorization: "Waiting for authorization" })[value] || (String(value || "").startsWith("declared_") ? `Declared ${cap(value.slice(9))}` : cap(value));
 const wsGlyph = (tone) => tone === "completed" ? "✿" : tone === "failed" ? "×" : tone === "blocked" ? "!" : tone === "active" ? "●" : "○";
 const tokenSum = (tokens) => tokens?.input_tokens == null && tokens?.output_tokens == null ? null : (tokens.input_tokens || 0) + (tokens.output_tokens || 0) + (tokens.cache_write_tokens || 0);
 // Cost is a lower bound when a participant reported tokens but no cost. Plain text only.
@@ -458,14 +458,18 @@ function renderWorkspaceOverview(data) {
   $("ws-updated").textContent = ok ? (data.record_found ? `Record updated ${stamp(data.updated_at)} · from the ${data.source}` : "Not scheduled yet · showing the manifest plan") : "Unavailable";
   const pill = $("ws-state");
   const running = tones.includes("active");
-  pill.textContent = !ok ? "Unavailable" : data.status === "ATTENTION" ? "Needs attention" : running ? "In progress" : "OK";
-  pill.className = `state-pill ${!ok || data.status === "ATTENTION" ? "blocked" : running ? "in_progress" : "completed"}`;
+  const awaiting = ok && data.status === "AWAITING_AUTHORIZATION";
+  pill.textContent = !ok ? "Unavailable" : data.status === "ATTENTION" ? "Needs attention" : awaiting ? "Awaiting your approval" : running ? "In progress" : "OK";
+  pill.className = `state-pill ${!ok || data.status === "ATTENTION" || awaiting ? "blocked" : running ? "in_progress" : "completed"}`;
   const message = $("ws-message");
   let copy;
   if (!ok) copy = ["failed", "!", "This workspace cannot be shown", `${data?.error_code || "WORKSPACE_UNAVAILABLE"} · ${data?.error || "No detail available."}`];
   else if (data.status === "ATTENTION") {
     const bad = tasks.filter((task) => ["failed", "cancelled", "refused", "needs_reconciliation", "blocked_by_failure"].includes(task.state));
     copy = ["blocked", "!", "Some tasks need attention", bad.map((task) => `${task.id}: ${wsLabel(task.state).toLowerCase()}`).join(" · ")];
+  } else if (awaiting) {
+    // Not a failure: these tasks launched nothing, or their run stopped before changing anything.
+    copy = ["blocked", "⚿", "Your authorization is needed", (data.approval_requests || []).map((request) => `${request.github || request.repository} needs ${request.code === "MUTATION_NOT_AUTHORIZED" ? "allow mutation when scheduling" : request.missing.join(" and ") || request.code} for ${request.tasks.join(", ")}`).join(" · ") || "A task's run asked for approval again; see its card."];
   } else if (running) copy = ["in_progress", "✦", "Work in motion", `${tones.filter((tone) => tone === "active").length} child runs active · ${done} of ${tasks.length} tasks finished.`];
   else if (tasks.length && tasks.every((task) => ["completed", "partial", "validated", "ready_for_downstream", "merged", "declared_merged", "declared_ready_for_downstream"].includes(task.state))) copy = ["completed", "✿", "Every task has finished", `${done} of ${tasks.length} tasks ran to completion${done < tasks.length ? "; the others were declared done" : ""}.`];
   else copy = ["waiting", "◒", "Waiting for the next frontier", `${done} of ${tasks.length} tasks finished. Waiting tasks dispatch once their upstream tasks are declared ready.`];
@@ -521,7 +525,12 @@ function workspaceTaskCard(task) {
   else if (task.depends_on?.length) facts.append(el("p", "ws-chip", `After ${task.depends_on.join(", ")}`));
   if (task.blocks?.length) facts.append(el("p", "ws-chip quiet", `Unblocks ${task.blocks.join(", ")}`));
   const blocker = task.refusal_code || task.run_blocker_code || task.run?.blocker_code;
-  if (blocker) facts.append(el("p", "ws-chip failed", blocker));
+  const awaiting = task.state === "awaiting_authorization";
+  if (blocker) facts.append(el("p", `ws-chip ${awaiting ? "blocked" : "failed"}`, blocker));
+  if (awaiting && task.authorization?.status === "awaiting") facts.append(el("p", "ws-chip blocked", task.authorization.missing.length ? `Needs approval: ${task.authorization.missing.join(", ").replaceAll("_", " ")}` : "Needs allow mutation when scheduling"));
+  else if (awaiting) facts.append(el("p", "ws-chip blocked", "Asked for approval again under the same authorization: inspect its run; not retried"));
+  else if (task.authorization?.status === "awaiting" && !["completed", "partial", "running", "validated", "ready_for_downstream", "merged"].includes(task.state)) facts.append(el("p", "ws-chip quiet", `Will need approval: ${task.authorization.missing.join(", ").replaceAll("_", " ") || task.authorization.code}`));
+  if (task.previous_attempts?.length) facts.append(el("p", "ws-chip quiet", `Attempt ${task.attempt || task.previous_attempts.length + 1} · after ${task.previous_attempts.map((a) => `${a.run_id || "no run"} (${[a.run_status, a.run_blocker_code].filter(Boolean).join(" ") || "unknown"})`).join(", ")}`));
   const limit = task.time_limit;
   if (limit?.max_duration_seconds) {
     const text = limit.stop_reason ? `Stopped by the ${duration(limit.max_duration_seconds)} time limit${limit.elapsed_seconds != null ? ` after ${duration(limit.elapsed_seconds)}` : ""}`
@@ -560,10 +569,32 @@ function renderWorkspaceBoard(data) {
     head.append(title, el("span", "soft-count", `${repo.tasks.length} ${repo.tasks.length === 1 ? "task" : "tasks"}${total != null ? ` · ${short(total)} tok` : ""}`));
     column.append(head);
     if (repo.blocker_code) column.append(el("p", "ws-chip blocked", `Repository: ${repo.blocker_code}`));
+    for (const request of (data.approval_requests || []).filter((item) => item.repository === repo.id)) column.append(approvalBox(request));
     if (!repo.tasks.length) column.append(el("p", "empty", "No tasks in this repository."));
     for (const task of repo.tasks) column.append(workspaceTaskCard(task));
     board.append(column);
   }
+}
+function approvalBox(request) {
+  // The repository-specific approval request; the action itself is previewed and confirmed like any other.
+  const box = el("div", "ws-approval");
+  const flag = request.code === "MUTATION_NOT_AUTHORIZED";
+  box.append(el("strong", "", flag ? "Allow mutation to launch" : `Approve local mutation · ${request.missing.join(", ").replaceAll("_", " ")}`));
+  box.append(el("small", "", `${request.code} · ${request.tasks.join(", ")}`));
+  const steps = flag ? ["The committed policy already grants worktrees and commits.", "Schedule again with allow mutation checked."]
+    : [request.policy_source === "default" ? "No .pi/autonomy.yaml is committed at the pinned commit: the default policy grants no mutation." : "The committed .pi/autonomy.yaml does not grant these.",
+      ...(request.uncommitted_policy ? ["The checkout's own .pi/autonomy.yaml is uncommitted: it does not count yet."] : []),
+      "1. Approve: grants only these permissions in .pi/autonomy.yaml (you review the diff).",
+      `2. Commit the policy on ${request.base_branch || "the base branch"}.`, "3. Set this repository's pinned_commit in the manifest to that commit.",
+      "4. Schedule with allow mutation: each blocked task starts a new attempt linked to the one that stopped."];
+  const list = el("ol", "ws-approval-steps"); for (const step of steps) list.append(el("li", "", step)); box.append(list);
+  box.append(el("small", "", `Never granted by this: ${request.never_granted.join(", ").replaceAll("_", " ")}.`));
+  if (controlState.enabled && !flag && request.missing.length) {
+    const button = el("button", "ws-action", "Approve local mutation…"); button.type = "button";
+    button.addEventListener("click", () => workspaceAction("approve_mutation", { repository: request.repository }, `${request.repository} · local mutation`));
+    box.append(button);
+  }
+  return box;
 }
 function renderWorkspaceTokens(data) {
   const box = $("ws-token-rows"); box.replaceChildren();
@@ -587,7 +618,7 @@ function renderWorkspaceSessions(data) {
   $("ws-session-count").textContent = `${sessions.length} ${sessions.length === 1 ? "session" : "sessions"}`;
   if (!sessions.length) { list.append(el("p", "empty", "No scheduler session has run yet.")); return; }
   for (const session of sessions) {
-    const tone = !session.finished_at ? "started" : session.status === "ATTENTION" ? "failed" : "finished";
+    const tone = !session.finished_at ? "started" : session.status === "ATTENTION" ? "failed" : session.status === "AWAITING_AUTHORIZATION" ? "blocked" : "finished";
     const row = el("div", `activity-item ${tone}`);
     const copy = el("div", "");
     const parts = [`${session.dispatched.length} dispatched`];
@@ -595,12 +626,13 @@ function renderWorkspaceSessions(data) {
     if (session.observed_running.length) parts.push(`${session.observed_running.length} observed running`);
     const refused = Object.entries(session.refused || {});
     if (refused.length) parts.push(`${refused.length} refused`);
-    copy.append(el("p", "", `${!session.finished_at ? "Scheduler running" : session.status === "ATTENTION" ? "Scheduler needs attention" : "Scheduler finished"} · cap ${session.cap ?? "—"} · ${parts.join(" · ")}`));
+    copy.append(el("p", "", `${!session.finished_at ? "Scheduler running" : session.status === "ATTENTION" ? "Scheduler needs attention" : session.status === "AWAITING_AUTHORIZATION" ? "Scheduler awaits your authorization" : "Scheduler finished"} · cap ${session.cap ?? "—"} · ${parts.join(" · ")}`));
     const detail = [...session.dispatched.map((id) => `→ ${id}`), ...session.resumed.map((id) => `↻ ${id}`), ...refused.map(([id, code]) => `× ${id} ${code}`),
-      ...(session.held_by_budget || []).map((id) => `⏸ ${id} held by budget`)];
+      ...(session.held_by_budget || []).map((id) => `⏸ ${id} held by budget`),
+      ...(session.awaiting_authorization || []).map((id) => `⚿ ${id} awaiting authorization`), ...(session.new_attempts || []).map((id) => `↻ ${id} new attempt`)];
     if (detail.length) copy.append(el("small", "ws-session-tasks", detail.join("  ")));
     copy.append(el("small", "", `${stamp(session.started_at)}${session.finished_at ? ` → ${stamp(session.finished_at)}` : " · in progress"}`));
-    row.append(el("span", "activity-icon", tone === "started" ? "↗" : tone === "failed" ? "!" : "✓"), copy);
+    row.append(el("span", "activity-icon", tone === "started" ? "↗" : tone === "failed" ? "!" : tone === "blocked" ? "⚿" : "✓"), copy);
     list.append(row);
   }
 }
@@ -770,7 +802,7 @@ async function postAction(body) {
   return response.json().catch(() => ({ ok: false, error_code: `HTTP_${response.status}`, error: "No answer from the Garden." }));
 }
 const ACTION_TITLES = { validate: "Validate the task", publish: "Request a draft PR", ci: "Check CI", promote: "Promote for downstream use",
-  cancel: "Cancel the child run", schedule: "Schedule the workspace", set_permission: "Change a permission", commit_policy: "Commit the policy", set_model: "Change a model", reset_model: "Reset a model" };
+  cancel: "Cancel the child run", schedule: "Schedule the workspace", set_permission: "Change a permission", approve_mutation: "Approve local mutation", commit_policy: "Commit the policy", set_model: "Change a model", reset_model: "Reset a model" };
 function factList(pairs) {
   const list = el("dl", "action-facts");
   for (const [key, value] of pairs) if (value != null && value !== "") list.append(el("dt", "", key), el("dd", "", String(value)));
@@ -813,12 +845,19 @@ function showPreview(action, result, onConfirm) {
     content.append(factList([["Repository", p.repository], ["Execution", p.execution_status], ["Run", p.run_id]]));
   } else if (action === "schedule") {
     content.append(factList([["Will launch", p.dispatch?.join(", ") || "nothing"], ["Will resume", p.resume?.join(", ") || "nothing"],
+      ["Awaiting authorization (not launched)", p.awaiting_authorization?.join(", ") || "none"],
       ["Interrupted", p.interrupted?.join(", ") || "none"], ["Parallel cap", p.cap], ["Allow mutation", p.allow_mutation ? "yes" : "no"],
       ["Budget", p.budget ? `${short(p.budget.spent_tokens)} of ${p.budget.max_tokens ? short(p.budget.max_tokens) : "—"} tokens${p.budget.cost_complete === false ? ` · cost is a lower bound, excludes ${(p.budget.unpriced || []).join(", ")}` : ""}${p.budget.incomplete ? " · in-flight spend unknown: nothing new will launch" : ""}${p.budget.exhausted ? " · exhausted: nothing new will launch" : ""}` : "none set"]]));
     content.append(el("pre", "action-pre", Object.entries(p.mutating_permissions || {}).map(([repo, perms]) => `${repo}: ${perms.length ? perms.join(", ") : "no mutating permissions"}`).join("\n")));
   } else if (action === "set_permission") {
     content.append(factList([["Repository", p.repository], ["Permission", p.permission?.replaceAll("_", " ")], ["New value", p.value ? "allowed" : "denied"], ["File", p.creates_file ? "created from the template" : "edited in place"]]));
     content.append(el("pre", "action-pre", p.diff || ""));
+  } else if (action === "approve_mutation") {
+    content.append(factList([["Repository", p.repository], ["Grants", p.grants?.join(", ").replaceAll("_", " ")], ["For tasks", p.tasks?.join(", ")],
+      ["File", p.creates_file ? "created, every other permission denied" : "edited in place"], ["Never granted", p.never_granted?.join(", ").replaceAll("_", " ")],
+      ["Already granted by the file", p.already_granted_beyond_local?.length ? p.already_granted_beyond_local.join(", ").replaceAll("_", " ") : "nothing beyond local"]]));
+    content.append(el("pre", "action-pre", p.diff || ""));
+    if (p.next_steps?.length) { const list = el("ol", "ws-approval-steps"); for (const step of p.next_steps) list.append(el("li", "", step)); content.append(list); }
   } else if (action === "commit_policy") {
     content.append(factList([["Repository", p.repository], ["Branch", p.branch], ["Head", p.head], ["Message", p.message]]));
     content.append(el("pre", "action-pre", p.diff || ""));
@@ -828,7 +867,7 @@ function showPreview(action, result, onConfirm) {
   if (p.note) content.append(el("p", "action-note", p.note));
   const confirm = $("action-confirm");
   const labels = { publish: "Push and open draft PR", promote: "Promote",
-    cancel: "Cancel the run", schedule: "Launch", set_permission: "Write the policy", commit_policy: "Commit", set_model: "Save the model", reset_model: "Reset the model" };
+    cancel: "Cancel the run", schedule: "Launch", set_permission: "Write the policy", approve_mutation: "Approve and write the policy", commit_policy: "Commit", set_model: "Save the model", reset_model: "Reset the model" };
   confirm.textContent = labels[action] || "Run checks";
   confirm.hidden = !result.ok; confirm.disabled = false;
   const blocked = { promote: "CI is not green on the validated commit, so promotion is not possible yet.", schedule: "Nothing can launch or resume: no task is ready, or the budget is exhausted.",

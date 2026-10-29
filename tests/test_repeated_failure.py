@@ -551,14 +551,14 @@ class WorkspaceConfigurationTest(WorkspaceRunFixture):
         self.out.unlink(missing_ok=True)
         target, _ = self.repos["alpha"]
         record = hr.start(target=target, explicit_repo="acme/alpha", execution_id="exec-cli", objective="Inspect",
-                          pi_executable=str(self.pi), failure_retry_budget=5)
+                          pi_executable=str(self.pi), failure_retry_budget=5, allow_mutation=True)
         self.assertEqual((record["failure_retry_budget"], record["failure_retry_budget_source"]), (5, "cli"))
         env = json.loads(self.out.read_text())
         self.assertEqual((env["PI_ORCHESTRATION_FAILURE_RETRY_BUDGET"], env["PI_ORCHESTRATION_FAILURE_RETRY_BUDGET_SOURCE"]),
                          ("5", "cli"))
         with self.assertRaises(hr.HeadlessError) as refused:
             hr.start(target=target, explicit_repo="acme/alpha", execution_id="exec-bad", objective="Inspect",
-                     pi_executable=str(self.pi), failure_retry_budget=-1)
+                     pi_executable=str(self.pi), failure_retry_budget=-1, allow_mutation=True)
         self.assertEqual(refused.exception.code, "FAILURE_RETRY_BUDGET_INVALID")
         self.assertFalse(list((self.state / "executions").rglob("exec-bad.json")))
 

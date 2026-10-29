@@ -116,6 +116,9 @@ def workspace_usage(runs_dir: Path, record: dict, extra_run_ids=()) -> dict:
     parts = []
     tasks = record.get("tasks") if isinstance(record.get("tasks"), dict) else {}
     linked = [entry.get("run_id") for entry in tasks.values() if isinstance(entry, dict)]
+    # Earlier attempts of a task (superseded after it stopped for authorization) spent tokens too.
+    linked += [attempt.get("run_id") for entry in tasks.values() if isinstance(entry, dict)
+               for attempt in entry.get("attempts") or [] if isinstance(attempt, dict)]
     seen: set = set()
     for run_id in (*linked, *extra_run_ids):
         if not isinstance(run_id, str) or not RUN_ID.fullmatch(run_id) or run_id in seen:

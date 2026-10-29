@@ -279,6 +279,23 @@ interrupted child is reported as needing reconciliation and is resumed into
 its existing run only with `--resume-interrupted`. Only one scheduler can run a
 workspace at a time.
 
+Before it launches anything, the scheduler checks that each implementation
+task may mutate its repository: the `.pi/autonomy.yaml` committed at the
+pinned commit must grant `create_worktrees` and `commit`, and you must pass
+`--allow-mutation`. A task that lacks either is not launched and spends no
+tokens. It is reported as `awaiting_authorization`, which is not a failure,
+and the tasks downstream of it as `waiting_for_authorization`. The scheduler
+prints one approval request per repository and exits 3. To approve, use
+"Approve local mutation" in `pico watch --workspace workspace.yaml --controls`.
+It grants exactly those two permissions, after you review the diff, and never
+push, PR, merge or deploy. Then commit the policy on the base branch ("Commit
+policy"), set the repository's `pinned_commit` to that commit, and schedule
+again. A task whose run had stopped to ask for approval gets a new attempt
+(`<workspace>--<task>--attempt-2`) linked to the blocked one, whose records
+are left as they were. `pico workspace preflight workspace.yaml
+[--allow-mutation]` shows the same check without launching. A read-only task
+can declare `mutation: none`.
+
 ### Validate contracts and publish coordinated draft PRs
 
 Tasks can declare the versioned contracts they `provide` and `require`, the

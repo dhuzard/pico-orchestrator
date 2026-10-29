@@ -129,7 +129,8 @@ class EntryPointRunTest(unittest.TestCase):
                    "FAKE_SCENARIO_REFERENCE": str(ROOT / "benchmarks" / "synthetic-workspace" / "reference"),
                    "FAKE_SCENARIO_LEAD_DIR": str(ROOT / "tests")}
             out = base / "run"
-            done = subprocess.run([sys.executable, str(RUN_REAL), head, "after", "--output-dir", str(out)],
+            # The setup commits a policy granting worktrees and commits, so children launch only with --allow-mutation.
+            done = subprocess.run([sys.executable, str(RUN_REAL), head, "after", "--output-dir", str(out), "--allow-mutation"],
                                   env=env, capture_output=True, text=True, check=False)
             self.assertEqual(done.returncode, 0, done.stderr)
             report = json.loads((out / "report.json").read_text())
@@ -147,7 +148,8 @@ class EntryPointRunTest(unittest.TestCase):
             again = subprocess.run([sys.executable, str(RUN_REAL), head, "after", "--output-dir", str(out)],
                                    env=env, capture_output=True, text=True, check=False)
             self.assertEqual(again.returncode, 2)
-            resumed = subprocess.run([sys.executable, str(RUN_REAL), head, "after", "--output-dir", str(out), "--continue"],
+            resumed = subprocess.run([sys.executable, str(RUN_REAL), head, "after", "--output-dir", str(out), "--continue",
+                                      "--allow-mutation"],
                                      env=env, capture_output=True, text=True, check=False)
             self.assertEqual(resumed.returncode, 0, resumed.stderr)
             self.assertTrue(json.loads((out / "report.json").read_text())["continued"])

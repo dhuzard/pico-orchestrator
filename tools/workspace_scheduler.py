@@ -19,6 +19,19 @@ Failure isolation. A task whose child failed, was cancelled, was refused at
 dispatch, or ended in an uncertain state blocks all of its transitive
 dependents (blocked_by_failure); independent tasks keep running.
 
+Mutation authorization. Before dispatching, every implementation task is
+checked against the .pi/autonomy.yaml committed at its repository's pinned
+commit (tools/workspace_authorization.py): it needs create_worktrees and
+commit, and the operator's --allow-mutation. A task that lacks either is not
+launched and spends no tokens; it is awaiting_authorization, which is not a
+failure, and its dependents are waiting_for_authorization, not
+blocked_by_failure. A child that exited BLOCKED asking for mutation approval
+counts as awaiting_authorization only if its run provably changed nothing.
+Once authorization changes (policy committed and re-pinned, or the flag
+passed), the next invocation starts a new attempt with its own execution id,
+linked to the blocked one; a run that asks again under the same authorization
+is not retried.
+
 Restart. Every launch goes through the idempotent execution records, so a
 restart never launches a second child for a recorded task. Children survive a
 scheduler crash (each runs in its own session) and are observed again, not
@@ -30,7 +43,8 @@ provenance); a child whose lease is still live is refused with RUN_LEASE_HELD.
 
 Exit codes: 0 every dispatched task ended COMPLETED or PARTIAL and nothing
 failed; 1 anything failed, was refused, needs reconciliation or is blocked by
-a failure, or another scheduler holds the workspace; 2 invalid manifest.
+a failure, or another scheduler holds the workspace; 2 invalid manifest;
+3 nothing failed but tasks await human mutation authorization.
 """
 from __future__ import annotations
 
@@ -46,10 +60,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import workspace_authorization  # noqa: E402
 import workspace_plan  # noqa: E402
 import workspace_run  # noqa: E402
 
 FAILURE_STATES = frozenset({"failed", "cancelled", "refused", "needs_reconciliation"})
+AWAITING = "awaiting_authorization"
 MAX_SESSIONS = 20
 
 
@@ -86,6 +102,8 @@ def classify(entry: dict | None) -> str:
     if status == "cancelled":
         return "cancelled"
     if status == "exited":
+        if run == "BLOCKED" and entry.get("stopped_for_authorization") is True:
+            return AWAITING
         return {"COMPLETED": "completed", "PARTIAL": "partial"}.get(run, "failed")
     if status == "created":
         return "not_launched"
@@ -98,7 +116,7 @@ OBSERVED_RELEASE = ("validated", "ready_for_downstream", "merged")
 def state_of(task: dict, entry: dict | None, refused: dict) -> str:
     """Scheduler state of one task, combining its execution and its observed contract state."""
     if task["id"] in refused:
-        return "refused"
+        return AWAITING if refused[task["id"]].get("awaiting") is True else "refused"
     observed = (entry or {}).get("observed") or {}
     if task.get("kind") == "qualification":
         if observed.get("readiness") in OBSERVED_RELEASE:
@@ -133,11 +151,17 @@ def budget_state(plan: dict, record: dict | None = None, runs_dir: Path | None =
 inflight_usage = workspace_run.inflight_usage
 
 
-def report(plan: dict, entries: dict, refused: dict, held: set[str] | None = None) -> dict:
+def report(plan: dict, entries: dict, refused: dict, held: set[str] | None = None,
+           verdicts: dict | None = None, awaiting: set[str] | None = None) -> dict:
+    """`verdicts` are the preflight's authorization verdicts; `awaiting` the tasks it kept from launching."""
     tasks = plan["tasks"]
     states = {t["id"]: state_of(t, entries.get(t["id"]), refused) for t in tasks}
+    for tid in awaiting or ():
+        if states.get(tid) == "not_launched":
+            states[tid] = AWAITING
     failed = {t for t, s in states.items() if s in FAILURE_STATES}
     by_failure = dependents_closure(tasks, failed)
+    by_authorization = dependents_closure(tasks, {t for t, s in states.items() if s == AWAITING}) - by_failure
     rows = []
     for task in tasks:
         state = states[task["id"]]
@@ -146,6 +170,8 @@ def report(plan: dict, entries: dict, refused: dict, held: set[str] | None = Non
                 state = "held_by_budget"
             elif task["id"] in by_failure:
                 state = "blocked_by_failure"
+            elif task["id"] in by_authorization:
+                state = "waiting_for_authorization"
             elif task["readiness"] != "planned":
                 state = f"declared_{task['readiness']}"
             elif task["wave"] is None or any(b["scope"] == "task" and b["id"] == task["id"] for b in plan["blockers"]):
@@ -158,13 +184,37 @@ def report(plan: dict, entries: dict, refused: dict, held: set[str] | None = Non
                      "run_status": entry.get("run_status"), "run_blocker_code": entry.get("run_blocker_code"),
                      "launches": entry.get("launches"), "refusal": refused.get(task["id"]),
                      "time_limit": workspace_run.time_limit_view(entry),
-                     "lead_call_limit": entry.get("lead_call_limit")})
+                     "lead_call_limit": entry.get("lead_call_limit"),
+                     "attempt": entry.get("attempt") or (1 if entry.get("execution_id") else None),
+                     "previous_attempts": [{k: a.get(k) for k in ("attempt", "execution_id", "run_id", "run_status",
+                                                                  "run_blocker_code")}
+                                           for a in entry.get("attempts") or [] if isinstance(a, dict)],
+                     "authorization": _verdict_view((verdicts or {}).get(task["id"]))})
     counts: dict[str, int] = {}
     for row in rows:
         counts[row["state"]] = counts.get(row["state"], 0) + 1
     bad = {"failed", "cancelled", "refused", "needs_reconciliation", "blocked_by_failure", "held_by_budget"}
-    return {"tasks": rows, "counts": dict(sorted(counts.items())),
-            "status": "ATTENTION" if any(r["state"] in bad for r in rows) else "OK"}
+    waiting = {r["id"] for r in rows if r["state"] == AWAITING}
+    if any(r["state"] in bad for r in rows):
+        status = "ATTENTION"
+    else:
+        status = "AWAITING_AUTHORIZATION" if waiting else "OK"
+    # A task can await authorization while its verdict says authorized: its run asked for approval again
+    # under the same authorization it was launched with. That is reported, never retried in a loop.
+    repeated = sorted(t for t in waiting if ((verdicts or {}).get(t) or {}).get("status") == "authorized")
+    # Tasks not reached yet whose repository will need approval too, so it can be given in one pass.
+    later = {r["id"] for r in rows if r["state"] not in {AWAITING, "completed", "partial", "running", "validated",
+                                                          "ready_for_downstream", "merged"}}
+    return {"tasks": rows, "counts": dict(sorted(counts.items())), "status": status,
+            "approval_requests": workspace_run.approval_requests(verdicts or {}, waiting),
+            "later_approval_requests": workspace_run.approval_requests(verdicts or {}, later),
+            "repeated_authorization_stops": repeated}
+
+
+def _verdict_view(verdict: dict | None) -> dict | None:
+    if not verdict:
+        return None
+    return {"status": verdict["status"], "code": verdict["code"], "missing": verdict["missing"]}
 
 
 def _record_session(workspace_id: str, manifest: Path, plan: dict, session: dict) -> None:
@@ -195,7 +245,8 @@ def run(manifest: Path, *, max_parallel: int | None = None, allow_mutation: bool
     repo_of = {t["id"]: t["repository"] for t in plan["tasks"]}
     order = sorted((t for t in plan["tasks"]), key=lambda t: (t["wave"] if t["wave"] is not None else 1 << 30, t["id"]))
     session = {"id": f"{_now()}-{os.getpid()}", "started_at": _now(), "finished_at": None, "cap": cap,
-               "dispatched": [], "resumed": [], "observed_running": [], "refused": {}}
+               "dispatched": [], "resumed": [], "observed_running": [], "refused": {},
+               "allow_mutation": bool(allow_mutation)}
     with scheduler_lock(plan["workspace_id"]):
         _record_session(plan["workspace_id"], manifest, plan, session)
         entries = _entries(plan, manifest)
@@ -206,6 +257,9 @@ def run(manifest: Path, *, max_parallel: int | None = None, allow_mutation: bool
         session["observed_running"] = sorted(external)
         held: set[str] = set()
         run_cache: dict[str, str] = {}
+        # Preflight, before any token is spent: which tasks may mutate their repository.
+        verdicts = workspace_run.authorization_verdicts(plan, allow_mutation=allow_mutation)
+        awaiting: set[str] = set()
         with cf.ThreadPoolExecutor(max_workers=cap) as pool:
             while True:
                 spend = budget_state(plan, running=set(owned) | external, run_cache=run_cache)
@@ -226,7 +280,13 @@ def run(manifest: Path, *, max_parallel: int | None = None, allow_mutation: bool
                     if tid in running or tid in attempted or tid in by_failure or repo_of[tid] in busy:
                         continue
                     resume = resume_interrupted and states[tid] == "needs_reconciliation"
-                    if not resume and not (states[tid] == "not_launched" and task["dispatchable"]):
+                    retry = (states[tid] == AWAITING and task["dispatchable"] and tid not in refused
+                             and workspace_run.retry_due(entries.get(tid), verdicts[tid]))
+                    if not resume and not retry and not (states[tid] == "not_launched" and task["dispatchable"]):
+                        continue
+                    if not resume and verdicts[tid]["status"] == "awaiting":
+                        # Missing or insufficient mutation authorization: launch nothing, spend nothing.
+                        awaiting.add(tid)
                         continue
                     if spend is not None and (spend["exhausted"] or spend["incomplete"]) and task.get("kind") != "qualification":
                         # Over budget, or in-flight spend unknown (fail closed): launch nothing new;
@@ -240,6 +300,8 @@ def run(manifest: Path, *, max_parallel: int | None = None, allow_mutation: bool
                         owned[tid] = pool.submit(_qualify, manifest, plan, tid)
                     else:
                         (session["resumed"] if resume else session["dispatched"]).append(tid)
+                        if retry:
+                            session.setdefault("new_attempts", []).append(tid)
                         owned[tid] = pool.submit(workspace_run.launch, manifest=manifest, task_id=tid,
                                                  allow_mutation=allow_mutation, resume=resume, wait=True,
                                                  access_check=None, pi_executable=pi_executable,
@@ -262,7 +324,12 @@ def run(manifest: Path, *, max_parallel: int | None = None, allow_mutation: bool
                     try:
                         entries[tid] = future.result()["task"]
                     except workspace_run.WorkspaceRunError as exc:
-                        refused[tid] = {"code": exc.code, "detail": exc.detail}
+                        # Awaiting only for a task that had not run (or already awaited) and still lacks
+                        # authorization; a refused resume of an interrupted execution stays a refusal.
+                        awaits = (exc.code in workspace_authorization.AWAITING_CODES
+                                  and verdicts[tid]["status"] == "awaiting"
+                                  and classify(entries.get(tid)) in {"not_launched", AWAITING})
+                        refused[tid] = {"code": exc.code, "detail": exc.detail, "awaiting": awaits}
                         session["refused"][tid] = exc.code
                 for tid in [t for t in external if t not in owned]:
                     observed = workspace_run.status(manifest=manifest, task_id=tid, access_check=None)["tasks"].get(tid)
@@ -270,8 +337,9 @@ def run(manifest: Path, *, max_parallel: int | None = None, allow_mutation: bool
                         entries[tid] = observed
                     if classify(entries.get(tid)) != "running":
                         external.discard(tid)
-        result = report(plan, entries, refused, held)
+        result = report(plan, entries, refused, held, verdicts, awaiting)
         session["held_by_budget"] = sorted(held)
+        session["awaiting_authorization"] = sorted(r["id"] for r in result["tasks"] if r["state"] == AWAITING)
         final_spend = budget_state(plan)
         if final_spend is not None:
             session["budget"] = final_spend
@@ -323,7 +391,7 @@ def lead_calls_text(view: dict | None) -> str:
     return f" ({text}, stopped by LEAD_CALL_LIMIT)" if view.get("stopped") else f" ({text})"
 
 
-def render(result: dict) -> str:
+def render(result: dict, manifest: Path | str | None = None) -> str:
     lines = [f"Workspace {result['workspace_id']}: {result['status']} (cap {result['cap']})"]
     for row in result["tasks"]:
         detail = row["run_blocker_code"] or (row["refusal"] or {}).get("code") or ""
@@ -333,6 +401,19 @@ def render(result: dict) -> str:
     lines.append("  " + ", ".join(f"{k}={v}" for k, v in result["counts"].items()))
     if any(r["state"] == "needs_reconciliation" for r in result["tasks"]):
         lines.append("  Inspect interrupted children, then rerun with --resume-interrupted to continue them.")
+    if result.get("approval_requests"):
+        lines.append("  Awaiting human authorization (not a failure; these tasks launch nothing until it is given):")
+        lines.extend(workspace_run.request_text(result["approval_requests"], manifest or "<manifest>"))
+    for request in result.get("later_approval_requests") or []:
+        lines.append(f"  Later tasks will also need approval in {request['repository']} ({request.get('github')}): "
+                     f"{request['code']} for {', '.join(request['tasks'])}"
+                     + (f", missing {', '.join(request['missing'])}" if request.get("missing") else ""))
+    for tid in result.get("repeated_authorization_stops") or []:
+        row = next(r for r in result["tasks"] if r["id"] == tid)
+        lines.append(f"  {tid}: run {row['run_id']} stopped with {row['run_blocker_code']} although its committed policy "
+                     "authorizes mutation; it is not retried under the same authorization. Inspect its trace.")
+    if any(r["state"] == "waiting_for_authorization" for r in result["tasks"]):
+        lines.append("  Tasks waiting_for_authorization dispatch once their upstream tasks are authorized, run and declared ready.")
     if result.get("budget"):
         b = result["budget"]
         lines.extend(budget_lines(b))
@@ -361,8 +442,9 @@ def main(argv: list[str] | None = None) -> int:
     except workspace_run.WorkspaceRunError as exc:
         print(json.dumps({"ok": False, "error_code": exc.code, "error": exc.detail}, sort_keys=True))
         return 2 if exc.code == "WORKSPACE_MANIFEST_INVALID" else 1
-    print(json.dumps({"ok": result["status"] == "OK", **result}, indent=2, sort_keys=True) if args.json else render(result))
-    return 0 if result["status"] == "OK" else 1
+    print(json.dumps({"ok": result["status"] == "OK", **result}, indent=2, sort_keys=True) if args.json
+          else render(result, args.manifest))
+    return {"OK": 0, "AWAITING_AUTHORIZATION": 3}.get(result["status"], 1)
 
 
 if __name__ == "__main__":

@@ -198,6 +198,12 @@
             ],
             "default": "planned"
           },
+          "mutation": {
+            "type": "string",
+            "enum": ["local", "none"],
+            "default": "local",
+            "description": "local (default): the task's run creates worktrees and commits in its repository, so before launch the .pi/autonomy.yaml committed at the pinned commit must grant create_worktrees and commit and the scheduler must run with --allow-mutation; otherwise the task awaits authorization and nothing is launched. none: a read-only task that needs no mutation authorization. Ignored for qualification tasks."
+          },
           "kind": {
             "type": "string",
             "enum": [

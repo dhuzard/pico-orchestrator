@@ -528,7 +528,10 @@ class SyntheticWorkspace(unittest.TestCase):
 
     def test_publication_flag_and_issue_numbers(self):
         off = self.manifest("off")
-        self.assertFalse((off.parent / "synth-lib" / ".pi").exists())
+        local = yaml.safe_load((off.parent / "synth-lib" / ".pi" / "autonomy.yaml").read_text())
+        # Workspace tasks need local mutation granted by a committed policy; publication stays off.
+        self.assertTrue(local["permissions"]["create_worktrees"] and local["permissions"]["commit"])
+        self.assertFalse(local["permissions"]["push_branch"] or local["permissions"]["create_pr"])
         on = self.manifest("on", publication=True, issues={"lib-slugify": 7})
         policy = yaml.safe_load((on.parent / "synth-lib" / ".pi" / "autonomy.yaml").read_text())
         jsonschema.validate(policy, json.loads((REPO_ROOT / "schemas" / "autonomy.schema.json").read_text()))
@@ -665,11 +668,13 @@ class SyntheticWorkspaceFakePi(unittest.TestCase):
 
     def test_launch_first_wave_and_collect_metrics_without_a_model(self):
         manifest = Path(load_setup().create(self.base / "ws")["manifest"])
-        launched = wr.launch(manifest=manifest, task_id="lib-slugify", access_check=None, pi_executable=str(self.pi))
+        launched = wr.launch(manifest=manifest, task_id="lib-slugify", access_check=None, pi_executable=str(self.pi),
+                             allow_mutation=True)
         self.assertEqual(launched["task"]["run_status"], "PARTIAL")  # the fake lead finishes PARTIAL
         blocked = None
         try:
-            wr.launch(manifest=manifest, task_id="app-post-url", access_check=None, pi_executable=str(self.pi))
+            wr.launch(manifest=manifest, task_id="app-post-url", access_check=None, pi_executable=str(self.pi),
+                      allow_mutation=True)
         except wr.WorkspaceRunError as exc:
             blocked = exc.code
         self.assertEqual(blocked, "WORKSPACE_TASK_BLOCKED")  # waits for lib-slugify to be ready_for_downstream

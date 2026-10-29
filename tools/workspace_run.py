@@ -18,7 +18,16 @@ Before launching, the task is checked against the read-only plan: its
 repository must resolve without blockers, the checkout HEAD must be the pinned
 commit (the coordinator never checks anything out), and the task must be
 dispatchable (nothing in `blocked_by`). Ordering across tasks and concurrency
-limits belong to the scheduler.
+limits belong to the scheduler. When a child would really start, the task's
+mutation authorization is checked too (tools/workspace_authorization.py), so
+an unauthorized task is refused before it spends a token; `preflight` reports
+every task's verdict and the approval steps without launching anything.
+
+A task whose run stopped to ask for mutation approval, without changing
+anything, is retried once its authorization changed, as a new attempt with
+its own execution id (`<workspace-id>--<task-id>--attempt-<n>`). The earlier
+attempt's execution and run records stay as they are; the workspace entry
+keeps its summary under `attempts`.
 
 Exit codes: 0 ok, 1 blocked or refused, 2 invalid invocation.
 """
@@ -39,9 +48,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import atomic_io  # noqa: E402
 import headless_run  # noqa: E402
 import usage  # noqa: E402
+import workspace_authorization  # noqa: E402
 import workspace_plan  # noqa: E402
 
 RECORD_VERSION = 1
+ATTEMPT_SEPARATOR = "--attempt-"
 
 
 class WorkspaceRunError(Exception):
@@ -55,8 +66,29 @@ def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def execution_id(workspace_id: str, task_id: str) -> str:
-    return f"{workspace_id}--{task_id}"
+def execution_id(workspace_id: str, task_id: str, attempt: int = 1) -> str:
+    """`<workspace>--<task>` for the first attempt, `<workspace>--<task>--attempt-<n>` for later ones."""
+    base = f"{workspace_id}--{task_id}"
+    return base if attempt == 1 else f"{base}{ATTEMPT_SEPARATOR}{attempt}"
+
+
+def current_execution_id(workspace_id: str, task_id: str, entry: dict | None) -> str:
+    """The execution id of a task's current attempt, as its workspace entry records it.
+
+    Only an id this module derives for that task is accepted; anything else falls back to the
+    first attempt's id, so a hand-edited record cannot point a task at another execution.
+    """
+    attempt = (entry or {}).get("attempt") if isinstance(entry, dict) else None
+    if type(attempt) is int and attempt > 1 and entry.get("execution_id") == execution_id(workspace_id, task_id, attempt):
+        return entry["execution_id"]
+    return execution_id(workspace_id, task_id)
+
+
+def _record_entries(workspace_id: str, record: dict | None = None) -> dict:
+    if record is None:
+        record = load_workspace(workspace_record_path(workspace_id)) or {}
+    tasks = record.get("tasks")
+    return tasks if isinstance(tasks, dict) else {}
 
 
 def workspace_record_path(workspace_id: str) -> Path:
@@ -192,7 +224,9 @@ def _inputs_digest(plan: dict, task: dict, repo: dict) -> str:
     return hashlib.sha256(json.dumps(fresh, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
-def objective_for(plan: dict, task: dict, repo: dict, inputs: dict | None = None) -> str:
+def objective_for(plan: dict, task: dict, repo: dict, inputs: dict | None = None,
+                  authorization: str | None = None) -> str:
+    """The child's objective; `authorization` is the sentence of an authorized launch, appended on its own line."""
     inputs = inputs or dispatch_inputs(plan, task, repo)
     def describe(u: dict) -> str:
         at = (f"validated commit {u['validated_commit']}" if u.get("validated_commit")
@@ -211,7 +245,8 @@ def objective_for(plan: dict, task: dict, repo: dict, inputs: dict | None = None
             + (f"Required contracts: {needs}. " if needs else "")
             + (f"Contracts this task must provide: {offers}. " if offers else "") +
             "Work only inside this repository; other repositories of the workspace are consumed through "
-            "their pinned, validated artifacts, never through unverified branch contents and never edited here.")
+            "their pinned, validated artifacts, never through unverified branch contents and never edited here."
+            + (f"\n{authorization}" if authorization else ""))
 
 
 def _entry(record: dict, task: dict, repo: dict, execution: dict, inputs: dict | None = None) -> dict:
@@ -226,6 +261,16 @@ def _entry(record: dict, task: dict, repo: dict, execution: dict, inputs: dict |
                   "launches": execution.get("launches"), "run_id": execution.get("run_id"),
                   "run_status": run.get("status"), "run_blocker_code": run.get("blocker_code"),
                   "trace_path": run.get("trace_path"), "last_seen": _now()})
+    # A run that stopped to ask for mutation approval and provably changed nothing awaits authorization;
+    # every other BLOCKED or FAILED run stays a failure.
+    entry.pop("stopped_for_authorization", None)
+    if run.get("status") == "BLOCKED" and run.get("blocker_code") in workspace_authorization.CODES:
+        try:
+            trace = json.loads(Path(run["trace_path"]).read_text(encoding="utf-8")) if run.get("trace_path") else None
+        except (OSError, ValueError):
+            trace = None
+        if workspace_authorization.stopped_for_authorization(trace, execution.get("checkout")):
+            entry["stopped_for_authorization"] = True
     # Time limit of the current launch (absent keys clear a previous launch's values).
     for key in ("max_duration_seconds", "deadline_at", "deadline_epoch", "stop_reason", "time_limit",
                 "max_lead_calls", "max_lead_calls_source", "lead_calls_warn_at",
@@ -285,6 +330,7 @@ def inflight_usage(plan: dict, task_ids, cache: dict | None = None) -> tuple[lis
     cache = cache if cache is not None else {}
     repos = {r["id"]: r for r in plan["repositories"]}
     by_task = {t["id"]: t for t in plan["tasks"]}
+    entries = _record_entries(plan["workspace_id"])
     headless = headless_run
     found: list[str] = []
     problems: list[str] = []
@@ -298,7 +344,7 @@ def inflight_usage(plan: dict, task_ids, cache: dict | None = None) -> tuple[lis
             continue
         try:
             execution = headless.load_record(headless.execution_path(
-                Path(repo["git_common_dir"]), execution_id(plan["workspace_id"], tid)))
+                Path(repo["git_common_dir"]), current_execution_id(plan["workspace_id"], tid, entries.get(tid))))
         except (headless.HeadlessError, OSError, ValueError) as exc:
             problems.append(f"{tid}: execution record unreadable ({getattr(exc, 'code', type(exc).__name__)})")
             continue
@@ -343,7 +389,8 @@ def running_tasks(plan: dict, exclude=(), workspace: dict | None = None) -> tupl
         if (tid in exclude or task.get("kind") == "qualification" or not repo or not repo.get("git_common_dir")
                 or _finished(entries.get(tid))):
             continue
-        path = headless_run.execution_path(Path(repo["git_common_dir"]), execution_id(plan["workspace_id"], tid))
+        path = headless_run.execution_path(Path(repo["git_common_dir"]),
+                                           current_execution_id(plan["workspace_id"], tid, entries.get(tid)))
         try:
             record = headless_run.load_record(path)
         except (headless_run.HeadlessError, OSError, ValueError) as exc:
@@ -475,27 +522,60 @@ def launch(*, manifest: Path, task_id: str, allow_mutation: bool = False, resume
                                 f"the {repo['id']} checkout has uncommitted tracked changes: {shown}{left_by}. "
                                 "Inspect them, then commit, move or discard them yourself; PICO never cleans a checkout")
 
+    verdict = workspace_authorization.check(task, repo, allow_mutation=allow_mutation)
+
+    def authorization_gate() -> None:
+        # Before any token is spent: a task that needs mutation runs only under its committed policy and the
+        # operator's explicit --allow-mutation. Awaiting authorization is not a failure (see the scheduler).
+        if verdict["status"] == "awaiting":
+            raise WorkspaceRunError(verdict["code"], authorization_detail(verdict))
+        # headless_run enforces the checkout's own policy file, so with mutation allowed it must be the committed
+        # one: an untracked or edited policy (also under a `mutation: none` task) would otherwise take effect.
+        if allow_mutation and workspace_authorization.uncommitted_policy(checkout, repo["pinned_commit"]):
+            raise WorkspaceRunError(workspace_authorization.UNCOMMITTED_CODE,
+                                    f".pi/autonomy.yaml in repository {repo['id']} differs from "
+                                    "the one committed at its pinned commit; commit or remove the change, re-pin, "
+                                    "and launch again")
+
     def before_spawn() -> None:
         checkout_gate()
+        authorization_gate()
         budget_gate()
 
     with locked_workspace(plan["workspace_id"]):
         prior = load_workspace(workspace_record_path(plan["workspace_id"]))
-        saved_inputs = ((prior or {}).get("tasks") or {}).get(task_id, {}).get("inputs")
+        prior_entry = ((prior or {}).get("tasks") or {}).get(task_id) or {}
+    attempt = prior_entry.get("attempt") if type(prior_entry.get("attempt")) is int else 1
+    exec_id = current_execution_id(plan["workspace_id"], task_id, prior_entry)
+    new_attempt = not resume and retry_due(prior_entry, verdict)
+    if new_attempt:
+        # The previous attempt stopped for mutation approval and changed nothing; authorization has changed
+        # since. A new execution id leaves that attempt's execution and run records untouched.
+        attempt += 1
+        exec_id = execution_id(plan["workspace_id"], task_id, attempt)
+    saved_inputs = None if new_attempt else prior_entry.get("inputs")
     inputs = saved_inputs if saved_inputs is not None else dispatch_inputs(plan, task, repo)
-    objective = objective_for(plan, task, repo, inputs)
-    if task.get("objective") is None:
-        # Pre-extension executions used the workspace goal. Resume only when
-        # the stored text exactly matches that historical deterministic form.
-        old = headless_run.load_record(headless_run.execution_path(
-            Path(repo["git_common_dir"]), execution_id(plan["workspace_id"], task_id)))
-        legacy = objective.replace(f"Repository-scoped objective: {task['title']}\n",
-                                   f"Workspace goal: {plan['goal']}\n", 1)
-        if old is not None and old.get("objective") == legacy:
-            objective = legacy
+    authorized = workspace_authorization.objective_line(verdict) if verdict["status"] == "authorized" else None
+    objective = objective_for(plan, task, repo, inputs, authorized)
+    old = headless_run.load_record(headless_run.execution_path(Path(repo["git_common_dir"]), exec_id))
+    if old is not None and old.get("objective") != objective:
+        # An execution keeps the objective it was created with: one launched before the authorization
+        # sentence existed (or while unauthorized), and pre-extension ones that used the workspace goal.
+        plain = objective_for(plan, task, repo, inputs)
+        candidates = [plain]
+        if task.get("objective") is None:
+            candidates += [text.replace(f"Repository-scoped objective: {task['title']}\n",
+                                        f"Workspace goal: {plan['goal']}\n", 1) for text in (objective, plain)]
+        objective = next((text for text in candidates if old.get("objective") == text), objective)
+    if new_attempt:
+        before_spawn()  # refuse before the record moves to the new attempt; they run again right before spawning
+        with locked_workspace(plan["workspace_id"]):
+            path, record = _workspace(plan, manifest)
+            _begin_attempt(record, task_id, attempt, exec_id, inputs, verdict)
+            save_workspace(path, record)
     try:
         execution = headless_run.start(target=checkout, explicit_repo=repo["repository"],
-                                       execution_id=execution_id(plan["workspace_id"], task_id),
+                                       execution_id=exec_id,
                                        objective=objective, allow_mutation=allow_mutation,
                                        resume=resume, wait=wait, pi_executable=pi_executable,
                                        before_spawn=before_spawn, takeover=takeover_stale_lease,
@@ -510,8 +590,102 @@ def launch(*, manifest: Path, task_id: str, allow_mutation: bool = False, resume
         entry = _entry(record, task, repo, execution, inputs)
         if budget_override is not None and execution.get("outcome") in {"launched", "resumed"}:
             entry["budget_override"] = budget_override
+        if execution.get("outcome") in {"launched", "resumed"}:
+            entry["authorization"] = authorization_view(verdict)
+            entry["authorization_fingerprint"] = workspace_authorization.fingerprint(verdict)
         save_workspace(path, record)
     return {"workspace_id": plan["workspace_id"], "task": entry, "workspace_record": str(path)}
+
+
+ATTEMPT_FIELDS = ("execution_id", "execution_status", "outcome", "launches", "run_id", "run_status", "run_blocker_code",
+                  "trace_path", "objective_sha256", "pinned_commit", "inputs", "inputs_digest", "authorization",
+                  "authorization_fingerprint", "stopped_for_authorization", "checkout", "budget_override")
+
+
+def authorization_view(verdict: dict) -> dict:
+    """The recorded part of a verdict: no paths, only the decision and what it rested on."""
+    return {k: verdict.get(k) for k in ("status", "code", "required", "missing", "policy_source", "policy_blob",
+                                        "uncommitted_policy", "allow_mutation", "pinned_commit")}
+
+
+def authorization_detail(verdict: dict) -> str:
+    if verdict["code"] == workspace_authorization.FLAG_CODE:
+        return (f"the policy committed in {verdict['repository']} grants " + " and ".join(verdict["required"])
+                + "; pass --allow-mutation to launch it")
+    if verdict.get("missing") and verdict["code"] in workspace_authorization.CODES:
+        source = "no committed .pi/autonomy.yaml (default policy)" if verdict.get("policy_source") == "default" \
+            else "the .pi/autonomy.yaml committed at the pinned commit"
+        return (f"{verdict['repository']} needs {', '.join(verdict['missing'])}, which {source} does not grant; "
+                "nothing was launched. See pico workspace preflight for the approval steps")
+    return f"{verdict['repository']}: {verdict.get('detail') or 'the committed autonomy policy cannot be used'}"
+
+
+def retry_due(entry: dict | None, verdict: dict) -> bool:
+    """A new attempt is due: the current one stopped for authorization, and the task is authorized now under
+    a different authorization state than the one it was launched with (so a repeated stop is never looped)."""
+    entry = entry or {}
+    return (entry.get("stopped_for_authorization") is True and entry.get("execution_status") == "exited"
+            and verdict["status"] == "authorized"
+            and workspace_authorization.fingerprint(verdict) != entry.get("authorization_fingerprint"))
+
+
+def _begin_attempt(record: dict, task_id: str, attempt: int, exec_id: str, inputs: dict, verdict: dict) -> None:
+    """Move a task's current attempt into its `attempts` history and point the entry at the new one.
+
+    The history keeps each attempt's execution and run ids, outcome, inputs and authorization, so
+    nothing recorded about it is rewritten; observed contract state belongs to the task and stays.
+    """
+    entry = record["tasks"].get(task_id) or {}
+    previous = {key: entry[key] for key in ATTEMPT_FIELDS if key in entry}
+    previous.update({"attempt": entry.get("attempt", 1), "superseded_at": _now(), "superseded_by": exec_id})
+    kept = {key: entry[key] for key in ("repository", "target_repository", "observed") if key in entry}
+    record["tasks"][task_id] = {**kept, "attempts": [*(entry.get("attempts") or []), previous], "attempt": attempt,
+                                "execution_id": exec_id, "inputs": inputs,
+                                "authorization": authorization_view(verdict),
+                                "authorization_fingerprint": workspace_authorization.fingerprint(verdict)}
+
+
+def authorization_verdicts(plan: dict, *, allow_mutation: bool) -> dict[str, dict]:
+    """Each task's mutation authorization verdict, before anything is launched (read-only)."""
+    repos = {r["id"]: r for r in plan["repositories"]}
+    return {task["id"]: workspace_authorization.check(task, repos.get(task["repository"]) or {"id": task["repository"]},
+                                                      allow_mutation=allow_mutation)
+            for task in plan["tasks"]}
+
+
+def approval_requests(verdicts: dict[str, dict], task_ids) -> list[dict]:
+    """Awaiting verdicts of `task_ids`, grouped into one request per repository and code."""
+    groups: dict[tuple, dict] = {}
+    for tid in sorted(task_ids):
+        verdict = verdicts.get(tid)
+        if not verdict or verdict["status"] != "awaiting":
+            continue
+        key = (verdict["repository"], verdict["code"])
+        if key not in groups:
+            groups[key] = {**{k: verdict.get(k) for k in (
+                "repository", "github", "code", "required", "missing", "policy_source", "uncommitted_policy",
+                "base_branch", "pinned_commit", "detail")},
+                "never_granted": list(workspace_authorization.NEVER_GRANTED), "tasks": []}
+        groups[key]["tasks"].append(tid)
+    return [groups[key] for key in sorted(groups)]
+
+
+def request_text(requests: list[dict], manifest: Path | str) -> list[str]:
+    lines = []
+    for request in requests:
+        lines += workspace_authorization.request_lines(request, request["tasks"], manifest)
+    return lines
+
+
+def preflight(*, manifest: Path, allow_mutation: bool = False, access_check=None) -> dict:
+    """Mutation authorization of every implementation task, without launching anything or spending tokens."""
+    plan = _plan(manifest, access_check=access_check)
+    verdicts = authorization_verdicts(plan, allow_mutation=allow_mutation)
+    tasks = [{"id": t["id"], "repository": t["repository"], "status": verdicts[t["id"]]["status"],
+              "code": verdicts[t["id"]]["code"], "missing": verdicts[t["id"]]["missing"]} for t in plan["tasks"]]
+    requests = approval_requests(verdicts, verdicts)
+    return {"workspace_id": plan["workspace_id"], "allow_mutation": allow_mutation, "tasks": tasks,
+            "approval_requests": requests, "status": "AWAITING_AUTHORIZATION" if requests else "AUTHORIZED"}
 
 
 def status(*, manifest: Path, task_id: str | None = None, access_check=None) -> dict:
@@ -532,7 +706,8 @@ def _status_locked(plan: dict, manifest: Path, task_id: str | None) -> dict:
             continue
         try:
             execution = headless_run.status(target=Path(repo["resolved_path"]), explicit_repo=repo["repository"],
-                                            execution_id=execution_id(plan["workspace_id"], task["id"]))
+                                            execution_id=current_execution_id(plan["workspace_id"], task["id"],
+                                                                              record["tasks"].get(task["id"])))
         except headless_run.HeadlessError as exc:
             if exc.code == "EXECUTION_UNKNOWN":
                 continue
@@ -548,9 +723,10 @@ def cancel(*, manifest: Path, task_id: str, access_check=None) -> dict:
     task, repo = _task(plan, task_id)
     if repo["resolved_path"] is None:
         raise WorkspaceRunError(repo["blocker_code"] or "TARGET_REPOSITORY_UNRESOLVED", "repository cannot be resolved")
+    entry = _record_entries(plan["workspace_id"]).get(task_id)
     try:
         execution = headless_run.cancel(target=Path(repo["resolved_path"]), explicit_repo=repo["repository"],
-                                        execution_id=execution_id(plan["workspace_id"], task_id))
+                                        execution_id=current_execution_id(plan["workspace_id"], task_id, entry))
     except headless_run.HeadlessError as exc:
         raise WorkspaceRunError(exc.code, exc.detail) from exc
     with locked_workspace(plan["workspace_id"]):
@@ -563,10 +739,15 @@ def cancel(*, manifest: Path, task_id: str, access_check=None) -> dict:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Launch, observe or cancel one workspace task as a repository-scoped child run.")
     sub = parser.add_subparsers(dest="command", required=True)
-    for name in ("launch", "status", "cancel"):
+    for name in ("launch", "status", "cancel", "preflight"):
         p = sub.add_parser(name)
         p.add_argument("manifest", type=Path)
-        p.add_argument("--task", required=name != "status")
+        if name != "preflight":
+            p.add_argument("--task", required=name != "status")
+        else:
+            p.add_argument("--allow-mutation", action="store_true",
+                           help="check as a scheduler run with --allow-mutation would")
+            p.add_argument("--json", action="store_true")
         p.add_argument("--no-access-check", action="store_true")
         if name == "launch":
             p.add_argument("--allow-mutation", action="store_true")
@@ -588,6 +769,18 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "status":
             result = status(manifest=args.manifest, task_id=args.task, access_check=access)
             ok = True
+        elif args.command == "preflight":
+            result = preflight(manifest=args.manifest, allow_mutation=args.allow_mutation, access_check=access)
+            ok = result["status"] == "AUTHORIZED"
+            if not args.json:
+                print(f"Workspace {result['workspace_id']}: {result['status']}")
+                for row in result["tasks"]:
+                    print(f"  {row['id']} [{row['repository']}] {row['status']}" + (f" {row['code']}" if row["code"] else ""))
+                lines = request_text(result["approval_requests"], args.manifest)
+                if lines:
+                    print("Awaiting human authorization (nothing was launched):")
+                    print("\n".join(lines))
+                return 0 if ok else 1
         else:
             result = cancel(manifest=args.manifest, task_id=args.task, access_check=access)
             ok = result["task"]["execution_status"] == "cancelled"

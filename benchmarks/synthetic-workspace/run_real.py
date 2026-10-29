@@ -22,12 +22,14 @@ and writes DIR/report.json. Nothing in the report is estimated: a value no run r
 Limits you should know. Without GitHub the planner never unblocks a dependent task (it needs a published
 draft PR with green CI), so a default run covers the first wave: lib-slugify. For the full four-task run use
 sandbox repositories you own: pass --publication --i-own-these-repos (and --issue TASK=N), which setup.py
-needs to commit the sandbox policy. In that mode `pico workspace schedule` keeps its repository access check,
-so missing or inaccessible repositories fail closed. Push the baselines, publish and promote by hand as the
-README describes, then run this script again with --continue: it skips setup and repeats launch, validate
-and metrics on the same state, with the options recorded by the first run. The sandbox policy grants
-worktrees, commits, pushes and draft PRs, so a headless child refuses with MUTATION_NOT_AUTHORIZED unless
---allow-mutation is passed; it is never implied, it is asked for on each invocation and recorded in the report.
+needs to commit the sandbox's publication permissions. In that mode `pico workspace schedule` keeps its
+repository access check, so missing or inaccessible repositories fail closed. Push the baselines, publish and
+promote by hand as the README describes, then run this script again with --continue: it skips setup and
+repeats launch, validate and metrics on the same state, with the options recorded by the first run. Every
+setup commits a policy granting worktrees and commits (plus pushes and draft PRs with --publication), so
+without --allow-mutation `pico workspace schedule` launches nothing and reports the tasks
+awaiting_authorization (MUTATION_NOT_AUTHORIZED); it is never implied, it is asked for on each invocation and
+recorded in the report.
 This script never pushes, never opens a pull request and never merges.
 """
 from __future__ import annotations

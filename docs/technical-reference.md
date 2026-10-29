@@ -2322,8 +2322,78 @@ consuming unverified branch contents.
 outcome uncertain), `blocked_by_failure` (a transitive dependency is in one of
 the four failure states), `waiting_for_readiness`, `declared_<readiness>`
 (not scheduled because its readiness is not `planned`), and
-`not_dispatchable` (cycle or task blocker). Failure blocks only dependents;
+`not_dispatchable` (cycle or task blocker), `awaiting_authorization` and
+`waiting_for_authorization` (see below). Failure blocks only dependents;
 independent tasks run.
+
+**Mutation authorization.** Before dispatching, the scheduler checks every
+implementation task with `tools/workspace_authorization.py`, so a task that
+may not mutate is never launched and spends no token. A task needs
+`create_worktrees` and `commit` (its run creates worktrees and commits on a
+`pico/` branch). They are read from the `.pi/autonomy.yaml` committed at the
+repository's pinned commit, from Git objects. The working-tree copy is
+ignored, so an untracked or edited policy authorizes nothing until it is
+committed and pinned (it is reported as `uncommitted_policy`). Without a
+committed policy the default applies, which grants no mutation. A symlinked
+or invalid committed policy fails closed (`AUTONOMY_POLICY_PATH_UNSAFE`,
+`AUTONOMY_POLICY_INVALID`). A granting policy still needs `--allow-mutation`
+(`MUTATION_NOT_AUTHORIZED`, as for any headless run). Tasks declared
+`mutation: none` and qualification tasks need nothing. Because a headless
+run enforces the checkout's own policy file, any task launched with
+`--allow-mutation` (also a `mutation: none` one) is refused with
+`AUTONOMY_POLICY_UNCOMMITTED` while that file differs from the committed one;
+this is a refusal, not awaiting authorization. Push, PR, mark-ready, merge
+and deploy are not part of this check. Publication still reads the policy on
+the default branch on GitHub.
+
+An unauthorized task is `awaiting_authorization`, not a failure, and its
+transitive dependents are `waiting_for_authorization`, not
+`blocked_by_failure`. A direct `pico workspace launch` refuses it with
+`MUTATION_AUTHORIZATION_REQUIRED` before spawning. A child that exited
+`BLOCKED` asking for approval (`MUTATION_AUTHORIZATION_REQUIRED`,
+`MUTATION_NOT_AUTHORIZED`, or `HUMAN_MUTATION_APPROVAL_REQUIRED`, the code
+leads chose before this check existed) is also `awaiting_authorization`, but
+only when its run record shows zero code and GitHub mutations, no worker,
+spawned agent, child run or bound worktree, and its execution recorded a
+parent checkout that Git confirmed clean, at its starting `HEAD` and branch,
+with no local branch moved and no worktree kept or removed. Any other
+`BLOCKED` or `FAILED` run stays `failed`, as does one without that evidence:
+a `--no-wait` launch, or an execution recorded before the checkout block
+included `head_before`, `head_after` and `branches_changed`. A
+launch refused with an authorization code counts as awaiting only for a task
+that had not run and whose verdict is awaiting; a refused resume of an
+interrupted execution stays `refused`. The scheduler prints one approval
+request per repository and code, with the missing permissions, where the
+policy came from and the next steps. The same requests are in `--json`
+(`approval_requests`) and in the Garden. Its status is
+`AWAITING_AUTHORIZATION` (exit 3) when nothing else needs attention.
+`pico workspace preflight <manifest> [--allow-mutation]` reports every
+verdict without launching or writing anything.
+
+Approval goes through the Garden's guarded controls (`pico watch --workspace
+<manifest> --controls`). `approve_mutation` previews the exact diff and is
+confirmed with the same HMAC-bound two-step as `set_permission`. It sets only
+the missing `create_worktrees` and `commit` lines to `true`. An existing
+policy keeps every other line. A new policy starts from the template with
+every other permission denied and merge disabled. The written file is
+uncommitted. `commit_policy` commits it on the base branch and never pushes.
+The human then sets the repository's `pinned_commit` to that commit. PICO
+never edits the manifest.
+
+**Attempts.** On the next `schedule` with authorization in place, a task
+whose run stopped for authorization starts a new attempt with its own
+execution id, `<workspace>--<task>--attempt-<n>`. The objective gains one
+sentence saying that local worktrees and commits were authorized by the check
+and that push, PRs, merge and deployment were not. The previous attempt's
+execution and run records are not rewritten. Its summary (execution id, run
+id, outcome, inputs and authorization) moves to the entry's `attempts` list,
+and the new attempt records fresh dispatch inputs. Earlier attempts' runs
+still count toward the workspace budget and the Garden's token totals.
+Completed tasks are never relaunched. A new attempt is started only when the
+authorization fingerprint (repository, pin, policy blob, required
+permissions, operator flag) differs from the one the stopped attempt ran
+under. A run that asks for approval again under the same authorization is
+reported (`repeated_authorization_stops`) and is not retried in a loop.
 
 **Restart and reconciliation.** Every launch goes through the idempotent
 execution records, so a restart never starts a second child, branch or PR for
@@ -2349,7 +2419,7 @@ process, so a graceful Pi shutdown cannot settle it first with another code.
 
 **Exit status.** 0 when nothing is in a failure state or blocked by one; 1
 otherwise, or when another scheduler holds the workspace; 2 for an invalid
-manifest. Coverage: `tests/test_workspace_scheduler.py` measures peak
+manifest; 3 when nothing failed but tasks await mutation authorization. Coverage: `tests/test_workspace_scheduler.py` measures peak
 concurrency from the fake `pi`'s start and end log across four temporary
 repositories, and covers per-repository serialization, failure isolation,
 the readiness frontier with recorded upstream pins, restart idempotency,
