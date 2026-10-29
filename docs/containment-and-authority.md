@@ -2,8 +2,9 @@
 
 Design requirements for worker containment (#63) and for the unattended issue
 dispatcher (#34). They follow from the trust-boundary summary in
-`docs/technical-reference.md` and from #64. This is a requirements document: it
-does not claim that any of it is implemented or tested end to end.
+`docs/technical-reference.md` and from #64. This is a requirements document;
+"Implementation status" below says what exists. Nothing here is tested end to
+end against a real agent.
 
 ## Why policy on the default branch is not enough
 
@@ -46,6 +47,28 @@ GitHub credential at all: containment of `gh` means the token is absent from the
 worker's environment and unreadable on disk, not that `gh` is filtered.
 Publication happens in a process outside the worker sandbox, through the adapter,
 which re-reads the default-branch policy (#64).
+
+## Implementation status (#63, Claude workers)
+
+Slices 2 to 4 are implemented for mutating Claude workers; the details are in
+"Worker sandbox" in `docs/technical-reference.md`.
+
+| Slice | Status |
+|---|---|
+| 1. Measure with real agents | Not done. It needs real model runs and the maintainer's go-ahead. |
+| 2. Filesystem scope | Done for Claude workers, through Claude Code's sandbox settings: writes only in the bound worktree, its shared git metadata (except `hooks/` and `config`), the temp directory and declared cache directories; no reads of the PICO state directory, `~/.config/gh` and other credential files, by the OS sandbox for shell commands and by `permissions.deny` Read and Edit rules for Claude's file tools. Hooks and MCP servers are off for every Claude worker (`disableAllHooks`, `--strict-mcp-config`). Other checkouts stay readable, and the user's own `~/.claude/settings.json` can still widen the sandbox (recorded, not refused). |
+| 3. Network off by default | Done for Claude workers: no network unless `worker_sandbox.network.allowed_domains` in `.pi/autonomy.yaml` on the default branch on GitHub lists hosts (never the checkout's copy; pinned at run start, a resume cannot widen it), refused without a prompt (`strictAllowlist`). Denials are **not** recorded in provenance: Claude Code reports them to the model inside the tool result, and PICO reads only the final JSON result. |
+| 4. Default on | Done: on unless `PI_ORCHESTRATOR_WORKER_SANDBOX=0`; missing prerequisites (bwrap and socat on PATH, a bwrap namespace probe, Claude Code 2.1.285 or later in preflight) fail closed with `WORKER_SANDBOX_UNAVAILABLE` (or `MODEL_BACKEND_VERSION_UNSUPPORTED` for the version); the posture, opt-out included, is recorded in `parent_orchestration.worker_sandbox`. |
+| 5. Codex workers | Not done: `spawn_subagent` workers get no OS sandbox from PICO. |
+| 6. The lead | Not done: the lead's bash is not sandboxed. |
+
+Against the acceptance table above: the deterministic tests check the
+settings PICO hands Claude Code (paths, denied reads, network, allowlist), the
+recorded posture and the fail-closed path with the platform check mocked. They
+do not run a sandbox, so they do not show that the kernel denies anything (an
+opt-in test, `PICO_REAL_CLAUDE_SANDBOX_PROBE=1`, only checks that the real Claude
+Code refuses to start without its sandbox);
+that, the "Allowed" rows and the per-attempt provenance records are still open.
 
 ## Authority separation for the issue dispatcher (#34)
 

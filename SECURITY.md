@@ -54,13 +54,31 @@ If you have not heard back after 14 days, add a comment to the advisory.
 PICO orchestrates coding agents on your machine. Reports about the following
 are in scope:
 
-- **Workers run with your credentials.** Claude and Codex workers run as you,
-  with your environment, your Git and GitHub credentials, and your file
-  system and network access. The worker scope checks (the bound worktree and
-  the command deny list) are a safety protocol and are best-effort. They are
-  not an OS sandbox. A way for a worker, or for prompt-injected repository,
-  issue or PR text, to escape its bound worktree, reach secrets or run
-  denied Git or GitHub actions is in scope.
+- **Workers run as you.** Claude and Codex workers run under your user
+  account. Their environment is an allowlist that withholds GitHub, SSH and
+  registry credentials. A mutating Claude worker's shell commands run in
+  Claude Code's OS sandbox by default: writes only in its bound worktree (and
+  that worktree's git metadata, the temp directory and declared cache
+  directories), no reads of PICO's state directory, `~/.config/gh` or other
+  credential files, and no network unless the default branch's policy
+  allowlists hosts. Every Claude worker runs with hooks and MCP servers off.
+  The command deny list is best-effort defense in depth, not a boundary. A way
+  for a worker, or for prompt-injected repository, issue or PR text, to escape
+  its bound worktree, reach secrets or run denied Git or GitHub actions is in
+  scope.
+- **What the worker sandbox does not cover.** Codex workers (`spawn_subagent`)
+  and the lead's own bash are not sandboxed by PICO. Claude Code's file tools
+  run outside its OS sandbox (PICO adds Read and Edit deny rules for the same
+  paths), and so do helper processes from user or managed settings (status
+  line, `apiKeyHelper`). The user's own `~/.claude/settings.json`
+  (`excludedCommands`, `allowWrite`, `allowedDomains`) still merges into every
+  worker's settings and can widen the sandbox; PICO only records which of those
+  keys are set. Declared cache directories are the user's real caches and can
+  be poisoned by a worker. A user can opt out with
+  `PI_ORCHESTRATOR_WORKER_SANDBOX=0`, which is recorded on the run; native
+  Windows has no sandbox. Sandbox denials are reported to the model, not to
+  PICO, so they are not in provenance. These are known limits, not
+  vulnerabilities; a way around the boundary where it does apply is in scope.
 - **The launcher runs cached code.** `scripts/use-latest.sh` (the `pico`
   command) fetches this repository into a local cache and runs it. A project
   pin in `.pi/orchestrator.lock` chooses the commit. Ways to make the

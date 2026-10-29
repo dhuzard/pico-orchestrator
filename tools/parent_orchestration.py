@@ -528,7 +528,8 @@ MAX_FAILURE_RETRY_BUDGET = 1000
 FAILURE_BUDGET_SOURCES = ("cli", "task", "manifest", "policy", "default", "env")
 MAX_FAILURE_SIGNATURES = 100
 PREREQUISITE_CODES = frozenset({"APPROVED_PILOT_INPUTS_UNAVAILABLE", "PREREQUISITE_UNMET",
-                                "MODEL_BACKEND_UNAVAILABLE", "MODEL_AUTH_UNAVAILABLE"})
+                                "MODEL_BACKEND_UNAVAILABLE", "MODEL_AUTH_UNAVAILABLE",
+                                "WORKER_SANDBOX_UNAVAILABLE"})
 PREREQUISITE_UNCHANGED_CODE = "PREREQUISITE_UNCHANGED"
 
 
@@ -607,6 +608,71 @@ def _clear_signatures(parent: dict, task_id: str, step_id: str, epoch: int) -> N
                                         if (item["task_id"], item["step_id"], item["route_epoch"]) != (task_id, step_id, epoch)]
         if not parent["failure_signatures"]:
             del parent["failure_signatures"]
+
+
+# Worker sandbox (#63): the posture the lifecycle extension applied to the run's Claude workers. `enabled` is the
+# default; `opted_out` is only ever the user's explicit PI_ORCHESTRATOR_WORKER_SANDBOX=0 and stays on the record.
+WORKER_SANDBOX_STATES = ("enabled", "opted_out")
+WORKER_SANDBOX_SOURCES = ("default", "env")
+# Where the widening came from (tools/worker_sandbox_policy.py): the default branch on GitHub, no policy there,
+# a failed read (nothing widened) or an invalid policy (nothing widened).
+WORKER_SANDBOX_POLICY_SOURCES = ("default_branch", "default", "unavailable", "invalid")
+WORKER_SANDBOX_USER_KEYS = ("sandbox.excludedCommands", "sandbox.filesystem.allowWrite", "sandbox.network.allowedDomains")
+SANDBOX_DOMAIN_RE = re.compile(r"^(\*\.)?([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]([a-z0-9-]{0,61}[a-z0-9])?"
+                               r"(:([1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5]))?$")
+SANDBOX_CACHE_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]*(/[A-Za-z0-9_][A-Za-z0-9._-]*)*$")
+POLICY_COMMIT_RE = re.compile(r"^[0-9a-f]{40,64}$")
+MAX_WORKER_SANDBOX_ENTRIES = 50
+
+
+def _worker_sandbox_event(parent: dict, event: dict) -> dict:
+    """Record the run's worker sandbox posture and return the widening workers may actually use.
+
+    The first entry pins the run's widening (allowlisted hosts, cache directories). A later entry (a resume)
+    may narrow it but never widen it: hosts or directories beyond the pin are dropped from the effective lists
+    and recorded as `refused_allowed_domains` / `refused_cache_directories`, next to what was kept. Consecutive
+    identical entries are kept once, so an opt-out at any point of the run stays visible. Written only by the
+    lifecycle extension.
+    """
+    if event["state"] not in WORKER_SANDBOX_STATES or event["source"] not in WORKER_SANDBOX_SOURCES:
+        raise ParentRunError("invalid worker sandbox posture", error_code="PARENT_EVENT_FIELDS_INVALID")
+    if event["state"] == "opted_out" and event["source"] != "env":
+        raise ParentRunError("a worker sandbox opt-out must be explicit", error_code="PARENT_EVENT_FIELDS_INVALID")
+    policy_source = event.get("policy_source", "default")
+    if policy_source not in WORKER_SANDBOX_POLICY_SOURCES:
+        raise ParentRunError("invalid worker sandbox policy source", error_code="PARENT_EVENT_FIELDS_INVALID")
+    requested = {}
+    for field, pattern, limit in (("allowed_domains", SANDBOX_DOMAIN_RE, 50), ("cache_directories", SANDBOX_CACHE_RE, 20)):
+        value = event.get(field, [])
+        if (not isinstance(value, list) or len(value) > limit
+                or not all(isinstance(item, str) and pattern.fullmatch(item) for item in value)):
+            raise ParentRunError(f"invalid worker sandbox {field}", error_code="PARENT_EVENT_FIELDS_INVALID")
+        requested[field] = list(dict.fromkeys(value))
+    commit = event.get("policy_commit")
+    if commit is not None and (not isinstance(commit, str) or not POLICY_COMMIT_RE.fullmatch(commit)):
+        raise ParentRunError("invalid worker sandbox policy commit", error_code="PARENT_EVENT_FIELDS_INVALID")
+    drift = event.get("local_drift", False)
+    user_keys = event.get("user_settings_widening", [])
+    if (type(drift) is not bool or not isinstance(user_keys, list)
+            or not all(key in WORKER_SANDBOX_USER_KEYS for key in user_keys)):
+        raise ParentRunError("invalid worker sandbox record fields", error_code="PARENT_EVENT_FIELDS_INVALID")
+    history = parent.setdefault("worker_sandbox", [])
+    pinned = history[0] if history else None
+    entry = {"state": event["state"], "source": event["source"], "policy_source": policy_source,
+             "policy_commit": commit, "local_drift": drift, "user_settings_widening": list(dict.fromkeys(user_keys))}
+    for field in ("allowed_domains", "cache_directories"):
+        allowed = requested[field] if pinned is None else [item for item in requested[field] if item in pinned[field]]
+        entry[field] = allowed
+        refused = [item for item in requested[field] if item not in allowed]
+        if refused:
+            entry[f"refused_{field}"] = refused
+    effective = {"allowed_domains": entry["allowed_domains"], "cache_directories": entry["cache_directories"]}
+    if not (history and {key: value for key, value in history[-1].items() if key != "at"} == entry):
+        history.append({"at": datetime.now(timezone.utc).isoformat(), **entry})
+        # Keep the pinning first entry when trimming.
+        if len(history) > MAX_WORKER_SANDBOX_ENTRIES:
+            del history[1:len(history) - MAX_WORKER_SANDBOX_ENTRIES + 1]
+    return effective
 
 
 def _failure_event(parent: dict, event: dict) -> None:
@@ -905,6 +971,8 @@ def _record_event_unlocked(run_id: str, event: dict, *, repo_root: Path = ROOT) 
         "lead_call_limit_reached": {"kind", "calls"},
         "failure": {"kind", "phase", "step_id", "code", "head", "inputs_digest", "blocker_kind"},
         "retry_gate": {"kind", "phase", "step_id", "head", "inputs_digest", "retry_budget", "source"},
+        "worker_sandbox": {"kind", "state", "source", "allowed_domains", "cache_directories", "policy_source",
+                           "policy_commit", "local_drift", "user_settings_widening"},
     }
     required = {
         "phase": {"kind", "phase", "status"},
@@ -926,6 +994,7 @@ def _record_event_unlocked(run_id: str, event: dict, *, repo_root: Path = ROOT) 
         "lead_call_limit_reached": {"kind"},
         "failure": {"kind", "phase", "step_id", "code"},
         "retry_gate": {"kind", "phase", "step_id", "retry_budget", "source"},
+        "worker_sandbox": {"kind", "state", "source"},
     }
     if kind not in allowed or set(event) - allowed[kind]:
         raise ParentRunError("unsupported event or unexpected fields")
@@ -1223,6 +1292,10 @@ def _record_event_unlocked(run_id: str, event: dict, *, repo_root: Path = ROOT) 
         _lead_limit_event(parent, event)
     elif kind == "failure":
         _failure_event(parent, event)
+    elif kind == "worker_sandbox":
+        effective = _worker_sandbox_event(parent, event)
+        provenance.update_parent_orchestration(repo_root, run_id, parent)
+        return {**parent, "worker_sandbox_effective": effective}
     elif kind == "retry_gate":
         gate = _retry_gate_event(parent, event)
         provenance.update_parent_orchestration(repo_root, run_id, parent)

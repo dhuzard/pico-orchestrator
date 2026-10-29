@@ -26,6 +26,45 @@ All notable changes to PICO are recorded here. The format follows
 
 ### Security
 
+- Mutating Claude workers run in Claude Code's OS sandbox by default (#63, slices 2 to 4).
+  Their shell commands may write only in the bound worktree, its git metadata, the temp
+  directory and cache directories the repository declares; cannot read PICO's state directory
+  (run records, leases), `~/.config/gh`, `~/.ssh` or other credential files (also at their
+  resolved location when they are symlinks); and have no network. Claude's file tools get
+  `permissions.deny` Read and Edit rules for the same paths. `sandbox.allowUnsandboxedCommands:
+  false` stops unsandboxed retries and a repository's `.claude/settings.json` from widening the
+  sandbox. Every Claude worker, read-only reviewers included, runs with `disableAllHooks` and
+  `--strict-mcp-config`, so hooks and MCP servers planted in a repository (`.claude/settings.json`,
+  `.mcp.json`) do not run. A repository can allowlist hosts and cache directories in a new,
+  schema-validated `worker_sandbox` section of `.pi/autonomy.yaml`, read only from the default
+  branch on GitHub like publication permissions (never from the checkout, which worker commits
+  reach) and pinned at run start: a resume can narrow it, never widen it. A failed read widens
+  nothing. It cannot turn the sandbox off. The posture is recorded on every run in
+  `parent_orchestration.worker_sandbox` (with the policy commit, any refused widening, and which
+  widening keys the user's own Claude Code settings set) and on each `ClaudeWorker` result
+  (`sandbox`).
+  Not covered: the user's own `~/.claude/settings.json` (`excludedCommands`, `allowWrite`,
+  `allowedDomains`) still merges into workers' settings and can widen the sandbox (recorded,
+  not refused); declared cache directories are the user's real caches and can be poisoned;
+  Codex workers and the lead (slices 5 and 6); platforms without the sandbox; and per-attempt
+  denial records (Claude Code reports sandbox denials to the model, not in the JSON result PICO
+  reads). Not yet measured with real agents (slice 1).
+
+  **Migration.** `PI_ORCHESTRATOR_WORKER_SANDBOX` changes meaning: unset now means on (it was
+  off), `1` stays on, and `0` is the explicit opt-out, recorded on the run as
+  `state: opted_out`. On Linux and WSL2 install `bubblewrap` and `socat`; PICO checks that both
+  are on the worker's PATH and that bubblewrap can actually create its namespaces (on Ubuntu
+  24.04 and later it may need an AppArmor profile; see Claude Code's sandboxing docs). Without
+  that, a mutating Claude worker is not started and fails with the new prerequisite code
+  `WORKER_SANDBOX_UNAVAILABLE`. Native Windows has no sandbox; use WSL2 or opt out. Route
+  preflight now requires Claude Code 2.1.285 or later
+  (`claude_code_worker_sandbox_minimum_version` in `routing/backend-compatibility.json`) unless the
+  sandbox is opted out, with `MODEL_BACKEND_VERSION_UNSUPPORTED` (`requirement: worker_sandbox`).
+  Checks that need the network (installs, registries) need
+  `worker_sandbox.network.allowed_domains` on the default branch, or dependencies installed
+  before the worker starts. Read-only Claude steps get no sandbox, only hooks and MCP off and the
+  deny rules. Run records now carry `parent_orchestration.worker_sandbox`, which older PICO
+  versions (closed schema) reject.
 - Issue and comment writes are enforced (#58). `github_integration.execute` and
   `backlog github-push` read `create_github_issues`, `comment_on_issue` and `comment_on_pr`
   (and `create_pr` for `update_pr`) from `.pi/autonomy.yaml` on the default branch on GitHub,
