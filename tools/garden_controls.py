@@ -18,8 +18,11 @@ Security model, all fail closed:
   `garden_actions` log. Publication additionally creates its own provenance
   run through github_integration.publish, as on the command line.
 
-Nothing here merges, marks a PR ready, edits autonomy policy, or changes
-models; the permission and model panels are read-only.
+Nothing here merges, marks a PR ready or deploys. Policy edits are limited
+to the permissions in EDITABLE_PERMISSIONS (set_permission) and to the
+bounded approval of local mutation (approve_mutation: create_worktrees and
+commit only), each previewed as an exact diff; neither commits the change,
+and commit_policy commits only that file on the base branch, never pushed.
 """
 from __future__ import annotations
 
@@ -45,12 +48,13 @@ import os  # noqa: E402
 from contextlib import redirect_stdout  # noqa: E402
 import model_profiles  # noqa: E402
 import routing_engine as engine  # noqa: E402
+import workspace_authorization  # noqa: E402
 import workspace_contracts  # noqa: E402
 import workspace_run  # noqa: E402
 import workspace_scheduler  # noqa: E402
 
 TASK_ACTIONS = ("validate", "publish", "ci", "promote", "cancel")
-WORKSPACE_ACTIONS = ("schedule", "set_permission", "commit_policy", "set_model", "reset_model")
+WORKSPACE_ACTIONS = ("schedule", "set_permission", "approve_mutation", "commit_policy", "set_model", "reset_model")
 ACTIONS = TASK_ACTIONS + WORKSPACE_ACTIONS
 # Editable from the Garden; mark_pr_ready, merge and deploy stay file-only.
 EDITABLE_PERMISSIONS = ("create_backlog_items", "create_github_issues", "create_worktrees", "commit",
@@ -394,7 +398,13 @@ class Controls:
         observed_plan = workspace_run._plan(self.manifest, access_check=None)
         record = workspace_run.load_workspace(workspace_run.workspace_record_path(plan["workspace_id"])) or {"tasks": {}}
         states = {t["id"]: workspace_scheduler.state_of(t, record["tasks"].get(t["id"]), {}) for t in observed_plan["tasks"]}
-        dispatch = sorted(t["id"] for t in observed_plan["tasks"] if t["dispatchable"] and states[t["id"]] == "not_launched")
+        # The scheduler's own preflight: tasks without mutation authorization are held, authorized retries launch.
+        verdicts = workspace_run.authorization_verdicts(observed_plan, allow_mutation=allow_mutation)
+        candidates = [t["id"] for t in observed_plan["tasks"] if t["dispatchable"] and (
+            states[t["id"]] == "not_launched" or (states[t["id"]] == workspace_scheduler.AWAITING and workspace_run.retry_due(
+                record["tasks"].get(t["id"]), verdicts[t["id"]])))]
+        awaiting = sorted(tid for tid in candidates if verdicts[tid]["status"] == "awaiting")
+        dispatch = sorted(tid for tid in candidates if tid not in awaiting)
         interrupted = sorted(t for t, state in states.items() if state == "needs_reconciliation")
         mutating = {}
         for repo in observed_plan["repositories"]:
@@ -408,11 +418,12 @@ class Controls:
         budget = workspace_scheduler.budget_state(observed_plan, record, running=running,
                                                   extra_problems=running_problems)
         expected = self._confirm("schedule", dispatch, interrupted if resume else [], allow_mutation,
-                                 observed_plan["max_parallel"], mutating, bool(budget and budget["exhausted"]))
+                                 observed_plan["max_parallel"], mutating, bool(budget and budget["exhausted"]), awaiting)
         if confirm is None:
             launchable = bool(dispatch) and not (budget and (budget["exhausted"] or budget["incomplete"]))
             return {"ok": launchable or bool(resume and interrupted), "stage": "preview", "confirm": expected,
                     "preview": {"dispatch": dispatch, "resume": interrupted if resume else [], "budget": budget,
+                                "awaiting_authorization": awaiting,
                                 "interrupted": interrupted, "cap": observed_plan["max_parallel"],
                                 "allow_mutation": allow_mutation, "mutating_permissions": mutating,
                                 "note": "Launches real Pi child runs, one per task, in their own repositories."
@@ -453,7 +464,7 @@ class Controls:
         if not isinstance(value, bool):
             raise ControlError(400, "CONTROL_BODY_INVALID", "value must be true or false")
         path = autonomy_policy.policy_path(checkout)
-        top = _safe_policy_location(path)
+        _safe_policy_location(path)
         root = Path(__file__).resolve().parent.parent
         before = path.read_text(encoding="utf-8") if path.is_file() else ""
         source = before or (root / "templates" / "autonomy.yaml").read_text(encoding="utf-8")
@@ -480,14 +491,72 @@ class Controls:
                                         "committed on the default branch on GitHub, so this change has no "
                                         "effect on them until it is committed and pushed to the default branch."}}
         self._check_confirm(confirm, expected)
-        _safe_policy_location(path)
-        path.parent.mkdir(exist_ok=True)
-        try:
-            atomic_io.atomic_write_text(path, after, root=top)
-        except atomic_io.UnsafePathError as exc:
-            raise ControlError(409, "AUTONOMY_POLICY_PATH_UNSAFE", "the policy path is a symlink or leaves the checkout") from exc
+        self._write_policy(path, after)
         return {"ok": True, "stage": "done", "status": "POLICY_UPDATED",
                 "audit": {"repository": repo["id"], "permission": name, "value": value}}
+
+    @staticmethod
+    def _write_policy(path: Path, text: str) -> None:
+        top = _safe_policy_location(path)
+        path.parent.mkdir(exist_ok=True)
+        try:
+            atomic_io.atomic_write_text(path, text, root=top)
+        except atomic_io.UnsafePathError as exc:
+            raise ControlError(409, "AUTONOMY_POLICY_PATH_UNSAFE", "the policy path is a symlink or leaves the checkout") from exc
+
+    def _approve_mutation(self, plan, data, confirm):
+        """Grant exactly the local-mutation permissions a repository's tasks are missing, and nothing else.
+
+        The answer to an approval request (MUTATION_AUTHORIZATION_REQUIRED): create_worktrees and commit
+        only. An existing policy keeps every other line; a new one denies every other permission. The
+        change is written to the checkout, uncommitted: it authorizes nothing until committed on the base
+        branch and pinned in the manifest. Push, PR, mark-ready, merge and deploy are never touched.
+        """
+        repo, checkout = self._repo(plan, data.get("repository"))
+        path = autonomy_policy.policy_path(checkout)
+        _safe_policy_location(path)
+        before = path.read_text(encoding="utf-8") if path.is_file() else ""
+        current = None
+        if before:
+            try:
+                current = yaml.safe_load(before)
+                if autonomy_policy.validate(current):
+                    raise ValueError
+            except (ValueError, yaml.YAMLError):
+                raise ControlError(409, "AUTONOMY_POLICY_INVALID", "the checkout's policy does not validate; fix it in the file") from None
+        permissions = (current or {}).get("permissions") or {}
+        missing = [name for name in workspace_authorization.REQUIRED if permissions.get(name) is not True]
+        if not missing:
+            raise ControlError(409, "POLICY_UNCHANGED", "the checkout's policy already grants create_worktrees and commit; "
+                               "commit it on the base branch and set the manifest pin to that commit")
+        template = (Path(__file__).resolve().parent.parent / "templates" / "autonomy.yaml").read_text(encoding="utf-8")
+        try:
+            after = workspace_authorization.bounded_policy(before, template, missing)
+        except ValueError as exc:
+            raise ControlError(409, "AUTONOMY_POLICY_UNEDITABLE", str(exc)[:200]) from None
+        tasks = sorted(t["id"] for t in plan["tasks"] if t["repository"] == repo["id"]
+                       and t.get("kind") != "qualification" and t.get("mutation") != "none")
+        diff = "".join(difflib.unified_diff(before.splitlines(True), after.splitlines(True),
+                                            fromfile=".pi/autonomy.yaml", tofile=".pi/autonomy.yaml"))
+        expected = self._confirm("approve_mutation", repo["id"], missing, hashlib.sha256(before.encode()).hexdigest())
+        if confirm is None:
+            base = repo.get("base_branch", "main")
+            return {"ok": True, "stage": "preview", "confirm": expected,
+                    "preview": {"repository": repo["repository"], "grants": missing, "tasks": tasks,
+                                "creates_file": not before, "diff": diff,
+                                "never_granted": list(workspace_authorization.NEVER_GRANTED),
+                                "already_granted_beyond_local": workspace_authorization.granted_beyond_local(current or {}),
+                                "next_steps": [f"Commit the policy on {base} (Commit policy).",
+                                               f"Set pinned_commit of {repo['id']} in the manifest to that commit.",
+                                               "Schedule again with allow mutation: each blocked task starts a new "
+                                               "attempt linked to the one that stopped."],
+                                "note": "Grants only " + " and ".join(missing) + " in this checkout's .pi/autonomy.yaml, "
+                                        "uncommitted. It authorizes nothing until it is committed on the base branch "
+                                        "and pinned. It never grants push, pull requests, mark-ready, merge or deploy."}}
+        self._check_confirm(confirm, expected)
+        self._write_policy(path, after)
+        return {"ok": True, "stage": "done", "status": "POLICY_UPDATED",
+                "audit": {"repository": repo["id"], "granted": missing}}
 
     def _model_change(self, action, data, confirm, apply):
         family, tier = data.get("family"), data.get("tier")

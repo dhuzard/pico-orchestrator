@@ -24,7 +24,7 @@ import provenance  # noqa: E402
 import session_scope  # noqa: E402
 import workspace_run as wr  # noqa: E402
 import workspace_scheduler as ws  # noqa: E402
-from test_headless_run import FAKE_PI, git  # noqa: E402
+from test_headless_run import FAKE_PI, git, stage_mutation_policy  # noqa: E402
 
 NAMES = ("alpha", "beta", "gamma", "delta")
 
@@ -45,6 +45,7 @@ class SchedulerFixture(unittest.TestCase):
             git("-C", str(path), "remote", "add", "origin", f"git@github.com:acme/{name}.git")
             (path / "README.md").write_text(f"# {name}\n")
             git("-C", str(path), "add", "README.md")
+            stage_mutation_policy(path)
             git("-C", str(path), "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "-m", "init")
             self.repos[name] = (path, git("-C", str(path), "rev-parse", "HEAD"))
         self.state = self.base / "state"
@@ -76,6 +77,7 @@ class SchedulerFixture(unittest.TestCase):
         return path
 
     def schedule(self, manifest, **kwargs):
+        kwargs.setdefault("allow_mutation", True)
         return ws.run(manifest, access_check=ok_access, pi_executable=str(self.pi), poll_seconds=0.05, **kwargs)
 
     def overlap(self) -> tuple[int, dict]:
@@ -170,7 +172,7 @@ class SchedulerTest(SchedulerFixture):
         os.environ["FAKE_PI_SLEEP"] = "1.0"
         # A previous scheduler launched a1 and died; the child outlives it.
         subprocess.run([sys.executable, str(REPO_ROOT / "tools" / "workspace_run.py"), "launch", str(manifest),
-                        "--task", "a1", "--no-wait", "--no-access-check", "--pi", str(self.pi)],
+                        "--task", "a1", "--no-wait", "--no-access-check", "--allow-mutation", "--pi", str(self.pi)],
                        check=True, capture_output=True, env=os.environ.copy())
         os.environ["FAKE_PI_SLEEP"] = "0.2"
         result = self.schedule(manifest)
@@ -297,12 +299,12 @@ class SchedulerTest(SchedulerFixture):
         manifest = self.manifest(self.one_per_repo()[:2])
         out = io.StringIO()
         with redirect_stdout(out):
-            rc = ws.main([str(manifest), "--no-access-check", "--json", "--pi", str(self.pi), "--poll-seconds", "0.05"])
+            rc = ws.main([str(manifest), "--no-access-check", "--allow-mutation", "--json", "--pi", str(self.pi), "--poll-seconds", "0.05"])
         self.assertEqual(rc, 0)
         self.assertTrue(json.loads(out.getvalue())["ok"])
         out = io.StringIO()
         with redirect_stdout(out):
-            rc = ws.main([str(manifest), "--no-access-check", "--pi", str(self.pi), "--poll-seconds", "0.05"])
+            rc = ws.main([str(manifest), "--no-access-check", "--allow-mutation", "--pi", str(self.pi), "--poll-seconds", "0.05"])
         self.assertEqual(rc, 0)
         self.assertIn("a1 [alpha] partial", out.getvalue())
         bad = self.base / "bad.yaml"
@@ -359,7 +361,8 @@ class SchedulerEnforcesTimeLimitTest(SchedulerFixture):
                 unittest.mock.patch.object(headless_run, "boot_elapsed", lambda record: None):
             os.environ["FAKE_PI_BEHAVIOR"] = "hang"
             manifest = self.manifest([{"id": "a1", "repository": "alpha", "title": "Alpha", "max_duration_seconds": 30}])
-            launched = wr.launch(manifest=manifest, task_id="a1", access_check=None, pi_executable=str(self.pi), wait=False)
+            launched = wr.launch(manifest=manifest, task_id="a1", access_check=None, pi_executable=str(self.pi), wait=False,
+                                 allow_mutation=True)
             record = headless_run.load_record(headless_run.execution_path(
                 session_scope.common_dir(self.repos["alpha"][0]), launched["task"]["execution_id"]))
             self.addCleanup(self._kill, record["pid"])
@@ -368,7 +371,7 @@ class SchedulerEnforcesTimeLimitTest(SchedulerFixture):
                     and time.monotonic() < deadline:
                 time.sleep(0.05)
             clock[0] += 31
-            result = ws.run(manifest, access_check=None, pi_executable=str(self.pi), poll_seconds=0.1)
+            result = ws.run(manifest, access_check=None, pi_executable=str(self.pi), poll_seconds=0.1, allow_mutation=True)
         row = result["tasks"][0]
         self.assertEqual((row["state"], row["run_blocker_code"]), ("cancelled", "EXECUTION_TIME_LIMIT"))
         self.assertEqual(row["time_limit"]["stop_reason"], "EXECUTION_TIME_LIMIT")

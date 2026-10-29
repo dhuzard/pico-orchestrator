@@ -12,8 +12,10 @@ Nothing here contacts GitHub. Repository identity is a remote URL naming a
 sandbox owner (default `pico-bench-sandbox`); the repositories need not exist
 there. Commits use a fixed identity and date, so the pinned commits are the same
 on every run of this script: two PICO revisions can be benchmarked against
-identical pins. Publication stays off (no `.pi/autonomy.yaml`) unless
-`--publication` is given.
+identical pins. Each repository commits a `.pi/autonomy.yaml` granting local
+mutation (worktrees and commits), which workspace tasks need before they
+launch; publication (push and draft PRs) stays off unless `--publication` is
+given.
 """
 from __future__ import annotations
 
@@ -77,9 +79,11 @@ def build_repository(target: Path, name: str, owner: str, publication: bool) -> 
     workflow = (HERE / "files" / "ci" / "tests.yml").read_text(encoding="utf-8")
     (workflows / "tests.yml").write_text(workflow.replace("__CI_COMMAND__", CI_COMMANDS[name]), encoding="utf-8")
     (repo / ".gitignore").write_text("__pycache__/\n*.pyc\n", encoding="utf-8")
-    if publication:
-        (repo / ".pi").mkdir()
-        (repo / ".pi" / "autonomy.yaml").write_text(yaml.safe_dump(AUTONOMY, sort_keys=False), encoding="utf-8")
+    # Local mutation always; push and PRs only with --publication.
+    policy = json.loads(json.dumps(AUTONOMY))
+    policy["permissions"].update({"push_branch": publication, "create_pr": publication})
+    (repo / ".pi").mkdir()
+    (repo / ".pi" / "autonomy.yaml").write_text(yaml.safe_dump(policy, sort_keys=False), encoding="utf-8")
     git(repo, "init", "-q", "-b", "main")
     git(repo, "remote", "add", "origin", f"https://github.com/{owner}/{name}.git")
     git(repo, "add", "-A")

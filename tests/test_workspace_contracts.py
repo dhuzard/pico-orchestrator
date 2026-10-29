@@ -30,7 +30,7 @@ import session_scope  # noqa: E402
 import workspace_contracts as wc  # noqa: E402
 import workspace_run as wr  # noqa: E402
 import workspace_scheduler as ws  # noqa: E402
-from test_headless_run import FAKE_PI, git  # noqa: E402
+from test_headless_run import FAKE_PI, git, stage_mutation_policy  # noqa: E402
 
 COMMIT = ["-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "-m"]
 PY = sys.executable
@@ -93,6 +93,7 @@ class ContractLifecycleTest(unittest.TestCase):
             git("-C", str(path), "remote", "add", "origin", f"git@github.com:acme/{name}.git")
             (path / "README.md").write_text(f"# {name}\n")
             git("-C", str(path), "add", "README.md")
+            stage_mutation_policy(path)
             git("-C", str(path), *COMMIT, "init")
             self.repos[name] = (path, git("-C", str(path), "rev-parse", "HEAD"))
             self.bare[name] = self.base / f"{name}.git"
@@ -174,7 +175,7 @@ class ContractLifecycleTest(unittest.TestCase):
         self.fake.merge_policy(f"acme/{repo}", granting)
 
     def schedule(self, manifest):
-        return ws.run(manifest, access_check=None, pi_executable=str(self.pi), poll_seconds=0.05)
+        return ws.run(manifest, access_check=None, pi_executable=str(self.pi), poll_seconds=0.05, allow_mutation=True)
 
     def plan_task(self, manifest, task_id):
         return next(t for t in wr._plan(manifest, access_check=None)["tasks"] if t["id"] == task_id)

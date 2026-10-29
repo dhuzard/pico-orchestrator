@@ -6,6 +6,29 @@ All notable changes to PICO are recorded here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- Workspace tasks are checked for mutation authorization before launch, and waiting for a human's
+  approval is no longer reported as a failure. On scientific-review-four-repo-proposal-v1, two
+  upstream tasks in repositories without `.pi/autonomy.yaml` spent lead tokens, then stopped `BLOCKED`
+  with `HUMAN_MUTATION_APPROVAL_REQUIRED`. They had no worker and made no mutation. Their five
+  downstream tasks were shown as `blocked_by_failure`. Now:
+  - An implementation task needs `create_worktrees` and `commit` from the policy committed at its
+    pinned commit, plus `--allow-mutation`, or it is not launched. An untracked policy does not count.
+  - Such a task is `awaiting_authorization` and its dependents are `waiting_for_authorization`. The
+    scheduler prints one approval request per repository and exits 3. The Garden shows the same
+    requests.
+  - A child that stopped asking for approval counts the same way, but only when its run shows no
+    mutation and no worker.
+  - The Garden's guarded `approve_mutation` action grants only those two permissions, after an exact
+    diff preview. It never grants push, PR, merge or deploy.
+  - After the policy is committed and re-pinned, the next schedule starts a new attempt
+    (`<workspace>--<task>--attempt-<n>`) linked to the blocked one, whose records are left as they
+    were. A run that asks again under the same authorization is not retried.
+  - New: `pico workspace preflight` and the manifest field `mutation: none` for read-only tasks.
+  - Breaking: a workspace whose repositories have no committed policy granting local mutation no
+    longer launches anything. The synthetic benchmark setup now always commits one.
+
 ### Documentation
 
 - Added `docs/containment-and-authority.md`: containment acceptance tests for worker sandboxing (#63),

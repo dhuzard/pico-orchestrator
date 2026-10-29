@@ -29,6 +29,8 @@ SHA = re.compile(r"^[0-9a-f]{40}$")
 CODE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,79}$")
 STAMP = re.compile(r"^[0-9T:.Z+-]{1,40}$")
 SESSION_ID = re.compile(r"^[0-9TZ:-]{1,40}-[0-9]{1,10}$")
+SESSION_STATUSES = {"OK", "ATTENTION", "AWAITING_AUTHORIZATION"}
+PERMISSION_NAMES = {"create_worktrees", "commit"}
 ASSETS = {"/": ("index.html", "text/html; charset=utf-8"),
           "/app.js": ("app.js", "text/javascript; charset=utf-8"),
           "/issues.js": ("issues.js", "text/javascript; charset=utf-8"),
@@ -291,9 +293,12 @@ def _sessions(record: dict) -> list[dict]:
                          "dispatched": _ids(session.get("dispatched")), "resumed": _ids(session.get("resumed")),
                          "qualified": _ids(session.get("qualified")),
                          "held_by_budget": _ids(session.get("held_by_budget")),
+                         "awaiting_authorization": _ids(session.get("awaiting_authorization")),
+                         "new_attempts": _ids(session.get("new_attempts")),
+                         "allow_mutation": session.get("allow_mutation") is True,
                          "observed_running": _ids(session.get("observed_running")),
                          "refused": {t: c for t, c in refused.items() if _match(t, SLUG) and _match(c, CODE)},
-                         "status": session.get("status") if session.get("status") in {"OK", "ATTENTION"} else None})
+                         "status": session.get("status") if session.get("status") in SESSION_STATUSES else None})
     sessions.sort(key=lambda s: s["started_at"] or "", reverse=True)
     return sessions
 
@@ -349,14 +354,21 @@ def workspace_view(state: Path, *, workspace_id: str | None = None, manifest: Pa
     latest = sessions[0]["refused"] if sessions else {}
     refused = {task_id: {"code": code} for task_id, code in latest.items()
                if workspace_scheduler.classify(entries.get(task_id)) == "not_launched"}
-    report = workspace_scheduler.report(plan, entries, refused)
+    # Tasks the latest session's preflight kept from launching still await authorization until launched.
+    awaiting = {task_id for task_id in (sessions[0]["awaiting_authorization"] if sessions else [])
+                if workspace_scheduler.classify(entries.get(task_id)) == "not_launched"}
+    verdicts = None
+    if source == "manifest":
+        # The same read-only check the scheduler runs, under the flag the latest session used.
+        verdicts = workspace_run.authorization_verdicts(plan, allow_mutation=bool(sessions and sessions[0]["allow_mutation"]))
+    report = workspace_scheduler.report(plan, entries, refused, None, verdicts, awaiting)
     rows = {row["id"]: row for row in report["tasks"]}
     # A scheduler still running records its dispatches before the children return.
     open_session = next((x for x in sessions if x["finished_at"] is None), None)
     if open_session is not None:
         in_flight = set(open_session["dispatched"]) | set(open_session["resumed"]) | set(open_session["qualified"])
         settled = {"completed", "partial", "failed", "cancelled", "refused", "needs_reconciliation",
-                   "validated", "ready_for_downstream", "merged"}
+                   "validated", "ready_for_downstream", "merged", "awaiting_authorization"}
         for task_id in in_flight & set(rows):
             if rows[task_id]["state"] not in settled:
                 rows[task_id] = {**rows[task_id], "state": "running"}
@@ -373,6 +385,14 @@ def workspace_view(state: Path, *, workspace_id: str | None = None, manifest: Pa
         tokens = run_tokens(run_record["parent_orchestration"]) if run_record else None
         if tokens is not None:
             tokens_by_repo.setdefault(task["repository"], []).append(tokens)
+        previous = []
+        for item in row.get("previous_attempts") or []:
+            _, earlier = _child_run(runs_dir, item.get("run_id"), entry.get("target_repository"))
+            if earlier:  # superseded attempts spent tokens too
+                tokens_by_repo.setdefault(task["repository"], []).append(run_tokens(earlier["parent_orchestration"]))
+            previous.append({"attempt": _count(item.get("attempt")), "run_id": _match(item.get("run_id"), RUN_ID),
+                             "run_status": _match(item.get("run_status"), CODE),
+                             "run_blocker_code": _match(item.get("run_blocker_code"), CODE)})
         tasks_by_repo.setdefault(task["repository"], []).append({
             "id": task["id"], "repository": task["repository"], "wave": task["wave"],
             "kind": task.get("kind") if task.get("kind") in {"implementation", "qualification"} else None,
@@ -385,6 +405,8 @@ def workspace_view(state: Path, *, workspace_id: str | None = None, manifest: Pa
             "refusal_code": _match((row["refusal"] or {}).get("code"), CODE),
             "time_limit": _time_limit(row.get("time_limit")),
             "lead_call_limit": _lead_call_limit(row.get("lead_call_limit")),
+            "attempt": _count(row.get("attempt")), "previous_attempts": previous,
+            "authorization": _authorization(row.get("authorization")),
             "run": run, "links": _merge_links(publication_links(run_record, runs_dir) if run_record else [],
                                               workspace_pr_links(entry, runs_dir)), "tokens": tokens})
     repositories = []
@@ -406,7 +428,28 @@ def workspace_view(state: Path, *, workspace_id: str | None = None, manifest: Pa
             "status": report["status"], "counts": report["counts"], "repositories": repositories,
             "tokens": sum_tokens([part for parts in tokens_by_repo.values() for part in parts]),
             "budget": _budget(plan, record, runs_dir) if source == "manifest" else None,
+            "approval_requests": [_approval_request(r) for r in report.get("approval_requests") or []],
+            "repeated_authorization_stops": _ids(report.get("repeated_authorization_stops")),
             "sessions": sessions}
+
+
+def _authorization(verdict) -> dict | None:
+    if not isinstance(verdict, dict) or verdict.get("status") not in {"not_required", "authorized", "awaiting", "unresolved"}:
+        return None
+    return {"status": verdict["status"], "code": _match(verdict.get("code"), CODE),
+            "missing": sorted(name for name in verdict.get("missing") or [] if name in PERMISSION_NAMES)}
+
+
+def _approval_request(request: dict) -> dict:
+    """One repository's approval request, reduced to fixed vocabularies and validated identifiers."""
+    return {"repository": _match(request.get("repository"), SLUG), "github": _match(request.get("github"), REPOSITORY),
+            "code": _match(request.get("code"), CODE), "tasks": _ids(request.get("tasks")),
+            "missing": sorted(name for name in request.get("missing") or [] if name in PERMISSION_NAMES),
+            "policy_source": request.get("policy_source") if request.get("policy_source") in {"default", "committed"} else None,
+            "uncommitted_policy": request.get("uncommitted_policy") is True,
+            "base_branch": _match(request.get("base_branch"), SLUG),
+            "pinned_commit": _match(request.get("pinned_commit"), SHA),
+            "never_granted": ["push_branch", "create_pr", "mark_pr_ready", "merge", "deploy"]}
 
 
 class WorkspaceSource:

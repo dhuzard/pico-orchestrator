@@ -23,7 +23,7 @@ import headless_run as hr  # noqa: E402
 import provenance  # noqa: E402
 import session_scope  # noqa: E402
 import workspace_run as wr  # noqa: E402
-from test_headless_run import FAKE_PI, git  # noqa: E402
+from test_headless_run import FAKE_PI, git, stage_mutation_policy  # noqa: E402
 
 
 def ok_access(repository: str) -> dict:
@@ -42,6 +42,7 @@ class WorkspaceRunFixture(unittest.TestCase):
             git("-C", str(path), "remote", "add", "origin", f"git@github.com:acme/{name}.git")
             (path / "README.md").write_text(f"# {name}\n")
             git("-C", str(path), "add", "README.md")
+            stage_mutation_policy(path)
             git("-C", str(path), "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "-m", "init")
             self.repos[name] = (path, git("-C", str(path), "rev-parse", "HEAD"))
         self.state = self.base / "state"
@@ -74,6 +75,7 @@ class WorkspaceRunFixture(unittest.TestCase):
         return path
 
     def launch(self, manifest, task, **kwargs):
+        kwargs.setdefault("allow_mutation", True)
         return wr.launch(manifest=manifest, task_id=task, access_check=ok_access, pi_executable=str(self.pi), **kwargs)
 
     def snapshots(self):
@@ -200,7 +202,7 @@ class WorkspaceRunTest(WorkspaceRunFixture):
             "Repository-scoped objective: Alpha adapter\n", "Workspace goal: Cross-repo goal\n", 1)
         os.environ["FAKE_PI_BEHAVIOR"] = "crash"
         hr.start(target=self.repos["alpha"][0], explicit_repo="acme/alpha", execution_id="ws--a1",
-                 objective=legacy, pi_executable=str(self.pi))
+                 objective=legacy, pi_executable=str(self.pi), allow_mutation=True)
         os.environ["FAKE_PI_BEHAVIOR"] = "finish"
         resumed = self.launch(manifest, "a1", resume=True, takeover_stale_lease=True)
         self.assertEqual(resumed["task"]["launches"], 2)
@@ -408,7 +410,7 @@ class WorkspaceRunTest(WorkspaceRunFixture):
             with redirect_stdout(out):
                 rc = wr.main(args)
             return rc, json.loads(out.getvalue())
-        base = ["launch", str(manifest), "--task", "b1", "--no-access-check", "--pi", str(self.pi)]
+        base = ["launch", str(manifest), "--task", "b1", "--no-access-check", "--allow-mutation", "--pi", str(self.pi)]
         rc, data = run(base)
         self.assertEqual((rc, data["error_code"]), (1, "WORKSPACE_BUDGET_EXHAUSTED"))
         rc, data = run(base + ["--ignore-budget"])
@@ -422,7 +424,7 @@ class WorkspaceRunTest(WorkspaceRunFixture):
             with redirect_stdout(out):
                 rc = wr.main(args)
             return rc, json.loads(out.getvalue())
-        rc, data = run(["launch", str(manifest), "--task", "a1", "--no-access-check", "--pi", str(self.pi)])
+        rc, data = run(["launch", str(manifest), "--task", "a1", "--no-access-check", "--allow-mutation", "--pi", str(self.pi)])
         self.assertEqual(rc, 0, data)
         self.assertEqual(data["task"]["run_status"], "PARTIAL")
         rc, data = run(["status", str(manifest), "--no-access-check"])

@@ -11,6 +11,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -123,6 +124,10 @@ if behavior == "finish":
     pcmd("finish", run_id, "PARTIAL", "--owner", owner)
 elif behavior == "settle":
     pcmd("settle", run_id, "--owner", owner)
+elif behavior == "blocked":
+    # What a real lead did on the scientific-review workspace: stop before any worker and ask for approval.
+    pcmd("finish", run_id, "BLOCKED", "--blocker-code", os.environ.get("FAKE_PI_BLOCKER", "MUTATION_AUTHORIZATION_REQUIRED"),
+         "--owner", owner)
 elif behavior == "crash":
     note("end")
     sys.exit(3)
@@ -134,6 +139,18 @@ note("end")
 
 def git(*args: str) -> str:
     return subprocess.run(["git", *args], check=True, capture_output=True, text=True).stdout.strip()
+
+
+def stage_mutation_policy(checkout: Path, **grants: bool) -> None:
+    """Write and stage a `.pi/autonomy.yaml` granting local mutation (create_worktrees, commit) and nothing that
+    publishes; `grants` overrides single permissions. Workspace tasks launch only under a committed policy."""
+    template = (Path(__file__).resolve().parent.parent / "templates" / "autonomy.yaml").read_text()
+    values = {"create_worktrees": True, "commit": True, "push_branch": False, "create_pr": False, **grants}
+    for name, value in values.items():
+        template = re.sub(rf"^(\s+{name}:\s*)(true|false)", rf"\g<1>{'true' if value else 'false'}", template, flags=re.M)
+    (checkout / ".pi").mkdir(exist_ok=True)
+    (checkout / ".pi" / "autonomy.yaml").write_text(template)
+    git("-C", str(checkout), "add", ".pi/autonomy.yaml")
 
 
 class HeadlessFixture(unittest.TestCase):
