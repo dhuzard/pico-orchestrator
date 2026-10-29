@@ -116,7 +116,7 @@ OBSERVED_RELEASE = ("validated", "ready_for_downstream", "merged")
 def state_of(task: dict, entry: dict | None, refused: dict) -> str:
     """Scheduler state of one task, combining its execution and its observed contract state."""
     if task["id"] in refused:
-        return AWAITING if refused[task["id"]].get("code") in workspace_authorization.AWAITING_CODES else "refused"
+        return AWAITING if refused[task["id"]].get("awaiting") is True else "refused"
     observed = (entry or {}).get("observed") or {}
     if task.get("kind") == "qualification":
         if observed.get("readiness") in OBSERVED_RELEASE:
@@ -324,7 +324,12 @@ def run(manifest: Path, *, max_parallel: int | None = None, allow_mutation: bool
                     try:
                         entries[tid] = future.result()["task"]
                     except workspace_run.WorkspaceRunError as exc:
-                        refused[tid] = {"code": exc.code, "detail": exc.detail}
+                        # Awaiting only for a task that had not run (or already awaited) and still lacks
+                        # authorization; a refused resume of an interrupted execution stays a refusal.
+                        awaits = (exc.code in workspace_authorization.AWAITING_CODES
+                                  and verdicts[tid]["status"] == "awaiting"
+                                  and classify(entries.get(tid)) in {"not_launched", AWAITING})
+                        refused[tid] = {"code": exc.code, "detail": exc.detail, "awaiting": awaits}
                         session["refused"][tid] = exc.code
                 for tid in [t for t in external if t not in owned]:
                     observed = workspace_run.status(manifest=manifest, task_id=tid, access_check=None)["tasks"].get(tid)

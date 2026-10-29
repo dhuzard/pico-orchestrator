@@ -49,6 +49,8 @@ FLAG_CODE = "MUTATION_NOT_AUTHORIZED"  # headless_run's refusal: the policy gran
 CODES = frozenset({REQUIRED_CODE, FLAG_CODE, "HUMAN_MUTATION_APPROVAL_REQUIRED"})
 POLICY_CODES = frozenset({"AUTONOMY_POLICY_INVALID", "AUTONOMY_POLICY_PATH_UNSAFE"})
 AWAITING_CODES = CODES | POLICY_CODES
+# A launch with --allow-mutation whose working-tree policy is not the committed one: a refusal, not awaiting.
+UNCOMMITTED_CODE = "AUTONOMY_POLICY_UNCOMMITTED"
 
 
 def _git(checkout: Path, *args: str) -> subprocess.CompletedProcess:
@@ -138,8 +140,10 @@ def fingerprint(verdict: dict | None) -> str | None:
 def stopped_for_authorization(run: dict | None, checkout: dict | None = None) -> bool:
     """A finished run that stopped to ask for mutation approval and provably changed nothing.
 
-    Only BLOCKED with an authorization code, zero code and GitHub mutations, no worker in any phase,
-    and (when known) a parent checkout left clean with no kept worktree. Anything else stays a failure.
+    Only BLOCKED with an authorization code, zero code and GitHub mutations, no worker, spawned agent,
+    child run or bound worktree, and a recorded parent checkout that Git confirmed clean, on the branch it
+    started on, with no worktree kept or removed. Anything else, including a missing or partial checkout
+    record (a `--no-wait` launch), stays a failure.
     """
     parent = (run or {}).get("parent_orchestration") if isinstance(run, dict) else None
     if not isinstance(parent, dict) or parent.get("final_status") != "BLOCKED" or parent.get("blocker_code") not in CODES:
@@ -147,11 +151,26 @@ def stopped_for_authorization(run: dict | None, checkout: dict | None = None) ->
     mutations = parent.get("mutations") or {}
     if mutations.get("code") != 0 or mutations.get("github") != 0:
         return False
-    if any((phase or {}).get("workers") for phase in parent.get("phases") or []):
+    if ((parent.get("context") or {}).get("spawned_agents") or 0) != 0:
         return False
-    if checkout and (checkout.get("dirty_count") or checkout.get("kept_worktrees") or checkout.get("new_untracked_count")):
+    for phase in parent.get("phases") or []:
+        phase = phase or {}
+        if phase.get("workers") or phase.get("child_run_ids") or phase.get("workspace_bound") or phase.get("bound_epochs"):
+            return False
+    if not isinstance(checkout, dict) or checkout.get("dirty_count") != 0 or checkout.get("new_untracked_count") != 0:
         return False
-    return True
+    if checkout.get("kept_worktrees") or checkout.get("removed_worktrees") or checkout.get("left_reason"):
+        return False
+    return checkout.get("branch_before") is not None and checkout.get("branch_after") == checkout.get("branch_before")
+
+
+def uncommitted_policy(checkout: Path, pinned_commit: str) -> bool:
+    """True when the checkout's `.pi/autonomy.yaml` (which headless_run enforces) is not the one committed at the pin."""
+    try:
+        _, blob = committed_policy(checkout, pinned_commit)
+    except autonomy_policy.AutonomyPolicyError:
+        return True
+    return _working_copy_differs(checkout, blob)
 
 
 def objective_line(verdict: dict) -> str:

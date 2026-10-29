@@ -529,6 +529,13 @@ def launch(*, manifest: Path, task_id: str, allow_mutation: bool = False, resume
         # operator's explicit --allow-mutation. Awaiting authorization is not a failure (see the scheduler).
         if verdict["status"] == "awaiting":
             raise WorkspaceRunError(verdict["code"], authorization_detail(verdict))
+        # headless_run enforces the checkout's own policy file, so with mutation allowed it must be the committed
+        # one: an untracked or edited policy (also under a `mutation: none` task) would otherwise take effect.
+        if allow_mutation and workspace_authorization.uncommitted_policy(checkout, repo["pinned_commit"]):
+            raise WorkspaceRunError(workspace_authorization.UNCOMMITTED_CODE,
+                                    f".pi/autonomy.yaml in repository {repo['id']} differs from "
+                                    "the one committed at its pinned commit; commit or remove the change, re-pin, "
+                                    "and launch again")
 
     def before_spawn() -> None:
         checkout_gate()

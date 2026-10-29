@@ -14,12 +14,15 @@ All notable changes to PICO are recorded here. The format follows
   with `HUMAN_MUTATION_APPROVAL_REQUIRED`. They had no worker and made no mutation. Their five
   downstream tasks were shown as `blocked_by_failure`. Now:
   - An implementation task needs `create_worktrees` and `commit` from the policy committed at its
-    pinned commit, plus `--allow-mutation`, or it is not launched. An untracked policy does not count.
+    pinned commit, plus `--allow-mutation`, or it is not launched. An untracked policy does not count,
+    and a launch with `--allow-mutation` is refused (`AUTONOMY_POLICY_UNCOMMITTED`) while the
+    checkout's policy file differs from the committed one, also for a `mutation: none` task.
   - Such a task is `awaiting_authorization` and its dependents are `waiting_for_authorization`. The
     scheduler prints one approval request per repository and exits 3. The Garden shows the same
     requests.
   - A child that stopped asking for approval counts the same way, but only when its run shows no
-    mutation and no worker.
+    mutation, worker, spawned agent, child run or bound worktree, and its recorded checkout is clean
+    and on its starting branch. A refused resume of an interrupted execution stays a refusal.
   - The Garden's guarded `approve_mutation` action grants only those two permissions, after an exact
     diff preview. It never grants push, PR, merge or deploy.
   - After the policy is committed and re-pinned, the next schedule starts a new attempt

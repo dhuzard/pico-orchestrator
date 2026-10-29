@@ -2184,9 +2184,13 @@ committed policy the default applies, which grants no mutation. A symlinked
 or invalid committed policy fails closed (`AUTONOMY_POLICY_PATH_UNSAFE`,
 `AUTONOMY_POLICY_INVALID`). A granting policy still needs `--allow-mutation`
 (`MUTATION_NOT_AUTHORIZED`, as for any headless run). Tasks declared
-`mutation: none` and qualification tasks need nothing. Push, PR, mark-ready,
-merge and deploy are not part of this check. Publication still reads the
-policy on the default branch on GitHub.
+`mutation: none` and qualification tasks need nothing. Because a headless
+run enforces the checkout's own policy file, any task launched with
+`--allow-mutation` (also a `mutation: none` one) is refused with
+`AUTONOMY_POLICY_UNCOMMITTED` while that file differs from the committed one;
+this is a refusal, not awaiting authorization. Push, PR, mark-ready, merge
+and deploy are not part of this check. Publication still reads the policy on
+the default branch on GitHub.
 
 An unauthorized task is `awaiting_authorization`, not a failure, and its
 transitive dependents are `waiting_for_authorization`, not
@@ -2195,9 +2199,14 @@ transitive dependents are `waiting_for_authorization`, not
 `BLOCKED` asking for approval (`MUTATION_AUTHORIZATION_REQUIRED`,
 `MUTATION_NOT_AUTHORIZED`, or `HUMAN_MUTATION_APPROVAL_REQUIRED`, the code
 leads chose before this check existed) is also `awaiting_authorization`, but
-only when its run record shows zero code and GitHub mutations, no worker in
-any phase, and a clean parent checkout with no kept worktree. Any other
-`BLOCKED` or `FAILED` run stays `failed`. The scheduler prints one approval
+only when its run record shows zero code and GitHub mutations, no worker,
+spawned agent, child run or bound worktree, and its execution recorded a
+parent checkout that Git confirmed clean, still on its starting branch, with
+no worktree kept or removed. Any other `BLOCKED` or `FAILED` run stays
+`failed`, as does one without a checkout record (a `--no-wait` launch). A
+launch refused with an authorization code counts as awaiting only for a task
+that had not run and whose verdict is awaiting; a refused resume of an
+interrupted execution stays `refused`. The scheduler prints one approval
 request per repository and code, with the missing permissions, where the
 policy came from and the next steps. The same requests are in `--json`
 (`approval_requests`) and in the Garden. Its status is

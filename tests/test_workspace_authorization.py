@@ -177,6 +177,18 @@ class PreflightTest(AuthorizationFixture):
             rc = ws.main([str(manifest), "--no-access-check", "--pi", str(self.pi), "--poll-seconds", "0.05"])
         self.assertEqual(rc, 3)
 
+    def test_an_uncommitted_policy_never_takes_effect_even_under_a_read_only_task(self):
+        # headless_run enforces the checkout's own file; an untracked one granting push must not ride along.
+        self.remove_policy("gamma")
+        checkout = self.repos["gamma"][0]
+        stage_mutation_policy(checkout, push_branch=True, create_pr=True)
+        git("-C", str(checkout), "reset", "-q")  # leave it untracked
+        manifest = self.manifest([{"id": "r1", "repository": "gamma", "title": "audit", "mutation": "none"}])
+        result = self.schedule(manifest, allow_mutation=True)
+        self.assertEqual(self.states(result), {"r1": "refused"})
+        self.assertEqual(result["session"]["refused"], {"r1": wa.UNCOMMITTED_CODE})
+        self.assertFalse(self.launched())
+
     def test_a_repository_blocker_is_still_a_refusal_not_awaiting_authorization(self):
         manifest = self.manifest([{"id": "a1", "repository": "alpha", "title": "x"},
                                   {"id": "b1", "repository": "beta", "title": "y", "depends_on": ["a1"]}])
@@ -295,6 +307,54 @@ class RecoveryTest(AuthorizationFixture):
         again = self.schedule(manifest)
         self.assertEqual(self.states(again), {"a1": "failed", "b1": "blocked_by_failure"})
         self.assertEqual(again["status"], "ATTENTION")
+
+    def test_a_refused_resume_of_an_interrupted_execution_is_not_awaiting(self):
+        # An execution from before this check crashed (it may have changed things); resuming it without
+        # --allow-mutation is refused with an authorization code, which must stay a refusal.
+        tasks = [{"id": "g1", "repository": "gamma", "title": "g"},
+                 {"id": "g2", "repository": "gamma", "title": "after", "depends_on": ["g1"]}]
+        manifest = self.manifest(tasks)
+        plan = wr._plan(manifest, access_check=None)
+        task, repo = wr._task(plan, "g1")
+        os.environ["FAKE_PI_BEHAVIOR"] = "crash"
+        hr.start(target=Path(repo["resolved_path"]), explicit_repo=repo["repository"],
+                 execution_id=wr.execution_id("ws", "g1"), objective=wr.objective_for(plan, task, repo),
+                 allow_mutation=True, pi_executable=str(self.pi))
+        os.environ["FAKE_PI_BEHAVIOR"] = "finish"
+        wr.status(manifest=manifest)
+        again = self.schedule(manifest, resume_interrupted=True, allow_mutation=False)
+        self.assertEqual(again["session"]["refused"], {"g1": wa.FLAG_CODE})
+        self.assertEqual(self.states(again), {"g1": "refused", "g2": "blocked_by_failure"})
+        self.assertEqual(again["status"], "ATTENTION")
+
+    def test_only_a_provably_untouched_run_counts_as_stopped_for_authorization(self):
+        run = {"parent_orchestration": {"final_status": "BLOCKED", "blocker_code": "HUMAN_MUTATION_APPROVAL_REQUIRED",
+                                        "mutations": {"code": 0, "github": 0}, "context": {"spawned_agents": 0},
+                                        "phases": [{"id": "s1", "workers": [], "child_run_ids": []}]}}
+        checkout = {"branch_before": "main", "branch_after": "main", "restored": False, "removed_worktrees": [],
+                    "kept_worktrees": [], "left_reason": None, "dirty_count": 0, "new_untracked_count": 0}
+        self.assertTrue(wa.stopped_for_authorization(run, checkout))
+
+        def with_parent(**changes):
+            return {"parent_orchestration": {**run["parent_orchestration"], **changes}}
+        phase = run["parent_orchestration"]["phases"][0]
+        for label, changed in {
+            "spawned agent": with_parent(context={"spawned_agents": 2}),
+            "child run": with_parent(phases=[{**phase, "child_run_ids": ["run-child"]}]),
+            "bound worktree": with_parent(phases=[{**phase, "workspace_bound": True, "bound_epochs": [0]}]),
+        }.items():
+            with self.subTest(label):
+                self.assertFalse(wa.stopped_for_authorization(changed, checkout))
+        for label, changes in {
+            "removed worktree": {"removed_worktrees": ["/x/wt"]}, "kept worktree": {"kept_worktrees": ["/x/wt"]},
+            "moved branch": {"branch_after": "pico/task"}, "unrestored": {"left_reason": "git switch failed"},
+            "unknown dirt": {"dirty_count": None}, "unknown untracked": {"new_untracked_count": None},
+            "dirty": {"dirty_count": 1}, "no branch": {"branch_before": None, "branch_after": None},
+        }.items():
+            with self.subTest(label):
+                self.assertFalse(wa.stopped_for_authorization(run, {**checkout, **changes}))
+        with self.subTest("no checkout record (a --no-wait launch)"):
+            self.assertFalse(wa.stopped_for_authorization(run, None))
 
     def test_other_blocker_codes_stay_failures(self):
         os.environ["FAKE_PI_BEHAVIOR_alpha"] = "blocked"
