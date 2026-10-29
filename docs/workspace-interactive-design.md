@@ -1,5 +1,25 @@
 # Workspace manifest builder (`pico workspace init`)
 
+## Local setup page
+
+`pico watch --setup-root DIR` opens a loopback setup page using this same
+builder. The private URL contains a per-session token in its fragment. The page
+discovers checkouts below `DIR`, shows their branch, HEAD, dirty state and
+available GitHub identities, and lets the operator explicitly select one
+identity for ambiguous remotes. Remote-only repositories need an explicit
+GitHub identity and expected checkout path. The server verifies GitHub access,
+builds a schema-valid manifest and previews its exact contents, pins, blockers
+and destination. `Save` re-runs resolution and refuses a stale preview, then
+uses the builder's exclusive-create write. Setup never clones, fetches, pulls,
+repins, grants permissions or starts a worker. A missing checkout needs an
+explicit preparation step before scheduling.
+
+`GET /api/setup` and `POST /api/setup` require the same Host and session-token
+checks as Garden data and actions; POST also requires the same-origin Origin
+header and JSON body. The setup root comes from the CLI, not from a browser
+request. Saving outside that root or overwriting a path is refused. Browser
+text is rendered as text, including repository names and manifest contents.
+
 `pico workspace init` builds a new workspace manifest
 (`schemas/workspace.schema.json`, `schema_version: 1`) from repositories the
 user selects, previews it with the planner's waves and blockers, and saves it

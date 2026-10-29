@@ -127,3 +127,14 @@ button.model-cell{border:0;background:none;padding:0;font:inherit;color:#3b878d;
 
 .task-status.abandoned,.detail-status.abandoned{color:#7d7a72;background:#efeeea}.worker-dot.abandoned{background:#c9c6bd}.agent-node.abandoned{border-style:dashed;background:#f8f8f5;color:#7d7a72}.task-glyph.abandoned{background:#efeeea;color:#8b887f}
 .ws-approval{display:flex;flex-direction:column;gap:6px;border:1px dashed #e9cf9f;background:#fffaf1;border-radius:12px;padding:12px 14px;margin:0 0 10px}.ws-approval strong{font-size:12px;color:#8c6a32}.ws-approval small{font-size:10px;color:#a88d5c;overflow-wrap:anywhere}.ws-approval .ws-action{align-self:flex-start}.ws-approval-steps{margin:2px 0;padding-left:18px;font-size:11px;line-height:1.5;color:#6f6450}.activity-item.blocked .activity-icon{background:#fff2db;color:#a87d3b}
+/* Workspace setup uses the existing Garden color and control system. */
+.setup-page { max-width: 1050px; margin: 0 auto; padding: 2rem; display: grid; gap: 1.5rem; }
+.setup-page .panel { padding: 1.5rem; }
+.setup-page h1 { margin: .3rem 0; }
+.setup-page fieldset { border: 1px solid #d8d6ce; border-radius: 12px; margin: 1rem 0; padding: 1rem; }
+.setup-page fieldset > label { display: flex; align-items: center; gap: .6rem; font-weight: 700; }
+.setup-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: .8rem; margin: 1rem 0; }
+.setup-fields label { display: grid; gap: .35rem; }
+.setup-fields input, .setup-page select { width: 100%; box-sizing: border-box; padding: .55rem; border: 1px solid #a9a79f; border-radius: 7px; font: inherit; }
+.setup-page pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 30rem; overflow: auto; }
+.setup-page button { margin-top: .6rem; }
