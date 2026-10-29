@@ -82,6 +82,8 @@ PICO runs on Linux and macOS, and on Windows through WSL2. You need:
 - [Task ambiguity and model capacity](docs/ambiguity.md) and
   [evaluating model capacity](docs/model-ambiguity-evaluation.md).
 - [Work modes](docs/work-modes.md): how the lead decomposes mixed work.
+- [Workspace manifest builder](docs/workspace-interactive-design.md):
+  `pico workspace init`, its builder spec and its safety rules.
 - [Orchestration guidance](docs/orchestration-guidance.md): how the policy
   maps to published orchestration guidance.
 - [Release checklist](docs/release-checklist.md) and
@@ -216,6 +218,23 @@ prompts or logs, and it never opens execution records.
 
 **Advanced: multi-repository workspaces.** The next sections plan, schedule
 and publish work across several repositories; skip them if you work in one.
+
+### Build a workspace manifest (`pico workspace init`)
+
+`pico workspace init` lists the Git checkouts below the current directory (or
+`--root DIR`), lets you search and select 2 to 64 of them by number, add a
+GitHub repository that is not cloned yet, and choose the identity of a
+checkout with several GitHub remotes (there is no default). It then verifies
+every repository read-only on GitHub, pins each local checkout at its `HEAD`
+(a repository that is not cloned yet at its default branch head) and previews
+the manifest, with one placeholder-titled task per repository unless you give
+a title, together with the planner's waves and blockers. The file
+(`<root>/<id>.workspace.yaml` or `--output`) is written only after you type
+`yes`, and never over an existing path. Nothing is cloned, fetched or
+launched, and the discovery root grants no permission. Without a terminal,
+use a builder spec: `pico workspace init --spec spec.yaml` previews and
+`--approve` saves. See [docs/workspace-interactive-design.md](docs/workspace-interactive-design.md)
+for the spec format, discovery bounds and exit codes.
 
 ### Plan a mission across several repositories (read-only)
 
