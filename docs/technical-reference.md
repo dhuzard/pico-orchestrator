@@ -2201,9 +2201,11 @@ transitive dependents are `waiting_for_authorization`, not
 leads chose before this check existed) is also `awaiting_authorization`, but
 only when its run record shows zero code and GitHub mutations, no worker,
 spawned agent, child run or bound worktree, and its execution recorded a
-parent checkout that Git confirmed clean, still on its starting branch, with
-no worktree kept or removed. Any other `BLOCKED` or `FAILED` run stays
-`failed`, as does one without a checkout record (a `--no-wait` launch). A
+parent checkout that Git confirmed clean, at its starting `HEAD` and branch,
+with no local branch moved and no worktree kept or removed. Any other
+`BLOCKED` or `FAILED` run stays `failed`, as does one without that evidence:
+a `--no-wait` launch, or an execution recorded before the checkout block
+included `head_before`, `head_after` and `branches_changed`. A
 launch refused with an authorization code counts as awaiting only for a task
 that had not run and whose verdict is awaiting; a refused resume of an
 interrupted execution stays `refused`. The scheduler prints one approval

@@ -332,7 +332,8 @@ class RecoveryTest(AuthorizationFixture):
                                         "mutations": {"code": 0, "github": 0}, "context": {"spawned_agents": 0},
                                         "phases": [{"id": "s1", "workers": [], "child_run_ids": []}]}}
         checkout = {"branch_before": "main", "branch_after": "main", "restored": False, "removed_worktrees": [],
-                    "kept_worktrees": [], "left_reason": None, "dirty_count": 0, "new_untracked_count": 0}
+                    "kept_worktrees": [], "left_reason": None, "dirty_count": 0, "new_untracked_count": 0,
+                    "head_before": "a" * 40, "head_after": "a" * 40, "branches_changed": []}
         self.assertTrue(wa.stopped_for_authorization(run, checkout))
 
         def with_parent(**changes):
@@ -349,12 +350,33 @@ class RecoveryTest(AuthorizationFixture):
             "removed worktree": {"removed_worktrees": ["/x/wt"]}, "kept worktree": {"kept_worktrees": ["/x/wt"]},
             "moved branch": {"branch_after": "pico/task"}, "unrestored": {"left_reason": "git switch failed"},
             "unknown dirt": {"dirty_count": None}, "unknown untracked": {"new_untracked_count": None},
-            "dirty": {"dirty_count": 1}, "no branch": {"branch_before": None, "branch_after": None},
+            "dirty": {"dirty_count": 1}, "moved head": {"head_after": "b" * 40},
+            "commit on another branch": {"branches_changed": ["refs/heads/x"]},
+            "unknown branches": {"branches_changed": None},
+            "recorded before HEAD was": {"head_before": None, "head_after": None, "branches_changed": None},
         }.items():
             with self.subTest(label):
                 self.assertFalse(wa.stopped_for_authorization(run, {**checkout, **changes}))
+        with self.subTest("detached at the same commit"):
+            self.assertTrue(wa.stopped_for_authorization(run, {**checkout, "branch_before": None, "branch_after": None}))
         with self.subTest("no checkout record (a --no-wait launch)"):
             self.assertFalse(wa.stopped_for_authorization(run, None))
+
+    def test_a_commit_the_run_made_without_switching_branch_is_seen(self):
+        run = {"parent_orchestration": {"final_status": "BLOCKED", "blocker_code": "HUMAN_MUTATION_APPROVAL_REQUIRED",
+                                        "mutations": {"code": 0, "github": 0}, "phases": []}}
+        checkout = self.repos["gamma"][0]
+        before = hr.checkout_state(checkout)
+        self.assertTrue(wa.stopped_for_authorization(run, hr.restore_checkout(checkout, before)))
+        for label, steps in {"own branch": [], "other branch": [("branch", "-q", "side"), ("switch", "-q", "side")]}.items():
+            with self.subTest(label):
+                before = hr.checkout_state(checkout)
+                for step in steps:
+                    git("-C", str(checkout), *step)
+                git("-C", str(checkout), *COMMIT, "unrecorded", "--allow-empty")
+                if steps:
+                    git("-C", str(checkout), "switch", "-q", "main")
+                self.assertFalse(wa.stopped_for_authorization(run, hr.restore_checkout(checkout, before)))
 
     def test_other_blocker_codes_stay_failures(self):
         os.environ["FAKE_PI_BEHAVIOR_alpha"] = "blocked"

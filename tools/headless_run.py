@@ -382,8 +382,10 @@ def checkout_state(checkout: Path) -> dict:
     listing = _git(checkout, "worktree", "list", "--porcelain").stdout.splitlines()
     paths = [line[len("worktree "):] for line in listing if line.startswith("worktree ")]
     main = str(checkout.resolve())
+    refs = _git(checkout, "for-each-ref", "--format=%(refname) %(objectname)", "refs/heads")
+    branches = dict(line.split(" ", 1) for line in refs.stdout.splitlines() if " " in line) if refs.returncode == 0 else None
     return {"branch": branch, "head": head, "worktrees": sorted(p for p in paths if str(Path(p).resolve()) != main),
-            "untracked": untracked_entries(checkout)}
+            "untracked": untracked_entries(checkout), "branches": branches}
 
 
 DIRTY_FILES_SHOWN = 50
@@ -444,6 +446,13 @@ def restore_checkout(checkout: Path, before: dict) -> dict:
             if not result["restored"]:
                 result["left_reason"] = "git switch failed"
         result["branch_after"] = checkout_state(checkout)["branch"]
+    # Where HEAD and the local branches ended up, so a commit the run made on the checkout's own branch (or on
+    # a branch it never switched to) is visible; None when Git cannot answer.
+    final = checkout_state(checkout)
+    result["head_before"], result["head_after"] = before.get("head"), final["head"]
+    old, new_refs = before.get("branches"), final["branches"]
+    result["branches_changed"] = (None if old is None or new_refs is None
+                                  else sorted(n for n in set(old) | set(new_refs) if old.get(n) != new_refs.get(n)))
     # What the run left uncommitted in the parent checkout itself, recorded whether or not it moved, so the next
     # launch's refusal (WORKSPACE_CHECKOUT_DIRTY) can name the run that caused it. Nothing is cleaned.
     dirty = tracked_changes(checkout)

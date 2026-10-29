@@ -141,9 +141,10 @@ def stopped_for_authorization(run: dict | None, checkout: dict | None = None) ->
     """A finished run that stopped to ask for mutation approval and provably changed nothing.
 
     Only BLOCKED with an authorization code, zero code and GitHub mutations, no worker, spawned agent,
-    child run or bound worktree, and a recorded parent checkout that Git confirmed clean, on the branch it
-    started on, with no worktree kept or removed. Anything else, including a missing or partial checkout
-    record (a `--no-wait` launch), stays a failure.
+    child run or bound worktree, and a recorded parent checkout that Git confirmed clean, at the HEAD and
+    branch it started on, with no local branch moved and no worktree kept or removed. Anything else stays
+    a failure, including a missing or partial checkout record (a `--no-wait` launch, or one recorded
+    before HEAD was).
     """
     parent = (run or {}).get("parent_orchestration") if isinstance(run, dict) else None
     if not isinstance(parent, dict) or parent.get("final_status") != "BLOCKED" or parent.get("blocker_code") not in CODES:
@@ -161,7 +162,9 @@ def stopped_for_authorization(run: dict | None, checkout: dict | None = None) ->
         return False
     if checkout.get("kept_worktrees") or checkout.get("removed_worktrees") or checkout.get("left_reason"):
         return False
-    return checkout.get("branch_before") is not None and checkout.get("branch_after") == checkout.get("branch_before")
+    if checkout.get("branches_changed") != [] or checkout.get("branch_after") != checkout.get("branch_before"):
+        return False
+    return checkout.get("head_before") is not None and checkout.get("head_after") == checkout.get("head_before")
 
 
 def uncommitted_policy(checkout: Path, pinned_commit: str) -> bool:
