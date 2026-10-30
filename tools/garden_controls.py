@@ -233,7 +233,7 @@ class Controls:
             record = (workspace_run.load_workspace(self._record_path(workspace_id))
                       if isinstance(workspace_id, str) and TASK_RE.fullmatch(workspace_id) else None)
             return workspace_plan.plan(self.manifest, access_check=None,
-                                       observed=workspace_run.observed_from_record(record or {}))
+                                       observed=workspace_run.observed_from_record(record or {}, manifest=self.manifest))
         except workspace_plan.WorkspaceError as exc:
             raise workspace_run.WorkspaceRunError("WORKSPACE_MANIFEST_INVALID", str(exc)) from exc
 
@@ -290,7 +290,7 @@ class Controls:
         running = self._scheduler is not None and self._scheduler.is_alive()
         record = workspace_run.load_workspace(self._record_path(plan["workspace_id"])) or {"tasks": {}}
         # Viewing controls must never reconcile executions, enforce deadlines or save records.
-        entries = workspace_run._record_entries(plan["workspace_id"], record)
+        entries = workspace_run.compatible_entries(record, self.manifest)
         runs_dir = self.state_dir / "runs" if self.state_dir is not None else None
         budget = workspace_scheduler.budget_state(plan, record, runs_dir=runs_dir)
         action_view = workspace_action_view.snapshot(plan, entries, budget=budget, scheduler_running=running)
