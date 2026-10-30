@@ -147,6 +147,7 @@ function compactContentEnvelope(parsed: RouteTaskEnvelope): RouteTaskEnvelope {
 			backend_bindings: parsed.backend_bindings,
 			fallback_applied: parsed.fallback_applied,
 			matches: parsed.matches,
+			path_floor_matches: parsed.path_floor_matches,
 			route_availability: parsed.route_availability,
 			content_truncated: true,
 			content_note:
@@ -355,8 +356,8 @@ export default function modelRouterExtension(pi: ExtensionAPI) {
 			"Deterministically select the execution route (CODEX, CLAUDE, CLAUDE_CODEX, or " +
 			"CODEX_CLAUDE_CODEX) for a fully classified engineering task, per routing/default-policy.yaml. " +
 			"The LLM classifies the task; this tool -- not the LLM -- selects the route by delegating to " +
-			"the shared deterministic routing engine. Also applies any project-local risk_overrides floors " +
-			"from .pi/routing.yaml. On an invalid task or project config, returns ok:false with structured " +
+			"the shared deterministic routing engine. Also applies any project-local risk_overrides floors, " +
+			"and the path_floors whose globs match the task's files_or_areas (recorded in path_floor_matches), from .pi/routing.yaml. On an invalid task or project config, returns ok:false with structured " +
 			"validation errors and no route: repair the classification or config and retry, never pick a " +
 			"route without calling this tool again. Escalating values (failure_cost=high, semantic_correctness=critical, " +
 			"ambiguity=high, behavior_preservation=required, assumptions_must_be_explicit, security_sensitive, " +

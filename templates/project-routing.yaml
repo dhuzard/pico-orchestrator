@@ -38,6 +38,32 @@ validation:
 #   destructive_operation: true
 risk_overrides: {}
 
+# Path-triggered floors. Each rule applies its `floors` (the same keys and
+# raise-only values as risk_overrides) only to a task that touches one of its
+# `paths`: before the run, when a glob matches one of the task's declared
+# `files_or_areas`; after the run, when it matches a path the worker really
+# changed in its bound worktree. A diff whose floors need a stronger route or
+# capacity than the one that ran is not integrated: the run stops with
+# CLASSIFICATION_UNDERRATED_BY_DIFF and resumes as a required re-route.
+#
+# Globs are repository-relative and anchored at the root: `*` and `?` match
+# inside one path segment, a whole `**` segment matches zero or more segments
+# (`migrations/**` covers `migrations/` and everything below it). Character
+# classes, braces, backslashes, a leading `!` or `/`, and `.`/`..` segments are
+# rejected. Matching is case-sensitive. A declared directory also touches the
+# globs below it (`src` touches `src/db/migrations/**`). Built-in floors that
+# no project can remove already make `.pi/**`, `.claude/**`, `.mcp.json` and
+# `.github/workflows/**` security-sensitive. Example:
+#
+#   path_floors:
+#     - paths: ["migrations/**", "schemas/**"]
+#       floors: { failure_cost: high, behavior_preservation: required }
+#     - paths: ["deploy/**", "**/*secret*"]
+#       floors: { security_sensitive: true }
+path_floors: []
+
+# Free-text context for the orchestrating prompt only; no tool enforces it.
+# Use path_floors for areas whose changes must raise routing.
 protected_areas: []
 
 notes: []

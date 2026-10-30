@@ -1384,11 +1384,15 @@ class CLICasesTest(unittest.TestCase):
                 result = json.loads(proc.stdout)
                 self.assertTrue(result["ok"])
                 self.assertEqual(result["policy_version"], 7)
-                self.assertEqual(result["selected_route"], case["expected_route"])
+                # The fixtures' expected_route is the global policy alone; a task declaring a path under a built-in
+                # path floor (.pi/, .claude/, .mcp.json, .github/workflows/, #76) is security-sensitive at runtime.
+                builtin = engine.match_all_path_floors(case["task"]["files_or_areas"], None, declared=True)
+                route = "CODEX_CLAUDE_CODEX" if builtin else case["expected_route"]
+                self.assertEqual(result["selected_route"], route)
                 self.assertEqual(set(result["matches"]["base"]), set(case["expected_matches"]))
                 self.assertEqual(
                     result["execution_plan"],
-                    expected_plan_for(self.assets, case["task"], case["expected_route"]),
+                    expected_plan_for(self.assets, case["task"], route),
                 )
 
     def test_override_fixtures_through_cli(self):
@@ -1520,7 +1524,8 @@ class CLICasesTest(unittest.TestCase):
         expected = {
             "case-15-vcs-operation": "CLAUDE",
             "case-16-issue-management": "CLAUDE",
-            "case-17-config-edit": "CLAUDE",
+            # Edits .pi/autonomy.yaml: the built-in .pi/** path floor makes it security-sensitive (#76).
+            "case-17-config-edit": "CODEX_CLAUDE_CODEX",
             "case-18-ci-fix-known-cause": "CLAUDE",
             "case-19-ci-fix-unknown-cause": "CODEX",
         }
@@ -1531,6 +1536,7 @@ class CLICasesTest(unittest.TestCase):
                 self.assertTrue(result["ok"], result)
                 self.assertEqual(result["selected_route"], route)
                 self.assertFalse(result["fallback_applied"])
+                self.assertEqual(bool(result["path_floor_matches"]), case_id == "case-17-config-edit")
                 self.assertEqual(engine.validate_route_task_result(result, self.assets), [])
 
     def test_invalid_project_config_through_cli_returns_ok_false_no_route(self):

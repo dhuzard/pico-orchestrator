@@ -600,12 +600,15 @@ cases:
       security_sensitive: false
       destructive_operation: false
     expected_decision:
-      route: CLAUDE
+      route: CODEX_CLAUDE_CODEX
       primary_intent: implementation
       capacities:
-        claude_worker: light
-    notes: Over-routed in real runs (CODEX/CODEX_CLAUDE_CODEX with high effort). Rubric gold is all low-risk;
-      expected_decision reflects policy v6 graduated capacity rules.
+        codex_specifier: high
+        claude_worker: high
+        codex_reviewer: high
+    notes: Over-routed in real runs (CODEX/CODEX_CLAUDE_CODEX with high effort). Rubric gold stays all low-risk,
+      but .pi/ is a built-in path floor (security_sensitive, issue 76) since autonomy policy widens what agents may do,
+      so the production decision is CODEX_CLAUDE_CODEX; without path floors it is CLAUDE with a light worker.
 
   - id: classifier-018-review-agents-md-summarize
     request: Review AGENTS.md and the .pi configuration and summarize what they require.
@@ -640,9 +643,10 @@ cases:
       route: CODEX
       primary_intent: analysis
       capacities:
-        codex_worker: economy
+        codex_worker: standard
     notes: Over-routed in real runs (CODEX/CODEX_CLAUDE_CODEX with high effort). Rubric gold is all low-risk;
-      expected_decision reflects policy v6 graduated capacity rules.
+      the built-in .pi/ path floor (security_sensitive, issue 76) keeps the read-only analysis on CODEX but stops the
+      economy downgrade (without path floors the worker is economy).
 
   - id: classifier-019-rename-fields-per-review
     request: Rename the fields the PR reviewer flagged (runId -> run_id, cfg -> config) and update their
@@ -792,3 +796,137 @@ cases:
         claude_worker: light
     notes: Over-routed in real runs (CODEX/CODEX_CLAUDE_CODEX with high effort). Rubric gold is all low-risk;
       expected_decision reflects policy v6 graduated capacity rules.
+
+  # Path-floor cases (#76): the request text understates the risk, the
+  # repository evidence and files_or_areas name a floored path, and the case's
+  # project_routing carries the project's path_floors. A classifier reading only
+  # the request under-routes them; the floors raise its route back to gold.
+  - id: classifier-023-path-floor-migration
+    request: Add a nullable nickname column to the users table and expose it on the user model.
+    repository_evidence:
+      - Schema changes ship as files under migrations/ and run once against the production database.
+      - A migration that has run in production cannot be edited or re-run; a mistake needs a corrective migration.
+      - The project's .pi/routing.yaml floors every path under migrations/.
+    task_facts:
+      id: classifier-023-path-floor-migration
+      goal: Add a nullable nickname column to users through a new migration and the user model.
+      dependencies: []
+      acceptance_criteria:
+        - A new migration adds the nullable column without touching existing rows.
+        - The user model reads and writes the column.
+      files_or_areas:
+        - migrations/0042_add_user_nickname.sql
+        - src/models/user.py
+    project_routing:
+      path_floors:
+        - paths: ["migrations/**", "schemas/**"]
+          floors: { failure_cost: high, behavior_preservation: required }
+    gold_classification:
+      task_type: migration
+      failure_cost: high
+      semantic_correctness: normal
+      ambiguity: 2
+      implementation_scope: small
+      implementation_required: true
+      cross_layer: false
+      behavior_preservation: required
+      diagnosis_required: false
+      assumptions_must_be_explicit: false
+      many_routine_decisions: false
+      production_feature: false
+      security_sensitive: false
+      destructive_operation: false
+      escalation_evidence:
+        failure_cost: The migration runs once against the production database and cannot be edited afterwards.
+        behavior_preservation: Existing rows and readers of users must behave exactly as before.
+    expected_decision:
+      route: CODEX_CLAUDE_CODEX
+      primary_intent: implementation
+      capacities:
+        codex_specifier: high
+        claude_worker: high
+        codex_reviewer: high
+    notes: The request reads like a routine model change; only the migrations/ path shows the production risk.
+
+  - id: classifier-024-path-floor-release-workflow
+    request: Bump the Node version in CI from 22 to 24.
+    repository_evidence:
+      - The only CI definition is .github/workflows/release.yml.
+      - That workflow runs on tags with the npm publish token and publishes the package.
+      - The project's .pi/routing.yaml floors every path under .github/workflows/.
+    task_facts:
+      id: classifier-024-path-floor-release-workflow
+      goal: Run CI and the release workflow on Node 24.
+      dependencies: []
+      acceptance_criteria:
+        - The release workflow uses Node 24.
+      files_or_areas:
+        - .github/workflows/release.yml
+    project_routing:
+      path_floors:
+        - paths: [".github/workflows/**", "**/*secret*"]
+          floors: { security_sensitive: true }
+    gold_classification:
+      task_type: config_edit
+      failure_cost: low
+      semantic_correctness: normal
+      ambiguity: 1
+      implementation_scope: small
+      implementation_required: true
+      cross_layer: false
+      behavior_preservation: not_required
+      diagnosis_required: false
+      assumptions_must_be_explicit: false
+      many_routine_decisions: false
+      production_feature: false
+      security_sensitive: true
+      destructive_operation: false
+      escalation_evidence:
+        security_sensitive: The edited workflow runs with the npm publish token.
+    expected_decision:
+      route: CODEX_CLAUDE_CODEX
+      primary_intent: implementation
+      capacities:
+        codex_specifier: high
+        claude_worker: high
+        codex_reviewer: high
+    notes: A one-line version bump in a workflow that holds the publish credential.
+
+  - id: classifier-025-path-floor-unmatched-docs
+    request: Fix the broken link in the migration guide.
+    repository_evidence:
+      - The guide is docs/guides/migrations.md.
+      - Database migrations themselves live under migrations/, which the project's .pi/routing.yaml floors.
+    task_facts:
+      id: classifier-025-path-floor-unmatched-docs
+      goal: Repair one broken link in the migration guide.
+      dependencies: []
+      acceptance_criteria:
+        - The link resolves.
+      files_or_areas:
+        - docs/guides/migrations.md
+    project_routing:
+      path_floors:
+        - paths: ["migrations/**", "schemas/**"]
+          floors: { failure_cost: high, behavior_preservation: required }
+    gold_classification:
+      task_type: documentation
+      failure_cost: low
+      semantic_correctness: normal
+      ambiguity: 0
+      implementation_scope: small
+      implementation_required: true
+      cross_layer: false
+      behavior_preservation: not_required
+      diagnosis_required: false
+      assumptions_must_be_explicit: false
+      many_routine_decisions: false
+      production_feature: false
+      security_sensitive: false
+      destructive_operation: false
+    expected_decision:
+      route: CLAUDE
+      primary_intent: implementation
+      capacities:
+        claude_worker: light
+    notes: A floor exists but no declared path matches it, so routing is unchanged (no false raise).

@@ -11,7 +11,9 @@ Protocol:
           non-empty escalation_evidence entry for that field yields
           {"ok": false, "blocker_code": "CLASSIFICATION_EVIDENCE_MISSING",
            "missing_evidence_fields": [...], "errors": [...]}. Values raised
-          only by project risk floors are exempt.
+          only by project risk floors are exempt: the project-wide
+          `risk_overrides` and every `path_floors` rule matched by the task's
+          `files_or_areas` (recorded in the result's `path_floor_matches`).
   stdout: a single JSON object (the routing result), exactly once
   stderr: diagnostics only (never part of the protocol result)
 
@@ -119,7 +121,8 @@ def main(argv: list[str] | None = None) -> int:
     task_errors = engine.validate_task_instance(classified_task, assets.task_schema)
     errors.extend(task_errors)
     # Evidence is checked on the raw classification, before project risk
-    # floors, so values raised only by a floor never need justification.
+    # floors (risk_overrides and matched path_floors), so values raised only
+    # by a floor never need justification.
     missing_evidence = [] if task_errors else engine.missing_escalation_evidence(classified_task)
     if missing_evidence:
         errors.extend(engine.classification_evidence_issues(classified_task))

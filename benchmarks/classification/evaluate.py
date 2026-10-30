@@ -37,7 +37,11 @@ FIXED_TASK_FIELDS = (
 # routing_engine.ESCALATING_CLASSIFICATION_VALUES).
 EVIDENCE_KEY = "escalation_evidence"
 REQUIRED_CASE_KEYS = frozenset({"id", "request", "repository_evidence", "task_facts", "gold_classification"})
-OPTIONAL_CASE_KEYS = frozenset({"notes", "expected_decision"})
+# `project_routing` is a case's `.pi/routing.yaml` (in practice its
+# `path_floors`): production routing applies it and the built-in path floors,
+# so `expected_decision` and the `*_with_path_floors` metrics route through
+# both; the classic metrics use neither.
+OPTIONAL_CASE_KEYS = frozenset({"notes", "expected_decision", "project_routing"})
 
 
 class BenchmarkError(Exception):
@@ -133,6 +137,12 @@ def validate_case(
         raise BenchmarkError(f"{case['id']}: task_facts.id must equal case id")
     validate_classification(case["id"], gold, fields)
 
+    if "project_routing" in case:
+        project_issues = engine.validate_project_routing_instance(case["project_routing"], assets.project_schema)
+        if project_issues:
+            raise BenchmarkError(
+                f"{case['id']}: invalid project_routing: {'; '.join(str(i) for i in project_issues)}"
+            )
     task = materialize_task(task_facts, gold)
     issues = engine.validate_instance(task, assets.task_schema, label=f"case[{case['id']}].gold")
     if issues:
@@ -145,7 +155,7 @@ def validate_case(
         )
     if "expected_decision" in case:
         expected = case["expected_decision"]
-        actual = decision_signature(task, assets)
+        actual = decision_signature(task, assets, case.get("project_routing"))
         actual_view = {
             "route": actual["route"],
             "primary_intent": actual["primary_intent"],
@@ -180,8 +190,17 @@ def materialize_task(task_facts: dict[str, Any], classification: dict[str, Any])
     return {**task_facts, **classification}
 
 
-def decision_signature(task: dict[str, Any], assets: engine.PolicyAssets) -> dict[str, Any]:
-    resolution = engine.resolve_route(task, assets.policy, None, assets.task_schema)
+def decision_signature(
+    task: dict[str, Any],
+    assets: engine.PolicyAssets,
+    project_routing: dict[str, Any] | None = None,
+    *,
+    path_floors: bool = True,
+) -> dict[str, Any]:
+    """The production decision for `task`. `path_floors=False` leaves out the
+    built-in and project path floors (the classic, no-path-floor metrics)."""
+    resolution = engine.resolve_route(task, assets.policy, project_routing, assets.task_schema,
+                                      path_floors=path_floors)
     route = resolution.selected_route
     effective = resolution.effective_classification
     intent = engine.derive_primary_intent(effective)
@@ -225,6 +244,12 @@ def evaluate(
     decision_correct = 0
     under_routed = 0
     over_routed = 0
+    # The same comparison with each case's project_routing (path floors)
+    # applied to both the candidate and the gold classification.
+    floored_route_correct = 0
+    floored_under_routed = 0
+    floored_over_routed = 0
+    path_floor_cases = 0
     invalid_predictions: list[dict[str, str]] = []
     missing_predictions: list[str] = []
     mismatches: list[dict[str, Any]] = []
@@ -236,7 +261,9 @@ def evaluate(
         case_id = case["id"]
         gold_task = validate_case(case, fields, assets)
         gold_classification = case["gold_classification"]
-        gold_decision = decision_signature(gold_task, assets)
+        gold_decision = decision_signature(gold_task, assets, path_floors=False)
+        project_routing = case.get("project_routing")
+        gold_floored = decision_signature(gold_task, assets, project_routing)
 
         if case_id not in predictions:
             missing_predictions.append(case_id)
@@ -277,7 +304,7 @@ def evaluate(
         if not wrong_fields:
             exact_correct += 1
 
-        candidate_decision = decision_signature(candidate_task, assets)
+        candidate_decision = decision_signature(candidate_task, assets, path_floors=False)
         if candidate_decision["route"] == gold_decision["route"]:
             route_correct += 1
         else:
@@ -291,6 +318,17 @@ def evaluate(
         if candidate_decision == gold_decision:
             decision_correct += 1
 
+        if project_routing is not None:
+            path_floor_cases += 1
+        candidate_floored = decision_signature(candidate_task, assets, project_routing)
+        floored_rank = rank[candidate_floored["route"]] - rank[gold_floored["route"]]
+        if floored_rank == 0:
+            floored_route_correct += 1
+        elif floored_rank > 0:
+            floored_under_routed += 1
+        else:
+            floored_over_routed += 1
+
         if wrong_fields or candidate_decision != gold_decision:
             mismatches.append(
                 {
@@ -302,6 +340,8 @@ def evaluate(
                     "predicted_primary_intent": candidate_decision["primary_intent"],
                     "gold_capacities": [list(item) for item in gold_decision["capacities"]],
                     "predicted_capacities": [list(item) for item in candidate_decision["capacities"]],
+                    "gold_route_with_path_floors": gold_floored["route"],
+                    "predicted_route_with_path_floors": candidate_floored["route"],
                 }
             )
 
@@ -337,6 +377,12 @@ def evaluate(
         "policy_under_routing_rate": under_routed / scored if scored else None,
         "policy_over_routing_rate": over_routed / scored if scored else None,
         "execution_decision_accuracy": decision_correct / scored if scored else None,
+        # The same routes with each case's project_routing (path floors)
+        # applied to candidate and gold: what production routing selects.
+        "path_floor_cases": path_floor_cases,
+        "route_accuracy_with_path_floors": floored_route_correct / scored if scored else None,
+        "policy_under_routing_rate_with_path_floors": floored_under_routed / scored if scored else None,
+        "policy_over_routing_rate_with_path_floors": floored_over_routed / scored if scored else None,
         # Fraction of scored cases whose classification uses each escalating
         # value (prediction vs gold); a calibrated classifier keeps these low.
         "escalation_rates": {
@@ -368,6 +414,10 @@ def print_human(result: dict[str, Any]) -> None:
     print(f"route accuracy: {_fmt(result['route_accuracy'])}")
     print(f"policy under-routing rate: {_fmt(result['policy_under_routing_rate'])}")
     print(f"policy over-routing rate: {_fmt(result['policy_over_routing_rate'])}")
+    print(f"scored cases with path floors: {result['path_floor_cases']}")
+    print(f"route accuracy with path floors: {_fmt(result['route_accuracy_with_path_floors'])}")
+    print(f"policy under-routing rate with path floors: {_fmt(result['policy_under_routing_rate_with_path_floors'])}")
+    print(f"policy over-routing rate with path floors: {_fmt(result['policy_over_routing_rate_with_path_floors'])}")
     print(f"execution-decision accuracy: {_fmt(result['execution_decision_accuracy'])}")
     print("field accuracy:")
     for field, value in result["field_accuracy"].items():
@@ -387,7 +437,9 @@ def print_human(result: dict[str, Any]) -> None:
             fields = ",".join(item["wrong_fields"]) or "<route/capacity only>"
             print(
                 f"  {item['case_id']}: fields={fields}; "
-                f"route={item['predicted_route']} (gold={item['gold_route']})"
+                f"route={item['predicted_route']} (gold={item['gold_route']}); "
+                f"with path floors route={item['predicted_route_with_path_floors']} "
+                f"(gold={item['gold_route_with_path_floors']})"
             )
 
 

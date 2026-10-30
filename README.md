@@ -1073,7 +1073,11 @@ worker conduct, not task risk. An escalating value (`failure_cost=high`,
 `security_sensitive`, `destructive_operation`) needs a one-line
 `escalation_evidence` entry; otherwise `route_task` returns `ok: false` with
 `blocker_code: CLASSIFICATION_EVIDENCE_MISSING`. Values raised only by project
-risk floors are exempt. Operational work uses the task types `vcs_operation`,
+risk floors (`risk_overrides`, or `path_floors` matched by the task's
+`files_or_areas`) are exempt. Before a wave is integrated, the same
+`path_floors` are matched against each worker's real diff; a diff that needs a
+stronger route or capacity is not integrated and the task is re-routed
+(`CLASSIFICATION_UNDERRATED_BY_DIFF`). Operational work uses the task types `vcs_operation`,
 `issue_management`, `config_edit` and `ci_fix`.
 
 Capacity assignment rules are ordered; per step, the first rule whose

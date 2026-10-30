@@ -16,7 +16,10 @@ says the record is ready with `ok: true`. After a saved-session restart or
 escalation, `PARENT_ROUTE_RECHECK_REQUIRED` permits only rerunning `route_task`
 for the unfinished task and its backend preflight; call status again before
 worker dispatch. Its status reply begins `NEXT STEP`: the run is active, not
-stopped, so do this rather than ending the run. If the parent is blocked because multiple GitHub
+stopped, so do this rather than ending the run. `integrate_begin` refusing with `NEXT STEP
+(CLASSIFICATION_UNDERRATED_BY_DIFF)` is the same kind of step: add the floored paths it names to the
+task's `files_or_areas`, rerun `route_task`, and redo the task's steps on the new route in a fresh
+worktree before integrating again. If the parent is blocked because multiple GitHub
 remotes need disambiguation, stop and ask the launcher to be rerun with the
 parent-authorized `--repo owner/repository` option; do not choose a remote by
 name or let a worker choose the target.
