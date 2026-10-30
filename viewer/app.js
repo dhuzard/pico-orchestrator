@@ -819,11 +819,12 @@ function preparationGuide(repo, panels) {
     steps.append(step);
   };
   addStep("Inspect", "Review the checkout and pinned policy above. No mutation occurs.");
-  const request = state.workspace?.approval_requests?.find((item) => item.repository === repo.id && item.missing?.length);
-  addStep("Approve local mutation", request
+  const approval = panels.action_view?.actions?.find((item) => item.action === "approve_mutation" && item.target === repo.id);
+  addStep("Approve local mutation", approval ? (approval.available
     ? "Preview the exact policy diff; only create_worktrees and commit may be granted here."
-    : "No current repository authorization request. Run preflight or schedule to surface one, then recheck.",
-  "approve_mutation", controlState.enabled && Boolean(request));
+    : `${approval.refusal_code || "Unavailable"}: ${approval.explanation || "Resolve the prerequisite and recheck."}`)
+    : "A newer Garden backend is required before this step is available.",
+  "approve_mutation", controlState.enabled && approval?.available === true);
   addStep("Commit policy", repo.policy_uncommitted === true
     ? `Preview a commit of .pi/autonomy.yaml on ${repo.base_branch || "the base branch"}; no push.`
     : "No uncommitted policy change is reported for this checkout.", "commit_policy", controlState.enabled && repo.policy_uncommitted === true);
