@@ -232,6 +232,9 @@ class GardenControlsTest(unittest.TestCase):
 
     def test_repin_after_bounded_policy_commit_changes_one_manifest_pin(self):
         self.drop_policy("alpha")
+        checkout = self.repos["alpha"][0]
+        git("-C", str(checkout), "config", "user.name", "t")
+        git("-C", str(checkout), "config", "user.email", "t@example.com")
         before = self.path.read_text()
         old = self.repos["alpha"][1]
         _, panels = self.request("GET", "/api/controls")
@@ -318,13 +321,15 @@ class GardenControlsTest(unittest.TestCase):
 
     def test_repin_refuses_branch_move_during_manifest_save(self):
         self.drop_policy("alpha")
+        checkout = self.repos["alpha"][0]
+        git("-C", str(checkout), "config", "user.name", "t")
+        git("-C", str(checkout), "config", "user.email", "t@example.com")
         before = self.path.read_text()
         _, approval = self.act(action="approve_mutation", repository="alpha")
         self.act(action="approve_mutation", repository="alpha", confirm=approval["confirm"])
         _, commit = self.act(action="commit_policy", repository="alpha")
         self.act(action="commit_policy", repository="alpha", confirm=commit["confirm"])
         _, preview = self.act(action="repin_manifest", repository="alpha")
-        checkout = self.repos["alpha"][0]
         write = gc.atomic_io.atomic_write_text
 
         def move_branch(path, content, **kwargs):
