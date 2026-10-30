@@ -764,7 +764,7 @@ function renderControls() {
       else {
         const local = effective.local_mutation || {};
         const grant = (value) => value === true ? "granted" : value === false ? "denied" : "unavailable";
-        box.append(el("p", "perm-detail", `Create worktrees: ${grant(local.create_worktrees)} · Commit: ${grant(local.commit)} · Launch still requires explicit allow mutation.`));
+        box.append(el("p", "perm-detail", `Create worktrees: ${grant(local.create_worktrees)} · Commit: ${grant(local.commit)} · Mutating child launches also require explicit allow mutation.`));
         if (effective.missing_local_permissions?.length) box.append(el("p", "perm-detail", `Missing at pin: ${effective.missing_local_permissions.join(", ").replaceAll("_", " ")}`));
       }
       box.append(el("p", "perm-detail", `Checkout ${effective.working_branch || "detached"} @ ${effective.working_head || "unavailable"} · working policy ${effective.working_policy_differs == null ? "comparison unavailable" : effective.working_policy_differs ? "differs from pin" : "matches pin"}`));
