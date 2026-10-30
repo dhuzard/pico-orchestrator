@@ -886,6 +886,13 @@ class Controls:
             def still_current(_temporary: Path) -> None:
                 if prepared["manifest"].read_text(encoding="utf-8") != prepared["before"]:
                     raise ControlError(409, "CONTROL_PREVIEW_STALE", "manifest changed while the pin was being saved")
+                checkout = Path(prepared["repo"]["resolved_path"])
+                if _git_value(checkout, "rev-parse", "HEAD") != prepared["head"] or \
+                        _git_value(checkout, "symbolic-ref", "--quiet", "--short", "HEAD") != prepared["branch"]:
+                    raise ControlError(409, "CONTROL_PREVIEW_STALE", "checkout changed while the pin was being saved")
+                if _git_value(checkout, "status", "--porcelain", "--untracked-files=no") != "" or \
+                        workspace_authorization._working_copy_differs(checkout, prepared["blob"]):
+                    raise ControlError(409, "CONTROL_PREVIEW_STALE", "checkout policy changed while the pin was being saved")
             try:
                 atomic_io.atomic_write_text(prepared["manifest"], prepared["after"],
                                             root=prepared["manifest"].parent, validate=still_current)

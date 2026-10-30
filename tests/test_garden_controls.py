@@ -11,6 +11,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 import yaml
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -306,6 +307,27 @@ class GardenControlsTest(unittest.TestCase):
         before = self.path.read_text()
         _, refused = self.act(action="repin_manifest", repository="alpha")
         self.assertEqual(refused["error_code"], "WORKSPACE_REPIN_SCOPE_CHANGED")
+        self.assertEqual(self.path.read_text(), before)
+
+    def test_repin_refuses_branch_move_during_manifest_save(self):
+        self.drop_policy("alpha")
+        before = self.path.read_text()
+        _, approval = self.act(action="approve_mutation", repository="alpha")
+        self.act(action="approve_mutation", repository="alpha", confirm=approval["confirm"])
+        _, commit = self.act(action="commit_policy", repository="alpha")
+        self.act(action="commit_policy", repository="alpha", confirm=commit["confirm"])
+        _, preview = self.act(action="repin_manifest", repository="alpha")
+        checkout = self.repos["alpha"][0]
+        write = gc.atomic_io.atomic_write_text
+
+        def move_branch(path, content, **kwargs):
+            if Path(path) == self.path:
+                git("-C", str(checkout), "checkout", "-q", "-b", "moved")
+            return write(path, content, **kwargs)
+
+        with patch.object(gc.atomic_io, "atomic_write_text", side_effect=move_branch):
+            _, refused = self.act(action="repin_manifest", repository="alpha", confirm=preview["confirm"])
+        self.assertEqual(refused["error_code"], "CONTROL_PREVIEW_STALE")
         self.assertEqual(self.path.read_text(), before)
 
     def test_bounded_approval_refuses_repository_without_mutating_task(self):
