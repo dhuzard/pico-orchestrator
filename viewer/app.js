@@ -10,7 +10,7 @@ function selectedRun() { return state.runs.find((run) => run.id === state.select
 function setStatus() {
   const node = $("connection");
   node.classList.toggle("offline", !state.healthy);
-  node.lastChild.textContent = state.paused ? " Paused" : state.healthy ? " Live updates" : state.tokenRequired ? " Open the URL printed at launch" : " Connection lost";
+  node.lastChild.textContent = state.paused ? " Display updates paused" : state.healthy ? " Live updates" : state.tokenRequired ? " Open the URL printed at launch" : " Connection lost";
 }
 function renderPicker(repository) {
   const picker = $("run-select");
@@ -407,7 +407,7 @@ const wsTone = (value) => {
   if (s === "running") return "active";
   if (["completed", "validated", "ready_for_downstream", "merged", "declared_merged", "declared_ready_for_downstream"].includes(s)) return "completed";
   if (["failed", "cancelled", "refused"].includes(s)) return "failed";
-  if (["partial", "needs_reconciliation", "blocked_by_failure", "not_dispatchable", "held_by_budget", "awaiting_authorization"].includes(s)) return "blocked";
+  if (["partial", "needs_reconciliation", "blocked_by_failure", "not_dispatchable", "held_by_budget", "awaiting_authorization", "waiting_for_authorization"].includes(s)) return "blocked";
   return "waiting";
 };
 const wsLabel = (value) => ({ running: "Running", completed: "Completed", partial: "Partial", failed: "Failed", cancelled: "Cancelled", refused: "Refused at dispatch", needs_reconciliation: "Needs reconciliation", blocked_by_failure: "Blocked by failure", waiting_for_readiness: "Waiting for readiness", not_dispatchable: "Not dispatchable", not_launched: "Not launched", validated: "Validated", ready_for_downstream: "Ready for downstream", merged: "Merged", held_by_budget: "Held by budget", awaiting_authorization: "Awaiting authorization", waiting_for_authorization: "Waiting for authorization" })[value] || (String(value || "").startsWith("declared_") ? `Declared ${cap(value.slice(9))}` : cap(value));
@@ -511,6 +511,8 @@ function duration(seconds) {
 function workspaceTaskCard(task) {
   const tone = wsTone(task.state);
   const card = el("article", `ws-task ${tone}`);
+  card.id = workspaceTaskDomId(task.repository_id, task.id);
+  card.tabIndex = -1;
   const head = el("div", "ws-task-head");
   head.append(el("span", `task-glyph ws-glyph ${tone}`, wsGlyph(tone)));
   const name = el("span", "task-name");
@@ -572,8 +574,62 @@ function renderWorkspaceBoard(data) {
     if (repo.blocker_code) column.append(el("p", "ws-chip blocked", `Repository: ${repo.blocker_code}`));
     for (const request of (data.approval_requests || []).filter((item) => item.repository === repo.id)) column.append(approvalBox(request));
     if (!repo.tasks.length) column.append(el("p", "empty", "No tasks in this repository."));
-    for (const task of repo.tasks) column.append(workspaceTaskCard(task));
+    for (const task of repo.tasks) column.append(workspaceTaskCard({ ...task, repository_id: repo.id }));
     board.append(column);
+  }
+}
+function workspaceTaskDomId(repository, task) {
+  return `ws-task-${encodeURIComponent(repository || "unknown")}-${encodeURIComponent(task || "unknown")}`;
+}
+const attentionReasons = {
+  awaiting_authorization: "Local mutation needs authorization before this task can launch.",
+  waiting_for_authorization: "An upstream task needs authorization before this one can launch.",
+  needs_reconciliation: "This interrupted attempt needs reconciliation before work continues.",
+  blocked_by_failure: "An upstream task failed or was cancelled.",
+  held_by_budget: "The workspace budget is holding new launches.",
+  not_dispatchable: "The scheduler cannot dispatch this task in its current state.",
+  failed: "The child run failed. Inspect its run before deciding how to recover.",
+  refused: "The task was refused at dispatch. Inspect its blocker before trying again.",
+  cancelled: "The child run was cancelled. Inspect its run before creating new work.",
+  partial: "The child run ended with unfinished work. Inspect the recorded outcome."
+};
+function attentionRows(data) {
+  if (!data?.ok) return [];
+  if (Array.isArray(data.attention)) return data.attention;
+  // Older Garden servers omit attention. Keep this read-only and derive only from recorded states.
+  return data.repositories.flatMap((repo) => repo.tasks.filter((task) => attentionReasons[task.state]).map((task) => ({
+    task_id: task.id, repository: repo.id, github: repo.repository, state: task.state,
+    reason_code: task.refusal_code || task.run_blocker_code || null,
+    reason: attentionReasons[task.state], blocked_by: task.blocked_by || [], run_id: task.run_id || null
+  })));
+}
+function renderWorkspaceAttention(data) {
+  const list = $("ws-attention-list"); list.replaceChildren();
+  const rows = attentionRows(data);
+  $("ws-attention-count").textContent = !data?.ok ? "Unavailable" : `${rows.length} ${rows.length === 1 ? "task" : "tasks"}`;
+  if (!data?.ok) { list.append(el("p", "empty", "Attention cannot be checked while the workspace is unavailable.")); return; }
+  if (!rows.length) { list.append(el("p", "empty", "No tasks need a decision right now. Review the repository board for running and waiting work.")); return; }
+  for (const row of rows) {
+    const tone = wsTone(row.state);
+    const item = el("article", `ws-attention-item ${tone}`);
+    const heading = el("div", "ws-attention-heading");
+    const title = el("div");
+    title.append(el("strong", "", row.task_id || "Task"), el("small", "", row.github || row.repository || "Repository unavailable"));
+    heading.append(title, el("span", `ws-state ${tone}`, wsLabel(row.state)));
+    item.append(heading);
+    item.append(el("p", "ws-attention-reason", row.reason || attentionReasons[row.state] || "Inspect this task's recorded state."));
+    if (row.reason_code) item.append(el("small", "ws-attention-code", row.reason_code));
+    if (row.blocked_by?.length) item.append(el("small", "ws-attention-code", `Blocked by ${row.blocked_by.join(", ")}`));
+    const links = el("div", "ws-attention-links");
+    const target = workspaceTaskDomId(row.repository, row.task_id);
+    const locate = el("button", "ws-attention-link", "View task"); locate.type = "button";
+    locate.addEventListener("click", () => {
+      const card = document.getElementById(target);
+      card?.scrollIntoView({ behavior: "smooth", block: "center" }); card?.focus({ preventScroll: true });
+    });
+    links.append(locate);
+    if (row.run_id) links.append(runAnchor(row.run_id, "View child run ↗"));
+    item.append(links); list.append(item);
   }
 }
 function approvalBox(request) {
@@ -637,7 +693,7 @@ function renderWorkspaceSessions(data) {
     list.append(row);
   }
 }
-function renderWorkspace(data) { renderWorkspaceOverview(data); renderWorkspaceBoard(data); renderWorkspaceTokens(data); renderWorkspaceSessions(data); renderControls(); setStatus(); }
+function renderWorkspace(data) { renderWorkspaceOverview(data); renderWorkspaceBoard(data); renderWorkspaceAttention(data); renderWorkspaceTokens(data); renderWorkspaceSessions(data); renderControls(); setStatus(); }
 // Controls (pico watch --controls): every action previews first and runs only after confirmation.
 // The session token arrives in the launch URL's fragment and is kept in memory only.
 const controlState = { token: null, enabled: false, panels: null, fetchedAt: 0 };
@@ -946,6 +1002,6 @@ $("conversation-view").addEventListener("click", () => { state.view = "conversat
 $("timeline-view").addEventListener("click", () => { state.view = "timeline"; state.followTimeline = true; renderObservatory(selectedRun()); });
 $("run-timeline").addEventListener("wheel", () => { state.followTimeline = false; }, { passive: true });
 $("run-timeline").addEventListener("pointerdown", () => { state.followTimeline = false; });
-$("pause").addEventListener("click", () => { state.paused = !state.paused; $("pause").textContent = state.paused ? "Resume updates" : "Pause updates"; setStatus(); if (!state.paused) refresh(); });
+$("pause").addEventListener("click", () => { state.paused = !state.paused; $("pause").textContent = state.paused ? "Resume display updates" : "Pause display updates"; setStatus(); if (!state.paused) refresh(); });
 refresh(); setInterval(refresh, 2000);
 setInterval(() => { const run = selectedRun(); if (run?.status === "IN_PROGRESS" && !state.paused) renderOverview(run); }, 1000);
