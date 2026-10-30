@@ -306,7 +306,9 @@ class WorkspacePlanTest(unittest.TestCase):
             path = self.manifest()
             record_path = workspace_run.workspace_record_path("ws-test")
             record_path.parent.mkdir(parents=True)
-            record_path.write_text(json.dumps({"record_version": 1, "workspace_id": "ws-test", "tasks": {
+            record_path.write_text(json.dumps({"record_version": 1, "workspace_id": "ws-test",
+                "evidence_bindings": workspace_run.evidence_bindings(path),
+                "evidence_pins": workspace_run.evidence_pins(path), "tasks": {
                 "a1": {"observed": {"readiness": "ready_for_downstream"}},
                 "b1": {"observed": {"readiness": "merged"}}}}))
             def run(args):

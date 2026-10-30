@@ -13,6 +13,7 @@ import threading
 import unittest
 from unittest.mock import patch
 import yaml
+from contextlib import contextmanager
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
@@ -151,6 +152,150 @@ class GardenControlsTest(unittest.TestCase):
         self.repos[name] = (path, git("-C", str(path), "rev-parse", "HEAD"))
         self.manifest()
 
+    def test_policy_confirmation_cannot_follow_a_reassigned_manifest_alias(self):
+        self.drop_policy("alpha")
+        self.drop_policy("beta")
+        # Identical commits and policy bytes must still not make two destinations interchangeable.
+        beta = self.repos["beta"][0]
+        git("-C", str(beta), "fetch", "-q", str(self.repos["alpha"][0]), "main")
+        git("-C", str(beta), "reset", "--hard", "FETCH_HEAD")
+        self.repos["beta"] = (beta, git("-C", str(beta), "rev-parse", "HEAD"))
+        for action in ("approve_mutation", "set_permission", "commit_policy"):
+            with self.subTest(action=action):
+                self.manifest()
+                for checkout, _ in self.repos.values():
+                    policy = checkout / ".pi" / "autonomy.yaml"
+                    if action == "commit_policy":
+                        policy.parent.mkdir(exist_ok=True)
+                        policy.write_text((REPO_ROOT / "templates" / "autonomy.yaml").read_text())
+                    elif policy.exists():
+                        policy.unlink()
+                request = {"action": action, "repository": "alpha"}
+                if action == "set_permission":
+                    request.update(permission="push_branch", value=True)
+                _, preview = self.act(**request)
+                self.assertEqual(preview["stage"], "preview", preview)
+                before = {name: (git("-C", str(checkout), "rev-parse", "HEAD"),
+                                 (checkout / ".pi" / "autonomy.yaml").read_bytes()
+                                 if (checkout / ".pi" / "autonomy.yaml").exists() else None)
+                          for name, (checkout, _) in self.repos.items()}
+                manifest = yaml.safe_load(self.path.read_text())
+                for repo in manifest["repositories"]:
+                    repo["id"] = "beta" if repo["id"] == "alpha" else "alpha"
+                self.path.write_text(yaml.safe_dump(manifest))
+                self.assertTrue(all(not repo["blocker_code"] for repo in self.controls._plan()["repositories"]))
+                _, result = self.act(**request, confirm=preview["confirm"])
+                self.assertEqual(result.get("error_code"), "CONTROL_PREVIEW_STALE", result)
+                for name, (checkout, _) in self.repos.items():
+                    policy = checkout / ".pi" / "autonomy.yaml"
+                    self.assertEqual((git("-C", str(checkout), "rev-parse", "HEAD"),
+                                      policy.read_bytes() if policy.exists() else None), before[name])
+
+    def test_schedule_confirmation_rejects_manifest_repository_or_task_changes(self):
+        for change in ("repository", "objective", "pin"):
+            with self.subTest(change=change):
+                self.manifest()
+                request = {"action": "schedule", "allow_mutation": True}
+                preview = self.controls.act(request)
+                self.assertEqual(preview["stage"], "preview", preview)
+                raw = yaml.safe_load(self.path.read_text())
+                if change == "repository":
+                    for repo in raw["repositories"]:
+                        repo["id"] = "beta" if repo["id"] == "alpha" else "alpha"
+                elif change == "objective":
+                    raw["tasks"][0]["objective"] = "Different implementation instructions"
+                else:
+                    checkout = self.repos["alpha"][0]
+                    git("-C", str(checkout), *COMMIT, "advance pin", "--allow-empty")
+                    raw["repositories"][0]["pinned_commit"] = git("-C", str(checkout), "rev-parse", "HEAD")
+                self.path.write_text(yaml.safe_dump(raw))
+                fresh = self.controls.act(request)
+                self.assertEqual(preview["preview"]["dispatch"], ["a1"])
+                self.assertEqual(fresh["preview"]["dispatch"], ["a1"])
+                with patch.object(gc.threading, "Thread") as scheduler_thread:
+                    result = self.controls.act({**request, "confirm": preview["confirm"]})
+                self.assertEqual(result.get("error_code"), "CONTROL_PREVIEW_STALE", result)
+                scheduler_thread.assert_not_called()
+                self.assertIsNone(self.controls._scheduler)
+
+    def test_schedule_confirmation_rechecks_upstream_dispatch_inputs(self):
+        self.manifest(a1={"readiness": "ready_for_downstream"})
+        plan = self.controls._plan()
+        with wr.locked_workspace("ws"):
+            record_path, record = wr._workspace(plan, self.path)
+            record["tasks"]["a1"] = {"observed": {"readiness": "ready_for_downstream",
+                "validated_commit": self.repos["alpha"][1], "validated_contracts": {"claims": "1.0"}}}
+            wr.save_workspace(record_path, record)
+        request = {"action": "schedule", "allow_mutation": True}
+        preview = self.controls.act(request)
+        self.assertEqual(preview["preview"]["dispatch"], ["b1"])
+        record["tasks"]["a1"]["observed"]["validated_commit"] = "a" * 40
+        with wr.locked_workspace("ws"):
+            wr.save_workspace(record_path, record)
+        fresh = self.controls.act(request)
+        self.assertEqual(fresh["preview"]["dispatch"], ["b1"])
+        with patch.object(gc.threading, "Thread") as scheduler_thread:
+            result = self.controls.act({**request, "confirm": preview["confirm"]})
+        self.assertEqual(result.get("error_code"), "CONTROL_PREVIEW_STALE", result)
+        scheduler_thread.assert_not_called()
+
+    def test_cancel_confirmation_rejects_reassigned_repository_aliases(self):
+        plan = self.controls._plan()
+        with wr.locked_workspace("ws"):
+            record_path, record = wr._workspace(plan, self.path)
+            record["tasks"]["a1"] = {"execution_status": "launched", "execution_id": "ws--a1", "run_id": "run-one"}
+            wr.save_workspace(record_path, record)
+        request = {"action": "cancel", "task": "a1"}
+        preview = self.controls.act(request)
+        self.assertEqual(preview["stage"], "preview", preview)
+        raw = yaml.safe_load(self.path.read_text())
+        for repo in raw["repositories"]:
+            repo["id"] = "beta" if repo["id"] == "alpha" else "alpha"
+        self.path.write_text(yaml.safe_dump(raw))
+        with patch.object(wr, "cancel") as cancel:
+            result = self.controls.act({**request, "confirm": preview["confirm"]})
+        self.assertEqual(result.get("error_code"), "CONTROL_PREVIEW_STALE", result)
+        cancel.assert_not_called()
+
+    def test_qualification_confirmation_rejects_reassigned_repository_aliases(self):
+        request = {"action": "validate", "task": "q1"}
+        preview = self.controls.act(request)
+        self.assertEqual(preview["stage"], "preview", preview)
+        raw = yaml.safe_load(self.path.read_text())
+        for repo in raw["repositories"]:
+            repo["id"] = "beta" if repo["id"] == "alpha" else "alpha"
+        self.path.write_text(yaml.safe_dump(raw))
+        fresh = self.controls.act(request)
+        self.assertEqual(fresh["preview"]["checks"], preview["preview"]["checks"])
+        self.assertNotEqual(fresh["preview"]["repository"], preview["preview"]["repository"])
+        with patch.object(gc.workspace_contracts, "validate") as validate:
+            result = self.controls.act({**request, "confirm": preview["confirm"]})
+        self.assertEqual(result.get("error_code"), "CONTROL_PREVIEW_STALE", result)
+        validate.assert_not_called()
+
+    def test_policy_actions_refuse_repository_identity_conflicts(self):
+        checkout = self.repos["alpha"][0]
+        policy = checkout / ".pi" / "autonomy.yaml"
+        policy.write_text(policy.read_text() + "# pending policy change\n")
+        for action in ("set_permission", "commit_policy", "approve_mutation"):
+            with self.subTest(action=action):
+                request = {"action": action, "repository": "alpha"}
+                if action == "set_permission":
+                    request.update(permission="push_branch", value=True)
+                if action == "approve_mutation":
+                    policy.write_text(policy.read_text().replace("create_worktrees: true", "create_worktrees: false"))
+                _, preview = self.act(**request)
+                self.assertEqual(preview["stage"], "preview", preview)
+                before = policy.read_bytes(), git("-C", str(checkout), "rev-parse", "HEAD")
+                git("-C", str(checkout), "remote", "set-url", "origin", "https://github.com/acme/unrelated.git")
+                try:
+                    for confirmation in ({}, {"confirm": preview["confirm"]}):
+                        _, result = self.act(**request, **confirmation)
+                        self.assertEqual(result.get("error_code"), "TARGET_REPOSITORY_CONFLICT", result)
+                        self.assertEqual((policy.read_bytes(), git("-C", str(checkout), "rev-parse", "HEAD")), before)
+                finally:
+                    git("-C", str(checkout), "remote", "set-url", "origin", "git@github.com:acme/alpha.git")
+
     def _victim(self):
         outside = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, outside, True)
@@ -229,6 +374,30 @@ class GardenControlsTest(unittest.TestCase):
         self.assertEqual((repos["alpha"]["issue_reference"], repos["beta"]["issue_reference"]), ("refs", "refs"))
         self.assertIn("claude", data["models"]["models"])
         self.assertNotIn("Interoperable claims", json.dumps(data))  # the workspace goal is never served
+
+    def test_panels_do_not_reconcile_executions_when_checking_repin_availability(self):
+        self.drop_policy("alpha")
+        checkout, old = self.repos["alpha"]
+        _, approval = self.act(action="approve_mutation", repository="alpha")
+        self.act(action="approve_mutation", repository="alpha", confirm=approval["confirm"])
+        git("-C", str(checkout), "add", ".pi/autonomy.yaml")
+        git("-C", str(checkout), *COMMIT, "grant local mutation")
+        record_path = wr.workspace_record_path("ws")
+        record = wr.load_workspace(record_path)
+        record["tasks"]["a1"] = {"repository": "alpha", "target_repository": "acme/alpha",
+                                   "pinned_commit": old, "execution_status": "exited",
+                                   "run_status": "BLOCKED", "run_id": "run-approval",
+                                   "execution_id": "ws--a1"}
+        wr.save_workspace(record_path, record)
+        before = record_path.read_bytes(), record_path.stat().st_mtime_ns
+        with patch.object(wr.headless_run, "status", side_effect=AssertionError("read must not reconcile executions")):
+            status, panel = self.request("GET", "/api/controls")
+        self.assertEqual(status, 200, panel)
+        self.assertEqual((record_path.read_bytes(), record_path.stat().st_mtime_ns), before)
+        # Availability remains advisory; action preview performs the evidence verification.
+        repin = next(row for row in panel["action_view"]["actions"]
+                     if row["action"] == "repin_manifest" and row["target"] == "alpha")
+        self.assertTrue(repin["available"], repin)
 
     def test_repin_after_bounded_policy_commit_changes_one_manifest_pin(self):
         self.drop_policy("alpha")
@@ -327,6 +496,102 @@ class GardenControlsTest(unittest.TestCase):
         self.assertEqual(refused["error_code"], "WORKSPACE_REPIN_SCOPE_CHANGED")
         self.assertEqual(self.path.read_text(), before)
 
+    def _stopped_authorization_repin(self):
+        self.drop_policy("alpha")
+        checkout, old = self.repos["alpha"]
+        approval = self.controls.act({"action": "approve_mutation", "repository": "alpha"})
+        self.controls.act({"action": "approve_mutation", "repository": "alpha", "confirm": approval["confirm"]})
+        git("-C", str(checkout), "add", ".pi/autonomy.yaml")
+        git("-C", str(checkout), *COMMIT, "grant local mutation")
+        run_id = "run-approval"
+        trace = {"run_id": run_id, "parent_orchestration": {
+            "final_status": "BLOCKED", "blocker_code": "MUTATION_AUTHORIZATION_REQUIRED",
+            "mutations": {"code": 0, "github": 0}}}
+        trace_path = gc.provenance.run_path(REPO_ROOT, run_id)
+        trace_path.parent.mkdir(parents=True, exist_ok=True)
+        trace_path.write_text(json.dumps(trace))
+        _, _, common = wr.headless_run._target(checkout, "acme/alpha")
+        execution_path = wr.headless_run.execution_path(common, "ws--a1")
+        wr.headless_run.save_record(execution_path, {
+            "record_version": 1, "execution_id": "ws--a1", "target_repository": "acme/alpha",
+            "status": "exited", "run_id": run_id, "session_dir": str(self.base / "sessions"),
+            "session_id": "approval", "checkout": {"head_before": old, "head_after": old,
+                "branch_before": "main", "branch_after": "main", "dirty_count": 0,
+                "new_untracked_count": 0, "branches_changed": []}})
+        record_path = wr.workspace_record_path("ws")
+        record = wr.load_workspace(record_path)
+        record["tasks"]["a1"] = {"repository": "alpha", "target_repository": "acme/alpha",
+            "pinned_commit": old, "execution_status": "exited", "run_status": "BLOCKED",
+            "execution_id": "ws--a1", "run_id": run_id}
+        wr.save_workspace(record_path, record)
+        return execution_path
+
+    def test_repin_takes_execution_locks_before_workspace_lock(self):
+        self._stopped_authorization_repin()
+        held = {"workspace": False, "executions": 0}
+        workspace_lock = wr.locked_workspace
+        execution_lock = wr.headless_run.locked_record
+        write = gc.atomic_io.atomic_write_text
+
+        @contextmanager
+        def workspace_guard(workspace_id):
+            with workspace_lock(workspace_id) as path:
+                held["workspace"] = True
+                try:
+                    yield path
+                finally:
+                    held["workspace"] = False
+
+        @contextmanager
+        def execution_guard(path):
+            self.assertFalse(held["workspace"], "execution lock acquired under workspace lock")
+            with execution_lock(path):
+                held["executions"] += 1
+                try:
+                    yield
+                finally:
+                    held["executions"] -= 1
+
+        def guarded_write(path, content, **kwargs):
+            if Path(path) == self.path:
+                self.assertTrue(held["workspace"])
+                self.assertGreater(held["executions"], 0, "execution evidence must stay locked through repin")
+            return write(path, content, **kwargs)
+
+        request = {"action": "repin_manifest", "repository": "alpha"}
+        with patch.object(wr, "locked_workspace", workspace_guard), \
+                patch.object(wr.headless_run, "locked_record", execution_guard), \
+                patch.object(gc.atomic_io, "atomic_write_text", side_effect=guarded_write):
+            preview = self.controls.act(request)
+            self.assertEqual(preview["stage"], "preview", preview)
+            result = self.controls.act({**request, "confirm": preview["confirm"]})
+        self.assertEqual(result.get("status"), "MANIFEST_REPINNED", result)
+
+    def test_repin_refuses_execution_change_between_inspection_and_workspace_lock(self):
+        execution_path = self._stopped_authorization_repin()
+        request = {"action": "repin_manifest", "repository": "alpha"}
+        preview = self.controls.act(request)
+        self.assertEqual(preview["stage"], "preview", preview)
+        before = self.path.read_bytes()
+        execution_lock = wr.headless_run.locked_record
+        acquisitions = 0
+
+        @contextmanager
+        def change_execution(path):
+            nonlocal acquisitions
+            with execution_lock(path):
+                acquisitions += 1
+                if acquisitions == 2:  # status inspection completed; apply is securing its evidence
+                    execution = wr.headless_run.load_record(execution_path)
+                    execution["status"] = "interrupted"
+                    wr.headless_run.save_record(execution_path, execution)
+                yield
+
+        with patch.object(wr.headless_run, "locked_record", change_execution):
+            result = self.controls.act({**request, "confirm": preview["confirm"]})
+        self.assertEqual(result.get("error_code"), "CONTROL_PREVIEW_STALE", result)
+        self.assertEqual(self.path.read_bytes(), before)
+
     def test_repin_refuses_branch_move_during_manifest_save(self):
         self.drop_policy("alpha")
         checkout = self.repos["alpha"][0]
@@ -364,6 +629,31 @@ class GardenControlsTest(unittest.TestCase):
                    if row["action"] == "approve_mutation" and row["target"] == "alpha")
         self.assertEqual((row["available"], row["refusal_code"]), (False, "MUTATION_APPROVAL_TASKS_NONE"))
         self.assertFalse(policy.exists())
+
+    def test_promote_confirmation_rejects_a_different_pr_on_the_same_head(self):
+        plan = self.controls._plan()
+        commit = self.repos["alpha"][1]
+        with wr.locked_workspace("ws"):
+            record_path, record = wr._workspace(plan, self.path)
+            record["tasks"]["a1"] = {"observed": {
+                "readiness": "validated", "validated_commit": commit,
+                "validation": {"status": "passed"}, "validated_contracts": {"claims": "1.0"},
+                "pr": {"repository": "acme/alpha", "number": 101, "publication_run_id": "run-first"}}}
+            wr.save_workspace(record_path, record)
+        self.fake.checks[101] = ("OPEN", commit, GREEN)
+        self.fake.checks[102] = ("OPEN", commit, GREEN)
+        request = {"action": "promote", "task": "a1"}
+        preview = self.controls.act(request)
+        self.assertEqual(preview["stage"], "preview", preview)
+        self.assertEqual(preview["preview"]["pr"]["number"], 101)
+        with wr.locked_workspace("ws"):
+            record = wr.load_workspace(record_path)
+            record["tasks"]["a1"]["observed"]["pr"] = {
+                "repository": "acme/alpha", "number": 102, "publication_run_id": "run-second"}
+            wr.save_workspace(record_path, record)
+        result = self.controls.act({**request, "confirm": preview["confirm"]})
+        self.assertEqual(result.get("error_code"), "CONTROL_PREVIEW_STALE", result)
+        self.assertEqual(wr.load_workspace(record_path)["tasks"]["a1"]["observed"]["readiness"], "validated")
 
     def test_validate_publish_ci_promote_flow(self):
         self.schedule(self.path)

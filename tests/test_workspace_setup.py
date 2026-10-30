@@ -100,6 +100,8 @@ class SetupTest(unittest.TestCase):
         record_dir = self.root / "state" / "workspaces"
         record_dir.mkdir(parents=True)
         (record_dir / "research.json").write_text(json.dumps({"record_version": 1, "workspace_id": "research",
+                                                             "evidence_bindings": watch.workspace_run.evidence_bindings(imported),
+                                                             "evidence_pins": watch.workspace_run.evidence_pins(imported),
                                                              "tasks": {"alpha": {"observed": {"readiness": "implemented"}}}}))
         status, discovered = self.request("GET", "/api/setup")
         self.assertEqual(status, 200)

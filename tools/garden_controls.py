@@ -45,7 +45,7 @@ import autonomy_policy  # noqa: E402
 import difflib  # noqa: E402
 import io  # noqa: E402
 import os  # noqa: E402
-from contextlib import redirect_stdout  # noqa: E402
+from contextlib import ExitStack, redirect_stdout  # noqa: E402
 import model_profiles  # noqa: E402
 import routing_engine as engine  # noqa: E402
 import workspace_authorization  # noqa: E402
@@ -181,8 +181,10 @@ def host_allowed(host: str | None, port: int) -> bool:
 
 
 class Controls:
-    def __init__(self, manifest: Path, port: int, *, adapter=None, token: str | None = None):
+    def __init__(self, manifest: Path, port: int, *, adapter=None, token: str | None = None,
+                 state_dir: Path | None = None):
         self.manifest = manifest
+        self.state_dir = state_dir
         self.port = port
         self.token = token or secrets.token_urlsafe(32)
         self._secret = secrets.token_bytes(32)
@@ -217,8 +219,23 @@ class Controls:
         return data
 
     # -- read-only panels --------------------------------------------------
+    def _record_path(self, workspace_id: str) -> Path:
+        if self.state_dir is not None:
+            return self.state_dir / "workspaces" / f"{workspace_id}.json"
+        return workspace_run.workspace_record_path(workspace_id)
+
     def _plan(self) -> dict:
-        return workspace_run._plan(self.manifest, access_check=None)
+        if self.state_dir is None:
+            return workspace_run._plan(self.manifest, access_check=None)
+        try:
+            raw = workspace_plan.load_manifest(self.manifest)
+            workspace_id = raw.get("id") if isinstance(raw, dict) else None
+            record = (workspace_run.load_workspace(self._record_path(workspace_id))
+                      if isinstance(workspace_id, str) and TASK_RE.fullmatch(workspace_id) else None)
+            return workspace_plan.plan(self.manifest, access_check=None,
+                                       observed=workspace_run.observed_from_record(record or {}, manifest=self.manifest))
+        except workspace_plan.WorkspaceError as exc:
+            raise workspace_run.WorkspaceRunError("WORKSPACE_MANIFEST_INVALID", str(exc)) from exc
 
     def panels(self) -> dict:
         plan = self._plan()
@@ -271,9 +288,11 @@ class Controls:
         except Exception:  # model config problems are reported, never served in detail
             models = {"configured": None, "models": {}, "error_code": "MODEL_CONFIG_INVALID"}
         running = self._scheduler is not None and self._scheduler.is_alive()
-        record = workspace_run.load_workspace(workspace_run.workspace_record_path(plan["workspace_id"])) or {"tasks": {}}
-        entries = workspace_run.status(manifest=self.manifest, access_check=None)["tasks"]
-        budget = workspace_scheduler.budget_state(plan, record)
+        record = workspace_run.load_workspace(self._record_path(plan["workspace_id"])) or {"tasks": {}}
+        # Viewing controls must never reconcile executions, enforce deadlines or save records.
+        entries = workspace_run.compatible_entries(record, self.manifest)
+        runs_dir = self.state_dir / "runs" if self.state_dir is not None else None
+        budget = workspace_scheduler.budget_state(plan, record, runs_dir=runs_dir)
         action_view = workspace_action_view.snapshot(plan, entries, budget=budget, scheduler_running=running)
         for repo in plan["repositories"]:
             try:
@@ -292,7 +311,7 @@ class Controls:
                                            "requires_preview": True,
                                            "invocation": {"action": "approve_mutation", "repository": repo["id"]}})
             try:
-                self._repin_prepare(plan, repo["id"])
+                self._repin_prepare(plan, repo["id"], inspect_execution=False)
                 available, code, explanation = True, None, "Preview the exact manifest pin change before confirming."
             except (ControlError, workspace_run.WorkspaceRunError) as exc:
                 available, code, explanation = False, exc.code, exc.detail
@@ -357,6 +376,15 @@ class Controls:
         message = json.dumps(parts, sort_keys=True, separators=(",", ":")).encode()
         return hmac.new(self._secret, message, hashlib.sha256).hexdigest()
 
+    def _confirmation_scope(self, plan: dict) -> dict:
+        """Freeze manifest semantics and physical destinations behind task/repository aliases."""
+        return {"manifest": str(self.manifest.resolve()),
+                "manifest_digest": hashlib.sha256(self.manifest.read_bytes()).hexdigest(),
+                "workspace": plan["workspace_id"], "orchestrator_revision": plan.get("orchestrator_revision"),
+                "repositories": [{key: repo.get(key) for key in
+                                  ("id", "repository", "resolved_path", "pinned_commit", "base_branch")}
+                                 for repo in plan["repositories"]]}
+
     def _audit(self, plan: dict, entry: dict) -> None:
         with workspace_run.locked_workspace(plan["workspace_id"]):
             path, record = workspace_run._workspace(plan, self.manifest)
@@ -417,7 +445,8 @@ class Controls:
                 raise ControlError(404, "WORKSPACE_HEAD_UNRESOLVED", f"{head} is not a local branch of {repo['repository']}")
             state = {"head": head, "commit": match["commit"]}
             args["head"] = head
-        expected = self._confirm("validate", task["id"], state, task["checks"])
+        expected = self._confirm("validate", self._confirmation_scope(plan), task["id"], state, task["checks"],
+                                 workspace_run.dispatch_inputs(plan, task, repo))
         if confirm is None:
             return {"ok": True, "stage": "preview", "confirm": expected,
                     "preview": {"repository": repo["repository"], **state,
@@ -475,10 +504,13 @@ class Controls:
     def _promote(self, plan, task, repo, data, confirm):
         observed = workspace_contracts.ci(manifest=self.manifest, task_id=task["id"], adapter=self.adapter)
         ci = observed["ci"]
-        expected = self._confirm("promote", task["id"], ci["head"], ci["status"], ci["pr_state"])
+        published = workspace_contracts._observed(plan, task["id"]).get("pr") or {}
+        pr = {key: published.get(key) for key in ("repository", "number", "publication_run_id")}
+        expected = self._confirm("promote", self._confirmation_scope(plan), task["id"], pr,
+                                 ci["head"], ci["status"], ci["pr_state"])
         if confirm is None:
             return {"ok": ci["status"] == "green", "stage": "preview", "confirm": expected,
-                    "preview": {"repository": repo["repository"], "ci": ci, "readiness": observed["readiness"],
+                    "preview": {"repository": repo["repository"], "pr": pr, "ci": ci, "readiness": observed["readiness"],
                                 "note": "Promotion declares the interface ready for downstream tasks. It does not merge."}}
         self._check_confirm(confirm, expected)
         result = workspace_contracts.promote(manifest=self.manifest, task_id=task["id"], adapter=self.adapter)
@@ -491,7 +523,8 @@ class Controls:
                  {"tasks": {}})["tasks"].get(task["id"]) or {}
         if entry.get("execution_status") not in {"launched", "interrupted", "launching"}:
             raise ControlError(409, "CONTROL_NOTHING_TO_CANCEL", "the task has no running or interrupted child run")
-        expected = self._confirm("cancel", task["id"], entry.get("execution_id"), entry.get("run_id"),
+        expected = self._confirm("cancel", self._confirmation_scope(plan), task["id"],
+                                 entry.get("execution_id"), entry.get("run_id"),
                                  entry.get("execution_status"))
         if confirm is None:
             return {"ok": True, "stage": "preview", "confirm": expected,
@@ -530,7 +563,12 @@ class Controls:
         running, running_problems = workspace_run.running_tasks(observed_plan, workspace=record)
         budget = workspace_scheduler.budget_state(observed_plan, record, running=running,
                                                   extra_problems=running_problems)
-        expected = self._confirm("schedule", dispatch, interrupted if resume else [], allow_mutation,
+        reviewed = set(dispatch) | (set(interrupted) if resume else set())
+        repositories = {repo["id"]: repo for repo in observed_plan["repositories"]}
+        inputs = {task["id"]: workspace_run.dispatch_inputs(observed_plan, task, repositories[task["repository"]])
+                  for task in observed_plan["tasks"] if task["id"] in reviewed}
+        expected = self._confirm("schedule", self._confirmation_scope(observed_plan), inputs,
+                                 dispatch, interrupted if resume else [], allow_mutation,
                                  observed_plan["max_parallel"], mutating, bool(budget and budget["exhausted"]), awaiting)
         if confirm is None:
             launchable = bool(dispatch) and not (budget and (budget["exhausted"] or budget["incomplete"]))
@@ -567,7 +605,18 @@ class Controls:
         repo = next((r for r in plan["repositories"] if r["id"] == repo_id), None)
         if repo is None or not repo.get("resolved_path"):
             raise ControlError(404, "CONTROL_REPOSITORY_INVALID", "unknown or unresolved repository")
+        if repo.get("blocker_code"):
+            raise ControlError(409, repo["blocker_code"], "repository identity or pin is unresolved")
         return repo, Path(repo["resolved_path"])
+
+    def _policy_context(self, plan: dict, repo: dict, checkout: Path) -> dict:
+        """Bind a policy approval to the verified destination, not a mutable manifest alias."""
+        return {"workspace": plan["workspace_id"], "manifest": str(self.manifest.resolve()),
+                "repository_id": repo["id"], "repository": repo["repository"],
+                "checkout": str(checkout.resolve()), "pinned_commit": repo["pinned_commit"],
+                "base_branch": repo.get("base_branch", "main"),
+                "head": _git_value(checkout, "rev-parse", "HEAD"),
+                "branch": _git_value(checkout, "symbolic-ref", "--quiet", "--short", "HEAD")}
 
     def _set_permission(self, plan, data, confirm):
         repo, checkout = self._repo(plan, data.get("repository"))
@@ -593,7 +642,8 @@ class Controls:
             raise ControlError(409, "AUTONOMY_POLICY_INVALID", "the edited policy would not validate")
         diff = "".join(difflib.unified_diff(before.splitlines(True), after.splitlines(True),
                                             fromfile=".pi/autonomy.yaml", tofile=".pi/autonomy.yaml"))
-        expected = self._confirm("set_permission", repo["id"], name, value, hashlib.sha256(before.encode()).hexdigest())
+        expected = self._confirm("set_permission", self._policy_context(plan, repo, checkout), name, value,
+                                 hashlib.sha256(before.encode()).hexdigest(), hashlib.sha256(after.encode()).hexdigest())
         if confirm is None:
             return {"ok": before != after, "stage": "preview", "confirm": expected,
                     "preview": {"repository": repo["repository"], "permission": name, "value": value,
@@ -626,8 +676,6 @@ class Controls:
         branch and pinned in the manifest. Push, PR, mark-ready, merge and deploy are never touched.
         """
         repo, checkout = self._repo(plan, data.get("repository"))
-        if repo.get("blocker_code"):
-            raise ControlError(409, repo["blocker_code"], "repository identity or pin is unresolved")
         base = repo.get("base_branch", "main")
         branch = _git_value(checkout, "symbolic-ref", "--quiet", "--short", "HEAD")
         if branch != base:
@@ -660,7 +708,8 @@ class Controls:
                                "this repository has no mutating implementation task requiring local authorization")
         diff = "".join(difflib.unified_diff(before.splitlines(True), after.splitlines(True),
                                             fromfile=".pi/autonomy.yaml", tofile=".pi/autonomy.yaml"))
-        expected = self._confirm("approve_mutation", repo["id"], missing, hashlib.sha256(before.encode()).hexdigest())
+        expected = self._confirm("approve_mutation", self._policy_context(plan, repo, checkout), tasks, missing,
+                                 hashlib.sha256(before.encode()).hexdigest(), hashlib.sha256(after.encode()).hexdigest())
         if confirm is None:
             return {"ok": True, "stage": "preview", "confirm": expected,
                     "preview": {"repository": repo["repository"], "grants": missing, "tasks": tasks,
@@ -758,7 +807,8 @@ class Controls:
         diff = git("diff", "HEAD", "--", relative).stdout if tracked else path.read_text(encoding="utf-8")
         head = git("rev-parse", "HEAD").stdout.strip()
         message = "Update PICO autonomy policy"
-        expected = self._confirm("commit_policy", repo["id"], head, hashlib.sha256(diff.encode()).hexdigest())
+        expected = self._confirm("commit_policy", self._policy_context(plan, repo, checkout), head,
+                                 hashlib.sha256(diff.encode()).hexdigest())
         if confirm is None:
             return {"ok": True, "stage": "preview", "confirm": expected,
                     "preview": {"repository": repo["repository"], "branch": branch, "head": head, "message": message,
@@ -777,11 +827,9 @@ class Controls:
         return {"ok": True, "stage": "done", "status": "POLICY_COMMITTED", "commit": commit,
                 "audit": {"repository": repo["id"], "commit": commit}}
 
-    def _repin_prepare(self, plan: dict, repository_id: str) -> dict:
-        """Read-only preflight for a single pin edit; every check repeats on confirmation."""
+    def _repin_prepare(self, plan: dict, repository_id: str, *, inspect_execution: bool = True) -> dict:
+        """Prepare a pin edit; panels skip live execution reconciliation, actions recheck it."""
         repo, checkout = self._repo(plan, repository_id)
-        if repo.get("blocker_code"):
-            raise ControlError(409, repo["blocker_code"], "repository identity or pin is unresolved")
         manifest = self.manifest.absolute()
         # The explicit CLI path may sit below platform symlinks (macOS /var);
         # refuse the manifest and its immediate directory, then keep the write scoped there.
@@ -841,22 +889,31 @@ class Controls:
                                "the committed policy at checkout HEAD must grant create_worktrees and commit")
         if workspace_authorization._working_copy_differs(checkout, blob):
             raise ControlError(409, "AUTONOMY_POLICY_UNCOMMITTED", "the working policy differs from checkout HEAD")
-        record = workspace_run.load_workspace(workspace_run.workspace_record_path(plan["workspace_id"])) or {}
+        record = workspace_run.load_workspace(self._record_path(plan["workspace_id"])) or {}
         if any(not session.get("finished_at") for session in record.get("sessions") or [] if isinstance(session, dict)):
             raise ControlError(409, "WORKSPACE_SCHEDULER_ACTIVE", "wait for the scheduler session to finish")
         selected = {task_id: entry for task_id, entry in (record.get("tasks") or {}).items()
                     if isinstance(entry, dict) and entry.get("repository") == repository_id}
+        executions = []
         for entry in selected.values():
             if entry.get("attempts") or entry.get("execution_status") != "exited" or not entry.get("run_id") \
                     or entry.get("pinned_commit") != old or entry.get("target_repository") != repo["repository"]:
                 raise ControlError(409, "WORKSPACE_REPIN_TASK_STARTED",
                                    "a task has work that cannot be silently moved to another pin")
+            if not inspect_execution:
+                # Availability is advisory. Action preview and confirmation verify live execution
+                # evidence; headless status can save records and stop overdue processes.
+                continue
             try:
                 trace = provenance.get_run(Path(__file__).resolve().parent.parent, entry["run_id"])
                 execution = workspace_run.headless_run.status(target=checkout, explicit_repo=repo["repository"],
                                                                execution_id=entry["execution_id"])
+                _, _, common = workspace_run.headless_run._target(checkout, repo["repository"])
+                execution_path = workspace_run.headless_run.execution_path(common, entry["execution_id"])
             except (OSError, ValueError, provenance.ProvenanceError, workspace_run.headless_run.HeadlessError) as exc:
                 raise ControlError(409, "WORKSPACE_REPIN_TASK_STARTED", "child run evidence cannot be verified") from exc
+            executions.append({"path": execution_path,
+                               "record": execution, "run_id": entry["run_id"], "trace": trace})
             if execution.get("run_id") != entry["run_id"] or execution.get("status") != "exited" \
                     or not workspace_authorization.stopped_for_authorization(trace, execution.get("checkout")):
                 raise ControlError(409, "WORKSPACE_REPIN_TASK_STARTED",
@@ -865,17 +922,42 @@ class Controls:
         diff = "".join(difflib.unified_diff(before.splitlines(True), after.splitlines(True),
                                             fromfile=str(manifest.name), tofile=str(manifest.name)))
         state_digest = hashlib.sha256(json.dumps(selected, sort_keys=True).encode()).hexdigest()
-        binding = self._confirm("repin_manifest", repository_id, hashlib.sha256(before.encode()).hexdigest(),
+        binding = self._confirm("repin_manifest", self._confirmation_scope(plan), repository_id,
+                                hashlib.sha256(before.encode()).hexdigest(),
                                 head, branch, blob, state_digest)
         return {"manifest": manifest, "before": before, "after": after, "diff": diff, "repo": repo,
-                "old": old, "head": head, "branch": branch, "blob": blob, "confirm": binding}
+                "old": old, "head": head, "branch": branch, "blob": blob, "confirm": binding,
+                "executions": executions}
 
     def _repin_manifest(self, plan: dict, data: dict, confirm: str | None) -> dict:
         repository_id = data.get("repository")
         if not isinstance(repository_id, str) or not TASK_RE.fullmatch(repository_id):
             raise ControlError(400, "CONTROL_REPOSITORY_INVALID", "repository id is invalid")
-        with workspace_run.locked_workspace(plan["workspace_id"]):
-            prepared = self._repin_prepare(plan, repository_id)
+        # status() takes execution locks and may reconcile records. Never call it while
+        # holding the workspace lock: launch takes these locks in the opposite order.
+        prepared = self._repin_prepare(plan, repository_id)
+        with ExitStack() as locks:
+            for path in sorted({item["path"] for item in prepared["executions"]}):
+                locks.enter_context(workspace_run.headless_run.locked_record(path))
+            locks.enter_context(workspace_run.locked_workspace(plan["workspace_id"]))
+
+            def still_current(_temporary: Path | None = None) -> None:
+                try:
+                    current = self._repin_prepare(self._plan(), repository_id, inspect_execution=False)
+                except (ControlError, workspace_run.WorkspaceRunError) as exc:
+                    raise ControlError(409, "CONTROL_PREVIEW_STALE", "workspace changed during repin") from exc
+                self._check_confirm(prepared["confirm"], current["confirm"])
+                for item in prepared["executions"]:
+                    try:
+                        execution = workspace_run.headless_run.load_record(item["path"])
+                        trace = provenance.get_run(Path(__file__).resolve().parent.parent, item["run_id"])
+                    except (OSError, ValueError, provenance.ProvenanceError,
+                            workspace_run.headless_run.HeadlessError) as exc:
+                        raise ControlError(409, "CONTROL_PREVIEW_STALE", "child run evidence changed during repin") from exc
+                    if execution != item["record"] or trace != item["trace"]:
+                        raise ControlError(409, "CONTROL_PREVIEW_STALE", "child run evidence changed during repin")
+
+            still_current()
             if confirm is None:
                 return {"ok": True, "stage": "preview", "confirm": prepared["confirm"],
                         "preview": {"repository": prepared["repo"]["repository"],
@@ -885,16 +967,6 @@ class Controls:
                                     "note": "Only this repository pin changes. No worker launches, policy changes, "
                                             "GitHub write, or branch update occurs."}}
             self._check_confirm(confirm, prepared["confirm"])
-            def still_current(_temporary: Path) -> None:
-                if prepared["manifest"].read_text(encoding="utf-8") != prepared["before"]:
-                    raise ControlError(409, "CONTROL_PREVIEW_STALE", "manifest changed while the pin was being saved")
-                checkout = Path(prepared["repo"]["resolved_path"])
-                if _git_value(checkout, "rev-parse", "HEAD") != prepared["head"] or \
-                        _git_value(checkout, "symbolic-ref", "--quiet", "--short", "HEAD") != prepared["branch"]:
-                    raise ControlError(409, "CONTROL_PREVIEW_STALE", "checkout changed while the pin was being saved")
-                if _git_value(checkout, "status", "--porcelain", "--untracked-files=no") != "" or \
-                        workspace_authorization._working_copy_differs(checkout, prepared["blob"]):
-                    raise ControlError(409, "CONTROL_PREVIEW_STALE", "checkout policy changed while the pin was being saved")
             try:
                 atomic_io.atomic_write_text(prepared["manifest"], prepared["after"],
                                             root=prepared["manifest"].parent, validate=still_current)

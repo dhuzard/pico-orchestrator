@@ -11,9 +11,13 @@ no test ever reads or writes this repository's real backlog/backlog.yaml.
 from __future__ import annotations
 
 import io
+import concurrent.futures
+import os
 import shutil
+import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from contextlib import redirect_stdout, redirect_stderr
 from pathlib import Path
@@ -62,6 +66,65 @@ class BacklogStoreTest(unittest.TestCase):
         self.assertEqual(item["status"], "proposed")
         fetched = store.backlog_get("ORCH-001", self.repo_root)
         self.assertEqual(fetched, item)
+
+    def test_concurrent_additions_keep_both_items(self):
+        first_read = threading.Event()
+        release_first = threading.Event()
+        second_started = threading.Event()
+        second_read = threading.Event()
+        original = store.load_backlog
+
+        def slow_first_read(repo_root):
+            items = original(repo_root)
+            if threading.current_thread().name == "ORCH-001":
+                first_read.set()
+                self.assertTrue(release_first.wait(5))
+            elif threading.current_thread().name == "ORCH-002":
+                second_read.set()
+            return items
+
+        def add(item_id):
+            threading.current_thread().name = item_id
+            if item_id == "ORCH-002":
+                second_started.set()
+            return store.backlog_add(id=item_id, title=item_id, description="test",
+                                     version="v1", repo_root=self.repo_root)
+
+        with patch.object(store, "load_backlog", slow_first_read):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                first = pool.submit(add, "ORCH-001")
+                self.assertTrue(first_read.wait(5))
+                second = pool.submit(add, "ORCH-002")
+                try:
+                    self.assertTrue(second_started.wait(5))
+                    self.assertFalse(second_read.wait(0.1), "second writer read before the first committed")
+                finally:
+                    release_first.set()
+                self.assertEqual({first.result(timeout=5)["id"], second.result(timeout=5)["id"]},
+                                 {"ORCH-001", "ORCH-002"})
+        self.assertEqual({item["id"] for item in original(self.repo_root)}, {"ORCH-001", "ORCH-002"})
+
+    def test_backlog_lock_blocks_another_process_without_dirtying_repo(self):
+        script = (
+            "import sys; sys.path.insert(0, sys.argv[1]); import backlog_store; "
+            "from pathlib import Path; print('ready', flush=True); "
+            "backlog_store.backlog_add(id='ORCH-001', title='one', description='test', "
+            "version='v1', repo_root=Path(sys.argv[2]))"
+        )
+        alternate_tmp = self.repo_root / "alternate-tmp"
+        alternate_tmp.mkdir()
+        child_env = {**os.environ, "TMPDIR": str(alternate_tmp)}
+        with store.locked_backlog(self.repo_root):
+            child = subprocess.Popen([sys.executable, "-c", script, str(TOOLS_DIR), str(self.repo_root)],
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=child_env)
+            self.assertEqual(child.stdout.readline().strip(), "ready")
+            with self.assertRaises(subprocess.TimeoutExpired):
+                child.wait(timeout=0.2)
+            self.assertEqual(store.load_backlog(self.repo_root), [])
+        _, stderr = child.communicate(timeout=10)
+        self.assertEqual(child.returncode, 0, stderr)
+        self.assertEqual([item["id"] for item in store.load_backlog(self.repo_root)], ["ORCH-001"])
+        self.assertFalse(any(self.repo_root.rglob("*.lock")))
 
     def test_generate_next_id_is_monotonic_and_gap_aware(self):
         store.backlog_add(title="A", description="d", version="v1", id="ORCH-001", repo_root=self.repo_root)

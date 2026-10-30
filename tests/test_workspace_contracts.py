@@ -186,6 +186,104 @@ class ContractLifecycleTest(unittest.TestCase):
         return wc.publish(manifest=manifest, task_id=task_id, apply=True, plan_hash=preview["plan_hash"], adapter=self.fake)
 
     # -- tests -------------------------------------------------------------
+    def test_qualification_checks_all_repository_blockers_before_running_any_check(self):
+        manifest = self.manifest(b1={"readiness": "merged"}, q1={"depends_on": ["b1"], "checks": [
+            {"id": "first", "repository": "beta", "argv": [PY, "-c", "pass"]},
+            {"id": "conflicted", "repository": "alpha", "argv": [PY, "-c", "pass"]}]})
+        git("-C", str(self.repos["alpha"][0]), "remote", "set-url", "origin", "git@github.com:other/alpha.git")
+        before = {name: git("-C", str(path), "worktree", "list") for name, (path, _) in self.repos.items()}
+        with mock.patch.object(wc, "run_check") as run_check:
+            with self.assertRaises(wr.WorkspaceRunError) as rejected:
+                wc.validate(manifest=manifest, task_id="q1")
+        self.assertEqual(rejected.exception.code, "TARGET_REPOSITORY_CONFLICT")
+        run_check.assert_not_called()
+        self.assertEqual(before, {name: git("-C", str(path), "worktree", "list")
+                                  for name, (path, _) in self.repos.items()})
+        self.assertFalse(wr.workspace_record_path("ws").exists())
+
+    def test_closed_green_pr_cannot_promote_and_revokes_a_previous_promotion(self):
+        manifest = self.manifest()
+        commit = self._closed_and_published(manifest)
+        for previously_promoted in (False, True):
+            with self.subTest(previously_promoted=previously_promoted):
+                if previously_promoted:
+                    self.fake.checks[101] = ("OPEN", commit, GREEN)
+                    wc.promote(manifest=manifest, task_id="a1", adapter=self.fake)
+                self.fake.checks[101] = ("CLOSED", commit, GREEN)
+                with self.assertRaises(wr.WorkspaceRunError) as rejected:
+                    wc.promote(manifest=manifest, task_id="a1", adapter=self.fake)
+                self.assertEqual(rejected.exception.code, "WORKSPACE_PR_NOT_OPEN")
+                observed = wr.observed_state("ws", manifest=manifest)["a1"]
+                self.assertEqual(observed["readiness"], "validated")
+                self.assertNotIn("promoted_at", observed)
+                self.assertEqual(self.plan_task(manifest, "b1")["blocked_by"], ["a1"])
+
+    def test_promotion_cannot_overwrite_a_newer_closed_pr_observation(self):
+        manifest = self.manifest()
+        commit = self._closed_and_published(manifest)
+        self.fake.checks[101] = ("OPEN", commit, GREEN)
+        original_ci = wc.ci
+
+        def observe_green_then_close(**kwargs):
+            green = original_ci(**kwargs)
+            self.assertEqual(green["ci"]["status"], "green")
+            # Another observer records closure after this promotion's CI read,
+            # before it acquires the lock to write ready_for_downstream.
+            self.fake.checks[101] = ("CLOSED", commit, GREEN)
+            original_ci(**kwargs)
+            return green
+
+        with mock.patch.object(wc, "ci", side_effect=observe_green_then_close):
+            with self.assertRaises(wr.WorkspaceRunError):
+                wc.promote(manifest=manifest, task_id="a1", adapter=self.fake)
+        observed = wr.observed_state("ws", manifest=manifest)["a1"]
+        self.assertEqual(observed["ci"]["pr_state"], "closed")
+        self.assertEqual(observed["readiness"], "validated")
+        self.assertNotIn("promoted_at", observed)
+        self.assertEqual(self.plan_task(manifest, "b1")["blocked_by"], ["a1"])
+
+    def test_closed_pr_evidence_overrides_declared_released_readiness(self):
+        manifest = self.manifest()
+        commit = self._closed_and_published(manifest)
+        self.fake.checks[101] = ("OPEN", commit, GREEN)
+        wc.promote(manifest=manifest, task_id="a1", adapter=self.fake)
+        for declared in ("ready_for_downstream", "merged"):
+            with self.subTest(declared=declared):
+                self.manifest(a1={"readiness": declared})
+                self.fake.checks[101] = ("CLOSED", commit, GREEN)
+                self.assertFalse(wc.ci(manifest=manifest, task_id="a1", adapter=self.fake)["ok"])
+                self.assertEqual(self.plan_task(manifest, "a1")["readiness"], "validated")
+                self.assertEqual(self.plan_task(manifest, "b1")["blocked_by"], ["a1"])
+                with mock.patch.object(wr.headless_run, "start") as start:
+                    with self.assertRaises(wr.WorkspaceRunError):
+                        wr.launch(manifest=manifest, task_id="b1", access_check=None)
+                start.assert_not_called()
+
+    def test_promoted_evidence_is_not_reused_after_task_or_check_scope_changes(self):
+        manifest = self.manifest()
+        commit = self._closed_and_published(manifest)
+        self.fake.checks[101] = ("OPEN", commit, GREEN)
+        wc.promote(manifest=manifest, task_id="a1", adapter=self.fake)
+        before = wr.workspace_record_path("ws").read_bytes()
+        for overrides in (
+            {"checks": [{"id": "schema", "repository": "alpha", "argv": [PY, "-c", "raise SystemExit(1)"]}]},
+            {"repository": "beta", "checks": [{"id": "schema", "repository": "beta", "argv": [PY, "-c", "pass"]}]},
+        ):
+            with self.subTest(overrides=overrides):
+                self.manifest(a1=overrides)
+                self.assertEqual(self.plan_task(manifest, "b1")["blocked_by"], ["a1"])
+                with mock.patch.object(wr.headless_run, "start") as start:
+                    with self.assertRaises(wr.WorkspaceRunError):
+                        wr.launch(manifest=manifest, task_id="b1", access_check=None)
+                start.assert_not_called()
+                with self.assertRaises(wr.WorkspaceRunError) as rejected:
+                    wc.promote(manifest=manifest, task_id="a1", adapter=self.fake)
+                self.assertEqual(rejected.exception.code, wr.EVIDENCE_CHANGED)
+                self.assertEqual(wr.workspace_record_path("ws").read_bytes(), before)
+        # Restoring the reviewed definition recovers its evidence without rewriting history.
+        self.manifest()
+        self.assertEqual(self.plan_task(manifest, "b1")["blocked_by"], [])
+
     def test_full_lifecycle_across_two_repositories(self):
         manifest = self.manifest()
         first = self.schedule(manifest)
@@ -578,8 +676,10 @@ class ContractLifecycleTest(unittest.TestCase):
             self.assertEqual(preview["issue_reference_decision"]["source"], "task")
 
         with self.subTest("the opt-in may close only the task's own issue"):
-            stray = wc.publish(manifest=self.manifest(a1={"closes_issue": True, "title": "Claim adapter, fixes #8"}),
-                               task_id="a1", adapter=self.fake)
+            # Keep the implementation instruction stable while changing publication wording.
+            changed = self.manifest(a1={"closes_issue": True, "objective": "Claim adapter",
+                                        "title": "Claim adapter, fixes #8"})
+            stray = wc.publish(manifest=changed, task_id="a1", adapter=self.fake)
             self.assertEqual((stray["status"], stray["blocker_code"]), ("BLOCKED", "PUBLICATION_BODY_INVALID"))
 
         with self.subTest("an uncommitted repository policy changes nothing"):

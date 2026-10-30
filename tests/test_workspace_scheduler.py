@@ -279,9 +279,12 @@ class SchedulerTest(SchedulerFixture):
         self.assertEqual(self.states(result), {"a1": "partial", "a2": "partial"}, result)
         self.assertEqual(git("-C", str(alpha), "branch", "--show-current"), starting_branch)
         self.assertEqual(git("-C", str(alpha), "rev-parse", "HEAD"), self.repos["alpha"][1])
-        self.assertEqual(len(git("-C", str(alpha), "worktree", "list").splitlines()), 1)
+        # Cleanup preserves a clean worktree whose ownership cannot be proved;
+        # it must not prevent the next task from using the restored checkout.
+        self.assertEqual(len(git("-C", str(alpha), "worktree", "list").splitlines()), 2)
         record = wr.load_workspace(wr.workspace_record_path("ws"))
         self.assertTrue(record["tasks"]["a1"]["checkout"]["restored"])
+        self.assertTrue(record["tasks"]["a1"]["checkout"]["kept_worktrees"])
 
     def test_second_task_is_refused_when_the_first_left_the_checkout_dirty(self):
         # The #4 pilot: a lead applied its diff to the parent checkout; the next task in that repository

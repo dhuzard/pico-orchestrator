@@ -21,9 +21,14 @@ only place `gh` is invoked from (via tools/github_sync.py).
 from __future__ import annotations
 
 import copy
+import fcntl
+import functools
+import hashlib
+import os
 import re
 import tempfile
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -159,6 +164,8 @@ def _is_rfc3339_datetime(value: str) -> bool:
 
 def load_schema(repo_root: Path = REPO_ROOT_DEFAULT) -> dict:
     path = schema_path(repo_root)
+    if not path.exists():
+        path = schema_path(REPO_ROOT_DEFAULT)
     with path.open("r", encoding="utf-8") as f:
         import json
 
@@ -227,6 +234,38 @@ def save_backlog(items: Iterable[dict], repo_root: Path = REPO_ROOT_DEFAULT) -> 
     finally:
         if Path(tmp_name).exists():
             Path(tmp_name).unlink()
+
+
+@contextmanager
+def locked_backlog(repo_root: Path):
+    """Serialize each backlog read, validation and replacement across processes."""
+    path = backlog_path(repo_root)
+    # Resolve only the parent: replacing an existing file/symlink must not
+    # change the lock key between two writers.
+    key = hashlib.sha256(str(path.parent.resolve() / path.name).encode("utf-8")).hexdigest()
+    # Linux, macOS and WSL all provide /tmp. Avoid TMPDIR and Git discovery,
+    # whose per-process differences could send writers to separate locks.
+    lock_root = Path("/tmp") / f"pico-backlog-locks-{os.getuid()}"
+    lock_root.mkdir(mode=0o700, exist_ok=True)
+    if lock_root.is_symlink() or lock_root.stat().st_uid != os.getuid() or lock_root.stat().st_mode & 0o077:
+        raise BacklogError(f"unsafe backlog lock directory: {lock_root}")
+    lock_path = lock_root / f"{key}.lock"
+    flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(lock_path, flags, 0o600)
+    with os.fdopen(fd, "r+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def _locked_mutation(function):
+    @functools.wraps(function)
+    def wrapped(*args, **kwargs):
+        with locked_backlog(kwargs.get("repo_root", REPO_ROOT_DEFAULT)):
+            return function(*args, **kwargs)
+    return wrapped
 
 
 # ---------------------------------------------------------------------------
@@ -407,6 +446,7 @@ def _assert_collection_valid_after(items: list[dict], schema: dict) -> None:
         raise SchemaValidationError(issues)
 
 
+@_locked_mutation
 def backlog_add(
     *,
     title: str,
@@ -510,6 +550,7 @@ def validate_transition(
             raise DependencyNotCompletedError(item["id"], new_status, unmet)
 
 
+@_locked_mutation
 def backlog_update(
     id: str,
     *,

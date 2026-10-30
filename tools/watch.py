@@ -315,7 +315,7 @@ def _manifest_plan(manifest: Path, state: Path | None = None) -> dict:
         workspace_id = raw.get("id") if isinstance(raw, dict) else None
         if state is not None and _match(workspace_id, SLUG):
             record = workspace_run.load_workspace(state / "workspaces" / f"{workspace_id}.json")
-            observed = workspace_run.observed_from_record(record or {})
+            observed = workspace_run.observed_from_record(record or {}, manifest=manifest)
     except (workspace_plan.WorkspaceError, workspace_run.WorkspaceRunError):
         observed = None  # the plan call below reports an unreadable manifest
     try:
@@ -351,6 +351,8 @@ def workspace_view(state: Path, *, workspace_id: str | None = None, manifest: Pa
     source = "manifest" if plan is not None else "record"
     plan = plan or _record_plan(record)
     raw_entries = record.get("tasks") if isinstance(record.get("tasks"), dict) else {}
+    if source == "manifest" and plan.get("manifest"):
+        raw_entries = workspace_run.compatible_entries(record, Path(plan["manifest"]))
     entries = {task_id: entry for task_id, entry in raw_entries.items() if isinstance(entry, dict)}
     sessions = _sessions(record)
     # A refusal is not persisted as a launch; the latest session's refusals
@@ -628,7 +630,8 @@ def make_handler(directory: Path, repository: str | None, workspace: WorkspaceSo
                                                "error": "panels need pico watch --workspace <manifest>"})
                 else:
                     try:
-                        panel_source = controls or garden_controls.Controls(workspace.manifest, 0, token="unused")
+                        panel_source = controls or garden_controls.Controls(
+                            workspace.manifest, 0, token="unused", state_dir=workspace.state)
                         payload = self._json(200, {"ok": True, "enabled": controls is not None,
                                                    "actions": list(garden_controls.ACTIONS) if controls else [],
                                                    **panel_source.panels()})
@@ -754,7 +757,7 @@ def main() -> None:
     if setup:
         server.RequestHandlerClass = make_handler(directory, repository, port=server.server_port, setup=setup)
     if args.controls:
-        controls = garden_controls.Controls(workspace.manifest, server.server_port)
+        controls = garden_controls.Controls(workspace.manifest, server.server_port, state_dir=state)
         server.RequestHandlerClass = make_handler(directory, repository, workspace, controls, server.server_port,
                                                   issues=issues)
     label = f"workspace {workspace.workspace_id}" if workspace else repository or "all repositories"

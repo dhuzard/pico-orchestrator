@@ -1400,6 +1400,13 @@ append-only artifacts with no shared-file contention concern. Both choices
 are documented in `tools/backlog_store.py`'s and `tools/provenance.py`'s
 module docstrings.
 
+Backlog additions and updates hold one filesystem lock across loading,
+validation, and replacement, so concurrent CLI processes cannot overwrite
+each other's changes. The lock lives under `/tmp` in a private directory keyed
+by the physical backlog path. This location is the same across CLI processes
+even if their `TMPDIR` or Git lookup differs, and it adds no untracked file to
+the target checkout.
+
 Each backlog item is validated against `schemas/backlog-item.schema.json`
 and has (at minimum) `id` (a stable `ORCH-NNN` identifier), `title`,
 `description`, `status`, `version`, `priority`, `dependencies`,
@@ -2205,10 +2212,10 @@ validate` checks are not recorded as signatures.
 
 **Checkout hygiene.** Before launching, the runner records the target's
 branch (or detached `HEAD`) and its linked worktrees. After the child exits it
-removes every worktree the run created that is clean (`git worktree remove`
-without `--force`; a worktree with uncommitted or untracked files is kept and
-reported), prunes stale entries, and, if the parent checkout moved and has no
-uncommitted tracked changes, switches it back to where it started. Branches
+keeps and reports newly observed worktrees, because their appearance during a
+run does not establish that the run owns them. It does not prune worktrees. If
+the parent checkout moved and has no uncommitted tracked changes, the runner
+switches it back to where it started. Branches
 are never deleted, since they hold the work. The result is recorded as the
 execution's `checkout` block (`restored`, `removed_worktrees`,
 `kept_worktrees`, `left_reason`, and `dirty_files`/`dirty_count`: the tracked
@@ -2216,7 +2223,8 @@ changes the run left uncommitted in the parent checkout itself, `null` when
 Git cannot answer; `new_untracked`/`new_untracked_count`: untracked, not
 ignored entries that appeared in the parent checkout during the run, an
 untracked directory counting as one entry and `.pi/worktrees/` excluded) and
-summarised on the workspace task entry. Untracked entries are a report only:
+summarised on the workspace task entry. `removed_worktrees` is retained for
+record compatibility and is empty for new executions. Untracked entries are a report only:
 they never refuse a launch, because they cannot change a commit or a check at
 the recorded commits, but they show a write outside the run's worktrees (#63).
 Nothing dirty is ever cleaned, stashed or reset.
@@ -2377,8 +2385,9 @@ the missing `create_worktrees` and `commit` lines to `true`. An existing
 policy keeps every other line. A new policy starts from the template with
 every other permission denied and merge disabled. The written file is
 uncommitted. `commit_policy` commits it on the base branch and never pushes.
-The human then sets the repository's `pinned_commit` to that commit. PICO
-never edits the manifest.
+The human then sets the repository's `pinned_commit` to that commit, either
+by editing the manifest or using the Garden's reviewed `repin_manifest`
+control. That control previews and applies only the selected repository's pin.
 
 **Attempts.** On the next `schedule` with authorization in place, a task
 whose run stopped for authorization starts a new attempt with its own
@@ -2452,8 +2461,19 @@ dependency).
 | --- | --- | --- |
 | `implemented` | launcher | child run ended `COMPLETED` or `PARTIAL` |
 | `validated` | `validate` | every check passed on one commit; provided contracts recorded at their versions |
-| `ready_for_downstream` | `promote` | draft PR exists, PR head is the validated commit, CI observed green now |
+| `ready_for_downstream` | `promote` | PR is open, PR head is the validated commit, CI observed green now |
 | `merged` | `ci` (observed) | PR state merged at the validated commit |
+
+Observed evidence is bound to the task's instructions, repository identity and
+checkout, checks, contracts and dependency definitions. Incompatible edits
+report `WORKSPACE_TASK_DEFINITION_CHANGED`; restore the definition or use a new
+task id. Historical records remain intact. Implementation evidence tolerates a
+repin contained in its exact validated commit or validated upstream input, or
+an advance from the old pin whose diff changes at most `.pi/autonomy.yaml`;
+qualification evidence requires unchanged pins. Runtime
+limits and budgets can change for resume. Legacy records acquire these bindings
+only against their original, unchanged manifest. A closed PR, stale head or
+non-green open PR revokes release even if the manifest declared it ready.
 
 **Gating.** An implementation task is dispatchable only when every dependency
 is `ready_for_downstream` or `merged` and every contract it requires from that
