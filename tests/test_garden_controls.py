@@ -151,6 +151,68 @@ class GardenControlsTest(unittest.TestCase):
         self.repos[name] = (path, git("-C", str(path), "rev-parse", "HEAD"))
         self.manifest()
 
+    def test_policy_confirmation_cannot_follow_a_reassigned_manifest_alias(self):
+        self.drop_policy("alpha")
+        self.drop_policy("beta")
+        # Identical commits and policy bytes must still not make two destinations interchangeable.
+        beta = self.repos["beta"][0]
+        git("-C", str(beta), "fetch", "-q", str(self.repos["alpha"][0]), "main")
+        git("-C", str(beta), "reset", "--hard", "FETCH_HEAD")
+        self.repos["beta"] = (beta, git("-C", str(beta), "rev-parse", "HEAD"))
+        for action in ("approve_mutation", "set_permission", "commit_policy"):
+            with self.subTest(action=action):
+                self.manifest()
+                for checkout, _ in self.repos.values():
+                    policy = checkout / ".pi" / "autonomy.yaml"
+                    if action == "commit_policy":
+                        policy.parent.mkdir(exist_ok=True)
+                        policy.write_text((REPO_ROOT / "templates" / "autonomy.yaml").read_text())
+                    elif policy.exists():
+                        policy.unlink()
+                request = {"action": action, "repository": "alpha"}
+                if action == "set_permission":
+                    request.update(permission="push_branch", value=True)
+                _, preview = self.act(**request)
+                self.assertEqual(preview["stage"], "preview", preview)
+                before = {name: (git("-C", str(checkout), "rev-parse", "HEAD"),
+                                 (checkout / ".pi" / "autonomy.yaml").read_bytes()
+                                 if (checkout / ".pi" / "autonomy.yaml").exists() else None)
+                          for name, (checkout, _) in self.repos.items()}
+                manifest = yaml.safe_load(self.path.read_text())
+                for repo in manifest["repositories"]:
+                    repo["id"] = "beta" if repo["id"] == "alpha" else "alpha"
+                self.path.write_text(yaml.safe_dump(manifest))
+                self.assertTrue(all(not repo["blocker_code"] for repo in self.controls._plan()["repositories"]))
+                _, result = self.act(**request, confirm=preview["confirm"])
+                self.assertEqual(result.get("error_code"), "CONTROL_PREVIEW_STALE", result)
+                for name, (checkout, _) in self.repos.items():
+                    policy = checkout / ".pi" / "autonomy.yaml"
+                    self.assertEqual((git("-C", str(checkout), "rev-parse", "HEAD"),
+                                      policy.read_bytes() if policy.exists() else None), before[name])
+
+    def test_policy_actions_refuse_repository_identity_conflicts(self):
+        checkout = self.repos["alpha"][0]
+        policy = checkout / ".pi" / "autonomy.yaml"
+        policy.write_text(policy.read_text() + "# pending policy change\n")
+        for action in ("set_permission", "commit_policy", "approve_mutation"):
+            with self.subTest(action=action):
+                request = {"action": action, "repository": "alpha"}
+                if action == "set_permission":
+                    request.update(permission="push_branch", value=True)
+                if action == "approve_mutation":
+                    policy.write_text(policy.read_text().replace("create_worktrees: true", "create_worktrees: false"))
+                _, preview = self.act(**request)
+                self.assertEqual(preview["stage"], "preview", preview)
+                before = policy.read_bytes(), git("-C", str(checkout), "rev-parse", "HEAD")
+                git("-C", str(checkout), "remote", "set-url", "origin", "https://github.com/acme/unrelated.git")
+                try:
+                    for confirmation in ({}, {"confirm": preview["confirm"]}):
+                        _, result = self.act(**request, **confirmation)
+                        self.assertEqual(result.get("error_code"), "TARGET_REPOSITORY_CONFLICT", result)
+                        self.assertEqual((policy.read_bytes(), git("-C", str(checkout), "rev-parse", "HEAD")), before)
+                finally:
+                    git("-C", str(checkout), "remote", "set-url", "origin", "git@github.com:acme/alpha.git")
+
     def _victim(self):
         outside = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, outside, True)
@@ -229,6 +291,30 @@ class GardenControlsTest(unittest.TestCase):
         self.assertEqual((repos["alpha"]["issue_reference"], repos["beta"]["issue_reference"]), ("refs", "refs"))
         self.assertIn("claude", data["models"]["models"])
         self.assertNotIn("Interoperable claims", json.dumps(data))  # the workspace goal is never served
+
+    def test_panels_do_not_reconcile_executions_when_checking_repin_availability(self):
+        self.drop_policy("alpha")
+        checkout, old = self.repos["alpha"]
+        _, approval = self.act(action="approve_mutation", repository="alpha")
+        self.act(action="approve_mutation", repository="alpha", confirm=approval["confirm"])
+        git("-C", str(checkout), "add", ".pi/autonomy.yaml")
+        git("-C", str(checkout), *COMMIT, "grant local mutation")
+        record_path = wr.workspace_record_path("ws")
+        record = wr.load_workspace(record_path)
+        record["tasks"]["a1"] = {"repository": "alpha", "target_repository": "acme/alpha",
+                                   "pinned_commit": old, "execution_status": "exited",
+                                   "run_status": "BLOCKED", "run_id": "run-approval",
+                                   "execution_id": "ws--a1"}
+        wr.save_workspace(record_path, record)
+        before = record_path.read_bytes(), record_path.stat().st_mtime_ns
+        with patch.object(wr.headless_run, "status", side_effect=AssertionError("read must not reconcile executions")):
+            status, panel = self.request("GET", "/api/controls")
+        self.assertEqual(status, 200, panel)
+        self.assertEqual((record_path.read_bytes(), record_path.stat().st_mtime_ns), before)
+        # Availability remains advisory; action preview performs the evidence verification.
+        repin = next(row for row in panel["action_view"]["actions"]
+                     if row["action"] == "repin_manifest" and row["target"] == "alpha")
+        self.assertTrue(repin["available"], repin)
 
     def test_repin_after_bounded_policy_commit_changes_one_manifest_pin(self):
         self.drop_policy("alpha")

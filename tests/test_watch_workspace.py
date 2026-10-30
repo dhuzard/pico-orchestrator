@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
@@ -322,6 +324,43 @@ class WorkspaceViewTest(WorkspaceViewFixture):
                 self.assertNotIn(SENTINEL, text)
                 for word in ("objective", "prompt", "transcript", "trace_path", "title", "goal", "raw_output"):
                     self.assertNotIn(f'"{word}"', text)
+
+    def test_controls_panel_reads_only_the_explicit_state_directory(self):
+        manifest = yaml.safe_load(self.manifest.read_text())
+        manifest["budget"] = {"max_tokens": 100}
+        self.manifest.write_text(yaml.safe_dump(manifest))
+        ambient = self.base / "ambient-state"
+        ambient.mkdir()
+        base = self.serve(watch.WorkspaceSource(self.state, self.manifest))
+
+        def files():
+            return {str(path.relative_to(self.base)): (path.read_bytes(), path.stat().st_mtime_ns)
+                    for path in self.base.rglob("*") if path.is_file()}
+
+        before = files()
+        with patch.dict(os.environ, {"PI_ORCHESTRATOR_STATE_DIR": str(ambient)}):
+            status, body = self.get(f"{base}/api/controls")
+        self.assertEqual(status, 200, body)
+        panel = json.loads(body)
+        self.assertFalse(panel["enabled"])
+        schedule = next(row for row in panel["action_view"]["actions"] if row["action"] == "schedule")
+        self.assertEqual(schedule["refusal_code"], "WORKSPACE_BUDGET_HELD")
+        states = {row["id"]: row["display"]["native"] for row in panel["action_view"]["states"]}
+        self.assertEqual(states["api-1"], "completed")
+        self.assertEqual(states["api-2"], "failed")
+        self.assertEqual(states["web-3"], "running")
+        self.assertEqual(files(), before)
+        self.assertEqual(list(ambient.iterdir()), [])
+
+    def test_controls_panel_does_not_initialize_workspace_records(self):
+        (self.state / "workspaces" / "garden.json").unlink()
+        ambient = self.base / "ambient-state"
+        base = self.serve(watch.WorkspaceSource(self.state, self.manifest))
+        with patch.dict(os.environ, {"PI_ORCHESTRATOR_STATE_DIR": str(ambient)}):
+            status, body = self.get(f"{base}/api/controls")
+        self.assertEqual(status, 200, body)
+        self.assertFalse((self.state / "workspaces" / "garden.json").exists())
+        self.assertFalse(ambient.exists())
 
     def test_http_unknown_workspace_and_mode_off(self):
         base = self.serve(watch.WorkspaceSource(self.state, "missing"))

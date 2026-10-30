@@ -628,7 +628,8 @@ def make_handler(directory: Path, repository: str | None, workspace: WorkspaceSo
                                                "error": "panels need pico watch --workspace <manifest>"})
                 else:
                     try:
-                        panel_source = controls or garden_controls.Controls(workspace.manifest, 0, token="unused")
+                        panel_source = controls or garden_controls.Controls(
+                            workspace.manifest, 0, token="unused", state_dir=workspace.state)
                         payload = self._json(200, {"ok": True, "enabled": controls is not None,
                                                    "actions": list(garden_controls.ACTIONS) if controls else [],
                                                    **panel_source.panels()})
@@ -754,7 +755,7 @@ def main() -> None:
     if setup:
         server.RequestHandlerClass = make_handler(directory, repository, port=server.server_port, setup=setup)
     if args.controls:
-        controls = garden_controls.Controls(workspace.manifest, server.server_port)
+        controls = garden_controls.Controls(workspace.manifest, server.server_port, state_dir=state)
         server.RequestHandlerClass = make_handler(directory, repository, workspace, controls, server.server_port,
                                                   issues=issues)
     label = f"workspace {workspace.workspace_id}" if workspace else repository or "all repositories"

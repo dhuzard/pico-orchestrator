@@ -181,8 +181,10 @@ def host_allowed(host: str | None, port: int) -> bool:
 
 
 class Controls:
-    def __init__(self, manifest: Path, port: int, *, adapter=None, token: str | None = None):
+    def __init__(self, manifest: Path, port: int, *, adapter=None, token: str | None = None,
+                 state_dir: Path | None = None):
         self.manifest = manifest
+        self.state_dir = state_dir
         self.port = port
         self.token = token or secrets.token_urlsafe(32)
         self._secret = secrets.token_bytes(32)
@@ -217,8 +219,23 @@ class Controls:
         return data
 
     # -- read-only panels --------------------------------------------------
+    def _record_path(self, workspace_id: str) -> Path:
+        if self.state_dir is not None:
+            return self.state_dir / "workspaces" / f"{workspace_id}.json"
+        return workspace_run.workspace_record_path(workspace_id)
+
     def _plan(self) -> dict:
-        return workspace_run._plan(self.manifest, access_check=None)
+        if self.state_dir is None:
+            return workspace_run._plan(self.manifest, access_check=None)
+        try:
+            raw = workspace_plan.load_manifest(self.manifest)
+            workspace_id = raw.get("id") if isinstance(raw, dict) else None
+            record = (workspace_run.load_workspace(self._record_path(workspace_id))
+                      if isinstance(workspace_id, str) and TASK_RE.fullmatch(workspace_id) else None)
+            return workspace_plan.plan(self.manifest, access_check=None,
+                                       observed=workspace_run.observed_from_record(record or {}))
+        except workspace_plan.WorkspaceError as exc:
+            raise workspace_run.WorkspaceRunError("WORKSPACE_MANIFEST_INVALID", str(exc)) from exc
 
     def panels(self) -> dict:
         plan = self._plan()
@@ -271,9 +288,11 @@ class Controls:
         except Exception:  # model config problems are reported, never served in detail
             models = {"configured": None, "models": {}, "error_code": "MODEL_CONFIG_INVALID"}
         running = self._scheduler is not None and self._scheduler.is_alive()
-        record = workspace_run.load_workspace(workspace_run.workspace_record_path(plan["workspace_id"])) or {"tasks": {}}
-        entries = workspace_run.status(manifest=self.manifest, access_check=None)["tasks"]
-        budget = workspace_scheduler.budget_state(plan, record)
+        record = workspace_run.load_workspace(self._record_path(plan["workspace_id"])) or {"tasks": {}}
+        # Viewing controls must never reconcile executions, enforce deadlines or save records.
+        entries = workspace_run._record_entries(plan["workspace_id"], record)
+        runs_dir = self.state_dir / "runs" if self.state_dir is not None else None
+        budget = workspace_scheduler.budget_state(plan, record, runs_dir=runs_dir)
         action_view = workspace_action_view.snapshot(plan, entries, budget=budget, scheduler_running=running)
         for repo in plan["repositories"]:
             try:
@@ -292,7 +311,7 @@ class Controls:
                                            "requires_preview": True,
                                            "invocation": {"action": "approve_mutation", "repository": repo["id"]}})
             try:
-                self._repin_prepare(plan, repo["id"])
+                self._repin_prepare(plan, repo["id"], inspect_execution=False)
                 available, code, explanation = True, None, "Preview the exact manifest pin change before confirming."
             except (ControlError, workspace_run.WorkspaceRunError) as exc:
                 available, code, explanation = False, exc.code, exc.detail
@@ -567,7 +586,18 @@ class Controls:
         repo = next((r for r in plan["repositories"] if r["id"] == repo_id), None)
         if repo is None or not repo.get("resolved_path"):
             raise ControlError(404, "CONTROL_REPOSITORY_INVALID", "unknown or unresolved repository")
+        if repo.get("blocker_code"):
+            raise ControlError(409, repo["blocker_code"], "repository identity or pin is unresolved")
         return repo, Path(repo["resolved_path"])
+
+    def _policy_context(self, plan: dict, repo: dict, checkout: Path) -> dict:
+        """Bind a policy approval to the verified destination, not a mutable manifest alias."""
+        return {"workspace": plan["workspace_id"], "manifest": str(self.manifest.resolve()),
+                "repository_id": repo["id"], "repository": repo["repository"],
+                "checkout": str(checkout.resolve()), "pinned_commit": repo["pinned_commit"],
+                "base_branch": repo.get("base_branch", "main"),
+                "head": _git_value(checkout, "rev-parse", "HEAD"),
+                "branch": _git_value(checkout, "symbolic-ref", "--quiet", "--short", "HEAD")}
 
     def _set_permission(self, plan, data, confirm):
         repo, checkout = self._repo(plan, data.get("repository"))
@@ -593,7 +623,8 @@ class Controls:
             raise ControlError(409, "AUTONOMY_POLICY_INVALID", "the edited policy would not validate")
         diff = "".join(difflib.unified_diff(before.splitlines(True), after.splitlines(True),
                                             fromfile=".pi/autonomy.yaml", tofile=".pi/autonomy.yaml"))
-        expected = self._confirm("set_permission", repo["id"], name, value, hashlib.sha256(before.encode()).hexdigest())
+        expected = self._confirm("set_permission", self._policy_context(plan, repo, checkout), name, value,
+                                 hashlib.sha256(before.encode()).hexdigest(), hashlib.sha256(after.encode()).hexdigest())
         if confirm is None:
             return {"ok": before != after, "stage": "preview", "confirm": expected,
                     "preview": {"repository": repo["repository"], "permission": name, "value": value,
@@ -626,8 +657,6 @@ class Controls:
         branch and pinned in the manifest. Push, PR, mark-ready, merge and deploy are never touched.
         """
         repo, checkout = self._repo(plan, data.get("repository"))
-        if repo.get("blocker_code"):
-            raise ControlError(409, repo["blocker_code"], "repository identity or pin is unresolved")
         base = repo.get("base_branch", "main")
         branch = _git_value(checkout, "symbolic-ref", "--quiet", "--short", "HEAD")
         if branch != base:
@@ -660,7 +689,8 @@ class Controls:
                                "this repository has no mutating implementation task requiring local authorization")
         diff = "".join(difflib.unified_diff(before.splitlines(True), after.splitlines(True),
                                             fromfile=".pi/autonomy.yaml", tofile=".pi/autonomy.yaml"))
-        expected = self._confirm("approve_mutation", repo["id"], missing, hashlib.sha256(before.encode()).hexdigest())
+        expected = self._confirm("approve_mutation", self._policy_context(plan, repo, checkout), tasks, missing,
+                                 hashlib.sha256(before.encode()).hexdigest(), hashlib.sha256(after.encode()).hexdigest())
         if confirm is None:
             return {"ok": True, "stage": "preview", "confirm": expected,
                     "preview": {"repository": repo["repository"], "grants": missing, "tasks": tasks,
@@ -758,7 +788,8 @@ class Controls:
         diff = git("diff", "HEAD", "--", relative).stdout if tracked else path.read_text(encoding="utf-8")
         head = git("rev-parse", "HEAD").stdout.strip()
         message = "Update PICO autonomy policy"
-        expected = self._confirm("commit_policy", repo["id"], head, hashlib.sha256(diff.encode()).hexdigest())
+        expected = self._confirm("commit_policy", self._policy_context(plan, repo, checkout), head,
+                                 hashlib.sha256(diff.encode()).hexdigest())
         if confirm is None:
             return {"ok": True, "stage": "preview", "confirm": expected,
                     "preview": {"repository": repo["repository"], "branch": branch, "head": head, "message": message,
@@ -777,11 +808,9 @@ class Controls:
         return {"ok": True, "stage": "done", "status": "POLICY_COMMITTED", "commit": commit,
                 "audit": {"repository": repo["id"], "commit": commit}}
 
-    def _repin_prepare(self, plan: dict, repository_id: str) -> dict:
-        """Read-only preflight for a single pin edit; every check repeats on confirmation."""
+    def _repin_prepare(self, plan: dict, repository_id: str, *, inspect_execution: bool = True) -> dict:
+        """Prepare a pin edit; panels skip live execution reconciliation, actions recheck it."""
         repo, checkout = self._repo(plan, repository_id)
-        if repo.get("blocker_code"):
-            raise ControlError(409, repo["blocker_code"], "repository identity or pin is unresolved")
         manifest = self.manifest.absolute()
         # The explicit CLI path may sit below platform symlinks (macOS /var);
         # refuse the manifest and its immediate directory, then keep the write scoped there.
@@ -841,7 +870,7 @@ class Controls:
                                "the committed policy at checkout HEAD must grant create_worktrees and commit")
         if workspace_authorization._working_copy_differs(checkout, blob):
             raise ControlError(409, "AUTONOMY_POLICY_UNCOMMITTED", "the working policy differs from checkout HEAD")
-        record = workspace_run.load_workspace(workspace_run.workspace_record_path(plan["workspace_id"])) or {}
+        record = workspace_run.load_workspace(self._record_path(plan["workspace_id"])) or {}
         if any(not session.get("finished_at") for session in record.get("sessions") or [] if isinstance(session, dict)):
             raise ControlError(409, "WORKSPACE_SCHEDULER_ACTIVE", "wait for the scheduler session to finish")
         selected = {task_id: entry for task_id, entry in (record.get("tasks") or {}).items()
@@ -851,6 +880,10 @@ class Controls:
                     or entry.get("pinned_commit") != old or entry.get("target_repository") != repo["repository"]:
                 raise ControlError(409, "WORKSPACE_REPIN_TASK_STARTED",
                                    "a task has work that cannot be silently moved to another pin")
+            if not inspect_execution:
+                # Availability is advisory. Action preview and confirmation verify live execution
+                # evidence; headless status can save records and stop overdue processes.
+                continue
             try:
                 trace = provenance.get_run(Path(__file__).resolve().parent.parent, entry["run_id"])
                 execution = workspace_run.headless_run.status(target=checkout, explicit_repo=repo["repository"],
