@@ -50,7 +50,8 @@ offers separate, reviewed steps:
    commits only that policy file and does not push.
 4. Preview and confirm **Repin manifest**. Garden shows the exact old and new
    commit and the one-line manifest diff. It accepts only a clean checkout on
-   its base branch, with HEAD descended from the old pin and a valid committed
+   its base branch, with HEAD descended from the old pin, only
+   `.pi/autonomy.yaml` changed between the two commits, and a valid committed
    policy that grants local mutation. It refuses repositories with running or
    completed child work, ambiguous identity, and manifest layouts it cannot
    edit precisely. It changes only the selected `pinned_commit`; it does not
