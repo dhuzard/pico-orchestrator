@@ -741,7 +741,7 @@ function renderControls() {
     const effective = repo.effective;
     box.append(el("h3", "perm-subtitle", "Working checkout policy"));
     if (repo.error_code) box.append(el("small", "perm-error", `Working policy unavailable: ${repo.error_code}`));
-    else box.append(el("small", "", `${repo.source} · profile ${repo.profile || "—"} · base ${repo.base_branch} · ${repo.policy_uncommitted ? "uncommitted changes" : "no uncommitted policy change"}`));
+    else box.append(el("small", "", `${repo.source} · profile ${repo.profile || "—"} · base ${repo.base_branch} · ${repo.policy_uncommitted === true ? "uncommitted changes" : repo.policy_uncommitted === false ? "no uncommitted policy change" : "working change status unavailable"}`));
     const flags = el("div", "perm-flags");
     const editable = new Set(controlState.enabled ? panels.editable_permissions || [] : []);
     for (const [name, on] of Object.entries(repo.permissions || {})) {
@@ -754,7 +754,7 @@ function renderControls() {
       }
       flags.append(flag);
     }
-    if (!repo.error_code) flags.append(el("span", "perm-flag locked", `${repo.merge_enabled ? "✓" : "×"} merge (file only)`));
+    if (!repo.error_code) flags.append(el("span", "perm-flag locked", `${repo.merge_enabled === true ? "✓" : repo.merge_enabled === false ? "×" : "?"} merge (file only)`));
     box.append(flags);
     box.append(el("h3", "perm-subtitle", "Effective local mutation at manifest pin"));
     if (!effective) box.append(el("p", "perm-detail", "Unavailable from this Garden version. Do not infer active permissions from the working file."));
@@ -763,7 +763,8 @@ function renderControls() {
       if (effective.error_code) box.append(el("p", "perm-error", `Pinned policy unavailable: ${effective.error_code}`));
       else {
         const local = effective.local_mutation || {};
-        box.append(el("p", "perm-detail", `Create worktrees: ${local.create_worktrees ? "granted" : "denied"} · Commit: ${local.commit ? "granted" : "denied"} · Launch still requires explicit allow mutation.`));
+        const grant = (value) => value === true ? "granted" : value === false ? "denied" : "unavailable";
+        box.append(el("p", "perm-detail", `Create worktrees: ${grant(local.create_worktrees)} · Commit: ${grant(local.commit)} · Launch still requires explicit allow mutation.`));
         if (effective.missing_local_permissions?.length) box.append(el("p", "perm-detail", `Missing at pin: ${effective.missing_local_permissions.join(", ").replaceAll("_", " ")}`));
       }
       box.append(el("p", "perm-detail", `Checkout ${effective.working_branch || "detached"} @ ${effective.working_head || "unavailable"} · working policy ${effective.working_policy_differs == null ? "comparison unavailable" : effective.working_policy_differs ? "differs from pin" : "matches pin"}`));
@@ -818,8 +819,14 @@ function preparationGuide(repo, panels) {
     steps.append(step);
   };
   addStep("Inspect", "Review the checkout and pinned policy above. No mutation occurs.");
-  addStep("Approve local mutation", "Preview the exact policy diff; only create_worktrees and commit may be granted here.", "approve_mutation");
-  addStep("Commit policy", `Preview a commit of .pi/autonomy.yaml on ${repo.base_branch || "the base branch"}; no push.`, "commit_policy");
+  const request = state.workspace?.approval_requests?.find((item) => item.repository === repo.id && item.missing?.length);
+  addStep("Approve local mutation", request
+    ? "Preview the exact policy diff; only create_worktrees and commit may be granted here."
+    : "No current repository authorization request. Run preflight or schedule to surface one, then recheck.",
+  "approve_mutation", controlState.enabled && Boolean(request));
+  addStep("Commit policy", repo.policy_uncommitted === true
+    ? `Preview a commit of .pi/autonomy.yaml on ${repo.base_branch || "the base branch"}; no push.`
+    : "No uncommitted policy change is reported for this checkout.", "commit_policy", controlState.enabled && repo.policy_uncommitted === true);
   const availability = panels.action_view?.actions?.find((item) => item.action === "repin_manifest" && item.target === repo.id);
   addStep("Repin manifest", availability ? (availability.available ? "Preview the exact manifest pin change to the committed checkout HEAD." : `${availability.refusal_code || "Unavailable"}: ${availability.explanation || "Resolve the prerequisite and recheck."}`)
     : "A newer Garden backend is required before this step is available.", "repin_manifest", controlState.enabled && availability?.available === true);
@@ -929,7 +936,7 @@ function showResult(result) {
   const content = $("action-content"); content.replaceChildren();
   content.append(el("p", `action-result ${result.ok ? "ok" : "fail"}`, result.ok ? (result.stage === "started" ? "Started. Child runs appear on the board as they launch." : "Done.") : `Not done · ${result.error_code || "UNKNOWN"}`));
   if (result.error) content.append(el("p", "action-note", result.error));
-  content.append(factList([["Status", result.status], ["Readiness", result.readiness], ["New manifest pin", result.pinned_commit], ["Plan", result.plan_status], ["CI", result.ci?.status], ["Mutations applied", result.mutations_applied]]));
+  content.append(factList([["Status", result.status], ["Readiness", result.readiness], ["Policy commit", result.commit], ["New manifest pin", result.pinned_commit], ["Plan", result.plan_status], ["CI", result.ci?.status], ["Mutations applied", result.mutations_applied]]));
   if (result.blockers?.length) content.append(el("p", "action-note", `Plan blockers remain: ${result.blockers.map((item) => item.code).filter(Boolean).join(", ")}`));
   if (result.url) {
     const link = el("a", "pr-link", `Open PR #${result.pr} ↗`); link.href = result.url; link.target = "_blank"; link.rel = "noopener noreferrer";
