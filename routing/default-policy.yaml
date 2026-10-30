@@ -14,6 +14,13 @@
 # is only ever kept or lowered, never raised.
 version: 7
 
+# Repository-independent, raise-only floors evaluated before project rules.
+# Agent policy/hooks and CI workflows affect permissions, execution and secrets.
+path_floors:
+  - paths: [".pi/**", ".claude/**", ".mcp.json", ".github/workflows/**"]
+    floors:
+      security_sensitive: true
+
 # Centralized family capabilities and capacity-to-model/context-window mapping.
 # Cost-first defaults (per 1M input/output tokens): gpt-6-luna $0.10/$0.50,
 # gpt-6.1-sol $2/$10, gpt-6-astra $10/$50. Concrete models are user-overridable

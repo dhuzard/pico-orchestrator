@@ -27,13 +27,25 @@ is a dry run until --apply with the reviewed --plan-hash, pushes are non-force,
 and the PR is a draft. Each repository gets its own PR, which links its
 upstream PRs; nothing here merges, marks ready, or pushes to a base branch.
 
+`validate` and `publish` also run the post-diff path-floor check on the work
+commit against the pinned commit (#76): its changed paths are matched against
+the built-in floors and the `.pi/routing.yaml` path floors of the pinned
+commit, never the work's own copy. Every floored path needs completed current
+phase/epoch evidence: all routed steps completed, an integrated wave's clean
+parent diff check naming the path by SHA-256, and the checked content unchanged
+at the candidate commit. A verified decision below the floors is refused with
+CLASSIFICATION_UNDERRATED_BY_DIFF; missing or stale evidence is refused with
+CLASSIFICATION_DIFF_UNVERIFIABLE.
+
 Observed state lives in the workspace record; the manifest is never changed.
 Exit codes: 0 ok, 1 blocked or refused, 2 invalid invocation.
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import re
 import subprocess
 import sys
 import time
@@ -46,7 +58,10 @@ import github_integration  # noqa: E402
 import github_sync as gh  # noqa: E402
 import headless_run  # noqa: E402
 import provenance  # noqa: E402
+import routing_engine as engine  # noqa: E402
 import workspace_run  # noqa: E402
+
+ORCHESTRATOR_ROOT = Path(__file__).resolve().parent.parent
 
 WorkspaceRunError = workspace_run.WorkspaceRunError
 RELEASED = {"ready_for_downstream", "merged"}
@@ -127,6 +142,122 @@ def run_check(check: dict, checkout: Path, commit: str, scratch: Path) -> dict:
     return result
 
 
+def _recorded_run(run_id: str | None) -> dict:
+    """Read the child record; historical or unreadable evidence never authorizes a floored path."""
+    if not run_id:
+        return {}
+    try:
+        return provenance.get_run(headless_run.ROOT, run_id)
+    except (provenance.ProvenanceError, OSError, ValueError):
+        return {}
+
+
+def _recorded_path_routing(run_id: str | None, checkout: Path, pin: str, commit: str,
+                           paths: list[str]) -> dict[str, list[dict]]:
+    """Completed phase decisions bound to the exact content being validated.
+
+    Parent integration records contain hashes of raw Git paths, avoiding path
+    disclosure in provenance. A checked commit may precede the candidate only
+    when the particular path's blob and mode are unchanged. Summaries alone,
+    worktree checks, incomplete epochs and unintegrated waves are not evidence.
+    """
+    parent = _recorded_run(run_id).get("parent_orchestration") or {}
+    waves = {wave.get("id"): wave for wave in parent.get("waves") or [] if isinstance(wave, dict)}
+    eligible: dict[str, list[dict]] = {path: [] for path in paths}
+    digests = {path: hashlib.sha256(path.encode("utf-8")).hexdigest() for path in paths}
+    for phase in parent.get("phases") or []:
+        if not isinstance(phase, dict) or phase.get("status") != "completed" or phase.get("workspace_bound"):
+            continue
+        escalations = phase.get("escalations") or []
+        if any(item.get("confirmed") is not True for item in escalations):
+            continue
+        epoch = len(escalations)
+        decision = escalations[-1] if escalations else phase
+        summary = decision.get("routing")
+        assignments = summary.get("assignments") if isinstance(summary, dict) else None
+        if not isinstance(assignments, list) or not assignments:
+            continue
+        completed = {worker.get("step_id") for worker in phase.get("workers") or []
+                     if worker.get("route_epoch", 0) == epoch and worker.get("status") == "completed"}
+        if any(not isinstance(item, dict) or not item.get("step_id") or item["step_id"] not in completed
+               for item in assignments):
+            continue
+        route = decision.get("to_route") if escalations else phase.get("route")
+        for check in phase.get("diff_floor_checks") or []:
+            wave = waves.get(check.get("wave_id")) or {}
+            if (check.get("operation") != "parent" or check.get("status") != "passed"
+                    or check.get("route_epoch") != epoch or check.get("route") != route
+                    or wave.get("status") != "integrated" or phase.get("id") not in (wave.get("task_ids") or [])):
+                continue
+            base, head = check.get("base"), check.get("head")
+            fingerprints = check.get("path_digests")
+            if (not all(isinstance(value, str) and re.fullmatch(r"[0-9a-f]{40,64}", value)
+                        for value in (base, head)) or not isinstance(fingerprints, list)
+                    or len(fingerprints) > 200 or not all(isinstance(value, str) and
+                        re.fullmatch(r"[0-9a-f]{64}", value) for value in fingerprints)):
+                continue
+            if any(_git(checkout, "merge-base", "--is-ancestor", earlier, later).returncode
+                   for earlier, later in ((pin, head), (base, head), (head, commit))):
+                continue
+            for path, digest in digests.items():
+                if digest not in fingerprints:
+                    continue
+                # Literal pathspecs prevent filenames beginning ':(' from
+                # turning a content comparison into a Git path expression.
+                changed = _git(checkout, "--literal-pathspecs", "diff", "--quiet", base, head, "--", path)
+                unchanged = _git(checkout, "--literal-pathspecs", "diff", "--quiet", head, commit, "--", path)
+                if changed.returncode == 1 and unchanged.returncode == 0:
+                    eligible[path].append(summary)
+    return eligible
+
+
+def path_floor_check(plan: dict, task: dict, repo: dict, commit: str) -> dict:
+    """routing_engine.check_recorded_path_floors for the task's work commit against its pinned commit."""
+    checkout = Path(repo["resolved_path"])
+    base = repo["pinned_commit"]
+    unverifiable = {"ok": False, "blocked": True, "blocker_code": engine.CLASSIFICATION_DIFF_UNVERIFIABLE,
+                    "diff_path_floor_matches": []}
+    diff = subprocess.run(["git", "-C", str(checkout), "diff", "--name-only", "--no-renames", "-z", base, commit, "--"],
+                          shell=False, capture_output=True, timeout=60)
+    if diff.returncode:
+        return {**unverifiable, "reason": "the diff from the pinned commit could not be read"}
+    try:
+        paths = [name for name in diff.stdout.decode("utf-8").split("\0") if name]
+    except UnicodeDecodeError:
+        return {**unverifiable, "reason": "a changed path is not valid UTF-8"}
+    assets = engine.load_policy_assets(ORCHESTRATOR_ROOT)
+    project_routing = None
+    if _git(checkout, "cat-file", "-e", f"{base}:.pi/routing.yaml").returncode == 0:
+        shown = _git(checkout, "show", f"{base}:.pi/routing.yaml")
+        try:
+            project_routing = (engine.yaml.load(shown.stdout, Loader=engine.UniqueKeySafeLoader)
+                               if not shown.returncode else None)
+        except engine.yaml.YAMLError:
+            shown = None
+        if (shown is None or shown.returncode or (project_routing is not None and
+                engine.validate_project_routing_instance(project_routing, assets.project_schema))):
+            return {**unverifiable, "reason": "the pinned commit's .pi/routing.yaml cannot be read or is invalid"}
+    run_id = (_entry(plan, task["id"]) or {}).get("run_id")
+    summaries = _recorded_path_routing(run_id, checkout, base, commit, paths)
+    verdicts = [engine.check_recorded_path_floors([path], project_routing, summaries[path],
+                                                assets.task_schema, assets.policy) for path in paths]
+    unverifiable_paths = any(verdict["ok"] is not True for verdict in verdicts)
+    blocked = any(verdict["blocked"] for verdict in verdicts)
+    code = (engine.CLASSIFICATION_DIFF_UNVERIFIABLE if unverifiable_paths else
+            engine.CLASSIFICATION_UNDERRATED_BY_DIFF if blocked else None)
+    return {"ok": not unverifiable_paths, "blocked": blocked, "blocker_code": code,
+            "diff_path_floor_matches": engine.match_all_path_floors(paths, project_routing, assets.policy),
+            "reason": ("floored paths require completed phase evidence tied to their integrated content" if blocked else None),
+            "base": base, "commit": commit}
+
+
+def _refuse_underrated(verdict: dict) -> None:
+    if verdict["blocked"]:
+        floored = sorted({path for match in verdict.get("diff_path_floor_matches") or [] for path in match["matched_paths"]})
+        raise WorkspaceRunError(verdict["blocker_code"],
+                                f"{verdict.get('reason', 'path floors')}: {', '.join(floored[:12]) or 'no floored path'}")
+
+
 def _scratch(plan: dict, task_id: str) -> Path:
     return headless_run.state_root() / "checks" / plan["workspace_id"] / task_id
 
@@ -162,6 +293,7 @@ def validate(*, manifest: Path, task_id: str, head: str | None = None) -> dict:
         if _git(checkout, "merge-base", "--is-ancestor", repo["pinned_commit"], commit).returncode:
             raise WorkspaceRunError("WORKSPACE_HEAD_UNRELATED", "the head does not descend from the pinned commit")
         targets[repo["id"]] = commit
+        _refuse_underrated(path_floor_check(plan, task, repo, commit))
     results = [run_check(check, Path(repos[check["repository"]]["resolved_path"]), targets[check["repository"]],
                          _scratch(plan, task_id)) for check in task["checks"]]
     passed = all(r["status"] == "passed" for r in results)
@@ -263,6 +395,8 @@ def publish(*, manifest: Path, task_id: str, apply: bool = False, plan_hash: str
     checkout = Path(repo["resolved_path"])
     if _commit_of(checkout, f"refs/heads/{observed['head_branch']}") != observed["validated_commit"]:
         raise WorkspaceRunError("WORKSPACE_HEAD_CHANGED", "the head moved since validation; validate again")
+    # Re-checked here: the floors of the pinned commit and the run's record are read again, not taken from validation.
+    _refuse_underrated(path_floor_check(plan, task, repo, observed["validated_commit"]))
     decision = issue_reference_decision(task, repo, adapter)
     republished = None
     republication = {}

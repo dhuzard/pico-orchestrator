@@ -73,7 +73,26 @@ A case may also carry optional `notes` and an `expected_decision`
 if the gold classification no longer produces that decision, so policy changes
 that move a case are explicit.
 
+A case may also carry a `project_routing` map: the `.pi/routing.yaml` of the
+case's repository, validated against `schemas/project-routing.schema.json`
+(in practice its `path_floors`). Production routing applies it, so
+`expected_decision` is the decision with it applied. Path-floor cases are
+cases whose request text understates the risk while the repository evidence
+and `files_or_areas` name a floored path.
+
 ## Run
+
+With gold predictions (every case's own `gold_classification`), which must
+score perfectly:
+
+```sh
+python3 -c 'import json, yaml
+for case in yaml.safe_load(open("benchmarks/classification/cases.yaml"))["cases"]:
+    print(json.dumps({"case_id": case["id"], "classification": case["gold_classification"]}))' > /tmp/gold.jsonl
+python3 benchmarks/classification/evaluate.py --predictions /tmp/gold.jsonl --require-all
+```
+
+With any other classifier:
 
 ```sh
 python3 benchmarks/classification/evaluate.py \
@@ -104,6 +123,17 @@ The evaluator reports:
 - **policy under-routing rate** — candidate route is later than the gold route
   in the policy's explicit `precedence` order;
 - **policy over-routing rate** — candidate route is earlier than the gold route;
+- **with path floors** — route accuracy and policy under-/over-routing rates
+  with each case's `project_routing` applied to both the candidate and the gold
+  classification, i.e. what production routing would select. The rates above
+  keep the same project configuration but disable path floors, so the pair shows how much under-routing the
+  project's path floors recover (cases without `project_routing` count the same
+  in both). The built-in path floors (`.pi/`, `.claude/`, `.mcp.json`,
+  `.github/workflows/`) apply to every case in the `with path floors` metrics
+  and in `expected_decision`. Path-floor cases recover by construction: their
+  floors are chosen to lift an understated classification back to the gold
+  route, so the pair measures how the floors interact with the policy, not how
+  well a real project's floors would be chosen;
 - **execution-decision accuracy** — route, primary intent, and assigned capacity
   tiers all match the gold decision;
 - **escalation rates** — for each escalating field, the fraction of scored
@@ -126,6 +156,8 @@ paraphrases. Include:
 - behavior-preservation/refactor cases;
 - security/destructive operations;
 - migrations;
+- path-floor cases: an understated request touching a path the case's
+  `project_routing.path_floors` floors, and a near miss that touches none;
 - scientific/semantic correctness;
 - cross-layer production features;
 - routine low-risk implementation;

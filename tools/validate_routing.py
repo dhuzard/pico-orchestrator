@@ -519,6 +519,7 @@ def main():
     errors.extend_issues(issues)
     issues = []
     validate_project_routing_schema(project_schema, task_schema, issues)
+    engine.validate_builtin_path_floors(policy, project_schema, issues)
     errors.extend_issues(issues)
 
     if not errors.ok():

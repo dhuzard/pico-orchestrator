@@ -372,6 +372,12 @@
                   "fallback_applied": {
                     "type": "boolean"
                   },
+                  "path_floor_matches": {
+                    "type": "array",
+                    "maxItems": 128,
+                    "description": "Path floors matched by the task's declared files_or_areas before the run. Absent when none matched.",
+                    "items": {"$ref": "#/$defs/path_floor_match"}
+                  },
                   "assignments": {
                     "type": "array",
                     "items": {
@@ -427,7 +433,7 @@
               },
               "escalations": {
                 "type": "array",
-                "description": "Append-only authorized route changes. The phase route and routing fields retain the initial decision.",
+                "description": "Append-only authorized route changes. The phase route and routing fields retain the initial decision. PATH_FLOOR entries are written only by an underrated post-diff check (diff_floor_checks); their to_route may equal from_route (a capacity-only raise).",
                 "items": {
                   "type": "object",
                   "additionalProperties": false,
@@ -435,10 +441,39 @@
                   "properties": {
                     "from_route": {"enum": ["CODEX", "CLAUDE", "CLAUDE_CODEX", "CODEX_CLAUDE_CODEX"]},
                     "to_route": {"enum": ["CODEX", "CLAUDE", "CLAUDE_CODEX", "CODEX_CLAUDE_CODEX"]},
-                    "reason": {"enum": ["FAILED_ATTEMPTS", "REVIEW_FINDINGS", "AMBIGUITY", "ARCHITECTURE", "SECURITY_SENSITIVE", "SEMANTIC_RISK", "CONTEXT_BUDGET"]},
+                    "reason": {"enum": ["FAILED_ATTEMPTS", "REVIEW_FINDINGS", "AMBIGUITY", "ARCHITECTURE", "SECURITY_SENSITIVE", "SEMANTIC_RISK", "CONTEXT_BUDGET", "PATH_FLOOR"]},
                     "at": {"type": "string", "format": "date-time"},
                     "confirmed": {"type": "boolean"},
+                    "paths": {"type": "array", "minItems": 1, "maxItems": 200, "items": {"type": "string", "maxLength": 4096},
+                              "description": "PATH_FLOOR only: the floored changed paths. The route result that confirms the re-route must pass the post-diff check against them."},
+                    "required_capacities": {"type": "object", "additionalProperties": {"enum": ["light", "economy", "standard", "high", "max"]},
+                                            "description": "PATH_FLOOR only: the capacity tier per step the engine required."},
                     "routing": {"$ref": "#/properties/parent_orchestration/properties/phases/items/properties/routing"}
+                  }
+                }
+              },
+              "diff_floor_checks": {
+                "type": "array",
+                "maxItems": 20,
+                "description": "Post-diff path-floor checks of the task's bound worktrees at integrate_begin, latest last. An underrated check (CLASSIFICATION_UNDERRATED_BY_DIFF) also appended a PATH_FLOOR escalation to to_route.",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["at", "status", "route_epoch", "route", "matches"],
+                  "properties": {
+                    "at": {"type": "string", "format": "date-time"},
+                    "status": {"enum": ["passed", "underrated"]},
+                    "route_epoch": {"type": "integer", "minimum": 0},
+                    "route": {"enum": ["CODEX", "CLAUDE", "CLAUDE_CODEX", "CODEX_CLAUDE_CODEX", null]},
+                    "to_route": {"enum": ["CODEX", "CLAUDE", "CLAUDE_CODEX", "CODEX_CLAUDE_CODEX"]},
+                    "capacity_raised": {"type": "boolean"},
+                    "head": {"type": "string", "pattern": "^[0-9a-f]{7,64}$", "description": "The checked checkout's HEAD commit."},
+                    "operation": {"const": "parent"},
+                    "base": {"type": "string", "pattern": "^([0-9a-f]{40}|[0-9a-f]{64})$"},
+                    "wave_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$"},
+                    "path_digests": {"type": "array", "maxItems": 200, "uniqueItems": true,
+                      "items": {"type": "string", "pattern": "^[0-9a-f]{64}$"}},
+                    "matches": {"type": "array", "maxItems": 128, "items": {"$ref": "#/$defs/path_floor_match"}}
                   }
                 }
               },
@@ -669,6 +704,10 @@
                   "type": "string",
                   "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$"
                 }
+              },
+              "integration_snapshot": {
+                "type": "string", "pattern": "^[0-9a-f]{64}$",
+                "description": "Digest of a verified clean checkout identity before integration."
               },
               "status": {
                 "type": "string",
@@ -1461,6 +1500,20 @@
       "type": "integer",
       "minimum": 0,
       "maximum": 10
+    },
+    "path_floor_match": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "One .pi/routing.yaml path_floors rule matched by a task's declared files_or_areas or by its real diff (tools/routing_engine.py match_path_floors).",
+      "required": ["source", "rule", "patterns", "floors", "matched_paths", "matched_path_count"],
+      "properties": {
+        "source": {"enum": ["builtin", "project"], "description": "builtin: routing_engine.BUILTIN_PATH_FLOORS; project: .pi/routing.yaml path_floors."},
+        "rule": {"type": "integer", "minimum": 0, "maximum": 63, "description": "Index of the rule in its source's list."},
+        "patterns": {"type": "array", "minItems": 1, "maxItems": 32, "items": {"type": "string", "maxLength": 1000}},
+        "floors": {"type": "object", "minProperties": 1},
+        "matched_paths": {"type": "array", "minItems": 1, "maxItems": 50, "items": {"type": "string", "maxLength": 4096}},
+        "matched_path_count": {"type": "integer", "minimum": 1}
+      }
     },
     "step": {
       "type": "object",

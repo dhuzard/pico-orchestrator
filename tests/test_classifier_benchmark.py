@@ -75,6 +75,10 @@ class ClassifierBenchmarkTest(unittest.TestCase):
         self.assertEqual(result["policy_under_routing_rate"], 0.0)
         self.assertEqual(result["policy_over_routing_rate"], 0.0)
         self.assertEqual(result["execution_decision_accuracy"], 1.0)
+        self.assertEqual(result["route_accuracy_with_path_floors"], 1.0)
+        self.assertEqual(result["policy_under_routing_rate_with_path_floors"], 0.0)
+        self.assertEqual(result["policy_over_routing_rate_with_path_floors"], 0.0)
+        self.assertGreaterEqual(result["path_floor_cases"], 3)
         self.assertEqual(result["mismatches"], [])
 
     def test_lower_risk_prediction_can_be_detected_as_policy_under_routing(self):
@@ -175,7 +179,8 @@ class ClassifierBenchmarkTest(unittest.TestCase):
             benchmark.validate_case(case, self.fields, self.assets)
 
     def test_operational_gold_cases_use_low_risk_flags(self):
-        operational = [c for c in self.cases if "expected_decision" in c]
+        # Path-floor cases pin a decision too, but they are not operational work.
+        operational = [c for c in self.cases if "expected_decision" in c and "project_routing" not in c]
         self.assertGreaterEqual(len(operational), 9)
         for case in operational:
             with self.subTest(case=case["id"]):
@@ -183,7 +188,65 @@ class ClassifierBenchmarkTest(unittest.TestCase):
                 for field, value in engine.ESCALATING_CLASSIFICATION_VALUES.items():
                     self.assertNotEqual(gold[field], value)
                 self.assertFalse(gold["diagnosis_required"])
+                if engine.match_all_path_floors(case["task_facts"]["files_or_areas"], None, self.assets.policy, declared=True):
+                    # A built-in path floor (.pi/ and friends) is not a rubric judgment; without path floors the
+                    # low-risk gold still stays off the strongest route.
+                    task = benchmark.materialize_task(case["task_facts"], gold)
+                    self.assertNotEqual(benchmark.decision_signature(task, self.assets, path_floors=False)["route"],
+                                        "CODEX_CLAUDE_CODEX")
+                    continue
                 self.assertNotEqual(case["expected_decision"]["route"], "CODEX_CLAUDE_CODEX")
+
+    def _understated(self, case_id: str) -> tuple[dict, dict]:
+        """A request-text-only prediction: every risk flag at its low-risk value."""
+        case = next(c for c in self.cases if c["id"] == case_id)
+        prediction = {field: value for field, value in case["gold_classification"].items() if field != "escalation_evidence"}
+        prediction.update({"task_type": "implementation" if prediction["task_type"] == "migration" else prediction["task_type"],
+                           "failure_cost": "low", "behavior_preservation": "not_required",
+                           "security_sensitive": False})
+        return case, {"case_id": case_id, "classification": prediction}
+
+    def test_path_floors_recover_understated_classifications(self):
+        floored = ["classifier-023-path-floor-migration", "classifier-024-path-floor-release-workflow"]
+        pairs = [self._understated(case_id) for case_id in floored]
+        result = benchmark.evaluate([case for case, _ in pairs], {p["case_id"]: p for _, p in pairs},
+                                    self.assets, require_all=True)
+        self.assertEqual(result["path_floor_cases"], 2)
+        self.assertEqual(result["policy_under_routing_rate"], 1.0)
+        self.assertEqual(result["policy_under_routing_rate_with_path_floors"], 0.0)
+        self.assertEqual(result["route_accuracy_with_path_floors"], 1.0)
+        for mismatch in result["mismatches"]:
+            self.assertEqual(mismatch["predicted_route_with_path_floors"], mismatch["gold_route_with_path_floors"])
+
+    def test_baseline_preserves_non_path_project_risk_overrides(self):
+        case, prediction = self._understated("classifier-023-path-floor-migration")
+        case = copy.deepcopy(case)
+        case["project_routing"] = {"risk_overrides": {"failure_cost": "high"}}
+        case.pop("expected_decision", None)
+        result = benchmark.evaluate([case], {case["id"]: prediction}, self.assets, require_all=True)
+        self.assertEqual(result["policy_under_routing_rate"], 0.0)
+        self.assertEqual(result["policy_under_routing_rate_with_path_floors"], 0.0)
+        self.assertEqual(result["route_accuracy"], result["route_accuracy_with_path_floors"])
+
+    def test_unmatched_path_floor_changes_nothing(self):
+        case = next(c for c in self.cases if c["id"] == "classifier-025-path-floor-unmatched-docs")
+        task = benchmark.materialize_task(case["task_facts"], case["gold_classification"])
+        self.assertEqual(benchmark.decision_signature(task, self.assets),
+                         benchmark.decision_signature(task, self.assets, case["project_routing"]))
+
+    def test_path_floor_cases_cover_floored_paths(self):
+        for case_id in ("classifier-023-path-floor-migration", "classifier-024-path-floor-release-workflow"):
+            with self.subTest(case=case_id):
+                case = next(c for c in self.cases if c["id"] == case_id)
+                matches = engine.match_path_floors(case["task_facts"]["files_or_areas"],
+                                                   case["project_routing"]["path_floors"])
+                self.assertTrue(matches)
+
+    def test_invalid_case_project_routing_is_rejected(self):
+        case = copy.deepcopy(next(c for c in self.cases if c["id"] == "classifier-023-path-floor-migration"))
+        case["project_routing"]["path_floors"][0]["floors"] = {"failure_cost": "lowest"}
+        with self.assertRaisesRegex(benchmark.BenchmarkError, "invalid project_routing"):
+            benchmark.validate_case(case, self.fields, self.assets)
 
     def test_jsonl_loader_rejects_duplicate_case_ids(self):
         case = self.cases[0]

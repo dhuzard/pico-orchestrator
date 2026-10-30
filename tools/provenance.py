@@ -1256,7 +1256,7 @@ def build_trace_report(repo_root: Path, record: dict) -> dict:
     subset of that same stored result's fields (`ok`, `policy_version`,
     `selected_route`, `fallback_applied`, base/effective `matches`,
     `classification`, `capacity_assignments`, `backend_bindings`,
-    `project_constraints`, `errors`) -- every value is copied unmodified,
+    `project_constraints`, `path_floor_matches`, `errors`) -- every value is copied unmodified,
     but fields with no safe/relevant trace meaning are intentionally
     dropped rather than exposing the raw result shape. Safe to hand to a
     user: attribution/telemetry fields are closed, `additionalProperties:
@@ -1295,6 +1295,7 @@ def build_trace_report(repo_root: Path, record: dict) -> dict:
             "capacity_assignments": route_result.get("capacity_assignments"),
             "backend_bindings": route_result.get("backend_bindings"),
             "project_constraints": route_result.get("project_constraints"),
+            "path_floor_matches": route_result.get("path_floor_matches"),
             "errors": route_result.get("errors"),
         }
         execution_plan = route_result.get("execution_plan")
@@ -1448,6 +1449,28 @@ _CLASSIFICATION_SUMMARY_FIELDS = (
 )
 
 
+def _path_floor_lines(matches: Any, indent: str, label: str) -> list[str]:
+    """One line per matched `.pi/routing.yaml` path floor: rule index, the
+    globs that matched, the floors, and the matched paths (bounded, as
+    recorded, with the exact count)."""
+    if not isinstance(matches, list) or not matches:
+        return []
+    lines = []
+    for match in matches:
+        if not isinstance(match, dict):
+            continue
+        paths = match.get("matched_paths") if isinstance(match.get("matched_paths"), list) else []
+        shown = [str(path) for path in paths[:10]]
+        count = match.get("matched_path_count")
+        more = (count if isinstance(count, int) else len(paths)) - len(shown)
+        lines.append(
+            f"{indent}{label}: {_fmt(match.get('source') or 'project')} rule {_fmt(match.get('rule'))} {_fmt(match.get('patterns'))} "
+            f"floors {_fmt(match.get('floors'))} via {_fmt(', '.join(shown))}"
+            + (f" (+{more} more)" if more > 0 else "")
+        )
+    return lines
+
+
 def _classification_summary(classification: Any) -> Any:
     if not isinstance(classification, dict):
         return None
@@ -1496,6 +1519,18 @@ def render_trace_text(report: dict) -> str:
         lines.append(f"  Blocker: {_fmt(parent.get('blocker_code'))}")
         for phase in parent.get("phases") or []:
             lines.append(f"  Phase {_fmt(phase.get('id'))}: {_fmt(phase.get('status'))}; route {_fmt(phase.get('route'))}; blocker {_fmt(phase.get('blocker_code'))}")
+            routing = phase.get("routing") if isinstance(phase.get("routing"), dict) else {}
+            lines.extend(_path_floor_lines(routing.get("path_floor_matches"), "    ", "Path floor (files_or_areas)"))
+            for escalation in phase.get("escalations") or []:
+                if isinstance(escalation, dict) and escalation.get("reason") == "PATH_FLOOR":
+                    lines.append(f"    Re-route (PATH_FLOOR): {_fmt(escalation.get('from_route'))} -> {_fmt(escalation.get('to_route'))}; confirmed {_fmt(escalation.get('confirmed'))}")
+            for check in phase.get("diff_floor_checks") or []:
+                if not isinstance(check, dict):
+                    continue
+                outcome = ("underrated (CLASSIFICATION_UNDERRATED_BY_DIFF) -> " + str(_fmt(check.get("to_route")))
+                           if check.get("status") == "underrated" else _fmt(check.get("status")))
+                lines.append(f"    Diff floor check (route epoch {_fmt(check.get('route_epoch'))}, route {_fmt(check.get('route'))}): {outcome}")
+                lines.extend(_path_floor_lines(check.get("matches"), "      ", "Path floor (diff)"))
             for worker in phase.get("workers") or []:
                 lines.append(f"    Worker {_fmt(worker.get('step_id'))}: {_fmt(worker.get('status'))}; model {_fmt(worker.get('model'))}; backend model {_fmt(worker.get('backend_model'))}; blocker {_fmt(worker.get('blocker_code'))}; backend {_fmt(worker.get('installed_backend_version'))} (required {_fmt(worker.get('required_backend_version'))})")
             for child_id in phase.get("child_run_ids") or []:
@@ -1536,6 +1571,7 @@ def render_trace_text(report: dict) -> str:
         lines.append(f"  Classification (effective): {_fmt(effective_summary)}")
         if route.get("project_constraints"):
             lines.append(f"  Project constraints: {_fmt(route.get('project_constraints'))}")
+        lines.extend(_path_floor_lines(route.get("path_floor_matches"), "  ", "Path floor (files_or_areas)"))
     lines.append("")
 
     lines.append("Execution plan:")
