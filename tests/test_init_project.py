@@ -18,6 +18,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "tools"))
 
 import init_project  # noqa: E402
+import atomic_io  # noqa: E402
 
 
 class InitProjectTest(unittest.TestCase):
@@ -78,6 +79,18 @@ class InitProjectTest(unittest.TestCase):
 
         init_project.init_project(self.tmp, overwrite=True)
         self.assertNotEqual(agents.read_text(encoding="utf-8"), "custom\n")
+
+    def test_init_rejects_symlinked_pi_directory_before_writing(self):
+        outside = self.tmp.parent / (self.tmp.name + "-outside")
+        outside.mkdir()
+        self.addCleanup(lambda: shutil.rmtree(outside, ignore_errors=True))
+        (self.tmp / ".pi").symlink_to(outside, target_is_directory=True)
+
+        with self.assertRaises(atomic_io.UnsafePathError):
+            init_project.init_project(self.tmp)
+
+        self.assertEqual(list(outside.iterdir()), [])
+        self.assertFalse((self.tmp / "AGENTS.md").exists())
 
     def test_copy_extension_is_optional(self):
         init_project.init_project(self.tmp)

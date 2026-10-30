@@ -277,6 +277,14 @@ class ExternalTargetMissionStorageTest(unittest.TestCase):
         self.assertEqual(mission_cli.target_missions_file(self.worktree), stored[0],
                          "linked worktrees share their repository's missions")
 
+    def test_plan_backlog_in_external_repo_without_vendored_schema(self):
+        goal = "- ORCH-001: Build feature"
+        self.assertEqual(self.run_cli("create", "--goal", goal), 0)
+        self.assertEqual(self.run_cli("plan-backlog", "MISSION-001"), 0)
+        items = backlog.load_backlog(self.target)
+        self.assertEqual([item["id"] for item in items], ["ORCH-001"])
+        self.assertFalse((self.target / "schemas" / "backlog-item.schema.json").exists())
+
     def test_legacy_target_local_missions_are_copied_once(self):
         legacy = self.target / "missions" / "missions.yaml"
         legacy.parent.mkdir()

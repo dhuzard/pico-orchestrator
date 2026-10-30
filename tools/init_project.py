@@ -15,6 +15,8 @@ import shutil
 import sys
 from pathlib import Path
 
+import atomic_io
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 PR_WORKFLOW_TEXT = """# Pi Coding Orchestrator PR workflow
@@ -73,7 +75,8 @@ work in this repository.
 """
 
 
-def copy_if_needed(src: Path, dst: Path, *, overwrite: bool) -> str:
+def copy_if_needed(src: Path, dst: Path, *, overwrite: bool, root: Path) -> str:
+    atomic_io.check_no_symlinks(dst, root)
     if dst.exists() and not overwrite:
         return f"kept existing {dst}"
     dst.parent.mkdir(parents=True, exist_ok=True)
@@ -81,7 +84,8 @@ def copy_if_needed(src: Path, dst: Path, *, overwrite: bool) -> str:
     return f"wrote {dst}"
 
 
-def write_if_needed(dst: Path, text: str, *, overwrite: bool) -> str:
+def write_if_needed(dst: Path, text: str, *, overwrite: bool, root: Path) -> str:
+    atomic_io.check_no_symlinks(dst, root)
     if dst.exists() and not overwrite:
         return f"kept existing {dst}"
     dst.parent.mkdir(parents=True, exist_ok=True)
@@ -122,19 +126,28 @@ def init_project(
     if not target.exists() or not target.is_dir():
         raise SystemExit(f"target repository directory does not exist: {target}")
 
+    destinations = [target / ".pi" / "routing.yaml", target / ".pi" / "autonomy.yaml",
+                    target / "AGENTS.md", target / ".pi" / "orchestrator-pr-workflow.md"]
+    if copy_extension:
+        destinations.extend(target / dst for _, dst in extension_runtime_files())
+    if github_templates:
+        destinations.extend(target / dst for _, dst in GITHUB_TEMPLATE_FILES)
+    for destination in destinations:
+        atomic_io.check_no_symlinks(destination, target)
+
     actions: list[str] = []
-    actions.append(copy_if_needed(REPO_ROOT / "templates" / "project-routing.yaml", target / ".pi" / "routing.yaml", overwrite=overwrite))
-    actions.append(copy_if_needed(REPO_ROOT / "templates" / "autonomy.yaml", target / ".pi" / "autonomy.yaml", overwrite=overwrite))
-    actions.append(copy_if_needed(REPO_ROOT / "templates" / "AGENTS.md", target / "AGENTS.md", overwrite=overwrite))
-    actions.append(write_if_needed(target / ".pi" / "orchestrator-pr-workflow.md", PR_WORKFLOW_TEXT, overwrite=overwrite))
+    actions.append(copy_if_needed(REPO_ROOT / "templates" / "project-routing.yaml", target / ".pi" / "routing.yaml", overwrite=overwrite, root=target))
+    actions.append(copy_if_needed(REPO_ROOT / "templates" / "autonomy.yaml", target / ".pi" / "autonomy.yaml", overwrite=overwrite, root=target))
+    actions.append(copy_if_needed(REPO_ROOT / "templates" / "AGENTS.md", target / "AGENTS.md", overwrite=overwrite, root=target))
+    actions.append(write_if_needed(target / ".pi" / "orchestrator-pr-workflow.md", PR_WORKFLOW_TEXT, overwrite=overwrite, root=target))
 
     if copy_extension:
         for src, dst in extension_runtime_files():
-            actions.append(copy_if_needed(REPO_ROOT / src, target / dst, overwrite=overwrite))
+            actions.append(copy_if_needed(REPO_ROOT / src, target / dst, overwrite=overwrite, root=target))
 
     if github_templates:
         for src, dst in GITHUB_TEMPLATE_FILES:
-            actions.append(copy_if_needed(REPO_ROOT / src, target / dst, overwrite=overwrite))
+            actions.append(copy_if_needed(REPO_ROOT / src, target / dst, overwrite=overwrite, root=target))
 
     return actions
 
