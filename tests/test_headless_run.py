@@ -501,9 +501,9 @@ class HeadlessRunTest(HeadlessFixture):
         git("-C", str(self.target), "worktree", "add", "--detach", str(other))
         cleanup = hr.restore_checkout(self.target, before)
         self.assertEqual(cleanup["removed_worktrees"], [])
-        self.assertIn(str(other), cleanup["kept_worktrees"])
+        self.assertIn(other.resolve(), [Path(path).resolve() for path in cleanup["kept_worktrees"]])
         self.assertTrue((other / "README.md").exists())
-        self.assertIn(str(other), hr.checkout_state(self.target)["worktrees"])
+        self.assertIn(other.resolve(), [Path(path).resolve() for path in hr.checkout_state(self.target)["worktrees"]])
 
     def test_dirty_worktrees_and_checkouts_are_never_touched(self):
         os.environ["FAKE_PI_MESS"] = "dirty"
