@@ -61,7 +61,7 @@ ESCALATION_REASONS = {"FAILED_ATTEMPTS", "REVIEW_FINDINGS", "AMBIGUITY", "ARCHIT
 PATH_FLOOR_REASON = "PATH_FLOOR"
 DIFF_FLOOR_STATUSES = {"passed", "underrated"}
 MAX_DIFF_FLOOR_CHECKS = 20
-MAX_PATH_FLOOR_RULES = 64
+MAX_PATH_FLOOR_RULES = 65
 # Floored paths kept on a PATH_FLOOR escalation: the re-route that confirms it must cover them.
 MAX_ESCALATION_PATHS = 200
 # Route changes (escalations of any reason) one phase may record. Past it the phase cannot be re-routed: the event is
@@ -73,8 +73,8 @@ USAGE_COUNTERS = ("duration_ms", "input_tokens", "output_tokens", "cached_tokens
 # A wave groups routed tasks with disjoint write scopes that run concurrently;
 # it is integrated into the parent checkout only after all its workers return.
 WAVE_STATUSES = ("declared", "integrating", "integrated", "abandoned")
-# Statuses an event may set; "abandoned" is written only by `_reconcile_open` when a run ends without COMPLETED.
-WAVE_EVENT_STATUSES = WAVE_STATUSES[:3]
+# An integration can also be abandoned after the lifecycle verifies restoration of the parent checkout.
+WAVE_EVENT_STATUSES = WAVE_STATUSES
 WAVE_OPEN_STATUSES = {"declared", "integrating"}
 ACTIVITY_EXCERPT_CHARS = 300
 ACTIVITY_SUMMARY_CHARS = 600
@@ -423,7 +423,10 @@ def status(run_id: str, *, repo_root: Path = ROOT, worktree: Path | None = None,
                                      if phase.get("route") is not None and phase.get("status") == "in_progress"),
             # Tasks a mutating worker may have written for and that no integrated wave covers yet: a resumed lifecycle
             # refuses to integrate them until their worktrees are bound (and so diff-checked) again.
-            "bound_phases": sorted(phase["id"] for phase in parent["phases"] if phase.get("workspace_bound"))}
+            "bound_phases": sorted(phase["id"] for phase in parent["phases"] if phase.get("workspace_bound")),
+            "path_floor_phases": sorted(phase["id"] for phase in parent["phases"]
+                                        if any(e.get("reason") == PATH_FLOOR_REASON for e in phase.get("escalations") or [])
+                                        and phase.get("workspace_bound"))}
 
 
 def empty_context() -> dict:
@@ -990,13 +993,27 @@ def _diff_floors_event(parent: dict, event: dict) -> None:
         raise ParentRunError("invalid diff floor check status", error_code="PARENT_DIFF_FLOORS_INVALID")
     matches = _path_floor_matches(event["matches"])
     head = event.get("head")
-    if head is not None and (not isinstance(head, str) or not COMMIT_RE.fullmatch(head)):
+    if head is not None and (not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{7,64}", head)):
         raise ParentRunError("invalid checked worktree head", error_code="PARENT_DIFF_FLOORS_INVALID")
     epoch = len(phase.get("escalations") or [])
     current = (phase.get("escalations") or [{}])[-1].get("to_route") or phase["route"]
     entry = {"at": _now(), "status": status, "route_epoch": epoch, "route": current, "matches": matches}
     if head is not None:
         entry["head"] = head
+    if event.get("operation") is not None:
+        base, wave_id, digests = event.get("base"), event.get("wave_id"), event.get("path_digests")
+        wave = next ( (w for w in parent.get("waves") or [] if w.get("id") == wave_id), None)
+        if (status != "passed" or event["operation"] != "parent" or not isinstance(base, str)
+                or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", base)
+                or not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", head)
+                or not wave or wave.get("status") != "integrating" or phase["id"] not in wave["task_ids"]
+                or not isinstance(digests, list) or len(digests) > 200
+                or not all(isinstance(d, str) and re.fullmatch(r"[0-9a-f]{64}", d) for d in digests)
+                or digests != sorted(set(digests))):
+            raise ParentRunError("invalid parent diff evidence", error_code="PARENT_DIFF_FLOORS_INVALID")
+        entry.update(operation="parent", base=base, wave_id=wave_id, path_digests=digests)
+    elif set(event) & {"base", "wave_id", "path_digests"}:
+        raise ParentRunError("invalid parent diff evidence", error_code="PARENT_DIFF_FLOORS_INVALID")
     if status == "underrated":
         if phase["status"] in {"completed", "blocked", "failed", "partial"} or current is None:
             raise ParentRunError("an underrated diff needs an open, routed phase", error_code="PARENT_DIFF_FLOORS_INVALID")
@@ -1130,7 +1147,7 @@ def _record_event_unlocked(run_id: str, event: dict, *, repo_root: Path = ROOT) 
         "worker_sandbox": {"kind", "state", "source", "allowed_domains", "cache_directories", "policy_source",
                            "policy_commit", "local_drift", "user_settings_widening"},
         "diff_floors": {"kind", "phase", "status", "from_route", "to_route", "capacity_raised", "matches", "head",
-                        "route_task_result", "paths"},
+                        "route_task_result", "paths", "operation", "base", "wave_id", "path_digests"},
     }
     required = {
         "phase": {"kind", "phase", "status"},

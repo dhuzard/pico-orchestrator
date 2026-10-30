@@ -9,6 +9,7 @@ repositories."""
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import shutil
 import subprocess
@@ -188,6 +189,18 @@ class PathFloorRoutingTest(Routed):
         stripped = copy.deepcopy(result)
         stripped["project_constraints"] = {}
         self.assertTrue(engine.validate_route_task_result(stripped, self.assets))
+
+    def test_all_project_rules_and_builtin_fit_in_run_record(self):
+        project = {"path_floors": [{"paths": [".pi/**"], "floors": {"security_sensitive": True}}
+                                   for _ in range(64)]}
+        self.assertFalse(engine.validate_project_routing_instance(project, self.assets.project_schema))
+        matches = engine.match_all_path_floors([".pi/routing.yaml"], project)
+        self.assertEqual(len(matches), 65)
+        self.assertEqual(len(po._path_floor_matches(matches)), 65)
+        schema = json.loads((ROOT / "schemas/run-record.schema.json").read_text())
+        phase = schema["properties"]["parent_orchestration"]["properties"]["phases"]["items"]
+        self.assertEqual(phase["properties"]["routing"]["properties"]["path_floor_matches"]["maxItems"], 65)
+        self.assertEqual(phase["properties"]["diff_floor_checks"]["items"]["properties"]["matches"]["maxItems"], 65)
 
     def test_recorded_paths_are_bounded(self):
         long_path = "migrations/" + "x" * 5000 + ".sql"
@@ -388,6 +401,23 @@ class DiffFloorCheckToolTest(Routed):
                                    capture_output=True, text=True, check=True, timeout=60)
         self.assertEqual(json.loads(malformed.stdout)["blocker_code"], engine.CLASSIFICATION_DIFF_UNVERIFIABLE)
 
+    def test_parent_evidence_binds_clean_head_and_full_attributed_paths(self):
+        base = git("rev-parse", "HEAD", cwd=self.repo).strip()
+        (self.repo / "src/settings.py").write_text("PUSH = True\n")
+        payload = {"operation": "parent", "parent_checkout": str(self.repo), "base": base,
+                   "members": [{"task_id": "one", "route_task_result": self.ran, "exclude_paths": []}]}
+        dirty = self.run_tool(payload)
+        self.assertNotIn("head", dirty)
+        self.assertNotIn("path_digests", dirty["verdicts"][0])
+        git("add", "-A", cwd=self.repo)
+        git("commit", "-qm", "change", cwd=self.repo)
+        clean = self.run_tool(payload)
+        self.assertEqual(clean["head"], git("rev-parse", "HEAD", cwd=self.repo).strip())
+        self.assertEqual(clean["verdicts"][0]["path_digests"],
+                         [hashlib.sha256(b"src/settings.py").hexdigest()])
+        payload["members"][0]["exclude_paths"] = ["src/settings.py"]
+        self.assertEqual(self.run_tool(payload)["verdicts"][0]["path_digests"], [])
+
     def test_merged_change_is_checked_at_integrate_end(self):
         base = git("rev-parse", "HEAD", cwd=self.repo).strip()
         payload = lambda members: {"operation": "parent", "parent_checkout": str(self.repo), "base": base,  # noqa: E731
@@ -448,6 +478,22 @@ class DiffFloorReRouteTest(Routed):
                 "from_route": ran["selected_route"], "to_route": verdict["required"]["route"],
                 "capacity_raised": verdict["capacity_raised"], "matches": verdict["diff_path_floor_matches"],
                 "route_task_result": ran, "paths": paths, "head": "c" * 40}
+
+    def test_parent_diff_evidence_requires_integrating_wave_and_is_schema_valid(self):
+        task = self.routed_phase(self.route(small_task()))
+        evidence = {"kind": "diff_floors", "phase": task, "status": "passed", "matches": [],
+                    "operation": "parent", "wave_id": "w1", "base": "a" * 40, "head": "b" * 40,
+                    "path_digests": [hashlib.sha256(b"src/settings.py").hexdigest()]}
+        with self.assertRaises(po.ParentRunError):
+            self.event(evidence)
+        self.event({"kind": "wave", "wave_id": "w1", "task_ids": [task], "status": "declared"})
+        self.event({"kind": "wave", "wave_id": "w1", "task_ids": [task], "status": "integrating"})
+        self.event(evidence)
+        check = self.phase()["diff_floor_checks"][-1]
+        self.assertEqual((check["operation"], check["base"], check["head"], check["wave_id"], check["route_epoch"]),
+                         ("parent", "a" * 40, "b" * 40, "w1", 0))
+        self.assertEqual(check["path_digests"], evidence["path_digests"])
+        self.event({"kind": "wave", "wave_id": "w1", "task_ids": [task], "status": "abandoned"})
 
     def test_underrated_diff_requires_a_reroute_and_resume_reaches_the_higher_route(self):
         ran = self.route(small_task())

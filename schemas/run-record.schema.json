@@ -374,7 +374,7 @@
                   },
                   "path_floor_matches": {
                     "type": "array",
-                    "maxItems": 64,
+                    "maxItems": 65,
                     "description": "Path floors matched by the task's declared files_or_areas before the run. Absent when none matched.",
                     "items": {"$ref": "#/$defs/path_floor_match"}
                   },
@@ -467,8 +467,13 @@
                     "route": {"enum": ["CODEX", "CLAUDE", "CLAUDE_CODEX", "CODEX_CLAUDE_CODEX", null]},
                     "to_route": {"enum": ["CODEX", "CLAUDE", "CLAUDE_CODEX", "CODEX_CLAUDE_CODEX"]},
                     "capacity_raised": {"type": "boolean"},
-                    "head": {"type": "string", "pattern": "^[0-9a-f]{7,40}$", "description": "The checked worktree's HEAD commit."},
-                    "matches": {"type": "array", "maxItems": 64, "items": {"$ref": "#/$defs/path_floor_match"}}
+                    "head": {"type": "string", "pattern": "^[0-9a-f]{7,64}$", "description": "The checked checkout's HEAD commit."},
+                    "operation": {"const": "parent"},
+                    "base": {"type": "string", "pattern": "^([0-9a-f]{40}|[0-9a-f]{64})$"},
+                    "wave_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$"},
+                    "path_digests": {"type": "array", "maxItems": 200, "uniqueItems": true,
+                      "items": {"type": "string", "pattern": "^[0-9a-f]{64}$"}},
+                    "matches": {"type": "array", "maxItems": 65, "items": {"$ref": "#/$defs/path_floor_match"}}
                   }
                 }
               },

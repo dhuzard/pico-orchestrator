@@ -41,6 +41,7 @@ nonzero only for a bootstrap failure of the routing assets.
 from __future__ import annotations
 
 import json
+import hashlib
 import sys
 from pathlib import Path
 from typing import NoReturn
@@ -130,18 +131,27 @@ def check_parent(payload: dict, assets: engine.PolicyAssets) -> dict:
     changed = working_changes(root, base)
     if isinstance(changed, dict):
         return changed
+    status = _git(root, "status", "--porcelain=v1", "-z", "--untracked-files=all")
+    head_raw = _git(root, "rev-parse", "--verify", "HEAD")
+    head = head_raw.decode("ascii").strip() if head_raw else None
+    # Only a clean tree is represented by HEAD. Uncommitted changes can still be checked,
+    # but they cannot supply commit-bound publication evidence.
+    evidence = status == b"" and head is not None and len(changed) <= 200
     verdicts = []
     for member in members:
         excluded = {path for path in member.get("exclude_paths", []) if isinstance(path, str)}
-        verdict = engine.check_diff_path_floors(member.get("route_task_result"),
-                                                [path for path in changed if path not in excluded], assets)
-        verdicts.append({"task_id": member.get("task_id"), **verdict})
+        attributed = [path for path in changed if path not in excluded]
+        verdict = engine.check_diff_path_floors(member.get("route_task_result"), attributed, assets)
+        digests = sorted({hashlib.sha256(path.encode("utf-8")).hexdigest() for path in attributed})
+        verdicts.append({"task_id": member.get("task_id"), **verdict,
+                         **({"path_digests": digests} if evidence else {})})
     unverifiable = [v for v in verdicts if v["ok"] is not True]
     blocked = [v for v in verdicts if v["blocked"]]
     code = (engine.CLASSIFICATION_DIFF_UNVERIFIABLE if unverifiable
             else engine.CLASSIFICATION_UNDERRATED_BY_DIFF if blocked else None)
     return {"ok": not unverifiable, "blocked": bool(blocked), "blocker_code": code, "base": base,
-            "changed_path_count": len(changed), "verdicts": verdicts}
+            "changed_path_count": len(changed), "verdicts": verdicts,
+            **({"head": head} if evidence else {})}
 
 
 def main() -> int:

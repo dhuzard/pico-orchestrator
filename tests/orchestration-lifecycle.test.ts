@@ -1915,6 +1915,19 @@ test("integrate_begin checks each bound worktree's diff against path floors and 
   const phase = eventsOf(h).filter((item: any) => item.kind === "phase" && item.phase === "A").at(-1) as any;
   assert.equal(phase.route_task_result.classification.base.files_or_areas[0], ".github/workflows/release.yml");
   await record.execute("b", { action: "bind_workspace", task_id: "A", step_id: "codex_specifier", path: "/tmp/wt-A2" });
+  const premature = await record.execute("i", { action: "integrate_begin", wave_id: "w1" });
+  assert.match(premature.content[0].text, /PARENT_ROUTE_STEPS_REQUIRED/);
+  const reviewerFirst = await h.handlers.get("tool_call")!({ toolName: "spawn_subagent", toolCallId: "review-first",
+    input: { task: "review", label: "A:codex_reviewer" } });
+  assert.match(reviewerFirst.reason, /PARENT_ROUTE_STEPS_REQUIRED/);
+  for (const [id, step, tool] of [["spec", "codex_specifier", "spawn_subagent"],
+      ["impl", "claude_worker", "ClaudeWorker"], ["review", "codex_reviewer", "spawn_subagent"]]) {
+    const input = tool === "ClaudeWorker" ? { prompt: `[pico-task A:${step}] work` }
+      : { task: "work in /tmp/wt-A2", label: `A:${step}` };
+    assert.equal(await h.handlers.get("tool_call")!({ toolName: tool, toolCallId: id, input }), undefined);
+    await h.handlers.get("tool_result")!({ toolName: tool, toolCallId: id, input, content: [],
+      details: tool === "ClaudeWorker" ? { task_id: "A" } : { subagent_id: id } });
+  }
   assert.equal((await record.execute("i", { action: "integrate_begin", wave_id: "w1" })).details.ok, true);
   const recheck = diffChecks(h).slice(2).map((call) => [call.input?.worktree, call.input?.allow_missing ?? false]);
   assert.deepEqual(recheck, [["/tmp/wt-A2", false], ["/tmp/wt-A", true], ["/tmp/wt-B", false]]);
@@ -2008,7 +2021,12 @@ test("integrate_end refuses a merged change that is underrated and re-routes the
   assert.equal(waveStatuses(h).includes("integrated"), false);
   assert.equal((eventsOf(h).filter((item: any) => item.kind === "diff_floors").at(-1) as any).status, "underrated");
   // Until the re-route is confirmed the integration cannot end.
-  assert.match((await record.execute("e2", { action: "integrate_end", wave_id: "w1" })).content[0].text, /PARENT_ROUTE_RECHECK_REQUIRED/);
+  assert.match((await record.execute("e2", { action: "integrate_end", wave_id: "w1" })).content[0].text, /INTEGRATION_ABORT_REQUIRED/);
+  h.checkout.digest = "changed";
+  assert.match((await record.execute("abort", { action: "integrate_abort", wave_id: "w1" })).content[0].text, /INTEGRATION_RESTORE_REQUIRED/);
+  h.checkout.digest = "clean";
+  assert.equal((await record.execute("abort", { action: "integrate_abort", wave_id: "w1" })).details.ok, true);
+  assert.equal(waveStatuses(h).at(-1), "abandoned");
 });
 
 test("the escalation limit refuses the re-route without blocking the run", async () => {
