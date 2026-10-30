@@ -25,8 +25,9 @@ class SetupTest(unittest.TestCase):
         self.head_a = make_repo(self.a, {"origin": "https://github.com/example/alpha.git"})
         self.head_b = make_repo(self.b, {"origin": "https://github.com/example/beta.git"})
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), watch.make_handler(self.root, None))
-        self.setup = workspace_setup.SetupControls(self.root, self.server.server_port,
-            github=lambda name: {"repository": name, "default_branch": "main", "default_head": "c" * 40})
+        self.setup = workspace_setup.SetupControls(self.root, self.server.server_port, state=self.root / "state",
+            github=lambda name: {"repository": name, "default_branch": "main", "default_head": "c" * 40},
+            access_check=lambda name: {"status": "ok", "blocker_code": None, "detail": None, "private": False})
         self.server.RequestHandlerClass = watch.make_handler(self.root, None, port=self.server.server_port,
                                                              setup=self.setup)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
@@ -90,6 +91,59 @@ class SetupTest(unittest.TestCase):
         spec = {**self.spec(), "root": "/tmp"}
         status, data = self.request("POST", "/api/setup", {"action": "preview", "spec": spec})
         self.assertEqual((status, data["error_code"]), (400, "WORKSPACE_INIT_ROOT_CHANGED"))
+
+    def test_import_and_reopen_existing_manifest_read_only(self):
+        spec = self.spec()
+        _, preview = self.request("POST", "/api/setup", {"action": "preview", "spec": spec})
+        imported = self.root / "existing.yaml"
+        imported.write_text(preview["text"])
+        record_dir = self.root / "state" / "workspaces"
+        record_dir.mkdir(parents=True)
+        (record_dir / "research.json").write_text(json.dumps({"record_version": 1, "workspace_id": "research",
+                                                             "tasks": {"alpha": {"observed": {"readiness": "implemented"}}}}))
+        status, discovered = self.request("GET", "/api/setup")
+        self.assertEqual(status, 200)
+        self.assertIn("existing.yaml", discovered["manifests"])
+        before = imported.read_bytes()
+        status, opened = self.request("GET", "/api/setup?manifest=existing.yaml")
+        self.assertEqual(status, 200)
+        self.assertTrue(opened["read_only"])
+        self.assertEqual(opened["workspace"]["workspace_id"], "research")
+        self.assertTrue(opened["workspace"]["record_found"])
+        self.assertEqual(opened["workspace"]["repositories"][0]["tasks"][0]["readiness"], "implemented")
+        self.assertEqual(opened["repositories"][0]["pinned_commit"], self.head_a)
+        self.assertEqual(opened["repositories"][0]["access"]["status"], "ok")
+        self.assertEqual(opened["repositories"][0]["branch"], "main")
+        self.assertFalse(opened["repositories"][0]["dirty"])
+        self.assertEqual(imported.read_bytes(), before)
+
+    def test_import_rejects_traversal_symlink_and_invalid_content(self):
+        (self.root / "outside.yaml").symlink_to("/etc/passwd")
+        (self.root / "bad.yaml").write_text("not a workspace: true\n")
+        status, listing = self.request("GET", "/api/setup")
+        self.assertEqual(status, 200)
+        self.assertNotIn("outside.yaml", listing["manifests"])
+        for path, expected in (("/api/setup?manifest=..%2Foutside.yaml", "WORKSPACE_IMPORT_NAME_INVALID"),
+                               ("/api/setup?manifest=outside.yaml", "WORKSPACE_IMPORT_UNAVAILABLE"),
+                               ("/api/setup?manifest=bad.yaml", "WORKSPACE_IMPORT_INVALID")):
+            status, data = self.request("GET", path)
+            self.assertIn(status, {400, 404, 422})
+            self.assertEqual(data["error_code"], expected)
+        status, data = self.request("GET", "/api/setup?manifest=bad.yaml", token=False)
+        self.assertEqual((status, data["error_code"]), (403, "CONTROL_TOKEN_INVALID"))
+
+    def test_import_reports_dirty_checkout_and_missing_pin_without_writes(self):
+        _, preview = self.request("POST", "/api/setup", {"action": "preview", "spec": self.spec()})
+        imported = self.root / "stale.yaml"
+        imported.write_text(preview["text"].replace(self.head_a, "f" * 40, 1))
+        (self.a / "local-change.txt").write_text("uncommitted work\n")
+        before = imported.read_bytes()
+        status, opened = self.request("GET", "/api/setup?manifest=stale.yaml")
+        self.assertEqual(status, 200, opened)
+        self.assertTrue(opened["repositories"][0]["dirty"])
+        self.assertEqual(opened["repositories"][0]["blocker_code"], "WORKSPACE_PIN_MISSING")
+        self.assertIn("WORKSPACE_PIN_MISSING", [item["code"] for item in opened["blockers"]])
+        self.assertEqual(imported.read_bytes(), before)
 
 
 if __name__ == "__main__": unittest.main()

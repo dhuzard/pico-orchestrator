@@ -9,7 +9,7 @@ import os
 from pathlib import Path
 import re
 import sys
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "tools"))
@@ -607,7 +607,12 @@ def make_handler(directory: Path, repository: str | None, workspace: WorkspaceSo
             if path == "/api/setup" and setup is not None:
                 try:
                     setup.check_token(self.headers)
-                    payload = self._json(200, setup.discovery())
+                    names = parse_qs(parts.query, keep_blank_values=True).get("manifest")
+                    if names is not None and len(names) != 1:
+                        raise garden_controls.ControlError(400, "WORKSPACE_IMPORT_NAME_INVALID",
+                                                           "choose one manifest file")
+                    payload = self._json(200, setup.inspect_manifest(names[0]) if names is not None
+                                         else setup.discovery())
                 except garden_controls.ControlError as exc:
                     payload = self._json(exc.status, {"ok": False, "error_code": exc.code, "error": exc.detail})
                 self._send(payload)
@@ -742,7 +747,7 @@ def main() -> None:
     if args.setup_root and not args.setup_root.is_dir():
         parser.error("--setup-root must be an existing directory")
     server = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(directory, repository, workspace, issues=issues))
-    setup = workspace_setup.SetupControls(args.setup_root, server.server_port) if args.setup_root else None
+    setup = workspace_setup.SetupControls(args.setup_root, server.server_port, state=state) if args.setup_root else None
     if setup:
         server.RequestHandlerClass = make_handler(directory, repository, port=server.server_port, setup=setup)
     if args.controls:

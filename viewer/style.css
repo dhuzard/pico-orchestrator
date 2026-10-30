@@ -138,3 +138,7 @@ button.model-cell{border:0;background:none;padding:0;font:inherit;color:#3b878d;
 .setup-fields input, .setup-page select { width: 100%; box-sizing: border-box; padding: .55rem; border: 1px solid #a9a79f; border-radius: 7px; font: inherit; }
 .setup-page pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 30rem; overflow: auto; }
 .setup-page button { margin-top: .6rem; }
+.setup-existing { display: flex; flex-wrap: wrap; gap: .5rem; margin: .8rem 0; }
+.setup-page #existing-name { display: block; width: min(100%, 32rem); box-sizing: border-box; padding: .55rem; border: 1px solid #a9a79f; border-radius: 7px; font: inherit; }
+.setup-import-repo { border-top: 1px solid #e5e5df; padding: .7rem 0; overflow-wrap: anywhere; }
+.setup-import-repo p { margin: .25rem 0; }

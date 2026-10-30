@@ -13,15 +13,92 @@ from pathlib import Path
 
 import garden_controls
 import workspace_init
+import workspace_plan
+import workspace_run
+
+MANIFEST_SUFFIXES = (".yaml", ".yml", ".json")
+MAX_MANIFEST_BYTES = 1024 * 1024
+MAX_MANIFESTS = 256
+
+
+def _git_probe(checkout: Path, *args: str, text: bool = False):
+    try:
+        return subprocess.run(["git", "-C", str(checkout), *args], shell=False,
+                              capture_output=True, text=text, timeout=10)
+    except (OSError, subprocess.TimeoutExpired, UnicodeError):
+        return None
 
 
 class SetupControls(garden_controls.Controls):
-    def __init__(self, root: Path, port: int, *, github=workspace_init.verify_github):
+    def __init__(self, root: Path, port: int, *, state: Path | None = None,
+                 github=workspace_init.verify_github, access_check=workspace_plan.gh_access):
         super().__init__(root, port)
         if not root.is_dir():
             raise ValueError("setup root must be a directory")
         self.root = root.resolve()
+        self.state = state or self.root / ".pico-state"
         self.github = github
+        self.access_check = access_check
+
+    def manifests(self) -> list[str]:
+        """List direct, regular manifest files; never follow a symlink out of the setup root."""
+        names = []
+        for path in self.root.iterdir():
+            try:
+                if path.suffix.lower() in MANIFEST_SUFFIXES and not path.is_symlink() and path.is_file() \
+                        and path.stat().st_size <= MAX_MANIFEST_BYTES:
+                    names.append(path.name)
+            except OSError:  # A file may disappear during discovery.
+                continue
+        return sorted(names)[:MAX_MANIFESTS]
+
+    def inspect_manifest(self, name: str) -> dict:
+        """Reopen an existing manifest without copying, rewriting, or activating it."""
+        import watch
+        conflicts = workspace_init.environment_conflicts(dict(os.environ))
+        if conflicts:
+            raise garden_controls.ControlError(409, "WORKSPACE_INIT_ENV_CONFLICT", "; ".join(conflicts))
+        if not isinstance(name, str) or not name or len(name) > 255 or Path(name).name != name \
+                or Path(name).suffix.lower() not in MANIFEST_SUFFIXES:
+            raise garden_controls.ControlError(400, "WORKSPACE_IMPORT_NAME_INVALID", "choose a manifest file in the setup root")
+        path = self.root / name
+        try:
+            available = not path.is_symlink() and path.is_file() and path.stat().st_size <= MAX_MANIFEST_BYTES
+        except OSError:
+            available = False
+        if not available:
+            raise garden_controls.ControlError(404, "WORKSPACE_IMPORT_UNAVAILABLE", "manifest file is absent, a symlink, or too large")
+        try:
+            raw = workspace_plan.load_manifest(path)
+            if not isinstance(raw, dict) or not workspace_init.SLUG_RE.fullmatch(str(raw.get("id", ""))):
+                raise workspace_plan.WorkspaceError("workspace id is invalid")
+            record = workspace_run.load_workspace(self.state / "workspaces" / f"{raw['id']}.json")
+            observed = workspace_run.observed_from_record(record or {})
+            plan = workspace_plan.plan(path, access_check=self.access_check, observed=observed)
+            # Import locally: watch's existing view owns the scheduler state and run mapping.
+            view = watch.workspace_view(self.state, plan=plan)
+        except (OSError, UnicodeError, workspace_plan.WorkspaceError, workspace_run.WorkspaceRunError,
+                watch.WorkspaceViewError) as exc:
+            raise garden_controls.ControlError(422, "WORKSPACE_IMPORT_INVALID",
+                                               "the manifest or its workspace record cannot be read") from exc
+        repositories = []
+        for repo in plan["repositories"]:
+            checkout = Path(repo["resolved_path"]) if repo.get("resolved_path") else None
+            head = workspace_run._head(checkout) if checkout else None
+            if checkout:
+                status = _git_probe(checkout, "status", "--porcelain=v1")
+                branch = _git_probe(checkout, "symbolic-ref", "--quiet", "--short", "HEAD", text=True)
+            else:
+                status = branch = None
+            repositories.append({"id": repo["id"], "repository": repo["repository"], "path": repo["path"],
+                                 "resolved_path": repo.get("resolved_path"), "base_branch": repo.get("base_branch"),
+                                 "head": head, "branch": branch.stdout.strip() if branch and branch.returncode == 0 else None,
+                                 "pinned_commit": repo["pinned_commit"],
+                                 "dirty": None if status is None or status.returncode else bool(status.stdout),
+                                 "access": repo["access"], "blocker_code": repo.get("blocker_code")})
+        return {"ok": True, "name": name, "path": str(path), "workspace": view,
+                "repositories": repositories, "blockers": plan["blockers"],
+                "read_only": True}
 
     def discovery(self) -> dict:
         conflicts = workspace_init.environment_conflicts(dict(os.environ))
@@ -41,7 +118,8 @@ class SetupControls(garden_controls.Controls):
                                "branch": git("symbolic-ref", "--quiet", "--short", "HEAD"),
                                "dirty": None if dirty is None else bool(dirty)})
         return {"ok": True, "root": str(self.root), "candidates": candidates,
-                "skipped": found.skipped, "unreadable": found.unreadable, "truncated": found.truncated}
+                "skipped": found.skipped, "unreadable": found.unreadable, "truncated": found.truncated,
+                "manifests": self.manifests()}
 
     def _prepare(self, data: dict):
         conflicts = workspace_init.environment_conflicts(dict(os.environ))

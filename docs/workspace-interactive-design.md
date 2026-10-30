@@ -20,6 +20,15 @@ header and JSON body. The setup root comes from the CLI, not from a browser
 request. Saving outside that root or overwriting a path is refused. Browser
 text is rendered as text, including repository names and manifest contents.
 
+The same setup page lists YAML and JSON manifest files directly in `DIR` and
+can inspect one by filename. `GET /api/setup?manifest=NAME` uses the same token
+and Host checks, refuses subpaths, symlinks and files over 1 MiB, then runs the
+existing planner against the file. The result shows current checkout paths,
+branch, HEAD, dirty state, selected pin, GitHub access, plan blockers and task
+states from Garden's workspace view. An existing workspace record is read from
+the watch state directory, so reopening shows recorded progress. Inspection
+does not edit or activate a manifest, run the scheduler, or perform Git writes.
+
 `pico workspace init` builds a new workspace manifest
 (`schemas/workspace.schema.json`, `schema_version: 1`) from repositories the
 user selects, previews it with the planner's waves and blockers, and saves it

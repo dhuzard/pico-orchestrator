@@ -3,6 +3,12 @@
 <title>Pico Garden · workspace setup</title><link rel="stylesheet" href="/style.css"><script src="/setup.js" defer></script></head>
 <body><main class="setup-page"><header><p class="eyebrow">PICO GARDEN</p><h1>Prepare a workspace</h1>
 <p>Choose Git checkouts or explicit GitHub repositories. Review the verified identities and pins before saving a new manifest.</p></header>
+<section class="panel" aria-labelledby="existing-title"><h2 id="existing-title">Open an existing workspace</h2>
+<p>Inspect a manifest already in this setup root. Importing reads it in place; it never copies, edits or activates it.</p>
+<div id="existing-list" class="setup-existing"></div>
+<label>Manifest filename in this root <input id="existing-name" maxlength="255" placeholder="example.workspace.yaml"></label>
+<button id="open-existing" type="button" class="quiet-button">Inspect manifest</button>
+<div id="existing-detail" hidden><p id="existing-status" role="status"></p><div id="existing-repos"></div><h3>Tasks</h3><div id="existing-tasks"></div><h3>Plan blockers</h3><div id="existing-blockers"></div></div></section>
 <section class="panel"><h2>1. Select repositories</h2><p id="root" role="status">Discovering…</p>
 <div id="candidates"></div><button id="add-remote" type="button" class="quiet-button">Add a repository without a checkout</button>
 <p id="discovery-note" class="detail-note"></p></section>
