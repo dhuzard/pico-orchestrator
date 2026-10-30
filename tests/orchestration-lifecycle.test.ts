@@ -678,7 +678,10 @@ process.stdin.on("end", () => {
     permission_denials: prompt.includes("DENY") ? [{ tool_name: "Write", tool_use_id: "t1",
       tool_input: { file_path: path.join(process.cwd(), "CHANGELOG.md"), content: "x" } }] : [] }));
   if (prompt.includes("FAIL")) { process.stdout.write(JSON.stringify({ type: "result", subtype: "error", is_error: true, result: "boom" })); process.exit(1); }
-  if (prompt.includes("HANG")) { fs.writeFileSync(path.join(${JSON.stringify(dir)}, "hang.pid"), String(process.pid)); setInterval(() => {}, 1000); return; }
+  if (prompt.includes("HANG")) {
+    process.on("SIGTERM", () => { fs.writeFileSync(path.join(${JSON.stringify(dir)}, "hang.terminated"), "SIGTERM"); process.exit(0); });
+    fs.writeFileSync(path.join(${JSON.stringify(dir)}, "hang.pid"), String(process.pid)); setInterval(() => {}, 1000); return;
+  }
   const barrier = process.env.FAKE_CLAUDE_BARRIER;
   if (!barrier) return reply();
   fs.writeFileSync(path.join(barrier, "started-" + process.pid), "");
@@ -1032,7 +1035,7 @@ test("aborting a ClaudeWorker call kills its Claude Code process", async () => {
     const pending = claudeWorkerRun(h, "hang", { prompt: "[pico-task A:claude_worker] HANG" }, controller.signal);
     const pidFile = join(dir, "hang.pid");
     for (let tries = 0; tries < 250 && !existsSync(pidFile); tries += 1) await new Promise((done) => setTimeout(done, 20));
-    const pid = Number(readFileSync(pidFile, "utf8"));
+    assert.ok(existsSync(pidFile), "the Claude Code child started before abort");
     controller.abort();
     const { result, after } = await pending;
     assert.equal(result.isError, true);
@@ -1041,10 +1044,9 @@ test("aborting a ClaudeWorker call kills its Claude Code process", async () => {
     assert.equal(after, undefined);
     const aborted = h.parentCalls("event").map((call) => call.input!).filter((input) => input.kind === "worker").at(-1)!;
     assert.deepEqual([aborted.status, aborted.blocker_code], ["blocked", "WORKER_ABORTED"]);
-    // The kill is asynchronous: a dying or not yet reaped child still answers signal 0 (#41).
-    const gone = () => { try { process.kill(pid, 0); return false; } catch (error) { return (error as NodeJS.ErrnoException).code === "ESRCH"; } };
-    for (let tries = 0; tries < 100 && !gone(); tries += 1) await new Promise((done) => setTimeout(done, 20));
-    assert.equal(gone(), true, "the Claude Code child is gone");
+    // The actual child acknowledges SIGTERM; the worker resolves after its close event.
+    // Probing its PID after close can observe an unrelated process that reused it.
+    assert.equal(readFileSync(join(dir, "hang.terminated"), "utf8"), "SIGTERM");
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
