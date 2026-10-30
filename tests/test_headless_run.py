@@ -386,6 +386,17 @@ class HeadlessRunTest(HeadlessFixture):
         again = self.start(behavior="finish")
         self.assertEqual(again["outcome"], "already_finished")
 
+    def test_cancel_finished_execution_preserves_terminal_result(self):
+        finished = self.start(behavior="finish")
+        self.assertEqual((finished["status"], finished["run"]["status"]), ("exited", "PARTIAL"))
+        with unittest.mock.patch.object(hr.os, "killpg") as killpg:
+            cancelled = hr.cancel(target=self.target, explicit_repo="acme/target", execution_id="exec-1")
+        killpg.assert_not_called()
+        self.assertEqual(cancelled["status"], "exited")
+        self.assertEqual(cancelled.get("outcome"), finished.get("outcome"))
+        self.assertEqual(cancelled["run"], finished["run"])
+        self.assertEqual(self.status()["status"], "exited")
+
     def test_concurrent_starts_with_one_id_launch_at_most_one_child(self):
         # Widen the window between reading the record and launching, where an
         # unlocked start would let both callers see "not running".
@@ -469,7 +480,7 @@ class HeadlessRunTest(HeadlessFixture):
             hr.status(target=other, explicit_repo="acme/other", execution_id="exec-1")
         self.assertEqual(ctx.exception.code, "EXECUTION_UNKNOWN")
 
-    def test_checkout_is_restored_and_clean_worktrees_removed(self):
+    def test_checkout_is_restored_and_clean_worktrees_kept(self):
         os.environ["FAKE_PI_MESS"] = "clean"
         record = self.start()
         cleanup = record["checkout"]
@@ -477,11 +488,22 @@ class HeadlessRunTest(HeadlessFixture):
         self.assertEqual(cleanup["branch_after"], cleanup["branch_before"])
         self.assertFalse(cleanup["branch_before"].startswith("pico/"))
         self.assertEqual(git("-C", str(self.target), "branch", "--show-current"), cleanup["branch_before"])
-        self.assertEqual(len(cleanup["removed_worktrees"]), 1)
-        self.assertEqual(len(git("-C", str(self.target), "worktree", "list").splitlines()), 1)
+        self.assertEqual(cleanup["removed_worktrees"], [])
+        self.assertEqual(len(cleanup["kept_worktrees"]), 1)
+        self.assertEqual(len(git("-C", str(self.target), "worktree", "list").splitlines()), 2)
         branches = git("-C", str(self.target), "branch", "--format=%(refname:short)").split()
         self.assertIn("pico/batch-1", branches)  # the work is kept on its branches
         self.assertIn("pico/task-1", branches)
+
+    def test_restore_keeps_unrelated_worktree_created_during_run(self):
+        before = hr.checkout_state(self.target)
+        other = Path(self._tmp.name) / "developer-worktree"
+        git("-C", str(self.target), "worktree", "add", "--detach", str(other))
+        cleanup = hr.restore_checkout(self.target, before)
+        self.assertEqual(cleanup["removed_worktrees"], [])
+        self.assertIn(str(other), cleanup["kept_worktrees"])
+        self.assertTrue((other / "README.md").exists())
+        self.assertIn(str(other), hr.checkout_state(self.target)["worktrees"])
 
     def test_dirty_worktrees_and_checkouts_are_never_touched(self):
         os.environ["FAKE_PI_MESS"] = "dirty"

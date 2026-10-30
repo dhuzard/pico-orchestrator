@@ -416,10 +416,10 @@ def tracked_changes(checkout: Path) -> list[str] | None:
 
 
 def restore_checkout(checkout: Path, before: dict) -> dict:
-    """After a child exits: remove clean worktrees it created and return a clean checkout to its starting point.
+    """After a child exits, return a clean checkout to its starting point.
 
-    Nothing dirty is touched: a worktree with uncommitted or untracked files is
-    kept, and a checkout with uncommitted tracked changes is left where it is.
+    New worktrees are reported but kept: their appearance during the run does
+    not establish ownership. A checkout with uncommitted tracked changes is left where it is.
     Branches are never deleted, because they hold the work. The tracked changes
     left in the parent checkout are recorded (`dirty_files`, `dirty_count`;
     None when Git cannot answer), and so are untracked entries that appeared
@@ -428,13 +428,7 @@ def restore_checkout(checkout: Path, before: dict) -> dict:
     after = checkout_state(checkout)
     result = {"branch_before": before["branch"], "branch_after": after["branch"], "restored": False,
               "removed_worktrees": [], "kept_worktrees": [], "left_reason": None}
-    for path in sorted(set(after["worktrees"]) - set(before["worktrees"])):
-        status = _git(Path(path), "status", "--porcelain")
-        if status.returncode == 0 and not status.stdout.strip() and _git(checkout, "worktree", "remove", path).returncode == 0:
-            result["removed_worktrees"].append(path)
-        else:
-            result["kept_worktrees"].append(path)
-    _git(checkout, "worktree", "prune")
+    result["kept_worktrees"] = sorted(set(after["worktrees"]) - set(before["worktrees"]))
     moved = (after["branch"] != before["branch"]) if before["branch"] else (after["head"] != before["head"])
     if moved:
         if _git(checkout, "status", "--porcelain", "--untracked-files=no").stdout.strip():
@@ -859,7 +853,8 @@ def cancel(*, target: Path, explicit_repo: str, execution_id: str, grace: float 
         if record["target_repository"].casefold() != identity.casefold():
             raise HeadlessError("EXECUTION_TARGET_MISMATCH", "execution id belongs to another repository")
         refresh(record)
-        _stop_locked(record, grace, "EXECUTION_CANCELLED")
+        if record["status"] not in {"exited", "cancelled"}:
+            _stop_locked(record, grace, "EXECUTION_CANCELLED")
         save_record(path, record)
         return record
 

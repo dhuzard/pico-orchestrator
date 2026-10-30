@@ -2205,10 +2205,10 @@ validate` checks are not recorded as signatures.
 
 **Checkout hygiene.** Before launching, the runner records the target's
 branch (or detached `HEAD`) and its linked worktrees. After the child exits it
-removes every worktree the run created that is clean (`git worktree remove`
-without `--force`; a worktree with uncommitted or untracked files is kept and
-reported), prunes stale entries, and, if the parent checkout moved and has no
-uncommitted tracked changes, switches it back to where it started. Branches
+keeps and reports newly observed worktrees, because their appearance during a
+run does not establish that the run owns them. It does not prune worktrees. If
+the parent checkout moved and has no uncommitted tracked changes, the runner
+switches it back to where it started. Branches
 are never deleted, since they hold the work. The result is recorded as the
 execution's `checkout` block (`restored`, `removed_worktrees`,
 `kept_worktrees`, `left_reason`, and `dirty_files`/`dirty_count`: the tracked
@@ -2216,7 +2216,8 @@ changes the run left uncommitted in the parent checkout itself, `null` when
 Git cannot answer; `new_untracked`/`new_untracked_count`: untracked, not
 ignored entries that appeared in the parent checkout during the run, an
 untracked directory counting as one entry and `.pi/worktrees/` excluded) and
-summarised on the workspace task entry. Untracked entries are a report only:
+summarised on the workspace task entry. `removed_worktrees` is retained for
+record compatibility and is empty for new executions. Untracked entries are a report only:
 they never refuse a launch, because they cannot change a commit or a check at
 the recorded commits, but they show a write outside the run's worktrees (#63).
 Nothing dirty is ever cleaned, stashed or reset.
