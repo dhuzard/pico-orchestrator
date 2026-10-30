@@ -1831,8 +1831,13 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
       const restored = await snapshot();
       if (!integrationSnapshot || !restored || restored.digest !== integrationSnapshot)
         return reply(false, `BLOCKED: INTEGRATION_RESTORE_REQUIRED: restore the parent checkout exactly to its state before integrate_begin (${integrationBase}) before aborting.`);
-      if (!await event({ kind: "wave", wave_id: waveId, task_ids: members, status: "abandoned" }))
+      const abandoned = await eventUnlessRefused({ kind: "wave", wave_id: waveId, task_ids: members, status: "abandoned" },
+        new Set(["INTEGRATION_RESTORE_REQUIRED"]));
+      if (abandoned.ok === false) {
+        if (abandoned.error_code === "INTEGRATION_RESTORE_REQUIRED")
+          return reply(false, "BLOCKED: INTEGRATION_RESTORE_REQUIRED: the parent could not verify a clean restored baseline; finish PARTIAL and inspect the checkout.", abandoned);
         return reply(false, "BLOCKED: parent provenance update failed; see diagnostic log.", parentFailure ?? {});
+      }
       integrating = null; integrationBase = null; integrationSnapshot = null; integrationNeedsAbort = false;
       implicitOpen.delete(waveId); implicitEpoch.delete(waveId);
       if (activeWave?.id === waveId) activeWave = null;

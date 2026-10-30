@@ -520,6 +520,9 @@ class DiffFloorReRouteTest(Routed):
                 "route_task_result": ran, "paths": paths, "head": "c" * 40}
 
     def test_parent_diff_evidence_requires_integrating_wave_and_is_schema_valid(self):
+        git("config", "user.name", "Test", cwd=self.target)
+        git("config", "user.email", "test@example.invalid", cwd=self.target)
+        git("commit", "-q", "--allow-empty", "-m", "init", cwd=self.target)
         task = self.routed_phase(self.route(small_task()))
         evidence = {"kind": "diff_floors", "phase": task, "status": "passed", "matches": [],
                     "operation": "parent", "wave_id": "w1", "base": "a" * 40, "head": "b" * 40,
@@ -534,6 +537,41 @@ class DiffFloorReRouteTest(Routed):
                          ("parent", "a" * 40, "b" * 40, "w1", 0))
         self.assertEqual(check["path_digests"], evidence["path_digests"])
         self.event({"kind": "wave", "wave_id": "w1", "task_ids": [task], "status": "abandoned"})
+
+    def test_abandon_requires_parent_to_verify_restored_clean_checkout(self):
+        git("config", "user.name", "Test", cwd=self.target)
+        git("config", "user.email", "test@example.invalid", cwd=self.target)
+        git("commit", "-q", "--allow-empty", "-m", "init", cwd=self.target)
+        task = self.routed_phase(self.route(small_task()))
+        wave = {"kind": "wave", "wave_id": "w1", "task_ids": [task]}
+        self.event({**wave, "status": "declared"})
+        with self.assertRaises(po.ParentRunError):
+            self.event({**wave, "status": "abandoned"})
+        self.event({**wave, "status": "integrating"})
+        (self.target / "new-file").write_text("uncommitted")
+        with self.assertRaises(po.ParentRunError) as refused:
+            self.event({**wave, "status": "abandoned"})
+        self.assertEqual(refused.exception.error_code, "INTEGRATION_RESTORE_REQUIRED")
+        (self.target / "new-file").unlink()
+        initial_branch = git("branch", "--show-current", cwd=self.target).strip()
+        git("checkout", "-qb", "other", cwd=self.target)
+        with self.assertRaises(po.ParentRunError):
+            self.event({**wave, "status": "abandoned"})
+        git("checkout", "-q", initial_branch, cwd=self.target)
+        self.event({**wave, "status": "abandoned"})
+
+    def test_dirty_integration_baseline_cannot_be_abandoned_automatically(self):
+        git("config", "user.name", "Test", cwd=self.target)
+        git("config", "user.email", "test@example.invalid", cwd=self.target)
+        git("commit", "-q", "--allow-empty", "-m", "init", cwd=self.target)
+        task = self.routed_phase(self.route(small_task()))
+        wave = {"kind": "wave", "wave_id": "w1", "task_ids": [task]}
+        (self.target / "dirty").write_text("preexisting")
+        self.event({**wave, "status": "declared"})
+        self.event({**wave, "status": "integrating"})
+        with self.assertRaises(po.ParentRunError) as refused:
+            self.event({**wave, "status": "abandoned"})
+        self.assertEqual(refused.exception.error_code, "INTEGRATION_RESTORE_REQUIRED")
 
     def test_underrated_diff_requires_a_reroute_and_resume_reaches_the_higher_route(self):
         ran = self.route(small_task())

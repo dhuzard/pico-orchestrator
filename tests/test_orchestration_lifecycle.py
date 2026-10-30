@@ -588,8 +588,9 @@ class LifecycleTest(unittest.TestCase):
         self.assertEqual(grown.exception.error_code, "PARENT_EVENT_CONFLICT")
         parent.event({"kind": "wave", "wave_id": "auto-2", "task_ids": ["b"], "status": "declared"})
         parent.event({"kind": "wave", "wave_id": "auto-2", "task_ids": ["b"], "status": "integrated"})
-        with self.assertRaises(po.ParentRunError):   # abandoned is never an event status
+        with self.assertRaises(po.ParentRunError) as abandoned:  # a declared wave cannot be aborted as integrating
             parent.event({"kind": "wave", "wave_id": "auto-1", "task_ids": ["a"], "status": "abandoned"})
+        self.assertEqual(abandoned.exception.error_code, "INTEGRATION_RESTORE_REQUIRED")
         parent.event({"kind": "wave", "wave_id": "auto-1", "task_ids": ["a"], "status": "integrating"})
         with self.assertRaises(po.ParentRunError) as refused:
             parent.finish("COMPLETED")

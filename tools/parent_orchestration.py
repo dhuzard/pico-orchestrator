@@ -27,6 +27,7 @@ import provenance
 import github_integration
 import routing_engine as engine
 import run_lease
+import session_scope
 
 STATUSES = {"COMPLETED", "BLOCKED", "FAILED", "PARTIAL"}
 # "abandoned" is written only by `_reconcile_open` when a run ends without a COMPLETED outcome;
@@ -859,6 +860,47 @@ def _usage_event(parent: dict, event: dict) -> None:
     usage["cost_complete"] = usage.get("cost_complete", True) and _event_priced(event, cost)
 
 
+def _clean_integration_snapshot(parent: dict) -> str | None:
+    """Commit and branch identity only when the entire visible checkout is clean and verifiable.
+
+    A dirty or unreadable baseline may still integrate, but cannot be aborted automatically.
+    Checking the index flags prevents Git from concealing modifications; operation markers
+    prevent a clean-looking but unfinished merge or rebase from being accepted.
+    """
+    checkpoint = parent.get("checkpoint") or {}
+    path = checkpoint.get("worktree")
+    if not isinstance(path, str):
+        return None
+    root = Path(path)
+    status = session_scope._git_out(root, "status", "--porcelain=v1", "-z", "--untracked-files=all")
+    flags = session_scope._git_out(root, "ls-files", "-v", "-z")
+    if status != b"" or flags is None:
+        return None
+    if any(entry[:1].islower() or entry[:1] == b"S" for entry in flags.split(b"\0") if entry):
+        return None
+    for name in ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply"):
+        location = session_scope._git_out(root, "rev-parse", "--git-path", name)
+        if location is None:
+            return None
+        try:
+            target = Path(os.fsdecode(location.rstrip(b"\n")))
+            if not target.is_absolute():
+                target = root / target
+            if target.exists():
+                return None
+        except (OSError, ValueError):
+            return None
+    try:
+        live = capture_checkout(root)
+        if live["head"] is None:
+            # Unborn repositories are clean but cannot identify a recoverable baseline.
+            return None
+        identity = json.dumps(live, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    except (UnicodeError, OSError, ValueError):
+        return None
+
+
 def _wave_event(parent: dict, event: dict) -> None:
     """Record wave membership: which routed tasks (phases) ran concurrently, and its integration state."""
     wave_id = _safe(event.get("wave_id"), ID_RE, "wave id")
@@ -891,6 +933,15 @@ def _wave_event(parent: dict, event: dict) -> None:
         raise ParentRunError("wave tasks conflict with prior event", error_code="PARENT_EVENT_CONFLICT")
     elif wave["status"] == "abandoned" or WAVE_STATUSES.index(status) < WAVE_STATUSES.index(wave["status"]):
         raise ParentRunError("wave cannot move backwards", error_code="PARENT_WAVE_TRANSITION_INVALID")
+    if status == "abandoned":
+        current = _clean_integration_snapshot(parent)
+        if (wave["status"] != "integrating" or not wave.get("integration_snapshot")
+                or current is None or current != wave["integration_snapshot"]):
+            raise ParentRunError("integration checkout cannot be verified as restored", error_code="INTEGRATION_RESTORE_REQUIRED")
+    if status == "integrating" and wave["status"] != "integrating":
+        digest = _clean_integration_snapshot(parent)
+        if digest is not None:
+            wave["integration_snapshot"] = digest
     wave["status"] = status
     for task_id in task_ids:
         task_phase = _phase(parent, task_id)
