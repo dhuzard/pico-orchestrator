@@ -83,6 +83,114 @@ class WorkspaceRunFixture(unittest.TestCase):
 
 
 class WorkspaceRunTest(WorkspaceRunFixture):
+    def test_manifest_repin_between_planning_and_spawn_refuses_the_child(self):
+        manifest = self.manifest()
+        spawned = unittest.mock.Mock()
+
+        def start(**kwargs):
+            changed = yaml.safe_load(manifest.read_text())
+            changed["repositories"][0]["pinned_commit"] = "f" * 40
+            manifest.write_text(yaml.safe_dump(changed))
+            kwargs["before_spawn"]()
+            spawned()
+
+        with unittest.mock.patch.object(hr, "start", side_effect=start):
+            with self.assertRaises(wr.WorkspaceRunError) as rejected:
+                self.launch(manifest, "a1")
+        self.assertEqual(rejected.exception.code, "WORKSPACE_MANIFEST_CHANGED")
+        spawned.assert_not_called()
+        self.assertFalse(wr.workspace_record_path("ws").exists())
+
+    def test_manifest_repin_after_child_returns_cannot_rebind_its_execution(self):
+        for existing in (False, True):
+            with self.subTest(existing=existing):
+                manifest = self.manifest()
+                record_path = wr.workspace_record_path("ws")
+                if existing:
+                    path, record = wr._workspace(wr._plan(manifest, access_check=None), manifest)
+                    record["tasks"]["b1"] = {"repository": "beta"}
+                    wr.save_workspace(path, record)
+                if record_path.exists() and not existing:
+                    record_path.unlink()
+
+                def start(**kwargs):
+                    kwargs["before_spawn"]()
+                    changed = yaml.safe_load(manifest.read_text())
+                    changed["repositories"][0]["pinned_commit"] = "f" * 40
+                    manifest.write_text(yaml.safe_dump(changed))
+                    return {"execution_id": "ws--a1", "target_repository": "acme/alpha",
+                            "objective": kwargs["objective"], "status": "exited", "run": {"status": "COMPLETED"}}
+
+                with unittest.mock.patch.object(hr, "start", side_effect=start):
+                    with self.assertRaises(wr.WorkspaceRunError) as rejected:
+                        self.launch(manifest, "a1")
+                self.assertEqual(rejected.exception.code, "WORKSPACE_MANIFEST_CHANGED")
+                after = wr.load_workspace(record_path)
+                self.assertEqual(after["evidence_pins"]["a1"]["alpha"], self.repos["alpha"][1])
+                self.assertEqual(after["tasks"]["a1"], {"repository": "alpha", "target_repository": "acme/alpha",
+                                                       "pinned_commit": self.repos["alpha"][1]})
+                if existing:
+                    self.assertEqual(after["tasks"]["b1"], {"repository": "beta"})
+                # Reconciliation must not adopt the orphan under the edited pin.
+                with unittest.mock.patch.object(hr, "status") as status:
+                    refreshed = wr.status(manifest=manifest, task_id="a1")
+                status.assert_not_called()
+                self.assertNotIn("a1", refreshed["tasks"])
+                self.assertIn(wr.EVIDENCE_CHANGED, {b["code"] for b in refreshed["plan_blockers"]})
+
+    def test_reserved_scope_after_failed_spawn_can_be_retried_without_success_evidence(self):
+        manifest = self.manifest()
+
+        def fail(**kwargs):
+            kwargs["before_spawn"]()
+            raise hr.HeadlessError("PI_SPAWN_FAILED", "simulated failure")
+
+        with unittest.mock.patch.object(hr, "start", side_effect=fail):
+            with self.assertRaises(wr.WorkspaceRunError) as rejected:
+                self.launch(manifest, "a1")
+        self.assertEqual(rejected.exception.code, "PI_SPAWN_FAILED")
+        entry = wr.load_workspace(wr.workspace_record_path("ws"))["tasks"]["a1"]
+        self.assertNotIn("execution_status", entry)
+        self.assertEqual(wr.observed_state("ws", manifest=manifest)["a1"], {})
+        retried = self.launch(manifest, "a1")
+        self.assertEqual(retried["task"]["run_status"], "PARTIAL")
+
+    def test_repin_audit_keeps_the_planned_evidence_pin(self):
+        manifest = self.manifest()
+        plan = wr._plan(manifest, access_check=None)
+        changed = yaml.safe_load(manifest.read_text())
+        changed["repositories"][0]["pinned_commit"] = "f" * 40
+        manifest.write_text(yaml.safe_dump(changed))
+        # Reviewed repin controls audit with the original plan after editing the
+        # manifest, but that must not relabel an older execution's evidence.
+        _, record = wr._workspace(plan, manifest)
+        self.assertEqual(record["evidence_pins"]["a1"]["alpha"], self.repos["alpha"][1])
+
+    def test_status_reads_execution_without_workspace_lock_and_preserves_concurrent_updates(self):
+        import fcntl
+        manifest = self.manifest()
+        plan = wr._plan(manifest, access_check=None)
+        path, record = wr._workspace(plan, manifest)
+        record["tasks"]["a1"] = {"repository": "alpha"}
+        wr.save_workspace(path, record)
+        advanced = {"repository": "alpha", "execution_status": "exited", "run_status": "COMPLETED"}
+
+        def read_execution(**kwargs):
+            # Fail immediately if status holds the workspace lock while taking
+            # the execution lock: a launch callback takes them in the other order.
+            with open(path.with_suffix(".json.lock"), "a+") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                current = wr.load_workspace(path)
+                current["tasks"]["a1"] = advanced
+                wr.save_workspace(path, current)
+                fcntl.flock(lock, fcntl.LOCK_UN)
+            return {"execution_id": "ws--a1", "target_repository": "acme/alpha", "objective": "old",
+                    "status": "launched", "run": {"status": "IN_PROGRESS"}}
+
+        with unittest.mock.patch.object(hr, "status", side_effect=read_execution):
+            result = wr.status(manifest=manifest, task_id="a1")
+        self.assertEqual(result["tasks"]["a1"], advanced)
+
     def test_evidence_binding_preserves_repin_limits_and_unrelated_tasks(self):
         manifest = self.manifest()
         plan = wr._plan(manifest, access_check=None)

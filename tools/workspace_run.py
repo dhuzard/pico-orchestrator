@@ -330,7 +330,7 @@ def _task(plan: dict, task_id: str) -> tuple[dict, dict]:
     return task, repo
 
 
-def _workspace(plan: dict, manifest: Path) -> tuple[Path, dict]:
+def _workspace(plan: dict, manifest: Path, *, require_current_pins: bool = False) -> tuple[Path, dict]:
     """Load (or initialize) the record; callers hold locked_workspace."""
     path = workspace_record_path(plan["workspace_id"])
     record = load_workspace(path)
@@ -345,11 +345,16 @@ def _workspace(plan: dict, manifest: Path) -> tuple[Path, dict]:
     incompatible = _incompatible_entries(record, manifest, bindings)
     saved = record.setdefault("evidence_bindings", {})
     pins = evidence_pins(manifest)
+    planned_pins = plan.get("evidence_pins", pins)
+    if require_current_pins and planned_pins != pins:
+        raise WorkspaceRunError("WORKSPACE_MANIFEST_CHANGED", "repository pins changed while the operation was running")
     saved_pins = record.setdefault("evidence_pins", {})
     for tid, binding in bindings.items():
         if tid not in incompatible and (tid not in record["tasks"] or tid not in saved or tid not in saved_pins):
             saved[tid] = binding
-            saved_pins[tid] = pins[tid]
+            # A repin control may audit with its pre-action plan. Never attach the
+            # newer manifest's pins to work or evidence produced under that plan.
+            saved_pins[tid] = planned_pins[tid]
     if not incompatible:
         record["manifest_digest"] = digest
     return path, record
@@ -701,6 +706,17 @@ def launch(*, manifest: Path, task_id: str, allow_mutation: bool = False, resume
         checkout_gate()
         authorization_gate()
         budget_gate()
+        with locked_workspace(plan["workspace_id"]):
+            if (plan["evidence_bindings"] != evidence_bindings(manifest)
+                    or plan["evidence_pins"] != evidence_pins(manifest)):
+                raise WorkspaceRunError("WORKSPACE_MANIFEST_CHANGED", "workspace inputs changed before child launch")
+            path, record = _workspace(plan, manifest, require_current_pins=True)
+            if task_id not in record["tasks"]:
+                # Reserve original scope before a child can outlive this coordinator.
+                # No execution status or successful evidence is inferred here.
+                record["tasks"][task_id] = {"repository": repo["id"], "target_repository": repo["repository"],
+                                             "pinned_commit": repo["pinned_commit"]}
+                save_workspace(path, record)
 
     with locked_workspace(plan["workspace_id"]):
         prior = load_workspace(workspace_record_path(plan["workspace_id"]))
@@ -730,7 +746,7 @@ def launch(*, manifest: Path, task_id: str, allow_mutation: bool = False, resume
     if new_attempt:
         before_spawn()  # refuse before the record moves to the new attempt; they run again right before spawning
         with locked_workspace(plan["workspace_id"]):
-            path, record = _workspace(plan, manifest)
+            path, record = _workspace(plan, manifest, require_current_pins=True)
             _begin_attempt(record, task_id, attempt, exec_id, inputs, verdict)
             save_workspace(path, record)
     try:
@@ -746,7 +762,7 @@ def launch(*, manifest: Path, task_id: str, allow_mutation: bool = False, resume
     except headless_run.HeadlessError as exc:
         raise WorkspaceRunError(exc.code, exc.detail) from exc
     with locked_workspace(plan["workspace_id"]):
-        path, record = _workspace(plan, manifest)
+        path, record = _workspace(plan, manifest, require_current_pins=True)
         entry = _entry(record, task, repo, execution, inputs)
         if budget_override is not None and execution.get("outcome") in {"launched", "resumed"}:
             entry["budget_override"] = budget_override
@@ -851,14 +867,11 @@ def preflight(*, manifest: Path, allow_mutation: bool = False, access_check=None
 def status(*, manifest: Path, task_id: str | None = None, access_check=None) -> dict:
     plan = _plan(manifest, access_check=access_check)
     with locked_workspace(plan["workspace_id"]):
-        return _status_locked(plan, manifest, task_id)
-
-
-def _status_locked(plan: dict, manifest: Path, task_id: str | None) -> dict:
-    path, record = _workspace(plan, manifest)
+        _, before = _workspace(plan, manifest)
     tasks = [t for t in plan["tasks"] if task_id is None or t["id"] == task_id]
     if task_id is not None and not tasks:
         raise WorkspaceRunError("WORKSPACE_TASK_UNKNOWN", f"task {task_id} is not in the manifest")
+    refreshed = []
     for task in tasks:
         if any(b["scope"] == "task" and b["id"] == task["id"] and b["code"] == EVIDENCE_CHANGED
                for b in plan["blockers"]):
@@ -868,17 +881,26 @@ def _status_locked(plan: dict, manifest: Path, task_id: str | None) -> dict:
                                                                     "TARGET_REPOSITORY_AMBIGUOUS", "WORKSPACE_REPOSITORY_PATH_MISSING"}:
             continue
         try:
+            # The launcher holds the execution lock while its before_spawn callback
+            # takes the workspace lock. Never acquire those locks in reverse order.
             execution = headless_run.status(target=Path(repo["resolved_path"]), explicit_repo=repo["repository"],
                                             execution_id=current_execution_id(plan["workspace_id"], task["id"],
-                                                                              record["tasks"].get(task["id"])))
+                                                                              before["tasks"].get(task["id"])))
         except headless_run.HeadlessError as exc:
             if exc.code == "EXECUTION_UNKNOWN":
                 continue
             raise WorkspaceRunError(exc.code, exc.detail) from exc
-        _entry(record, task, repo, execution)
-    save_workspace(path, record)
-    return {"workspace_id": plan["workspace_id"], "tasks": compatible_entries(record, manifest), "workspace_record": str(path),
-            "plan_status": plan["status"], "plan_blockers": plan["blockers"]}
+        refreshed.append((task, repo, execution))
+    with locked_workspace(plan["workspace_id"]):
+        path, record = _workspace(plan, manifest, require_current_pins=True)
+        for task, repo, execution in refreshed:
+            # A launch, retry or contract observation may have advanced this entry
+            # during the read. Leave it intact; a later poll can refresh it again.
+            if record["tasks"].get(task["id"]) == before["tasks"].get(task["id"]):
+                _entry(record, task, repo, execution)
+        save_workspace(path, record)
+        return {"workspace_id": plan["workspace_id"], "tasks": compatible_entries(record, manifest), "workspace_record": str(path),
+                "plan_status": plan["status"], "plan_blockers": plan["blockers"]}
 
 
 def cancel(*, manifest: Path, task_id: str, access_check=None) -> dict:
