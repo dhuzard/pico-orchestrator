@@ -309,6 +309,14 @@ class GardenControlsTest(unittest.TestCase):
         refused = controls.act({"action": "repin_manifest", "repository": "alpha"})
         self.assertEqual(refused["error_code"], "WORKSPACE_MANIFEST_PATH_UNSAFE")
 
+    def test_repin_accepts_platform_style_symlinked_ancestor(self):
+        alias = self.path.parent / "outer_alias"
+        alias.symlink_to(self.path.parent.parent, target_is_directory=True)
+        manifest = alias / self.path.parent.name / self.path.name
+        controls = gc.Controls(manifest, self.port, adapter=self.fake)
+        refused = controls.act({"action": "repin_manifest", "repository": "alpha"})
+        self.assertEqual(refused["error_code"], "WORKSPACE_PIN_UNCHANGED")
+
     def test_repin_refuses_unrelated_committed_change(self):
         checkout = self.repos["alpha"][0]
         (checkout / "README.md").write_text("new version\n")

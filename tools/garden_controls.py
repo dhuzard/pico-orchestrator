@@ -783,10 +783,12 @@ class Controls:
         if repo.get("blocker_code"):
             raise ControlError(409, repo["blocker_code"], "repository identity or pin is unresolved")
         manifest = self.manifest.absolute()
+        # The explicit CLI path may sit below platform symlinks (macOS /var);
+        # refuse the manifest and its immediate directory, then keep the write scoped there.
         if manifest.is_symlink() or manifest.parent.is_symlink():
             raise ControlError(409, "WORKSPACE_MANIFEST_PATH_UNSAFE", "manifest path is a symlink")
         try:
-            atomic_io.check_no_symlinks(manifest, Path(manifest.anchor))
+            atomic_io.check_no_symlinks(manifest, manifest.parent)
             if not manifest.is_file() or manifest.stat().st_size > MAX_MANIFEST_BYTES:
                 raise OSError("manifest is absent or too large")
             before = manifest.read_text(encoding="utf-8")
@@ -895,7 +897,7 @@ class Controls:
                     raise ControlError(409, "CONTROL_PREVIEW_STALE", "checkout policy changed while the pin was being saved")
             try:
                 atomic_io.atomic_write_text(prepared["manifest"], prepared["after"],
-                                            root=Path(prepared["manifest"].anchor), validate=still_current)
+                                            root=prepared["manifest"].parent, validate=still_current)
             except (OSError, atomic_io.UnsafePathError) as exc:
                 raise ControlError(409, "WORKSPACE_MANIFEST_WRITE_FAILED", "manifest could not be saved safely") from exc
         refreshed = self._plan()
