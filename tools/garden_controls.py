@@ -53,9 +53,11 @@ import workspace_contracts  # noqa: E402
 import workspace_run  # noqa: E402
 import workspace_scheduler  # noqa: E402
 import workspace_action_view  # noqa: E402
+import workspace_plan  # noqa: E402
+import provenance  # noqa: E402
 
 TASK_ACTIONS = ("validate", "publish", "ci", "promote", "cancel")
-WORKSPACE_ACTIONS = ("schedule", "set_permission", "approve_mutation", "commit_policy", "set_model", "reset_model")
+WORKSPACE_ACTIONS = ("schedule", "set_permission", "approve_mutation", "commit_policy", "repin_manifest", "set_model", "reset_model")
 ACTIONS = TASK_ACTIONS + WORKSPACE_ACTIONS
 # Editable from the Garden; mark_pr_ready, merge and deploy stay file-only.
 EDITABLE_PERMISSIONS = ("create_backlog_items", "create_github_issues", "create_worktrees", "commit",
@@ -67,6 +69,82 @@ MAX_BODY = 16 * 1024
 MAX_AUDIT = 100
 PERMISSIONS = ("create_backlog_items", "create_github_issues", "create_worktrees", "commit", "push_branch",
                "create_pr", "comment_on_issue", "comment_on_pr", "mark_pr_ready", "deploy")
+MAX_MANIFEST_BYTES = 1024 * 1024
+
+
+def _manifest_repin_text(before: str, raw: dict, repository_id: str, old: str, new: str) -> str:
+    """Change one scalar in a conventional block YAML manifest; refuse ambiguous layouts."""
+    lines = before.splitlines(keepends=True)
+    sections = [i for i, line in enumerate(lines) if re.fullmatch(r"repositories:\s*(?:#.*)?\n?", line)]
+    if len(sections) != 1:
+        raise ControlError(409, "WORKSPACE_MANIFEST_UNEDITABLE", "repositories must be a block YAML list")
+    start = sections[0] + 1
+    end = next((i for i in range(start, len(lines)) if re.match(r"^[A-Za-z_][A-Za-z0-9_]*:", lines[i])), len(lines))
+    entries = [i for i in range(start, end) if lines[i].startswith("- ")]
+    declared = raw.get("repositories") or []
+    if len(entries) != len(declared):
+        raise ControlError(409, "WORKSPACE_MANIFEST_UNEDITABLE", "repository entries must be block YAML mappings")
+    index = next((i for i, item in enumerate(declared) if item["id"] == repository_id), None)
+    if index is None:
+        raise ControlError(404, "CONTROL_REPOSITORY_INVALID", "repository is not in the manifest")
+    first = entries[index]
+    last = entries[index + 1] if index + 1 < len(entries) else end
+    matches = [(i, re.fullmatch(r"(  pinned_commit:\s*)([0-9a-f]{40})(\s*(?:#.*)?\n?)", lines[i]))
+               for i in range(first, last)]
+    matches = [(i, match) for i, match in matches if match]
+    if len(matches) != 1 or matches[0][1].group(2) != old:
+        raise ControlError(409, "WORKSPACE_MANIFEST_UNEDITABLE", "the selected pin must be one plain YAML line")
+    line, match = matches[0]
+    lines[line] = f"{match.group(1)}{new}{match.group(3)}"
+    after = "".join(lines)
+    try:
+        updated = yaml.safe_load(after)
+    except yaml.YAMLError:
+        updated = None
+    expected = {**raw, "repositories": [{**item, "pinned_commit": new} if item["id"] == repository_id else item
+                                               for item in declared]}
+    if updated != expected or workspace_plan.validate_manifest(updated):
+        raise ControlError(409, "WORKSPACE_MANIFEST_UNEDITABLE", "the pin edit would change another manifest field")
+    return after
+
+
+def _git_value(checkout: Path, *args: str) -> str | None:
+    try:
+        result = subprocess.run(["git", "-C", str(checkout), *args], shell=False,
+                                capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def _effective_authority(repo: dict) -> dict:
+    """Show pinned local authority separately from the unqueried GitHub policy."""
+    checkout = Path(repo["resolved_path"]) if repo.get("resolved_path") else None
+    pin = repo.get("pinned_commit")
+    result = {"pinned_commit": pin, "policy_source": "unavailable", "policy_blob": None,
+              "local_mutation": {name: False for name in workspace_authorization.REQUIRED},
+              "missing_local_permissions": list(workspace_authorization.REQUIRED),
+              "operator_allow_mutation_required": True, "working_head": None,
+              "working_branch": None, "working_policy_differs": None,
+              "publication": {"source": "default_branch_github", "status": "not_checked"},
+              "error_code": repo.get("blocker_code")}
+    if checkout is None or result["error_code"]:
+        return result
+    result["working_head"] = _git_value(checkout, "rev-parse", "HEAD")
+    result["working_branch"] = _git_value(checkout, "symbolic-ref", "--quiet", "--short", "HEAD")
+    try:
+        policy, blob = workspace_authorization.committed_policy(checkout, pin)
+    except autonomy_policy.AutonomyPolicyError:
+        result["error_code"] = "AUTONOMY_POLICY_INVALID"
+        return result
+    grants = (policy or {}).get("permissions") or {}
+    result.update({"policy_source": "committed" if policy is not None else "default",
+                   "policy_blob": blob,
+                   "local_mutation": {name: grants.get(name) is True for name in workspace_authorization.REQUIRED},
+                   "missing_local_permissions": [name for name in workspace_authorization.REQUIRED
+                                                 if grants.get(name) is not True],
+                   "working_policy_differs": workspace_authorization._working_copy_differs(checkout, blob)})
+    return result
 
 
 class ControlError(Exception):
@@ -180,6 +258,7 @@ class Controls:
                                          str(path.relative_to(checkout))], shell=False, capture_output=True,
                                         text=True, timeout=10)
                 item["policy_uncommitted"] = bool(status.stdout.strip())
+            item["effective"] = _effective_authority(repo)
             repositories.append(item)
         try:
             path = model_profiles.default_config_path()
@@ -196,6 +275,34 @@ class Controls:
         entries = workspace_run.status(manifest=self.manifest, access_check=None)["tasks"]
         budget = workspace_scheduler.budget_state(plan, record)
         action_view = workspace_action_view.snapshot(plan, entries, budget=budget, scheduler_running=running)
+        for repo in plan["repositories"]:
+            try:
+                approval = self._approve_mutation(plan, {"repository": repo["id"]}, None)
+                approve_available = approval.get("ok") is True
+                approve_code = None if approve_available else "MUTATION_APPROVAL_UNAVAILABLE"
+                approve_explanation = "Preview the local policy grants required by this repository's tasks."
+            except (ControlError, workspace_run.WorkspaceRunError) as exc:
+                approve_available, approve_code, approve_explanation = False, exc.code, exc.detail
+            action_view["actions"].append({"action": "approve_mutation", "target": repo["id"],
+                                           "available": approve_available, "refusal_code": approve_code,
+                                           "explanation": approve_explanation,
+                                           "required_permissions": list(workspace_authorization.REQUIRED),
+                                           "state_id": action_view["state_id"],
+                                           "effective_configuration": {"pinned_commit": repo.get("pinned_commit")},
+                                           "requires_preview": True,
+                                           "invocation": {"action": "approve_mutation", "repository": repo["id"]}})
+            try:
+                self._repin_prepare(plan, repo["id"])
+                available, code, explanation = True, None, "Preview the exact manifest pin change before confirming."
+            except (ControlError, workspace_run.WorkspaceRunError) as exc:
+                available, code, explanation = False, exc.code, exc.detail
+            action_view["actions"].append({"action": "repin_manifest", "target": repo["id"],
+                                           "available": available, "refusal_code": code,
+                                           "explanation": explanation, "required_permissions": [],
+                                           "state_id": action_view["state_id"],
+                                           "effective_configuration": {"pinned_commit": repo.get("pinned_commit")},
+                                           "requires_preview": True,
+                                           "invocation": {"action": "repin_manifest", "repository": repo["id"]}})
         return {"repositories": repositories, "models": models,
                 "editable_permissions": list(EDITABLE_PERMISSIONS),
                 "scheduler": {"running": running, "last": self.last_schedule},
@@ -519,6 +626,12 @@ class Controls:
         branch and pinned in the manifest. Push, PR, mark-ready, merge and deploy are never touched.
         """
         repo, checkout = self._repo(plan, data.get("repository"))
+        if repo.get("blocker_code"):
+            raise ControlError(409, repo["blocker_code"], "repository identity or pin is unresolved")
+        base = repo.get("base_branch", "main")
+        branch = _git_value(checkout, "symbolic-ref", "--quiet", "--short", "HEAD")
+        if branch != base:
+            raise ControlError(409, "POLICY_APPROVAL_BRANCH", f"checkout must be on its base branch {base}")
         path = autonomy_policy.policy_path(checkout)
         _safe_policy_location(path)
         before = path.read_text(encoding="utf-8") if path.is_file() else ""
@@ -542,11 +655,13 @@ class Controls:
             raise ControlError(409, "AUTONOMY_POLICY_UNEDITABLE", str(exc)[:200]) from None
         tasks = sorted(t["id"] for t in plan["tasks"] if t["repository"] == repo["id"]
                        and t.get("kind") != "qualification" and t.get("mutation") != "none")
+        if not tasks:
+            raise ControlError(409, "MUTATION_APPROVAL_TASKS_NONE",
+                               "this repository has no mutating implementation task requiring local authorization")
         diff = "".join(difflib.unified_diff(before.splitlines(True), after.splitlines(True),
                                             fromfile=".pi/autonomy.yaml", tofile=".pi/autonomy.yaml"))
         expected = self._confirm("approve_mutation", repo["id"], missing, hashlib.sha256(before.encode()).hexdigest())
         if confirm is None:
-            base = repo.get("base_branch", "main")
             return {"ok": True, "stage": "preview", "confirm": expected,
                     "preview": {"repository": repo["repository"], "grants": missing, "tasks": tasks,
                                 "creates_file": not before, "diff": diff,
@@ -661,3 +776,124 @@ class Controls:
         commit = git("rev-parse", "HEAD").stdout.strip()
         return {"ok": True, "stage": "done", "status": "POLICY_COMMITTED", "commit": commit,
                 "audit": {"repository": repo["id"], "commit": commit}}
+
+    def _repin_prepare(self, plan: dict, repository_id: str) -> dict:
+        """Read-only preflight for a single pin edit; every check repeats on confirmation."""
+        repo, checkout = self._repo(plan, repository_id)
+        if repo.get("blocker_code"):
+            raise ControlError(409, repo["blocker_code"], "repository identity or pin is unresolved")
+        manifest = self.manifest.absolute()
+        if manifest.is_symlink() or manifest.parent.is_symlink():
+            raise ControlError(409, "WORKSPACE_MANIFEST_PATH_UNSAFE", "manifest path is a symlink")
+        try:
+            atomic_io.check_no_symlinks(manifest, manifest.parent)
+            if not manifest.is_file() or manifest.stat().st_size > MAX_MANIFEST_BYTES:
+                raise OSError("manifest is absent or too large")
+            before = manifest.read_text(encoding="utf-8")
+        except (OSError, UnicodeError, atomic_io.UnsafePathError) as exc:
+            raise ControlError(409, "WORKSPACE_MANIFEST_PATH_UNSAFE", "manifest cannot be safely edited") from exc
+        try:
+            raw = workspace_plan.load_manifest(manifest)
+        except workspace_plan.WorkspaceError as exc:
+            raise ControlError(409, "WORKSPACE_MANIFEST_INVALID", "manifest changed or cannot be read") from exc
+        if not isinstance(raw, dict) or workspace_plan.validate_manifest(raw) or raw.get("id") != plan["workspace_id"]:
+            raise ControlError(409, "WORKSPACE_MANIFEST_INVALID", "manifest changed or cannot be validated")
+        declared = next((item for item in raw["repositories"] if item["id"] == repository_id), None)
+        if declared is None or declared["pinned_commit"] != repo["pinned_commit"] \
+                or declared["repository"] != repo["repository"] or declared["path"] != repo["path"]:
+            raise ControlError(409, "CONTROL_PREVIEW_STALE", "repository declaration changed; inspect the workspace again")
+        old = repo["pinned_commit"]
+        head = _git_value(checkout, "rev-parse", "HEAD")
+        branch = _git_value(checkout, "symbolic-ref", "--quiet", "--short", "HEAD")
+        base = repo.get("base_branch", "main")
+        if branch != base or not head or not re.fullmatch(r"[0-9a-f]{40}", head):
+            raise ControlError(409, "WORKSPACE_REPIN_BRANCH", f"checkout must be on its base branch {base}")
+        if head == old:
+            raise ControlError(409, "WORKSPACE_PIN_UNCHANGED", "manifest already pins the checkout HEAD")
+        try:
+            ancestor = subprocess.run(["git", "-C", str(checkout), "merge-base", "--is-ancestor", old, head],
+                                      shell=False, capture_output=True, timeout=10)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise ControlError(409, "WORKSPACE_REPIN_NOT_DESCENDANT", "commit ancestry cannot be checked") from exc
+        if ancestor.returncode:
+            raise ControlError(409, "WORKSPACE_REPIN_NOT_DESCENDANT", "checkout HEAD must descend from the old pin")
+        try:
+            changed = subprocess.run(["git", "-C", str(checkout), "diff", "--name-only", "-z", old, head, "--"],
+                                     shell=False, capture_output=True, timeout=10)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise ControlError(409, "WORKSPACE_REPIN_SCOPE_CHANGED", "policy-only scope cannot be checked") from exc
+        paths = set(changed.stdout.split(b"\0")) - {b""} if changed.returncode == 0 else set()
+        if changed.returncode or paths != {b".pi/autonomy.yaml"}:
+            raise ControlError(409, "WORKSPACE_REPIN_SCOPE_CHANGED",
+                               "this authorization repin permits only .pi/autonomy.yaml changes since the old pin")
+        dirty = _git_value(checkout, "status", "--porcelain", "--untracked-files=no")
+        if dirty is None or dirty:
+            raise ControlError(409, "WORKSPACE_CHECKOUT_DIRTY", "commit tracked checkout changes before repinning")
+        try:
+            policy, blob = workspace_authorization.committed_policy(checkout, head)
+        except autonomy_policy.AutonomyPolicyError as exc:
+            raise ControlError(409, "AUTONOMY_POLICY_INVALID", "the policy at checkout HEAD is invalid") from exc
+        grants = (policy or {}).get("permissions") or {}
+        if any(grants.get(name) is not True for name in workspace_authorization.REQUIRED):
+            raise ControlError(409, "MUTATION_AUTHORIZATION_REQUIRED",
+                               "the committed policy at checkout HEAD must grant create_worktrees and commit")
+        if workspace_authorization._working_copy_differs(checkout, blob):
+            raise ControlError(409, "AUTONOMY_POLICY_UNCOMMITTED", "the working policy differs from checkout HEAD")
+        record = workspace_run.load_workspace(workspace_run.workspace_record_path(plan["workspace_id"])) or {}
+        if any(not session.get("finished_at") for session in record.get("sessions") or [] if isinstance(session, dict)):
+            raise ControlError(409, "WORKSPACE_SCHEDULER_ACTIVE", "wait for the scheduler session to finish")
+        selected = {task_id: entry for task_id, entry in (record.get("tasks") or {}).items()
+                    if isinstance(entry, dict) and entry.get("repository") == repository_id}
+        for entry in selected.values():
+            if entry.get("attempts") or entry.get("execution_status") != "exited" or not entry.get("run_id") \
+                    or entry.get("pinned_commit") != old or entry.get("target_repository") != repo["repository"]:
+                raise ControlError(409, "WORKSPACE_REPIN_TASK_STARTED",
+                                   "a task has work that cannot be silently moved to another pin")
+            try:
+                trace = provenance.get_run(Path(__file__).resolve().parent.parent, entry["run_id"])
+                execution = workspace_run.headless_run.status(target=checkout, explicit_repo=repo["repository"],
+                                                               execution_id=entry["execution_id"])
+            except (OSError, ValueError, provenance.ProvenanceError, workspace_run.headless_run.HeadlessError) as exc:
+                raise ControlError(409, "WORKSPACE_REPIN_TASK_STARTED", "child run evidence cannot be verified") from exc
+            if execution.get("run_id") != entry["run_id"] or execution.get("status") != "exited" \
+                    or not workspace_authorization.stopped_for_authorization(trace, execution.get("checkout")):
+                raise ControlError(409, "WORKSPACE_REPIN_TASK_STARTED",
+                                   "a task has work that cannot be silently moved to another pin")
+        after = _manifest_repin_text(before, raw, repository_id, old, head)
+        diff = "".join(difflib.unified_diff(before.splitlines(True), after.splitlines(True),
+                                            fromfile=str(manifest.name), tofile=str(manifest.name)))
+        state_digest = hashlib.sha256(json.dumps(selected, sort_keys=True).encode()).hexdigest()
+        binding = self._confirm("repin_manifest", repository_id, hashlib.sha256(before.encode()).hexdigest(),
+                                head, branch, blob, state_digest)
+        return {"manifest": manifest, "before": before, "after": after, "diff": diff, "repo": repo,
+                "old": old, "head": head, "branch": branch, "blob": blob, "confirm": binding}
+
+    def _repin_manifest(self, plan: dict, data: dict, confirm: str | None) -> dict:
+        repository_id = data.get("repository")
+        if not isinstance(repository_id, str) or not TASK_RE.fullmatch(repository_id):
+            raise ControlError(400, "CONTROL_REPOSITORY_INVALID", "repository id is invalid")
+        with workspace_run.locked_workspace(plan["workspace_id"]):
+            prepared = self._repin_prepare(plan, repository_id)
+            if confirm is None:
+                return {"ok": True, "stage": "preview", "confirm": prepared["confirm"],
+                        "preview": {"repository": prepared["repo"]["repository"],
+                                    "branch": prepared["branch"], "old_pin": prepared["old"],
+                                    "new_pin": prepared["head"], "policy_blob": prepared["blob"],
+                                    "diff": prepared["diff"],
+                                    "note": "Only this repository pin changes. No worker launches, policy changes, "
+                                            "GitHub write, or branch update occurs."}}
+            self._check_confirm(confirm, prepared["confirm"])
+            def still_current(_temporary: Path) -> None:
+                if prepared["manifest"].read_text(encoding="utf-8") != prepared["before"]:
+                    raise ControlError(409, "CONTROL_PREVIEW_STALE", "manifest changed while the pin was being saved")
+            try:
+                atomic_io.atomic_write_text(prepared["manifest"], prepared["after"],
+                                            root=prepared["manifest"].parent, validate=still_current)
+            except (OSError, atomic_io.UnsafePathError) as exc:
+                raise ControlError(409, "WORKSPACE_MANIFEST_WRITE_FAILED", "manifest could not be saved safely") from exc
+        refreshed = self._plan()
+        return {"ok": True, "stage": "done", "status": "MANIFEST_REPINNED", "pinned_commit": prepared["head"],
+                "plan_status": refreshed["status"],
+                "blockers": [{key: row.get(key) for key in ("scope", "id", "code")}
+                             for row in refreshed["blockers"]],
+                "audit": {"repository": repository_id, "old_pin": prepared["old"], "new_pin": prepared["head"]}}
