@@ -84,6 +84,8 @@ PICO runs on Linux and macOS, and on Windows through WSL2. You need:
 - [Work modes](docs/work-modes.md): how the lead decomposes mixed work.
 - [Workspace manifest builder](docs/workspace-interactive-design.md):
   `pico workspace init`, its builder spec and its safety rules.
+- [Remote Garden architecture](docs/remote-garden-adr.md): proposed private
+  Android access, trust boundaries and security gates; remote access is not yet enabled.
 - [Orchestration guidance](docs/orchestration-guidance.md): how the policy
   maps to published orchestration guidance.
 - [Release checklist](docs/release-checklist.md) and
