@@ -340,6 +340,7 @@ child, and `--resume` continues an interrupted child in the same parent run.
 The child is an ordinary single-repository run with its own
 `target_repository`; the launcher links its run id into the workspace record
 in orchestrator state. `pico workspace status` reconciles every task and
+includes planner blocker codes; a blocked plan returns `ok: false` and exit 1.
 `pico workspace cancel --task <id>` stops one child. Ordering and concurrency
 across tasks belong to the scheduler (`pico workspace schedule`).
 
