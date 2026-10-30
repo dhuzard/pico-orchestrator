@@ -1402,10 +1402,10 @@ module docstrings.
 
 Backlog additions and updates hold one filesystem lock across loading,
 validation, and replacement, so concurrent CLI processes cannot overwrite
-each other's changes. The lock lives in Git's common metadata directory, keyed
-by the physical backlog path. For a collection outside Git, it lives in a
-private PICO directory under the user's temporary directory. Neither location
-adds an untracked file to the target checkout.
+each other's changes. The lock lives under `/tmp` in a private directory keyed
+by the physical backlog path. This location is the same across CLI processes
+even if their `TMPDIR` or Git lookup differs, and it adds no untracked file to
+the target checkout.
 
 Each backlog item is validated against `schemas/backlog-item.schema.json`
 and has (at minimum) `id` (a stable `ORCH-NNN` identifier), `title`,

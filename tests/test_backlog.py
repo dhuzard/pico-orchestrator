@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import io
 import concurrent.futures
+import os
 import shutil
 import subprocess
 import sys
@@ -110,9 +111,12 @@ class BacklogStoreTest(unittest.TestCase):
             "backlog_store.backlog_add(id='ORCH-001', title='one', description='test', "
             "version='v1', repo_root=Path(sys.argv[2]))"
         )
+        alternate_tmp = self.repo_root / "alternate-tmp"
+        alternate_tmp.mkdir()
+        child_env = {**os.environ, "TMPDIR": str(alternate_tmp)}
         with store.locked_backlog(self.repo_root):
             child = subprocess.Popen([sys.executable, "-c", script, str(TOOLS_DIR), str(self.repo_root)],
-                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=child_env)
             self.assertEqual(child.stdout.readline().strip(), "ready")
             with self.assertRaises(subprocess.TimeoutExpired):
                 child.wait(timeout=0.2)
