@@ -161,6 +161,19 @@ class WorkspaceViewTest(WorkspaceViewFixture):
         self.assertEqual(tasks["docs-2"]["refusal_code"], "WORKSPACE_PIN_MISMATCH")
         self.assertEqual(tasks["web-3"]["refusal_code"], None)
 
+    def test_attention_uses_native_states_and_excludes_private_text(self):
+        view = self.view(manifest=self.manifest)
+        rows = {row["task_id"]: row for row in view["attention"]}
+        self.assertEqual(rows["api-2"]["state"], "failed")
+        self.assertEqual(rows["api-2"]["reason_code"], "WORKER_FAILED")
+        self.assertEqual(rows["web-2"]["state"], "blocked_by_failure")
+        self.assertEqual(rows["web-2"]["blocked_by"], ["api-2"])
+        self.assertEqual(rows["docs-2"]["reason_code"], "WORKSPACE_PIN_MISMATCH")
+        self.assertNotIn("api-1", rows)
+        self.assertNotIn("web-3", rows)
+        self.assertNotIn(SENTINEL, json.dumps(rows))
+        self.assertTrue(all(row["actions"] == [] for row in rows.values()))
+
     def test_child_runs_links_and_sessions(self):
         tasks = self.tasks(self.view(manifest=self.manifest))
         self.assertEqual(tasks["api-1"]["run"]["id"], "run-api1")

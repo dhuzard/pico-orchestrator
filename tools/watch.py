@@ -19,6 +19,7 @@ import workspace_run
 import garden_controls  # noqa: E402
 import workspace_setup  # noqa: E402
 import garden_issues  # noqa: E402
+import workspace_attention  # noqa: E402
 import run_lease  # noqa: E402
 from usage import TOKEN_FIELDS, cost_coverage, run_tokens, sum_tokens  # noqa: E402,F401
 import workspace_scheduler
@@ -423,7 +424,7 @@ def workspace_view(state: Path, *, workspace_id: str | None = None, manifest: Pa
         repositories.append({"id": repo_id, "repository": _match(identity or declared.get("repository"), REPOSITORY),
                              "pinned_commit": _match(pinned, SHA), "blocker_code": _match(declared.get("blocker_code"), CODE),
                              "tasks": tasks, "tokens": sum_tokens(tokens_by_repo.get(repo_id, []))})
-    return {"workspace_id": workspace_id, "source": source, "record_found": bool(record),
+    view = {"workspace_id": workspace_id, "source": source, "record_found": bool(record),
             "updated_at": _match(record.get("updated_at"), STAMP),
             "plan_status": plan.get("status") if plan.get("status") in {"PLANNED", "BLOCKED"} else None,
             "max_parallel": _count(plan.get("max_parallel")),
@@ -434,6 +435,8 @@ def workspace_view(state: Path, *, workspace_id: str | None = None, manifest: Pa
             "approval_requests": [_approval_request(r) for r in report.get("approval_requests") or []],
             "repeated_authorization_stops": _ids(report.get("repeated_authorization_stops")),
             "sessions": sessions}
+    view["attention"] = workspace_attention.attention_rows(view)
+    return view
 
 
 def _authorization(verdict) -> dict | None:
