@@ -299,6 +299,13 @@ class GardenControlsTest(unittest.TestCase):
         self.assertEqual(refused["error_code"], "WORKSPACE_MANIFEST_PATH_UNSAFE")
         self.assertEqual(original.read_text(), before)
 
+    def test_repin_refuses_symlinked_manifest_directory(self):
+        alias = self.path.parent / "alias"
+        alias.symlink_to(self.path.parent, target_is_directory=True)
+        controls = gc.Controls(alias / self.path.name, self.port, adapter=self.fake)
+        refused = controls.act({"action": "repin_manifest", "repository": "alpha"})
+        self.assertEqual(refused["error_code"], "WORKSPACE_MANIFEST_PATH_UNSAFE")
+
     def test_repin_refuses_unrelated_committed_change(self):
         checkout = self.repos["alpha"][0]
         (checkout / "README.md").write_text("new version\n")
