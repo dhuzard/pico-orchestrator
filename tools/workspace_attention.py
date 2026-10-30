@@ -8,7 +8,7 @@ from __future__ import annotations
 
 
 REASONS = {
-    "awaiting_authorization": "Repository mutation authorization is required before this task can start.",
+    "awaiting_authorization": "This task is waiting for repository mutation authorization.",
     "waiting_for_authorization": "An upstream task is waiting for repository authorization.",
     "needs_reconciliation": "The previous run stopped with an uncertain outcome and needs reconciliation.",
     "failed": "The child run failed.",

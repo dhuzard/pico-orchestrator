@@ -560,7 +560,10 @@ function workspaceTaskCard(task) {
   return card;
 }
 function renderWorkspaceBoard(data) {
-  const board = $("ws-repos"); board.replaceChildren();
+  const board = $("ws-repos");
+  const focusedTask = board.contains(document.activeElement) && document.activeElement?.classList.contains("ws-task")
+    ? document.activeElement.id : null;
+  board.replaceChildren();
   if (!data?.ok) { board.append(el("p", "empty", "The workspace cannot be read. Check the id or manifest passed to --workspace.")); return; }
   if (!data.repositories.length) { board.append(el("p", "empty", "This workspace has no recorded tasks yet.")); return; }
   for (const repo of data.repositories) {
@@ -577,12 +580,13 @@ function renderWorkspaceBoard(data) {
     for (const task of repo.tasks) column.append(workspaceTaskCard({ ...task, repository_id: repo.id }));
     board.append(column);
   }
+  if (focusedTask) document.getElementById(focusedTask)?.focus({ preventScroll: true });
 }
 function workspaceTaskDomId(repository, task) {
   return `ws-task-${encodeURIComponent(repository || "unknown")}-${encodeURIComponent(task || "unknown")}`;
 }
 const attentionReasons = {
-  awaiting_authorization: "Local mutation needs authorization before this task can launch.",
+  awaiting_authorization: "This task is waiting for repository mutation authorization.",
   waiting_for_authorization: "An upstream task needs authorization before this one can launch.",
   needs_reconciliation: "This interrupted attempt needs reconciliation before work continues.",
   blocked_by_failure: "An upstream task failed or was cancelled.",
