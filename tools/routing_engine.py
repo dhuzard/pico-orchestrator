@@ -1825,15 +1825,6 @@ def merge_risk_floors(floor_sets: Iterable[dict], task_schema: dict) -> dict:
 # system. Both sides are compared in Unicode NFC, so a precomposed and a
 # decomposed spelling of the same name match the same globs.
 
-# Built-in floors, applied in every repository before the project's own
-# `path_floors` and by the same matcher: agent and harness configuration
-# (`.pi/` holds routing and autonomy policy, `.claude/` and `.mcp.json` hooks and
-# MCP servers) and CI workflows (they run with repository secrets). A task or a
-# diff touching them is security-sensitive. Recorded with `source: builtin`.
-BUILTIN_PATH_FLOORS: tuple[dict, ...] = (
-    {"paths": [".pi/**", ".claude/**", ".mcp.json", ".github/workflows/**"],
-     "floors": {"security_sensitive": True}},
-)
 # Recorded paths longer than this are cut (with the number of characters cut),
 # so a record stays schema-valid; matching always uses the full path.
 RECORDED_PATH_MAX = 4096
@@ -1844,9 +1835,9 @@ def normalize_repo_path(value: Any) -> str | None:
     Unicode NFC, or None when it cannot name one (control characters,
     absolute, escaping the root, or using a backslash). Leading `./` and
     trailing `/` are dropped and repeated `/` collapsed."""
-    if not isinstance(value, str):
+    if not isinstance(value, str) or re.search(r"[\x00-\x1f\x7f]", value):
         return None
-    text = unicodedata.normalize("NFC", value.strip())
+    text = unicodedata.normalize("NFC", value)
     while text.startswith("./"):
         text = text[2:]
     segments = [segment for segment in text.split("/") if segment not in ("", ".")]
@@ -1952,14 +1943,14 @@ def match_path_floors(paths: Iterable[Any], path_floors: Iterable[dict] | None, 
     return matches
 
 
-def match_all_path_floors(paths: Iterable[Any], project_routing: dict | None, *, declared: bool = False) -> list[dict]:
+def match_all_path_floors(paths: Iterable[Any], project_routing: dict | None, policy: dict, *, declared: bool = False) -> list[dict]:
     """Built-in floors, then the project's `path_floors`, matched against `paths`."""
     paths = list(paths)
-    return [*match_path_floors(paths, BUILTIN_PATH_FLOORS, source="builtin", declared=declared),
+    return [*match_path_floors(paths, policy["path_floors"], source="builtin", declared=declared),
             *match_path_floors(paths, (project_routing or {}).get("path_floors"), declared=declared)]
 
 
-def project_risk_floors(task: dict, project_routing: dict | None, task_schema: dict, *,
+def project_risk_floors(task: dict, project_routing: dict | None, task_schema: dict, policy: dict, *,
                         diff_paths: Iterable[Any] = (), path_floors: bool = True) -> tuple[dict, list[dict]]:
     """The floors `route_task` applies to `task`: project-wide `risk_overrides`
     merged with every built-in and project path floor its `files_or_areas`
@@ -1971,10 +1962,10 @@ def project_risk_floors(task: dict, project_routing: dict | None, task_schema: d
     matches: list[dict] = []
     extra: list[dict] = []
     if path_floors:
-        matches = match_all_path_floors(task.get("files_or_areas") or [], config, declared=True)
+        matches = match_all_path_floors(task.get("files_or_areas") or [], config, policy, declared=True)
         diff_paths = list(diff_paths)
         if diff_paths:
-            extra = match_all_path_floors(diff_paths, config)
+            extra = match_all_path_floors(diff_paths, config, policy)
     floors = merge_risk_floors([config.get("risk_overrides") or {},
                                 *(match["floors"] for match in [*matches, *extra])], task_schema)
     return floors, matches
@@ -2183,6 +2174,14 @@ def _non_string_key_issues(value: Any, label: str) -> list[ValidationIssue]:
     return issues
 
 
+def validate_builtin_path_floors(policy: dict, project_schema: dict, issues: list[ValidationIssue]) -> None:
+    """The global policy uses the same closed, raise-only rules as project floors."""
+    if not isinstance(policy, dict) or "path_floors" not in policy:
+        issues.append(ValidationIssue(message="policy.path_floors must be declared"))
+        return
+    issues.extend(validate_instance({"path_floors": policy["path_floors"]}, project_schema, label="policy"))
+
+
 def validate_project_routing_instance(config: Any, project_schema: dict) -> list[ValidationIssue]:
     issues = _non_string_key_issues(config, "project_routing")
     issues.extend(validate_instance(config, project_schema, label="project_routing"))
@@ -2277,6 +2276,7 @@ def load_policy_assets(repo_root: Path, model_config_path: Path | None = None) -
         load_backend_compatibility(repo_root, model_config=model_config, effective_policy=policy)
     validate_delegation_policy(delegation_policy, delegation_schema, policy, issues)
     validate_project_routing_schema(project_schema, task_schema, issues)
+    validate_builtin_path_floors(policy, project_schema, issues)
     if issues:
         joined = "; ".join(str(i) for i in issues)
         raise RoutingAssetError(f"routing/delegation policy assets are structurally invalid: {joined}")
@@ -2346,7 +2346,7 @@ def resolve_route(
     base_matched = match_routes(task, policy)
     base_route = select_route(base_matched, policy)
 
-    risk_floors, path_floor_matches = project_risk_floors(task, project_routing, task_schema,
+    risk_floors, path_floor_matches = project_risk_floors(task, project_routing, task_schema, policy,
                                                           diff_paths=diff_paths, path_floors=path_floors)
     effective_task = apply_risk_overrides(task, risk_floors, task_schema) if risk_floors else dict(task)
     effective_matched = match_routes(effective_task, policy) if risk_floors else base_matched
@@ -2649,7 +2649,7 @@ def check_diff_path_floors(route_result: Any, changed_paths: Iterable[Any], asse
     project_constraints = route_result.get("project_constraints") or {}
     excluded = (route_result.get("route_availability") or {}).get("excluded_routes") or []
     changed = sorted({normalize_repo_path(value) for value in raw})
-    diff_matches = match_all_path_floors(changed, project_constraints)
+    diff_matches = match_all_path_floors(changed, project_constraints, assets.policy)
     ran = _decision_view(route_result["selected_route"], route_result["capacity_assignments"])
     result = {
         "ok": True,
@@ -2732,11 +2732,12 @@ def summary_satisfies_floors(summary: Any, floors: dict, task_schema: dict) -> b
 
 
 def check_recorded_path_floors(changed_paths: Iterable[Any], project_routing: dict | None,
-                               summaries: Iterable[Any], task_schema: dict) -> dict:
+                               summaries: Iterable[Any], task_schema: dict, policy: dict) -> dict:
     """The post-diff check where only the run record is reachable (workspace
     validation and publication): a commit's changed paths against the built-in
     floors and `project_routing` (read from the pinned base, never the work),
-    compared with the routing summaries the child run recorded. No floor
+    compared with routing summaries already verified by the caller as covering
+    these paths at the candidate commit in a completed phase/epoch. No floor
     matched: passes. Some recorded summary already satisfies every matched
     floor: passes (re-routing would change nothing). Otherwise
     CLASSIFICATION_UNDERRATED_BY_DIFF; with no usable summary, or a changed
@@ -2746,7 +2747,7 @@ def check_recorded_path_floors(changed_paths: Iterable[Any], project_routing: di
     if any(normalize_repo_path(value) is None for value in raw):
         return {"ok": False, "blocked": True, "blocker_code": CLASSIFICATION_DIFF_UNVERIFIABLE,
                 "diff_path_floor_matches": [], "reason": "a changed path is not a repository-relative path"}
-    matches = match_all_path_floors(raw, project_routing)
+    matches = match_all_path_floors(raw, project_routing, policy)
     result = {"ok": True, "blocked": False, "blocker_code": None, "diff_path_floor_matches": matches}
     if not matches:
         return result

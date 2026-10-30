@@ -30,10 +30,11 @@ upstream PRs; nothing here merges, marks ready, or pushes to a base branch.
 `validate` and `publish` also run the post-diff path-floor check on the work
 commit against the pinned commit (#76): its changed paths are matched against
 the built-in floors and the `.pi/routing.yaml` path floors of the pinned
-commit, never the work's own copy, and compared with the routing decisions the
-task's child run recorded. A commit those floors put above every recorded
-decision is refused with CLASSIFICATION_UNDERRATED_BY_DIFF; one that matches a
-floor while no recorded decision can be read is refused with
+commit, never the work's own copy. Every floored path needs completed current
+phase/epoch evidence: all routed steps completed, an integrated wave's clean
+parent diff check naming the path by SHA-256, and the checked content unchanged
+at the candidate commit. A verified decision below the floors is refused with
+CLASSIFICATION_UNDERRATED_BY_DIFF; missing or stale evidence is refused with
 CLASSIFICATION_DIFF_UNVERIFIABLE.
 
 Observed state lives in the workspace record; the manifest is never changed.
@@ -42,7 +43,9 @@ Exit codes: 0 ok, 1 blocked or refused, 2 invalid invocation.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import re
 import subprocess
 import sys
 import time
@@ -139,20 +142,73 @@ def run_check(check: dict, checkout: Path, commit: str, scratch: Path) -> dict:
     return result
 
 
-def _recorded_routing(run_id: str | None) -> list[dict]:
-    """Routing summaries the child run recorded for its phases (and their re-routes); empty when unreadable."""
+def _recorded_run(run_id: str | None) -> dict:
+    """Read the child record; historical or unreadable evidence never authorizes a floored path."""
     if not run_id:
-        return []
+        return {}
     try:
-        record = provenance.get_run(headless_run.ROOT, run_id)
+        return provenance.get_run(headless_run.ROOT, run_id)
     except (provenance.ProvenanceError, OSError, ValueError):
-        return []
-    summaries = []
-    for phase in (record.get("parent_orchestration") or {}).get("phases") or []:
-        for item in [phase, *(phase.get("escalations") or [])]:
-            if isinstance(item, dict) and isinstance(item.get("routing"), dict):
-                summaries.append(item["routing"])
-    return summaries
+        return {}
+
+
+def _recorded_path_routing(run_id: str | None, checkout: Path, pin: str, commit: str,
+                           paths: list[str]) -> dict[str, list[dict]]:
+    """Completed phase decisions bound to the exact content being validated.
+
+    Parent integration records contain hashes of raw Git paths, avoiding path
+    disclosure in provenance. A checked commit may precede the candidate only
+    when the particular path's blob and mode are unchanged. Summaries alone,
+    worktree checks, incomplete epochs and unintegrated waves are not evidence.
+    """
+    parent = _recorded_run(run_id).get("parent_orchestration") or {}
+    waves = {wave.get("id"): wave for wave in parent.get("waves") or [] if isinstance(wave, dict)}
+    eligible: dict[str, list[dict]] = {path: [] for path in paths}
+    digests = {path: hashlib.sha256(path.encode("utf-8")).hexdigest() for path in paths}
+    for phase in parent.get("phases") or []:
+        if not isinstance(phase, dict) or phase.get("status") != "completed" or phase.get("workspace_bound"):
+            continue
+        escalations = phase.get("escalations") or []
+        if any(item.get("confirmed") is not True for item in escalations):
+            continue
+        epoch = len(escalations)
+        decision = escalations[-1] if escalations else phase
+        summary = decision.get("routing")
+        assignments = summary.get("assignments") if isinstance(summary, dict) else None
+        if not isinstance(assignments, list) or not assignments:
+            continue
+        completed = {worker.get("step_id") for worker in phase.get("workers") or []
+                     if worker.get("route_epoch", 0) == epoch and worker.get("status") == "completed"}
+        if any(not isinstance(item, dict) or not item.get("step_id") or item["step_id"] not in completed
+               for item in assignments):
+            continue
+        route = decision.get("to_route") if escalations else phase.get("route")
+        for check in phase.get("diff_floor_checks") or []:
+            wave = waves.get(check.get("wave_id")) or {}
+            if (check.get("operation") != "parent" or check.get("status") != "passed"
+                    or check.get("route_epoch") != epoch or check.get("route") != route
+                    or wave.get("status") != "integrated" or phase.get("id") not in (wave.get("task_ids") or [])):
+                continue
+            base, head = check.get("base"), check.get("head")
+            fingerprints = check.get("path_digests")
+            if (not all(isinstance(value, str) and re.fullmatch(r"[0-9a-f]{40,64}", value)
+                        for value in (base, head)) or not isinstance(fingerprints, list)
+                    or len(fingerprints) > 200 or not all(isinstance(value, str) and
+                        re.fullmatch(r"[0-9a-f]{64}", value) for value in fingerprints)):
+                continue
+            if any(_git(checkout, "merge-base", "--is-ancestor", earlier, later).returncode
+                   for earlier, later in ((pin, head), (base, head), (head, commit))):
+                continue
+            for path, digest in digests.items():
+                if digest not in fingerprints:
+                    continue
+                # Literal pathspecs prevent filenames beginning ':(' from
+                # turning a content comparison into a Git path expression.
+                changed = _git(checkout, "--literal-pathspecs", "diff", "--quiet", base, head, "--", path)
+                unchanged = _git(checkout, "--literal-pathspecs", "diff", "--quiet", head, commit, "--", path)
+                if changed.returncode == 1 and unchanged.returncode == 0:
+                    eligible[path].append(summary)
+    return eligible
 
 
 def path_floor_check(plan: dict, task: dict, repo: dict, commit: str) -> dict:
@@ -182,8 +238,17 @@ def path_floor_check(plan: dict, task: dict, repo: dict, commit: str) -> dict:
                 engine.validate_project_routing_instance(project_routing, assets.project_schema))):
             return {**unverifiable, "reason": "the pinned commit's .pi/routing.yaml cannot be read or is invalid"}
     run_id = (_entry(plan, task["id"]) or {}).get("run_id")
-    verdict = engine.check_recorded_path_floors(paths, project_routing, _recorded_routing(run_id), assets.task_schema)
-    return {**verdict, "base": base, "commit": commit}
+    summaries = _recorded_path_routing(run_id, checkout, base, commit, paths)
+    verdicts = [engine.check_recorded_path_floors([path], project_routing, summaries[path],
+                                                assets.task_schema, assets.policy) for path in paths]
+    unverifiable_paths = any(verdict["ok"] is not True for verdict in verdicts)
+    blocked = any(verdict["blocked"] for verdict in verdicts)
+    code = (engine.CLASSIFICATION_DIFF_UNVERIFIABLE if unverifiable_paths else
+            engine.CLASSIFICATION_UNDERRATED_BY_DIFF if blocked else None)
+    return {"ok": not unverifiable_paths, "blocked": blocked, "blocker_code": code,
+            "diff_path_floor_matches": engine.match_all_path_floors(paths, project_routing, assets.policy),
+            "reason": ("floored paths require completed phase evidence tied to their integrated content" if blocked else None),
+            "base": base, "commit": commit}
 
 
 def _refuse_underrated(verdict: dict) -> None:

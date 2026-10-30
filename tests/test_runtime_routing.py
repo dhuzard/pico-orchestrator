@@ -1386,7 +1386,7 @@ class CLICasesTest(unittest.TestCase):
                 self.assertEqual(result["policy_version"], 7)
                 # The fixtures' expected_route is the global policy alone; a task declaring a path under a built-in
                 # path floor (.pi/, .claude/, .mcp.json, .github/workflows/, #76) is security-sensitive at runtime.
-                builtin = engine.match_all_path_floors(case["task"]["files_or_areas"], None, declared=True)
+                builtin = engine.match_all_path_floors(case["task"]["files_or_areas"], None, self.assets.policy, declared=True)
                 route = "CODEX_CLAUDE_CODEX" if builtin else case["expected_route"]
                 self.assertEqual(result["selected_route"], route)
                 self.assertEqual(set(result["matches"]["base"]), set(case["expected_matches"]))

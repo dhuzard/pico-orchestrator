@@ -188,7 +188,7 @@ class ClassifierBenchmarkTest(unittest.TestCase):
                 for field, value in engine.ESCALATING_CLASSIFICATION_VALUES.items():
                     self.assertNotEqual(gold[field], value)
                 self.assertFalse(gold["diagnosis_required"])
-                if engine.match_all_path_floors(case["task_facts"]["files_or_areas"], None, declared=True):
+                if engine.match_all_path_floors(case["task_facts"]["files_or_areas"], None, self.assets.policy, declared=True):
                     # A built-in path floor (.pi/ and friends) is not a rubric judgment; without path floors the
                     # low-risk gold still stays off the strongest route.
                     task = benchmark.materialize_task(case["task_facts"], gold)
@@ -217,6 +217,16 @@ class ClassifierBenchmarkTest(unittest.TestCase):
         self.assertEqual(result["route_accuracy_with_path_floors"], 1.0)
         for mismatch in result["mismatches"]:
             self.assertEqual(mismatch["predicted_route_with_path_floors"], mismatch["gold_route_with_path_floors"])
+
+    def test_baseline_preserves_non_path_project_risk_overrides(self):
+        case, prediction = self._understated("classifier-023-path-floor-migration")
+        case = copy.deepcopy(case)
+        case["project_routing"] = {"risk_overrides": {"failure_cost": "high"}}
+        case.pop("expected_decision", None)
+        result = benchmark.evaluate([case], {case["id"]: prediction}, self.assets, require_all=True)
+        self.assertEqual(result["policy_under_routing_rate"], 0.0)
+        self.assertEqual(result["policy_under_routing_rate_with_path_floors"], 0.0)
+        self.assertEqual(result["route_accuracy"], result["route_accuracy_with_path_floors"])
 
     def test_unmatched_path_floor_changes_nothing(self):
         case = next(c for c in self.cases if c["id"] == "classifier-025-path-floor-unmatched-docs")

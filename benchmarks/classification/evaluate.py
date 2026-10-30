@@ -261,8 +261,8 @@ def evaluate(
         case_id = case["id"]
         gold_task = validate_case(case, fields, assets)
         gold_classification = case["gold_classification"]
-        gold_decision = decision_signature(gold_task, assets, path_floors=False)
         project_routing = case.get("project_routing")
+        gold_decision = decision_signature(gold_task, assets, project_routing, path_floors=False)
         gold_floored = decision_signature(gold_task, assets, project_routing)
 
         if case_id not in predictions:
@@ -304,7 +304,7 @@ def evaluate(
         if not wrong_fields:
             exact_correct += 1
 
-        candidate_decision = decision_signature(candidate_task, assets, path_floors=False)
+        candidate_decision = decision_signature(candidate_task, assets, project_routing, path_floors=False)
         if candidate_decision["route"] == gold_decision["route"]:
             route_correct += 1
         else:

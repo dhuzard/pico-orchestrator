@@ -126,7 +126,7 @@ The evaluator reports:
 - **with path floors** — route accuracy and policy under-/over-routing rates
   with each case's `project_routing` applied to both the candidate and the gold
   classification, i.e. what production routing would select. The rates above
-  ignore `project_routing`, so the pair shows how much under-routing the
+  keep the same project configuration but disable path floors, so the pair shows how much under-routing the
   project's path floors recover (cases without `project_routing` count the same
   in both). The built-in path floors (`.pi/`, `.claude/`, `.mcp.json`,
   `.github/workflows/`) apply to every case in the `with path floors` metrics

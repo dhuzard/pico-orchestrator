@@ -313,7 +313,7 @@ path_floors:
   floor: ordered fields can only be raised, booleans can only be `true`, and
   unknown keys are rejected. `validate_project_routing_schema` checks that the
   reference stays in place.
-- **Built-in floors.** `routing_engine.BUILTIN_PATH_FLOORS` applies in every
+- **Built-in floors.** `routing/default-policy.yaml` `path_floors` applies in every
   repository, before the project's rules and through the same matcher:
   `.pi/**` (routing and autonomy policy), `.claude/**` and `.mcp.json` (hooks
   and MCP servers), and `.github/workflows/**` (CI runs with repository
@@ -431,14 +431,23 @@ path_floors:
   work's own copy), and `pico workspace publish` repeats the check. The full
   route result is not kept in the run record, so the comparison uses the
   routing summaries the child run recorded for its phases (and re-routes):
-  the commit passes when no floor matches, or when some recorded decision
-  already meets every matched floor (re-applying them changes nothing). A
-  floor no recorded decision meets is refused with
-  `CLASSIFICATION_UNDERRATED_BY_DIFF`, and a matched floor with no readable
-  decision, an invalid pinned `.pi/routing.yaml` or an unusable path name with
+  a floored path passes only with evidence from a completed phase in its
+  current, confirmed route epoch whose routed steps all completed. The phase
+  must have a passed parent diff check from an integrated wave. That check
+  records the integration base/head and SHA-256 hashes of the full raw Git
+  paths attributed to the phase, avoiding path disclosure. It is recorded
+  only for a clean parent checkout and at most 200 changed paths; larger or
+  uncommitted integrations have no qualifying publication evidence. The
+  checked head must be an ancestor of the candidate and the path's content
+  and mode must remain unchanged. Different paths may be covered by different
+  completed phases. An unrelated summary, an older epoch, an unfinished wave,
+  or a worktree-only check cannot authorize publication. Old records without
+  this evidence fail closed for floored paths.
+  A verified decision below a floor is refused with
+  `CLASSIFICATION_UNDERRATED_BY_DIFF`; missing or stale evidence, invalid
+  pinned configuration and unusable path names use
   `CLASSIFICATION_DIFF_UNVERIFIABLE`. The summary keeps `behavior_preservation`
-  only as `required`, so a `preferred` floor counts as unmet. This is coarser
-  than the in-run check: any recorded phase can satisfy the floors.
+  only as `required`, so a `preferred` floor counts as unmet.
 - **Not covered.** Content-based detection (secret scanning, SQL parsing) is
   out of scope: only paths are matched. Ignored files are not checked (Git
   does not merge them). The check cannot prove that the new route's steps

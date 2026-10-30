@@ -129,7 +129,7 @@ class PathFloorRoutingTest(Routed):
                 self.assertEqual(verdict["blocker_code"], engine.CLASSIFICATION_UNDERRATED_BY_DIFF)
         for path in (".github/dependabot.yml", "pi/x", "docs/.claude.md", ".mcp.json.bak"):
             with self.subTest(unfloored=path):
-                self.assertEqual(engine.match_all_path_floors([path], None), [])
+                self.assertEqual(engine.match_all_path_floors([path], None, self.assets.policy), [])
 
     def test_schema_accepts_path_floors_and_rejects_weakening_unknown_and_malformed(self):
         self.assertEqual(engine.validate_project_routing_instance(PROJECT, self.assets.project_schema), [])
@@ -266,23 +266,56 @@ class PathFloorRoutingTest(Routed):
                       "{'failure_cost': 'high', 'behavior_preservation': 'required'} via migrations/000.sql, ", text)
         self.assertIn("migrations/009.sql (+2 more)", text)
 
+    def test_raw_control_characters_fail_closed_before_normalization(self):
+        ran = self.route(small_task())
+        for control in ("\t", "\r", "\n", "\x00", "\x7f"):
+            for path in (control + "src/file.py", "src/file.py" + control):
+                with self.subTest(path=repr(path)):
+                    self.assertIsNone(engine.normalize_repo_path(path))
+                    self.assertEqual(engine.check_diff_path_floors(ran, [path], self.assets)["blocker_code"],
+                                     engine.CLASSIFICATION_DIFF_UNVERIFIABLE)
+
+    def test_raw_filename_whitespace_is_preserved_for_matching(self):
+        project = {"path_floors": [{"paths": ["secret?"], "floors": {"security_sensitive": True}}]}
+        self.assertEqual(engine.normalize_repo_path("secret "), "secret ")
+        verdict = engine.check_diff_path_floors(self.route(small_task(), project), ["secret "], self.assets)
+        self.assertTrue(verdict["blocked"])
+
+    def test_builtin_floors_are_loaded_from_policy_and_validated(self):
+        policy = copy.deepcopy(self.assets.policy)
+        policy["path_floors"] = [{"paths": ["custom/**"], "floors": {"failure_cost": "high"}}]
+        resolved = engine.resolve_route(small_task(files_or_areas=["custom/x"]), policy, None,
+                                        self.assets.task_schema)
+        self.assertEqual(resolved.effective_classification["failure_cost"], "high")
+        self.assertEqual(engine.match_all_path_floors([".pi/x"], None, policy), [])
+        for invalid in (None, [{"paths": ["../escape"], "floors": {"security_sensitive": True}}],
+                        [{"paths": ["custom/**"], "floors": {"security_sensitive": False}}]):
+            policy["path_floors"] = invalid
+            issues = []
+            engine.validate_builtin_path_floors(policy, self.assets.project_schema, issues)
+            self.assertTrue(issues)
+        del policy["path_floors"]
+        issues = []
+        engine.validate_builtin_path_floors(policy, self.assets.project_schema, issues)
+        self.assertTrue(issues)
+
     def test_recorded_routing_check_for_workspace_validation(self):
         schema = self.assets.task_schema
         low = {"failure_cost": "low", "semantic_correctness": "normal", "ambiguity": 2, "diagnosis_required": False,
                "implementation_scope": "small", "signals": []}
         high = {**low, "failure_cost": "high", "signals": ["behavior_preservation_required"]}
-        verdict = engine.check_recorded_path_floors(["src/x.py"], PROJECT, [], schema)
+        verdict = engine.check_recorded_path_floors(["src/x.py"], PROJECT, [], schema, self.assets.policy)
         self.assertEqual((verdict["ok"], verdict["blocked"]), (True, False))
-        verdict = engine.check_recorded_path_floors(["migrations/1.sql"], PROJECT, [low], schema)
+        verdict = engine.check_recorded_path_floors(["migrations/1.sql"], PROJECT, [low], schema, self.assets.policy)
         self.assertEqual(verdict["blocker_code"], engine.CLASSIFICATION_UNDERRATED_BY_DIFF)
-        self.assertFalse(engine.check_recorded_path_floors(["migrations/1.sql"], PROJECT, [low, high], schema)["blocked"])
-        self.assertEqual(engine.check_recorded_path_floors(["migrations/1.sql"], PROJECT, [], schema)["blocker_code"],
+        self.assertFalse(engine.check_recorded_path_floors(["migrations/1.sql"], PROJECT, [low, high], schema, self.assets.policy)["blocked"])
+        self.assertEqual(engine.check_recorded_path_floors(["migrations/1.sql"], PROJECT, [], schema, self.assets.policy)["blocker_code"],
                          engine.CLASSIFICATION_DIFF_UNVERIFIABLE)
-        self.assertEqual(engine.check_recorded_path_floors([".pi/autonomy.yaml"], None, [high], schema)["blocker_code"],
+        self.assertEqual(engine.check_recorded_path_floors([".pi/autonomy.yaml"], None, [high], schema, self.assets.policy)["blocker_code"],
                          engine.CLASSIFICATION_UNDERRATED_BY_DIFF)
         self.assertFalse(engine.check_recorded_path_floors([".pi/autonomy.yaml"], None,
-                                                           [{**low, "signals": ["security_sensitive"]}], schema)["blocked"])
-        self.assertEqual(engine.check_recorded_path_floors(["a\tb"], None, [high], schema)["blocker_code"],
+                                                           [{**low, "signals": ["security_sensitive"]}], schema, self.assets.policy)["blocked"])
+        self.assertEqual(engine.check_recorded_path_floors(["a\tb"], None, [high], schema, self.assets.policy)["blocker_code"],
                          engine.CLASSIFICATION_DIFF_UNVERIFIABLE)
 
 
@@ -673,9 +706,9 @@ class WorkspaceValidationFloorsTest(unittest.TestCase):
         self.plan = {"workspace_id": "ws"}
         self.task = {"id": "a1"}
         self.repo_entry = {"resolved_path": str(self.repo), "pinned_commit": self.pin}
-        self.summaries: list = []
+        self.record = {"parent_orchestration": {"phases": [], "waves": []}}
         self._patches = [unittest.mock.patch.object(wc, "_entry", return_value={"run_id": "r"}),
-                         unittest.mock.patch.object(wc, "_recorded_routing", side_effect=lambda run_id: self.summaries)]
+                         unittest.mock.patch.object(wc, "_recorded_run", side_effect=lambda run_id: self.record)]
         for patch in self._patches:
             patch.start()
 
@@ -698,24 +731,96 @@ class WorkspaceValidationFloorsTest(unittest.TestCase):
     def test_unfloored_commit_passes_without_a_run(self):
         self.assertEqual(self.check(self.commit("src/a.py"))["blocked"], False)
 
-    def test_floored_commit_needs_a_recorded_decision_at_or_above_the_floors(self):
+    def add_evidence(self, commit: str, paths: list[str], *, failure_cost: str = "high",
+                     signals: list[str] | None = None) -> dict:
+        summary = {"failure_cost": failure_cost, "semantic_correctness": "normal", "ambiguity": 2,
+                   "diagnosis_required": False, "implementation_scope": "small",
+                   "signals": signals if signals is not None else ["behavior_preservation_required"],
+                   "assignments": [{"step_id": "implement"}, {"step_id": "review"}]}
+        phase_id = f"phase-{len(self.record['parent_orchestration']['phases'])}"
+        wave_id = f"wave-{phase_id}"
+        phase = {"id": phase_id, "status": "completed", "route": "CODEX_CLAUDE_CODEX", "routing": summary,
+                 "workers": [{"step_id": step, "status": "completed", "route_epoch": 0}
+                             for step in ("implement", "review")],
+                 "diff_floor_checks": [{"status": "passed", "operation": "parent", "base": self.pin,
+                                        "head": commit, "wave_id": wave_id, "route_epoch": 0,
+                                        "route": "CODEX_CLAUDE_CODEX", "matches": [],
+                                        "path_digests": sorted(hashlib.sha256(path.encode()).hexdigest()
+                                                               for path in paths)}]}
+        self.record["parent_orchestration"]["phases"].append(phase)
+        self.record["parent_orchestration"]["waves"].append({"id": wave_id, "status": "integrated", "task_ids": [phase_id]})
+        return phase
+
+    def test_floored_commit_needs_completed_commit_bound_evidence(self):
         commit = self.commit("migrations/1.sql")
         self.assertEqual(self.check(commit)["blocker_code"], engine.CLASSIFICATION_DIFF_UNVERIFIABLE)
-        self.summaries = [{"failure_cost": "low", "semantic_correctness": "normal", "ambiguity": 2,
-                           "diagnosis_required": False, "implementation_scope": "small", "signals": []}]
+        phase = self.add_evidence(commit, ["migrations/1.sql"], failure_cost="low", signals=[])
         self.assertEqual(self.check(commit)["blocker_code"], engine.CLASSIFICATION_UNDERRATED_BY_DIFF)
-        with self.assertRaises(self.wc.WorkspaceRunError) as refused:
+        with self.assertRaises(self.wc.WorkspaceRunError):
             self.wc._refuse_underrated(self.check(commit))
-        self.assertEqual(refused.exception.code, engine.CLASSIFICATION_UNDERRATED_BY_DIFF)
-        self.summaries.append({**self.summaries[0], "failure_cost": "high", "signals": ["behavior_preservation_required"]})
+        phase["routing"].update(failure_cost="high", signals=["behavior_preservation_required"])
         self.assertFalse(self.check(commit)["blocked"])
 
+    def test_unrelated_summary_and_old_worktree_checks_do_not_authorize_publish(self):
+        commit = self.commit(".pi/autonomy.yaml")
+        phase = self.add_evidence(commit, ["src/unrelated.py"], signals=["security_sensitive"])
+        self.assertEqual(self.check(commit)["blocker_code"], engine.CLASSIFICATION_DIFF_UNVERIFIABLE)
+        phase["diff_floor_checks"][0]["path_digests"] = [hashlib.sha256(b".pi/autonomy.yaml").hexdigest()]
+        phase["diff_floor_checks"][0].pop("operation")
+        self.assertEqual(self.check(commit)["blocker_code"], engine.CLASSIFICATION_DIFF_UNVERIFIABLE)
+
+    def test_incomplete_or_stale_epoch_and_wave_evidence_fails_closed(self):
+        commit = self.commit("migrations/1.sql")
+        self.add_evidence(commit, ["migrations/1.sql"])
+        original = copy.deepcopy(self.record)
+        mutations = [
+            lambda p: p.update(status="in_progress"),
+            lambda p: p["workers"][1].update(status="not_started"),
+            lambda p: p["workers"][1].update(route_epoch=1),
+            lambda p: p["diff_floor_checks"][0].update(route_epoch=1),
+            lambda p: p.update(escalations=[{"confirmed": False}]),
+            lambda p: p.update(escalations=[{"confirmed": True, "routing": p["routing"], "to_route": p["route"]}]),
+            lambda p: p["diff_floor_checks"][0].update(wave_id="unrelated"),
+            lambda p: self.record["parent_orchestration"]["waves"][0].update(status="integrating"),
+        ]
+        for mutate in mutations:
+            self.record = copy.deepcopy(original)
+            mutate(self.record["parent_orchestration"]["phases"][0])
+            self.assertEqual(self.check(commit)["blocker_code"], engine.CLASSIFICATION_DIFF_UNVERIFIABLE)
+
+    def test_integrated_content_remains_valid_across_unrelated_later_commits(self):
+        first = self.commit("migrations/1.sql")
+        self.add_evidence(first, ["migrations/1.sql"])
+        later = self.commit("src/other.py")
+        self.assertFalse(self.check(later)["blocked"])
+        changed = self.commit("migrations/1.sql", "changed after review\n")
+        self.assertEqual(self.check(changed)["blocker_code"], engine.CLASSIFICATION_DIFF_UNVERIFIABLE)
+
+    def test_evidence_must_include_real_changed_path_in_checked_commit(self):
+        first = self.commit("src/other.py")
+        later = self.commit("migrations/1.sql")
+        self.add_evidence(first, ["migrations/1.sql"])
+        self.assertEqual(self.check(later)["blocker_code"], engine.CLASSIFICATION_DIFF_UNVERIFIABLE)
+
+    def test_separate_phases_can_cover_separate_floored_paths(self):
+        first = self.commit("migrations/1.sql")
+        self.add_evidence(first, ["migrations/1.sql"])
+        second = self.commit(".pi/autonomy.yaml")
+        self.add_evidence(second, [".pi/autonomy.yaml"], failure_cost="low", signals=["security_sensitive"])
+        self.assertFalse(self.check(second)["blocked"])
+
+    def test_literal_git_pathspec_and_raw_control_characters(self):
+        commit = self.commit(":(glob)file")
+        self.add_evidence(commit, [":(glob)file"])
+        evidence = self.wc._recorded_path_routing("r", self.repo, self.pin, commit, [":(glob)file"])
+        self.assertEqual(len(evidence[":(glob)file"]), 1)
+        commit = self.commit("src/file.py\n")
+        self.assertEqual(self.check(commit)["blocker_code"], engine.CLASSIFICATION_DIFF_UNVERIFIABLE)
+
     def test_the_work_cannot_remove_the_pinned_floors(self):
-        self.summaries = [{"failure_cost": "low", "semantic_correctness": "normal", "ambiguity": 2,
-                           "diagnosis_required": False, "implementation_scope": "small", "signals": ["security_sensitive"]}]
         self.commit(".pi/routing.yaml", "path_floors: []\n")
         commit = self.commit("migrations/1.sql")
-        # The edited routing.yaml is itself a built-in floor (satisfied: security_sensitive), the migration is not.
+        self.add_evidence(commit, [".pi/routing.yaml", "migrations/1.sql"], failure_cost="low", signals=["security_sensitive"])
         self.assertEqual(self.check(commit)["blocker_code"], engine.CLASSIFICATION_UNDERRATED_BY_DIFF)
 
 
