@@ -715,7 +715,7 @@ def _status_locked(plan: dict, manifest: Path, task_id: str | None) -> dict:
         _entry(record, task, repo, execution)
     save_workspace(path, record)
     return {"workspace_id": plan["workspace_id"], "tasks": record["tasks"], "workspace_record": str(path),
-            "plan_status": plan["status"]}
+            "plan_status": plan["status"], "plan_blockers": plan["blockers"]}
 
 
 def cancel(*, manifest: Path, task_id: str, access_check=None) -> dict:
@@ -768,7 +768,7 @@ def main(argv: list[str] | None = None) -> int:
             ok = result["task"]["execution_status"] == "launched" or result["task"]["run_status"] in {"COMPLETED", "PARTIAL"}
         elif args.command == "status":
             result = status(manifest=args.manifest, task_id=args.task, access_check=access)
-            ok = True
+            ok = result["plan_status"] != "BLOCKED"
         elif args.command == "preflight":
             result = preflight(manifest=args.manifest, allow_mutation=args.allow_mutation, access_check=access)
             ok = result["status"] == "AUTHORIZED"
