@@ -45,7 +45,7 @@ import autonomy_policy  # noqa: E402
 import difflib  # noqa: E402
 import io  # noqa: E402
 import os  # noqa: E402
-from contextlib import redirect_stdout  # noqa: E402
+from contextlib import ExitStack, redirect_stdout  # noqa: E402
 import model_profiles  # noqa: E402
 import routing_engine as engine  # noqa: E402
 import workspace_authorization  # noqa: E402
@@ -894,6 +894,7 @@ class Controls:
             raise ControlError(409, "WORKSPACE_SCHEDULER_ACTIVE", "wait for the scheduler session to finish")
         selected = {task_id: entry for task_id, entry in (record.get("tasks") or {}).items()
                     if isinstance(entry, dict) and entry.get("repository") == repository_id}
+        executions = []
         for entry in selected.values():
             if entry.get("attempts") or entry.get("execution_status") != "exited" or not entry.get("run_id") \
                     or entry.get("pinned_commit") != old or entry.get("target_repository") != repo["repository"]:
@@ -907,8 +908,12 @@ class Controls:
                 trace = provenance.get_run(Path(__file__).resolve().parent.parent, entry["run_id"])
                 execution = workspace_run.headless_run.status(target=checkout, explicit_repo=repo["repository"],
                                                                execution_id=entry["execution_id"])
+                _, _, common = workspace_run.headless_run._target(checkout, repo["repository"])
+                execution_path = workspace_run.headless_run.execution_path(common, entry["execution_id"])
             except (OSError, ValueError, provenance.ProvenanceError, workspace_run.headless_run.HeadlessError) as exc:
                 raise ControlError(409, "WORKSPACE_REPIN_TASK_STARTED", "child run evidence cannot be verified") from exc
+            executions.append({"path": execution_path,
+                               "record": execution, "run_id": entry["run_id"], "trace": trace})
             if execution.get("run_id") != entry["run_id"] or execution.get("status") != "exited" \
                     or not workspace_authorization.stopped_for_authorization(trace, execution.get("checkout")):
                 raise ControlError(409, "WORKSPACE_REPIN_TASK_STARTED",
@@ -917,17 +922,42 @@ class Controls:
         diff = "".join(difflib.unified_diff(before.splitlines(True), after.splitlines(True),
                                             fromfile=str(manifest.name), tofile=str(manifest.name)))
         state_digest = hashlib.sha256(json.dumps(selected, sort_keys=True).encode()).hexdigest()
-        binding = self._confirm("repin_manifest", repository_id, hashlib.sha256(before.encode()).hexdigest(),
+        binding = self._confirm("repin_manifest", self._confirmation_scope(plan), repository_id,
+                                hashlib.sha256(before.encode()).hexdigest(),
                                 head, branch, blob, state_digest)
         return {"manifest": manifest, "before": before, "after": after, "diff": diff, "repo": repo,
-                "old": old, "head": head, "branch": branch, "blob": blob, "confirm": binding}
+                "old": old, "head": head, "branch": branch, "blob": blob, "confirm": binding,
+                "executions": executions}
 
     def _repin_manifest(self, plan: dict, data: dict, confirm: str | None) -> dict:
         repository_id = data.get("repository")
         if not isinstance(repository_id, str) or not TASK_RE.fullmatch(repository_id):
             raise ControlError(400, "CONTROL_REPOSITORY_INVALID", "repository id is invalid")
-        with workspace_run.locked_workspace(plan["workspace_id"]):
-            prepared = self._repin_prepare(plan, repository_id)
+        # status() takes execution locks and may reconcile records. Never call it while
+        # holding the workspace lock: launch takes these locks in the opposite order.
+        prepared = self._repin_prepare(plan, repository_id)
+        with ExitStack() as locks:
+            for path in sorted({item["path"] for item in prepared["executions"]}):
+                locks.enter_context(workspace_run.headless_run.locked_record(path))
+            locks.enter_context(workspace_run.locked_workspace(plan["workspace_id"]))
+
+            def still_current(_temporary: Path | None = None) -> None:
+                try:
+                    current = self._repin_prepare(self._plan(), repository_id, inspect_execution=False)
+                except (ControlError, workspace_run.WorkspaceRunError) as exc:
+                    raise ControlError(409, "CONTROL_PREVIEW_STALE", "workspace changed during repin") from exc
+                self._check_confirm(prepared["confirm"], current["confirm"])
+                for item in prepared["executions"]:
+                    try:
+                        execution = workspace_run.headless_run.load_record(item["path"])
+                        trace = provenance.get_run(Path(__file__).resolve().parent.parent, item["run_id"])
+                    except (OSError, ValueError, provenance.ProvenanceError,
+                            workspace_run.headless_run.HeadlessError) as exc:
+                        raise ControlError(409, "CONTROL_PREVIEW_STALE", "child run evidence changed during repin") from exc
+                    if execution != item["record"] or trace != item["trace"]:
+                        raise ControlError(409, "CONTROL_PREVIEW_STALE", "child run evidence changed during repin")
+
+            still_current()
             if confirm is None:
                 return {"ok": True, "stage": "preview", "confirm": prepared["confirm"],
                         "preview": {"repository": prepared["repo"]["repository"],
@@ -937,16 +967,6 @@ class Controls:
                                     "note": "Only this repository pin changes. No worker launches, policy changes, "
                                             "GitHub write, or branch update occurs."}}
             self._check_confirm(confirm, prepared["confirm"])
-            def still_current(_temporary: Path) -> None:
-                if prepared["manifest"].read_text(encoding="utf-8") != prepared["before"]:
-                    raise ControlError(409, "CONTROL_PREVIEW_STALE", "manifest changed while the pin was being saved")
-                checkout = Path(prepared["repo"]["resolved_path"])
-                if _git_value(checkout, "rev-parse", "HEAD") != prepared["head"] or \
-                        _git_value(checkout, "symbolic-ref", "--quiet", "--short", "HEAD") != prepared["branch"]:
-                    raise ControlError(409, "CONTROL_PREVIEW_STALE", "checkout changed while the pin was being saved")
-                if _git_value(checkout, "status", "--porcelain", "--untracked-files=no") != "" or \
-                        workspace_authorization._working_copy_differs(checkout, prepared["blob"]):
-                    raise ControlError(409, "CONTROL_PREVIEW_STALE", "checkout policy changed while the pin was being saved")
             try:
                 atomic_io.atomic_write_text(prepared["manifest"], prepared["after"],
                                             root=prepared["manifest"].parent, validate=still_current)

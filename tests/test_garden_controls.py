@@ -13,6 +13,7 @@ import threading
 import unittest
 from unittest.mock import patch
 import yaml
+from contextlib import contextmanager
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
@@ -494,6 +495,102 @@ class GardenControlsTest(unittest.TestCase):
         _, refused = self.act(action="repin_manifest", repository="alpha")
         self.assertEqual(refused["error_code"], "WORKSPACE_REPIN_SCOPE_CHANGED")
         self.assertEqual(self.path.read_text(), before)
+
+    def _stopped_authorization_repin(self):
+        self.drop_policy("alpha")
+        checkout, old = self.repos["alpha"]
+        approval = self.controls.act({"action": "approve_mutation", "repository": "alpha"})
+        self.controls.act({"action": "approve_mutation", "repository": "alpha", "confirm": approval["confirm"]})
+        git("-C", str(checkout), "add", ".pi/autonomy.yaml")
+        git("-C", str(checkout), *COMMIT, "grant local mutation")
+        run_id = "run-approval"
+        trace = {"run_id": run_id, "parent_orchestration": {
+            "final_status": "BLOCKED", "blocker_code": "MUTATION_AUTHORIZATION_REQUIRED",
+            "mutations": {"code": 0, "github": 0}}}
+        trace_path = gc.provenance.run_path(REPO_ROOT, run_id)
+        trace_path.parent.mkdir(parents=True, exist_ok=True)
+        trace_path.write_text(json.dumps(trace))
+        _, _, common = wr.headless_run._target(checkout, "acme/alpha")
+        execution_path = wr.headless_run.execution_path(common, "ws--a1")
+        wr.headless_run.save_record(execution_path, {
+            "record_version": 1, "execution_id": "ws--a1", "target_repository": "acme/alpha",
+            "status": "exited", "run_id": run_id, "session_dir": str(self.base / "sessions"),
+            "session_id": "approval", "checkout": {"head_before": old, "head_after": old,
+                "branch_before": "main", "branch_after": "main", "dirty_count": 0,
+                "new_untracked_count": 0, "branches_changed": []}})
+        record_path = wr.workspace_record_path("ws")
+        record = wr.load_workspace(record_path)
+        record["tasks"]["a1"] = {"repository": "alpha", "target_repository": "acme/alpha",
+            "pinned_commit": old, "execution_status": "exited", "run_status": "BLOCKED",
+            "execution_id": "ws--a1", "run_id": run_id}
+        wr.save_workspace(record_path, record)
+        return execution_path
+
+    def test_repin_takes_execution_locks_before_workspace_lock(self):
+        self._stopped_authorization_repin()
+        held = {"workspace": False, "executions": 0}
+        workspace_lock = wr.locked_workspace
+        execution_lock = wr.headless_run.locked_record
+        write = gc.atomic_io.atomic_write_text
+
+        @contextmanager
+        def workspace_guard(workspace_id):
+            with workspace_lock(workspace_id) as path:
+                held["workspace"] = True
+                try:
+                    yield path
+                finally:
+                    held["workspace"] = False
+
+        @contextmanager
+        def execution_guard(path):
+            self.assertFalse(held["workspace"], "execution lock acquired under workspace lock")
+            with execution_lock(path):
+                held["executions"] += 1
+                try:
+                    yield
+                finally:
+                    held["executions"] -= 1
+
+        def guarded_write(path, content, **kwargs):
+            if Path(path) == self.path:
+                self.assertTrue(held["workspace"])
+                self.assertGreater(held["executions"], 0, "execution evidence must stay locked through repin")
+            return write(path, content, **kwargs)
+
+        request = {"action": "repin_manifest", "repository": "alpha"}
+        with patch.object(wr, "locked_workspace", workspace_guard), \
+                patch.object(wr.headless_run, "locked_record", execution_guard), \
+                patch.object(gc.atomic_io, "atomic_write_text", side_effect=guarded_write):
+            preview = self.controls.act(request)
+            self.assertEqual(preview["stage"], "preview", preview)
+            result = self.controls.act({**request, "confirm": preview["confirm"]})
+        self.assertEqual(result.get("status"), "MANIFEST_REPINNED", result)
+
+    def test_repin_refuses_execution_change_between_inspection_and_workspace_lock(self):
+        execution_path = self._stopped_authorization_repin()
+        request = {"action": "repin_manifest", "repository": "alpha"}
+        preview = self.controls.act(request)
+        self.assertEqual(preview["stage"], "preview", preview)
+        before = self.path.read_bytes()
+        execution_lock = wr.headless_run.locked_record
+        acquisitions = 0
+
+        @contextmanager
+        def change_execution(path):
+            nonlocal acquisitions
+            with execution_lock(path):
+                acquisitions += 1
+                if acquisitions == 2:  # status inspection completed; apply is securing its evidence
+                    execution = wr.headless_run.load_record(execution_path)
+                    execution["status"] = "interrupted"
+                    wr.headless_run.save_record(execution_path, execution)
+                yield
+
+        with patch.object(wr.headless_run, "locked_record", change_execution):
+            result = self.controls.act({**request, "confirm": preview["confirm"]})
+        self.assertEqual(result.get("error_code"), "CONTROL_PREVIEW_STALE", result)
+        self.assertEqual(self.path.read_bytes(), before)
 
     def test_repin_refuses_branch_move_during_manifest_save(self):
         self.drop_policy("alpha")
