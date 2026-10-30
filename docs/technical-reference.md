@@ -2385,8 +2385,9 @@ the missing `create_worktrees` and `commit` lines to `true`. An existing
 policy keeps every other line. A new policy starts from the template with
 every other permission denied and merge disabled. The written file is
 uncommitted. `commit_policy` commits it on the base branch and never pushes.
-The human then sets the repository's `pinned_commit` to that commit. PICO
-never edits the manifest.
+The human then sets the repository's `pinned_commit` to that commit, either
+by editing the manifest or using the Garden's reviewed `repin_manifest`
+control. That control previews and applies only the selected repository's pin.
 
 **Attempts.** On the next `schedule` with authorization in place, a task
 whose run stopped for authorization starts a new attempt with its own
@@ -2460,8 +2461,19 @@ dependency).
 | --- | --- | --- |
 | `implemented` | launcher | child run ended `COMPLETED` or `PARTIAL` |
 | `validated` | `validate` | every check passed on one commit; provided contracts recorded at their versions |
-| `ready_for_downstream` | `promote` | draft PR exists, PR head is the validated commit, CI observed green now |
+| `ready_for_downstream` | `promote` | PR is open, PR head is the validated commit, CI observed green now |
 | `merged` | `ci` (observed) | PR state merged at the validated commit |
+
+Observed evidence is bound to the task's instructions, repository identity and
+checkout, checks, contracts and dependency definitions. Incompatible edits
+report `WORKSPACE_TASK_DEFINITION_CHANGED`; restore the definition or use a new
+task id. Historical records remain intact. Implementation evidence tolerates a
+repin contained in its exact validated commit or validated upstream input, or
+an advance from the old pin whose diff changes at most `.pi/autonomy.yaml`;
+qualification evidence requires unchanged pins. Runtime
+limits and budgets can change for resume. Legacy records acquire these bindings
+only against their original, unchanged manifest. A closed PR, stale head or
+non-green open PR revokes release even if the manifest declared it ready.
 
 **Gating.** An implementation task is dispatchable only when every dependency
 is `ready_for_downstream` or `merged` and every contract it requires from that

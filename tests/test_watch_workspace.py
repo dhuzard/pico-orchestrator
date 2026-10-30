@@ -19,6 +19,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "tools"))
 import watch  # noqa: E402
 import workspace_plan  # noqa: E402
+import workspace_run  # noqa: E402
 import workspace_scheduler  # noqa: E402
 
 SENTINEL = "SENTINEL-PRIVATE-7f3a"
@@ -100,7 +101,9 @@ class WorkspaceViewFixture(unittest.TestCase):
              "dispatched": ["web-3"], "resumed": [], "observed_running": [],
              "refused": {"docs-2": "WORKSPACE_PIN_MISMATCH"}}]
         record = {"record_version": 1, "workspace_id": "garden", "manifest": str(self.manifest),
-                  "manifest_digest": "0" * 64, "orchestrator_revision": None, "created_at": "2026-10-20T09:00:00Z",
+                  "manifest_digest": "0" * 64, "evidence_bindings": workspace_run.evidence_bindings(self.manifest),
+                  "evidence_pins": workspace_run.evidence_pins(self.manifest),
+                  "orchestrator_revision": None, "created_at": "2026-10-20T09:00:00Z",
                   "updated_at": "2026-10-20T10:00:00Z", "tasks": self.entries, "scheduler_sessions": sessions,
                   "objective": f"Objective {SENTINEL}"}
         (self.state / "workspaces" / "garden.json").write_text(json.dumps(record))

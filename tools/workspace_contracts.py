@@ -63,15 +63,16 @@ def _git(checkout: Path, *args: str, timeout: int = 30) -> subprocess.CompletedP
 def _context(manifest: Path, task_id: str) -> tuple[dict, dict, dict]:
     plan = workspace_run._plan(manifest, access_check=None)
     task, repo = workspace_run._task(plan, task_id)
+    referenced = {repo["id"], *(check["repository"] for check in task["checks"])}
     for blocker in plan["blockers"]:
         if (blocker["scope"] == "task" and blocker["id"] == task_id) or \
-           (blocker["scope"] == "repository" and blocker["id"] == repo["id"]):
+           (blocker["scope"] == "repository" and blocker["id"] in referenced):
             raise WorkspaceRunError(blocker["code"], blocker["detail"])
     return plan, task, repo
 
 
 def _observed(plan: dict, task_id: str) -> dict:
-    return workspace_run.observed_state(plan["workspace_id"]).get(task_id) or {}
+    return workspace_run.observed_state(plan["workspace_id"], manifest=Path(plan["manifest"])).get(task_id) or {}
 
 
 def _entry(plan: dict, task_id: str) -> dict:
@@ -81,6 +82,8 @@ def _entry(plan: dict, task_id: str) -> dict:
 
 def _update(plan: dict, manifest: Path, task_id: str, mutate) -> dict:
     with workspace_run.locked_workspace(plan["workspace_id"]):
+        if plan["evidence_pins"] != workspace_run.evidence_pins(manifest):
+            raise WorkspaceRunError("WORKSPACE_MANIFEST_CHANGED", "repository pins changed while the operation was running")
         path, record = workspace_run._workspace(plan, manifest)
         entry = record["tasks"].setdefault(task_id, {})
         mutate(entry.setdefault("observed", {}))
@@ -140,7 +143,7 @@ def validate(*, manifest: Path, task_id: str, head: str | None = None) -> dict:
     if task["kind"] == "qualification":
         if task["blocked_by"]:
             raise WorkspaceRunError("WORKSPACE_TASK_BLOCKED", "dependencies not validated: " + ", ".join(task["blocked_by"]))
-        all_observed = workspace_run.observed_state(plan["workspace_id"])
+        all_observed = workspace_run.observed_state(plan["workspace_id"], manifest=manifest)
         tasks = {t["id"]: t for t in plan["tasks"]}
         for repo_id in sorted({c["repository"] for c in task["checks"]}):
             commits = {all_observed.get(d, {}).get("validated_commit") for d in task["depends_on"]
@@ -208,7 +211,7 @@ def pr_body(plan: dict, task: dict, repo: dict, observed: dict, decision: dict |
             supersedes: list[int] | None = None) -> str:
     tasks = {t["id"]: t for t in plan["tasks"]}
     repos = {r["id"]: r for r in plan["repositories"]}
-    every = workspace_run.observed_state(plan["workspace_id"])
+    every = workspace_run.observed_state(plan["workspace_id"], manifest=Path(plan["manifest"]))
     decision = decision if decision is not None else issue_reference_decision(task, repo)
     keyword = "Closes" if decision["closes"] else "Refs"
     lines = [f"{keyword} #{task['issue']}", "",
@@ -264,7 +267,7 @@ def publish(*, manifest: Path, task_id: str, apply: bool = False, plan_hash: str
     republished = None
     republication = {}
     if new_branch:
-        every = workspace_run.observed_state(plan["workspace_id"])
+        every = workspace_run.observed_state(plan["workspace_id"], manifest=manifest)
         same_repo = {t["id"] for t in plan["tasks"] if t["repository"] == task["repository"] and t["id"] != task_id}
         reserved = frozenset(branch for other in same_repo for branch in
                              ((every.get(other) or {}).get("head_branch"),
@@ -329,8 +332,13 @@ def ci(*, manifest: Path, task_id: str, adapter=gh) -> dict:
                      "checks": len(data["statusCheckRollup"]), "observed_at": _now()}
         if state == "merged" and status != "stale":
             obs["readiness"] = "merged"
+        elif state != "open" or status != "green":
+            # Closed unmerged PRs and stale/red checks cannot retain an earlier release.
+            if obs.get("readiness") in RELEASED:
+                obs["readiness"] = "validated"
+                obs.pop("promoted_at", None)
     entry = _update(plan, manifest, task_id, mutate)
-    return {"ok": status == "green", "task_id": task_id, "ci": entry["observed"]["ci"],
+    return {"ok": status == "green" and state in {"open", "merged"}, "task_id": task_id, "ci": entry["observed"]["ci"],
             "readiness": entry["observed"].get("readiness")}
 
 
@@ -339,11 +347,15 @@ def promote(*, manifest: Path, task_id: str, adapter=gh) -> dict:
     observed = ci(manifest=manifest, task_id=task_id, adapter=adapter)
     if observed["readiness"] == "merged":
         return {"ok": True, "task_id": task_id, "readiness": "merged", "ci": observed["ci"]}
+    if observed["ci"]["pr_state"] != "open":
+        raise WorkspaceRunError("WORKSPACE_PR_NOT_OPEN", "only an open pull request can be promoted")
     if observed["ci"]["status"] != "green":
         raise WorkspaceRunError("WORKSPACE_CI_NOT_GREEN", f"CI is {observed['ci']['status']} on the validated commit")
     plan, _, _ = _context(manifest, task_id)
 
     def mutate(obs: dict) -> None:
+        if obs.get("ci") != observed["ci"] or observed["ci"]["head"] != obs.get("validated_commit"):
+            raise WorkspaceRunError("WORKSPACE_CI_CHANGED", "CI or validation changed during promotion; observe it again")
         obs["readiness"] = "ready_for_downstream"
         obs["promoted_at"] = _now()
     entry = _update(plan, manifest, task_id, mutate)

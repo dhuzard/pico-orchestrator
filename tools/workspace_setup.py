@@ -73,7 +73,7 @@ class SetupControls(garden_controls.Controls):
             if not isinstance(raw, dict) or not workspace_init.SLUG_RE.fullmatch(str(raw.get("id", ""))):
                 raise workspace_plan.WorkspaceError("workspace id is invalid")
             record = workspace_run.load_workspace(self.state / "workspaces" / f"{raw['id']}.json")
-            observed = workspace_run.observed_from_record(record or {})
+            observed = workspace_run.observed_from_record(record or {}, manifest=path)
             plan = workspace_plan.plan(path, access_check=self.access_check, observed=observed)
             # Import locally: watch's existing view owns the scheduler state and run mapping.
             view = watch.workspace_view(self.state, plan=plan)

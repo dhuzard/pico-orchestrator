@@ -292,9 +292,20 @@ def plan_tasks(tasks: list[dict], repository_ids: set[str],
         waves[level[task_id]].append(task_id)
     blockers.extend(_contract_blockers(by_id, deps, repository_ids))
     observed = observed or {}
-    readiness = {task_id: effective_readiness(task.get("readiness") or "planned",
+    invalid = {tid for tid in by_id if (observed.get(tid) or {}).get("evidence_error")}
+    for task_id in sorted(invalid):
+        blockers.append({"scope": "task", "id": task_id, "code": observed[task_id]["evidence_error"],
+                         "detail": "recorded evidence belongs to a different task definition; restore it or use a new task id"})
+    readiness = {task_id: "planned" if task_id in invalid else effective_readiness(task.get("readiness") or "planned",
                                               (observed.get(task_id) or {}).get("readiness"))
                  for task_id, task in by_id.items()}
+    for task_id in by_id:
+        ci = (observed.get(task_id) or {}).get("ci") or {}
+        if ci and (ci.get("pr_state") not in {"open", "merged"} or ci.get("status") == "stale"
+                   or (ci.get("pr_state") == "open" and ci.get("status") != "green")):
+            # An explicit negative observation supersedes an older declared release.
+            if readiness[task_id] in UNBLOCKING_STATES:
+                readiness[task_id] = "validated"
     validated = {task_id: (observed.get(task_id) or {}).get("validated_contracts") or {} for task_id in by_id}
 
     def contract_ready(task_id: str, dep: str) -> bool:
@@ -323,7 +334,8 @@ def plan_tasks(tasks: list[dict], repository_ids: set[str],
                         "requires": task.get("requires") or [], "checks": task.get("checks") or [],
                         "depends_on": deps[task_id], "blocks": sorted(dependents[task_id]),
                         "wave": level.get(task_id), "readiness": readiness[task_id], "blocked_by": blocked_by,
-                        "dispatchable": readiness[task_id] == "planned" and not blocked_by and task_id in level})
+                        "dispatchable": readiness[task_id] == "planned" and not blocked_by and task_id in level
+                                        and task_id not in invalid})
     return planned, waves, blockers
 
 
@@ -412,7 +424,7 @@ def main(argv: list[str] | None = None) -> int:
             raw = load_manifest(Path(args.manifest))
             workspace_id = raw.get("id") if isinstance(raw, dict) and isinstance(raw.get("id"), str) else ""
             try:
-                observed = workspace_run.observed_state(workspace_id)
+                observed = workspace_run.observed_state(workspace_id, manifest=Path(args.manifest))
             except workspace_run.WorkspaceRunError as exc:
                 raise WorkspaceError(f"workspace record is unreadable: {exc.detail}") from exc
         result = plan(Path(args.manifest), access_check=None if args.no_access_check else gh_access,

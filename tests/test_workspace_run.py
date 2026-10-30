@@ -83,6 +83,124 @@ class WorkspaceRunFixture(unittest.TestCase):
 
 
 class WorkspaceRunTest(WorkspaceRunFixture):
+    def test_evidence_binding_preserves_repin_limits_and_unrelated_tasks(self):
+        manifest = self.manifest()
+        plan = wr._plan(manifest, access_check=None)
+        path, record = wr._workspace(plan, manifest)
+        record["tasks"]["a1"] = {"observed": {"readiness": "ready_for_downstream", "validated_commit": "a" * 40}}
+        wr.save_workspace(path, record)
+        data = yaml.safe_load(manifest.read_text())
+        alpha = self.repos["alpha"][0]
+        policy = alpha / ".pi/autonomy.yaml"
+        policy.write_text(policy.read_text() + "\n# Reviewed approval\n")
+        git("-C", str(alpha), "add", ".pi/autonomy.yaml")
+        git("-C", str(alpha), "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-qm", "approve")
+        data["repositories"][0]["pinned_commit"] = git("-C", str(alpha), "rev-parse", "HEAD")
+        data["max_lead_calls"] = 30
+        data["budget"] = {"max_tokens": 2000}
+        data["tasks"][1]["title"] = "Independent new beta objective"
+        data["tasks"].append({"id": "new", "repository": "gamma", "title": "New task"})
+        manifest.write_text(yaml.safe_dump(data))
+        self.assertEqual(wr.observed_state("ws", manifest=manifest)["a1"]["readiness"], "ready_for_downstream")
+        self.assertEqual(wr.compatible_entries(record, manifest)["a1"], record["tasks"]["a1"])
+
+    def test_implementation_evidence_rejects_code_and_unrelated_repins(self):
+        manifest = self.manifest()
+        plan = wr._plan(manifest, access_check=None)
+        path, record = wr._workspace(plan, manifest)
+        record["tasks"]["a1"] = {"observed": {"readiness": "ready_for_downstream"}}
+        wr.save_workspace(path, record)
+        data = yaml.safe_load(manifest.read_text())
+        alpha = self.repos["alpha"][0]
+        (alpha / "README.md").write_text("Changed source\n")
+        git("-C", str(alpha), "add", "README.md")
+        git("-C", str(alpha), "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-qm", "change")
+        changed = git("-C", str(alpha), "rev-parse", "HEAD")
+        for pin in (changed, self.repos["beta"][1]):
+            with self.subTest(pin=pin):
+                data["repositories"][0]["pinned_commit"] = pin
+                manifest.write_text(yaml.safe_dump(data))
+                self.assertEqual(wr.observed_state("ws", manifest=manifest)["a1"],
+                                 {"evidence_error": wr.EVIDENCE_CHANGED})
+
+    def test_qualification_evidence_invalidates_when_a_check_repository_is_repinned(self):
+        tasks = [{"id": "a1", "repository": "alpha", "title": "Upstream", "readiness": "merged"},
+                 {"id": "q1", "repository": "alpha", "title": "Qualify", "kind": "qualification",
+                  "depends_on": ["a1"], "checks": [{"id": "beta-check", "repository": "beta", "argv": ["true"]}]}]
+        manifest = self.manifest(tasks)
+        path, record = wr._workspace(wr._plan(manifest, access_check=None), manifest)
+        record["tasks"]["q1"] = {"observed": {"readiness": "validated",
+                                 "validation": {"commits": {"beta": self.repos["beta"][1]}, "status": "passed"}}}
+        wr.save_workspace(path, record)
+        beta = self.repos["beta"][0]
+        policy = beta / ".pi/autonomy.yaml"
+        policy.write_text(policy.read_text() + "\n# Changed checked content\n")
+        git("-C", str(beta), "add", ".pi/autonomy.yaml")
+        git("-C", str(beta), "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-qm", "policy")
+        self.manifest(tasks, pins={"beta": git("-C", str(beta), "rev-parse", "HEAD")})
+        self.assertEqual(wr.observed_state("ws", manifest=manifest)["q1"], {"evidence_error": wr.EVIDENCE_CHANGED})
+
+    def test_repin_to_exact_validated_work_preserves_implementation_evidence(self):
+        manifest = self.manifest()
+        path, record = wr._workspace(wr._plan(manifest, access_check=None), manifest)
+        alpha = self.repos["alpha"][0]
+        (alpha / "README.md").write_text("Validated work\n")
+        git("-C", str(alpha), "add", "README.md")
+        git("-C", str(alpha), "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-qm", "work")
+        validated = git("-C", str(alpha), "rev-parse", "HEAD")
+        record["tasks"]["a1"] = {"observed": {"readiness": "ready_for_downstream", "validated_commit": validated,
+                                             "validation": {"status": "passed"}}}
+        wr.save_workspace(path, record)
+        self.manifest(pins={"alpha": validated})
+        self.assertEqual(wr.observed_state("ws", manifest=manifest)["a1"]["readiness"], "ready_for_downstream")
+
+    def test_legacy_evidence_adoption_requires_original_unchanged_manifest(self):
+        manifest = self.manifest()
+        plan = wr._plan(manifest, access_check=None)
+        path, record = wr._workspace(plan, manifest)
+        record.pop("evidence_bindings")
+        record["tasks"]["a1"] = {"observed": {"readiness": "ready_for_downstream"}}
+        wr.save_workspace(path, record)
+        self.assertEqual(wr.observed_state("ws", manifest=manifest)["a1"]["readiness"], "ready_for_downstream")
+        original = manifest.read_text()
+        manifest.write_text(original.replace("Alpha adapter", "Changed objective"))
+        self.assertEqual(wr.observed_state("ws", manifest=manifest)["a1"], {"evidence_error": wr.EVIDENCE_CHANGED})
+        # A status refresh cannot bless old evidence under the edited manifest.
+        self.assertNotIn("a1", wr.status(manifest=manifest)["tasks"])
+        self.assertEqual(wr.observed_state("ws", manifest=manifest)["a1"], {"evidence_error": wr.EVIDENCE_CHANGED})
+        manifest.write_text(original)
+        wr.status(manifest=manifest)
+        self.assertEqual(wr.load_workspace(path)["evidence_bindings"]["a1"], wr.evidence_bindings(manifest)["a1"])
+
+    def test_changed_manifest_does_not_reassign_old_evidence_in_cli_or_garden(self):
+        import watch
+        manifest = self.manifest()
+        plan = wr._plan(manifest, access_check=None)
+        path, record = wr._workspace(plan, manifest)
+        record["tasks"]["a1"] = {"repository": "alpha", "target_repository": "acme/alpha",
+                                 "execution_status": "exited", "run_status": "COMPLETED",
+                                 "run_id": "run-20261030-120000-a1", "observed": {
+                                     "readiness": "ready_for_downstream", "pr": {"number": 12}}}
+        wr.save_workspace(path, record)
+        data = yaml.safe_load(manifest.read_text())
+        data["tasks"][0]["repository"] = "beta"
+        # Different manifest path with the same workspace id must use its own definition.
+        changed = self.base / "changed.yaml"
+        changed.write_text(yaml.safe_dump(data))
+        output = io.StringIO()
+        with redirect_stdout(output):
+            code = wr.workspace_plan.main([str(changed), "--json", "--no-access-check"])
+        result = json.loads(output.getvalue())
+        self.assertEqual(code, 1)
+        self.assertIn(wr.EVIDENCE_CHANGED, {b["code"] for b in result["blockers"]})
+        self.assertEqual(next(t for t in result["tasks"] if t["id"] == "a1")["readiness"], "planned")
+        view = watch.workspace_view(self.state, manifest=changed)
+        rows = [t for r in view["repositories"] for t in r["tasks"] if t["id"] == "a1"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["state"], "not_dispatchable")
+        self.assertIsNone(rows[0]["run_id"])
+        self.assertEqual(wr.load_workspace(path)["tasks"]["a1"], record["tasks"]["a1"])
+
     def test_status_exposes_plan_blockers_and_cli_fails_on_blocked_plan(self):
         manifest = self.manifest(pins={"alpha": "f" * 40})
         result = wr.status(manifest=manifest, access_check=ok_access)
@@ -203,7 +321,7 @@ class WorkspaceRunTest(WorkspaceRunFixture):
         self.manifest(tasks)
         with self.assertRaises(wr.WorkspaceRunError) as rejected:
             self.launch(manifest, "a1")
-        self.assertEqual(rejected.exception.code, "EXECUTION_OBJECTIVE_MISMATCH")
+        self.assertEqual(rejected.exception.code, wr.EVIDENCE_CHANGED)
         self.assertEqual(self.launch(self.manifest(tasks=[{"id": "new", "repository": "alpha", "title": "Changed",
                                                    "objective": tasks[0]["objective"]}]), "new")["task"]["execution_id"], "ws--new")
 
