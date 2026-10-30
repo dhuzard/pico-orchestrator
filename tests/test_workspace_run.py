@@ -113,7 +113,7 @@ class WorkspaceRunTest(WorkspaceRunFixture):
                 if record_path.exists() and not existing:
                     record_path.unlink()
 
-                def start(**kwargs):
+                def start(*, manifest=manifest, **kwargs):
                     kwargs["before_spawn"]()
                     changed = yaml.safe_load(manifest.read_text())
                     changed["repositories"][0]["pinned_commit"] = "f" * 40
