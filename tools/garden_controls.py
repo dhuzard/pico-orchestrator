@@ -376,6 +376,15 @@ class Controls:
         message = json.dumps(parts, sort_keys=True, separators=(",", ":")).encode()
         return hmac.new(self._secret, message, hashlib.sha256).hexdigest()
 
+    def _confirmation_scope(self, plan: dict) -> dict:
+        """Freeze manifest semantics and physical destinations behind task/repository aliases."""
+        return {"manifest": str(self.manifest.resolve()),
+                "manifest_digest": hashlib.sha256(self.manifest.read_bytes()).hexdigest(),
+                "workspace": plan["workspace_id"], "orchestrator_revision": plan.get("orchestrator_revision"),
+                "repositories": [{key: repo.get(key) for key in
+                                  ("id", "repository", "resolved_path", "pinned_commit", "base_branch")}
+                                 for repo in plan["repositories"]]}
+
     def _audit(self, plan: dict, entry: dict) -> None:
         with workspace_run.locked_workspace(plan["workspace_id"]):
             path, record = workspace_run._workspace(plan, self.manifest)
@@ -436,7 +445,8 @@ class Controls:
                 raise ControlError(404, "WORKSPACE_HEAD_UNRESOLVED", f"{head} is not a local branch of {repo['repository']}")
             state = {"head": head, "commit": match["commit"]}
             args["head"] = head
-        expected = self._confirm("validate", task["id"], state, task["checks"])
+        expected = self._confirm("validate", self._confirmation_scope(plan), task["id"], state, task["checks"],
+                                 workspace_run.dispatch_inputs(plan, task, repo))
         if confirm is None:
             return {"ok": True, "stage": "preview", "confirm": expected,
                     "preview": {"repository": repo["repository"], **state,
@@ -494,10 +504,13 @@ class Controls:
     def _promote(self, plan, task, repo, data, confirm):
         observed = workspace_contracts.ci(manifest=self.manifest, task_id=task["id"], adapter=self.adapter)
         ci = observed["ci"]
-        expected = self._confirm("promote", task["id"], ci["head"], ci["status"], ci["pr_state"])
+        published = workspace_contracts._observed(plan, task["id"]).get("pr") or {}
+        pr = {key: published.get(key) for key in ("repository", "number", "publication_run_id")}
+        expected = self._confirm("promote", self._confirmation_scope(plan), task["id"], pr,
+                                 ci["head"], ci["status"], ci["pr_state"])
         if confirm is None:
             return {"ok": ci["status"] == "green", "stage": "preview", "confirm": expected,
-                    "preview": {"repository": repo["repository"], "ci": ci, "readiness": observed["readiness"],
+                    "preview": {"repository": repo["repository"], "pr": pr, "ci": ci, "readiness": observed["readiness"],
                                 "note": "Promotion declares the interface ready for downstream tasks. It does not merge."}}
         self._check_confirm(confirm, expected)
         result = workspace_contracts.promote(manifest=self.manifest, task_id=task["id"], adapter=self.adapter)
@@ -510,7 +523,8 @@ class Controls:
                  {"tasks": {}})["tasks"].get(task["id"]) or {}
         if entry.get("execution_status") not in {"launched", "interrupted", "launching"}:
             raise ControlError(409, "CONTROL_NOTHING_TO_CANCEL", "the task has no running or interrupted child run")
-        expected = self._confirm("cancel", task["id"], entry.get("execution_id"), entry.get("run_id"),
+        expected = self._confirm("cancel", self._confirmation_scope(plan), task["id"],
+                                 entry.get("execution_id"), entry.get("run_id"),
                                  entry.get("execution_status"))
         if confirm is None:
             return {"ok": True, "stage": "preview", "confirm": expected,
@@ -549,7 +563,12 @@ class Controls:
         running, running_problems = workspace_run.running_tasks(observed_plan, workspace=record)
         budget = workspace_scheduler.budget_state(observed_plan, record, running=running,
                                                   extra_problems=running_problems)
-        expected = self._confirm("schedule", dispatch, interrupted if resume else [], allow_mutation,
+        reviewed = set(dispatch) | (set(interrupted) if resume else set())
+        repositories = {repo["id"]: repo for repo in observed_plan["repositories"]}
+        inputs = {task["id"]: workspace_run.dispatch_inputs(observed_plan, task, repositories[task["repository"]])
+                  for task in observed_plan["tasks"] if task["id"] in reviewed}
+        expected = self._confirm("schedule", self._confirmation_scope(observed_plan), inputs,
+                                 dispatch, interrupted if resume else [], allow_mutation,
                                  observed_plan["max_parallel"], mutating, bool(budget and budget["exhausted"]), awaiting)
         if confirm is None:
             launchable = bool(dispatch) and not (budget and (budget["exhausted"] or budget["incomplete"]))

@@ -190,6 +190,88 @@ class GardenControlsTest(unittest.TestCase):
                     self.assertEqual((git("-C", str(checkout), "rev-parse", "HEAD"),
                                       policy.read_bytes() if policy.exists() else None), before[name])
 
+    def test_schedule_confirmation_rejects_manifest_repository_or_task_changes(self):
+        for change in ("repository", "objective", "pin"):
+            with self.subTest(change=change):
+                self.manifest()
+                request = {"action": "schedule", "allow_mutation": True}
+                preview = self.controls.act(request)
+                self.assertEqual(preview["stage"], "preview", preview)
+                raw = yaml.safe_load(self.path.read_text())
+                if change == "repository":
+                    for repo in raw["repositories"]:
+                        repo["id"] = "beta" if repo["id"] == "alpha" else "alpha"
+                elif change == "objective":
+                    raw["tasks"][0]["objective"] = "Different implementation instructions"
+                else:
+                    checkout = self.repos["alpha"][0]
+                    git("-C", str(checkout), *COMMIT, "advance pin", "--allow-empty")
+                    raw["repositories"][0]["pinned_commit"] = git("-C", str(checkout), "rev-parse", "HEAD")
+                self.path.write_text(yaml.safe_dump(raw))
+                fresh = self.controls.act(request)
+                self.assertEqual(preview["preview"]["dispatch"], ["a1"])
+                self.assertEqual(fresh["preview"]["dispatch"], ["a1"])
+                with patch.object(gc.threading, "Thread") as scheduler_thread:
+                    result = self.controls.act({**request, "confirm": preview["confirm"]})
+                self.assertEqual(result.get("error_code"), "CONTROL_PREVIEW_STALE", result)
+                scheduler_thread.assert_not_called()
+                self.assertIsNone(self.controls._scheduler)
+
+    def test_schedule_confirmation_rechecks_upstream_dispatch_inputs(self):
+        self.manifest(a1={"readiness": "ready_for_downstream"})
+        plan = self.controls._plan()
+        with wr.locked_workspace("ws"):
+            record_path, record = wr._workspace(plan, self.path)
+            record["tasks"]["a1"] = {"observed": {"readiness": "ready_for_downstream",
+                "validated_commit": self.repos["alpha"][1], "validated_contracts": {"claims": "1.0"}}}
+            wr.save_workspace(record_path, record)
+        request = {"action": "schedule", "allow_mutation": True}
+        preview = self.controls.act(request)
+        self.assertEqual(preview["preview"]["dispatch"], ["b1"])
+        record["tasks"]["a1"]["observed"]["validated_commit"] = "a" * 40
+        with wr.locked_workspace("ws"):
+            wr.save_workspace(record_path, record)
+        fresh = self.controls.act(request)
+        self.assertEqual(fresh["preview"]["dispatch"], ["b1"])
+        with patch.object(gc.threading, "Thread") as scheduler_thread:
+            result = self.controls.act({**request, "confirm": preview["confirm"]})
+        self.assertEqual(result.get("error_code"), "CONTROL_PREVIEW_STALE", result)
+        scheduler_thread.assert_not_called()
+
+    def test_cancel_confirmation_rejects_reassigned_repository_aliases(self):
+        plan = self.controls._plan()
+        with wr.locked_workspace("ws"):
+            record_path, record = wr._workspace(plan, self.path)
+            record["tasks"]["a1"] = {"execution_status": "launched", "execution_id": "ws--a1", "run_id": "run-one"}
+            wr.save_workspace(record_path, record)
+        request = {"action": "cancel", "task": "a1"}
+        preview = self.controls.act(request)
+        self.assertEqual(preview["stage"], "preview", preview)
+        raw = yaml.safe_load(self.path.read_text())
+        for repo in raw["repositories"]:
+            repo["id"] = "beta" if repo["id"] == "alpha" else "alpha"
+        self.path.write_text(yaml.safe_dump(raw))
+        with patch.object(wr, "cancel") as cancel:
+            result = self.controls.act({**request, "confirm": preview["confirm"]})
+        self.assertEqual(result.get("error_code"), "CONTROL_PREVIEW_STALE", result)
+        cancel.assert_not_called()
+
+    def test_qualification_confirmation_rejects_reassigned_repository_aliases(self):
+        request = {"action": "validate", "task": "q1"}
+        preview = self.controls.act(request)
+        self.assertEqual(preview["stage"], "preview", preview)
+        raw = yaml.safe_load(self.path.read_text())
+        for repo in raw["repositories"]:
+            repo["id"] = "beta" if repo["id"] == "alpha" else "alpha"
+        self.path.write_text(yaml.safe_dump(raw))
+        fresh = self.controls.act(request)
+        self.assertEqual(fresh["preview"]["checks"], preview["preview"]["checks"])
+        self.assertNotEqual(fresh["preview"]["repository"], preview["preview"]["repository"])
+        with patch.object(gc.workspace_contracts, "validate") as validate:
+            result = self.controls.act({**request, "confirm": preview["confirm"]})
+        self.assertEqual(result.get("error_code"), "CONTROL_PREVIEW_STALE", result)
+        validate.assert_not_called()
+
     def test_policy_actions_refuse_repository_identity_conflicts(self):
         checkout = self.repos["alpha"][0]
         policy = checkout / ".pi" / "autonomy.yaml"
@@ -450,6 +532,31 @@ class GardenControlsTest(unittest.TestCase):
                    if row["action"] == "approve_mutation" and row["target"] == "alpha")
         self.assertEqual((row["available"], row["refusal_code"]), (False, "MUTATION_APPROVAL_TASKS_NONE"))
         self.assertFalse(policy.exists())
+
+    def test_promote_confirmation_rejects_a_different_pr_on_the_same_head(self):
+        plan = self.controls._plan()
+        commit = self.repos["alpha"][1]
+        with wr.locked_workspace("ws"):
+            record_path, record = wr._workspace(plan, self.path)
+            record["tasks"]["a1"] = {"observed": {
+                "readiness": "validated", "validated_commit": commit,
+                "validation": {"status": "passed"}, "validated_contracts": {"claims": "1.0"},
+                "pr": {"repository": "acme/alpha", "number": 101, "publication_run_id": "run-first"}}}
+            wr.save_workspace(record_path, record)
+        self.fake.checks[101] = ("OPEN", commit, GREEN)
+        self.fake.checks[102] = ("OPEN", commit, GREEN)
+        request = {"action": "promote", "task": "a1"}
+        preview = self.controls.act(request)
+        self.assertEqual(preview["stage"], "preview", preview)
+        self.assertEqual(preview["preview"]["pr"]["number"], 101)
+        with wr.locked_workspace("ws"):
+            record = wr.load_workspace(record_path)
+            record["tasks"]["a1"]["observed"]["pr"] = {
+                "repository": "acme/alpha", "number": 102, "publication_run_id": "run-second"}
+            wr.save_workspace(record_path, record)
+        result = self.controls.act({**request, "confirm": preview["confirm"]})
+        self.assertEqual(result.get("error_code"), "CONTROL_PREVIEW_STALE", result)
+        self.assertEqual(wr.load_workspace(record_path)["tasks"]["a1"]["observed"]["readiness"], "validated")
 
     def test_validate_publish_ci_promote_flow(self):
         self.schedule(self.path)
