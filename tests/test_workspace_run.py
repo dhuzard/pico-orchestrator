@@ -83,6 +83,20 @@ class WorkspaceRunFixture(unittest.TestCase):
 
 
 class WorkspaceRunTest(WorkspaceRunFixture):
+    def test_status_exposes_plan_blockers_and_cli_fails_on_blocked_plan(self):
+        manifest = self.manifest(pins={"alpha": "f" * 40})
+        result = wr.status(manifest=manifest, access_check=ok_access)
+        self.assertEqual(result["plan_status"], "BLOCKED")
+        self.assertEqual(result["tasks"], {})
+        self.assertIn("WORKSPACE_PIN_MISSING", {row["code"] for row in result["plan_blockers"]})
+        output = io.StringIO()
+        with redirect_stdout(output):
+            code = wr.main(["status", str(manifest), "--no-access-check"])
+        payload = json.loads(output.getvalue())
+        self.assertEqual(code, 1)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["plan_blockers"], result["plan_blockers"])
+
     def test_three_children_run_isolated_and_are_linked(self):
         manifest = self.manifest()
         before = self.snapshots()
