@@ -194,13 +194,20 @@ class PathFloorRoutingTest(Routed):
         project = {"path_floors": [{"paths": [".pi/**"], "floors": {"security_sensitive": True}}
                                    for _ in range(64)]}
         self.assertFalse(engine.validate_project_routing_instance(project, self.assets.project_schema))
-        matches = engine.match_all_path_floors([".pi/routing.yaml"], project)
+        matches = engine.match_all_path_floors([".pi/routing.yaml"], project, self.assets.policy)
         self.assertEqual(len(matches), 65)
         self.assertEqual(len(po._path_floor_matches(matches)), 65)
         schema = json.loads((ROOT / "schemas/run-record.schema.json").read_text())
         phase = schema["properties"]["parent_orchestration"]["properties"]["phases"]["items"]
-        self.assertEqual(phase["properties"]["routing"]["properties"]["path_floor_matches"]["maxItems"], 65)
-        self.assertEqual(phase["properties"]["diff_floor_checks"]["items"]["properties"]["matches"]["maxItems"], 65)
+        self.assertEqual(phase["properties"]["routing"]["properties"]["path_floor_matches"]["maxItems"], 128)
+        self.assertEqual(phase["properties"]["diff_floor_checks"]["items"]["properties"]["matches"]["maxItems"], 128)
+        policy = {**self.assets.policy, "path_floors": [self.assets.policy["path_floors"][0] for _ in range(64)]}
+        issues = []
+        engine.validate_builtin_path_floors(policy, self.assets.project_schema, issues)
+        self.assertEqual(issues, [])
+        combined = engine.match_all_path_floors([".pi/routing.yaml"], project, policy)
+        self.assertEqual(len(combined), 128)
+        self.assertEqual(len(po._path_floor_matches(combined)), 128)
 
     def test_recorded_paths_are_bounded(self):
         long_path = "migrations/" + "x" * 5000 + ".sql"

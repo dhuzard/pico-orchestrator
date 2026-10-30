@@ -374,7 +374,7 @@
                   },
                   "path_floor_matches": {
                     "type": "array",
-                    "maxItems": 65,
+                    "maxItems": 128,
                     "description": "Path floors matched by the task's declared files_or_areas before the run. Absent when none matched.",
                     "items": {"$ref": "#/$defs/path_floor_match"}
                   },
@@ -473,7 +473,7 @@
                     "wave_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$"},
                     "path_digests": {"type": "array", "maxItems": 200, "uniqueItems": true,
                       "items": {"type": "string", "pattern": "^[0-9a-f]{64}$"}},
-                    "matches": {"type": "array", "maxItems": 65, "items": {"$ref": "#/$defs/path_floor_match"}}
+                    "matches": {"type": "array", "maxItems": 128, "items": {"$ref": "#/$defs/path_floor_match"}}
                   }
                 }
               },

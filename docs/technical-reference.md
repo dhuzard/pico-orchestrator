@@ -418,8 +418,8 @@ path_floors:
   or the lead's own edits. A path only another member's checked worktree
   changed is left to that member. An underrated merge is recorded and
   re-routed the same way, and the integration does not end: restore the
-  parent checkout to the recorded HEAD, confirm the re-route, then call
-  `integrate_end` again.
+  parent checkout to the recorded HEAD, call `integrate_abort`, run the new
+  route's workers in a fresh wave, then integrate again.
 - **Limit.** A phase may record at most 8 escalations of any reason
   (`MAX_ESCALATIONS_PER_PHASE`). Past it a lead escalation or an underrated
   diff is refused with `PARENT_ESCALATION_LIMIT`: nothing changes and nothing

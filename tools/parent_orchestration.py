@@ -61,7 +61,8 @@ ESCALATION_REASONS = {"FAILED_ATTEMPTS", "REVIEW_FINDINGS", "AMBIGUITY", "ARCHIT
 PATH_FLOOR_REASON = "PATH_FLOOR"
 DIFF_FLOOR_STATUSES = {"passed", "underrated"}
 MAX_DIFF_FLOOR_CHECKS = 20
-MAX_PATH_FLOOR_RULES = 65
+# Both the built-in policy and project routing may each define up to 64 rules.
+MAX_PATH_FLOOR_RULES = 128
 # Floored paths kept on a PATH_FLOOR escalation: the re-route that confirms it must cover them.
 MAX_ESCALATION_PATHS = 200
 # Route changes (escalations of any reason) one phase may record. Past it the phase cannot be re-routed: the event is
