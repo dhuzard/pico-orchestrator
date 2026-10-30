@@ -646,7 +646,7 @@ function approvalBox(request) {
     : [request.policy_source === "default" ? "No .pi/autonomy.yaml is committed at the pinned commit: the default policy grants no mutation." : "The committed .pi/autonomy.yaml does not grant these.",
       ...(request.uncommitted_policy ? ["The checkout's own .pi/autonomy.yaml is uncommitted: it does not count yet."] : []),
       "1. Approve: grants only these permissions in .pi/autonomy.yaml (you review the diff).",
-      `2. Commit the policy on ${request.base_branch || "the base branch"}.`, "3. Set this repository's pinned_commit in the manifest to that commit.",
+      `2. Commit the policy on ${request.base_branch || "the base branch"}.`, "3. Repin this repository in the manifest after reviewing the exact change.",
       "4. Schedule with allow mutation: each blocked task starts a new attempt linked to the one that stopped."];
   const list = el("ol", "ws-approval-steps"); for (const step of steps) list.append(el("li", "", step)); box.append(list);
   box.append(el("small", "", `Never granted by this: ${request.never_granted.join(", ").replaceAll("_", " ")}.`));
@@ -724,44 +724,56 @@ function renderControls() {
   if (mode) mode.textContent = controlState.enabled ? "Local · actions on, each one confirmed · refreshes every 2 seconds" : "Local, read-only · refreshes every 2 seconds";
   if (!panels) return;
   $("ws-controls-state").textContent = controlState.enabled ? "actions on" : panels.enabled ? "actions need the launch URL" : "read-only";
-  $("ws-perm-note").textContent = controlState.enabled
-    ? "Select a permission to change it. You review the exact diff of .pi/autonomy.yaml first; merge, deploy and mark-ready stay file-only. Publishing (push branch, create PR) reads the policy committed on the default branch on GitHub, so a change here has no effect on it until it is committed and pushed to the default branch."
-    : "Read from each checkout's autonomy policy. Change them in the file. Publishing reads the policy on the default branch on GitHub, not this checkout.";
+  $("ws-perm-note").textContent = "Publishing reads a separate policy committed on GitHub's default branch. Its authority is not checked here. No local preparation step pushes, opens a PR, merges or deploys.";
   $("ws-model-note").textContent = controlState.enabled
     ? "Select a model to change it for that tier. The next run uses the new value."
     : "Change them with pico models set. The next run uses the new value.";
-  const list = $("ws-permissions"); list.replaceChildren();
+  const list = $("ws-permissions");
+  const focused = list.contains(document.activeElement) ? document.activeElement?.dataset.focusKey : null;
+  list.replaceChildren();
   for (const repo of panels.repositories) {
     const box = el("div", "perm-repo");
     const title = el("strong", "", repo.repository || repo.id);
     if (repo.policy_uncommitted) {
       title.append(el("span", "perm-badge", "uncommitted"));
-      if (controlState.enabled) {
-        const commit = el("button", "ws-action perm-commit", "Commit policy"); commit.type = "button";
-        commit.addEventListener("click", () => workspaceAction("commit_policy", { repository: repo.id }, repo.id));
-        title.append(commit);
-      }
     }
     box.append(title);
-    if (repo.error_code) { box.append(el("small", "", repo.error_code)); list.append(box); continue; }
-    box.append(el("small", "", `${repo.source} · profile ${repo.profile || "—"} · PRs per ${repo.pr_granularity || "—"} · issues ${repo.issue_reference === "closes" ? "closed on merge" : "referenced (Refs)"} · base ${repo.base_branch}`));
+    const effective = repo.effective;
+    box.append(el("h3", "perm-subtitle", "Working checkout policy"));
+    if (repo.error_code) box.append(el("small", "perm-error", `Working policy unavailable: ${repo.error_code}`));
+    else box.append(el("small", "", `${repo.source} · profile ${repo.profile || "—"} · base ${repo.base_branch} · ${repo.policy_uncommitted === true ? "uncommitted changes" : repo.policy_uncommitted === false ? "no uncommitted policy change" : "working change status unavailable"}`));
     const flags = el("div", "perm-flags");
     const editable = new Set(controlState.enabled ? panels.editable_permissions || [] : []);
-    for (const [name, on] of Object.entries(repo.permissions)) {
+    for (const [name, on] of Object.entries(repo.permissions || {})) {
       const locked = !editable.has(name);
       const flag = el(locked ? "span" : "button", `perm-flag ${["deploy", "mark_pr_ready"].includes(name) ? "locked" : on ? "on" : ""}`, `${on ? "✓" : "×"} ${name.replaceAll("_", " ")}`);
       if (!locked) {
         flag.type = "button"; flag.title = `${on ? "Deny" : "Allow"} ${name.replaceAll("_", " ")} for ${repo.repository}`;
+        flag.dataset.focusKey = `${repo.id}:permission:${name}`;
         flag.addEventListener("click", () => workspaceAction("set_permission", { repository: repo.id, permission: name, value: !on }, `${repo.id} · ${name}`));
       }
       flags.append(flag);
     }
-    flags.append(el("span", "perm-flag locked", `${repo.merge_enabled ? "✓" : "×"} merge (never from the Garden)`));
+    if (!repo.error_code) flags.append(el("span", "perm-flag locked", `${repo.merge_enabled === true ? "✓" : repo.merge_enabled === false ? "×" : "?"} merge (file only)`));
     box.append(flags);
-    const limits = Object.entries(repo.limits || {}).map(([key, value]) => `${key.replaceAll("_", " ")} ${value}`).join(" · ");
-    if (limits) box.append(el("small", "", limits));
+    box.append(el("h3", "perm-subtitle", "Effective local mutation at manifest pin"));
+    if (!effective) box.append(el("p", "perm-detail", "Unavailable from this Garden version. Do not infer active permissions from the working file."));
+    else {
+      box.append(el("p", "perm-detail", `Pin ${effective.pinned_commit || "unavailable"} · ${effective.policy_source || "unavailable"} policy${effective.policy_blob ? ` · blob ${effective.policy_blob.slice(0, 12)}` : ""}`));
+      if (effective.error_code) box.append(el("p", "perm-error", `Pinned policy unavailable: ${effective.error_code}`));
+      else {
+        const local = effective.local_mutation || {};
+        const grant = (value) => value === true ? "granted" : value === false ? "denied" : "unavailable";
+        box.append(el("p", "perm-detail", `Create worktrees: ${grant(local.create_worktrees)} · Commit: ${grant(local.commit)} · Mutating child launches also require explicit allow mutation.`));
+        if (effective.missing_local_permissions?.length) box.append(el("p", "perm-detail", `Missing at pin: ${effective.missing_local_permissions.join(", ").replaceAll("_", " ")}`));
+      }
+      box.append(el("p", "perm-detail", `Checkout ${effective.working_branch || "detached"} @ ${effective.working_head || "unavailable"} · working policy ${effective.working_policy_differs == null ? "comparison unavailable" : effective.working_policy_differs ? "differs from pin" : "matches pin"}`));
+    }
+    box.append(el("p", "perm-detail", "Draft PR and GitHub write authority: not checked here; the default-branch policy is evaluated separately."));
+    box.append(preparationGuide(repo, panels));
     list.append(box);
   }
+  if (focused) [...list.querySelectorAll("[data-focus-key]")].find((node) => node.dataset.focusKey === focused)?.focus({ preventScroll: true });
   const models = panels.models; const box = $("ws-models"); box.replaceChildren();
   $("ws-model-source").textContent = models.error_code ? "unavailable" : models.configured ? "user config" : "defaults";
   if (models.error_code) { box.append(el("p", "empty", models.error_code)); return; }
@@ -782,6 +794,48 @@ function renderControls() {
   }
   box.append(table);
   renderActionsBar();
+}
+async function recheckPreparation() {
+  try { await Promise.all([refreshControls(true), refreshWorkspace()]); }
+  catch { state.workspace = { ok: false, error_code: "WORKSPACE_UNAVAILABLE", error: "The workspace could not be read. Try rechecking again." }; }
+  renderWorkspace(state.workspace);
+}
+function preparationGuide(repo, panels) {
+  const guide = el("div", "prep-guide");
+  guide.append(el("h3", "perm-subtitle", "Prepare local work"));
+  guide.append(el("p", "perm-detail", controlState.enabled
+    ? "Each button asks the server for a fresh preview. A step may be refused if its prerequisites have changed. Confirm one step at a time."
+    : "Open Garden with --workspace <manifest> --controls and its printed URL to preview changes. Rechecking stays read-only."));
+  const steps = el("ol", "prep-steps");
+  const addStep = (label, detail, action, enabled = controlState.enabled) => {
+    const step = el("li"); step.append(el("strong", "", label), el("small", "", detail));
+    if (action) {
+      const button = el("button", "ws-action", `Preview ${label.toLowerCase()}…`); button.type = "button";
+      button.disabled = !enabled;
+      button.dataset.focusKey = `${repo.id}:guide:${action}`;
+      button.addEventListener("click", () => workspaceAction(action, { repository: repo.id }, repo.id));
+      step.append(button);
+    }
+    steps.append(step);
+  };
+  addStep("Inspect", "Review the checkout and pinned policy above. No mutation occurs.");
+  const approval = panels.action_view?.actions?.find((item) => item.action === "approve_mutation" && item.target === repo.id);
+  addStep("Approve local mutation", approval ? (approval.available
+    ? "Preview the exact policy diff; only create_worktrees and commit may be granted here."
+    : `${approval.refusal_code || "Unavailable"}: ${approval.explanation || "Resolve the prerequisite and recheck."}`)
+    : "A newer Garden backend is required before this step is available.",
+  "approve_mutation", controlState.enabled && approval?.available === true);
+  addStep("Commit policy", repo.policy_uncommitted === true
+    ? `Preview a commit of .pi/autonomy.yaml on ${repo.base_branch || "the base branch"}; no push.`
+    : "No uncommitted policy change is reported for this checkout.", "commit_policy", controlState.enabled && repo.policy_uncommitted === true);
+  const availability = panels.action_view?.actions?.find((item) => item.action === "repin_manifest" && item.target === repo.id);
+  addStep("Repin manifest", availability ? (availability.available ? "Preview the exact manifest pin change to the committed checkout HEAD." : `${availability.refusal_code || "Unavailable"}: ${availability.explanation || "Resolve the prerequisite and recheck."}`)
+    : "A newer Garden backend is required before this step is available.", "repin_manifest", controlState.enabled && availability?.available === true);
+  const last = el("li"); last.append(el("strong", "", "Revalidate"), el("small", "Re-read the plan and effective policy. Scheduling remains a separate preview and decision."));
+  const button = el("button", "ws-action", "Recheck state"); button.type = "button";
+  button.dataset.focusKey = `${repo.id}:guide:recheck`;
+  button.addEventListener("click", recheckPreparation); last.append(button); steps.append(last);
+  guide.append(steps); return guide;
 }
 function renderActionsBar() {
   const bar = $("ws-actions-bar"); bar.replaceChildren();
@@ -865,7 +919,7 @@ async function postAction(body) {
   return response.json().catch(() => ({ ok: false, error_code: `HTTP_${response.status}`, error: "No answer from the Garden." }));
 }
 const ACTION_TITLES = { validate: "Validate the task", publish: "Request a draft PR", ci: "Check CI", promote: "Promote for downstream use",
-  cancel: "Cancel the child run", schedule: "Schedule the workspace", set_permission: "Change a permission", approve_mutation: "Approve local mutation", commit_policy: "Commit the policy", set_model: "Change a model", reset_model: "Reset a model" };
+  cancel: "Cancel the child run", schedule: "Schedule the workspace", set_permission: "Change a permission", approve_mutation: "Approve local mutation", commit_policy: "Commit the policy", repin_manifest: "Repin the manifest", set_model: "Change a model", reset_model: "Reset a model" };
 function factList(pairs) {
   const list = el("dl", "action-facts");
   for (const [key, value] of pairs) if (value != null && value !== "") list.append(el("dt", "", key), el("dd", "", String(value)));
@@ -883,7 +937,8 @@ function showResult(result) {
   const content = $("action-content"); content.replaceChildren();
   content.append(el("p", `action-result ${result.ok ? "ok" : "fail"}`, result.ok ? (result.stage === "started" ? "Started. Child runs appear on the board as they launch." : "Done.") : `Not done · ${result.error_code || "UNKNOWN"}`));
   if (result.error) content.append(el("p", "action-note", result.error));
-  content.append(factList([["Status", result.status], ["Readiness", result.readiness], ["CI", result.ci?.status], ["Mutations applied", result.mutations_applied]]));
+  content.append(factList([["Status", result.status], ["Readiness", result.readiness], ["Policy commit", result.commit], ["New manifest pin", result.pinned_commit], ["Plan", result.plan_status], ["CI", result.ci?.status], ["Mutations applied", result.mutations_applied]]));
+  if (result.blockers?.length) content.append(el("p", "action-note", `Plan blockers remain: ${result.blockers.map((item) => item.code).filter(Boolean).join(", ")}`));
   if (result.url) {
     const link = el("a", "pr-link", `Open PR #${result.pr} ↗`); link.href = result.url; link.target = "_blank"; link.rel = "noopener noreferrer";
     const line = el("p", "action-note"); line.append(link); content.append(line);
@@ -924,13 +979,16 @@ function showPreview(action, result, onConfirm) {
   } else if (action === "commit_policy") {
     content.append(factList([["Repository", p.repository], ["Branch", p.branch], ["Head", p.head], ["Message", p.message]]));
     content.append(el("pre", "action-pre", p.diff || ""));
+  } else if (action === "repin_manifest") {
+    content.append(factList([["Repository", p.repository], ["Branch", p.branch], ["Previous pin", p.old_pin], ["New pin", p.new_pin], ["Policy blob", p.policy_blob]]));
+    content.append(el("pre", "action-pre", p.diff || ""));
   } else if (action === "set_model" || action === "reset_model") {
     content.append(factList([["Family", p.family], ["Tier", p.tier], ["Current", `${p.current?.model} · capacity ${p.current?.capacity}`], ["New", `${p.new?.model} · capacity ${p.new?.capacity}`]]));
   }
   if (p.note) content.append(el("p", "action-note", p.note));
   const confirm = $("action-confirm");
   const labels = { publish: "Push and open draft PR", promote: "Promote",
-    cancel: "Cancel the run", schedule: "Launch", set_permission: "Write the policy", approve_mutation: "Approve and write the policy", commit_policy: "Commit", set_model: "Save the model", reset_model: "Reset the model" };
+    cancel: "Cancel the run", schedule: "Launch", set_permission: "Write the policy", approve_mutation: "Approve and write the policy", commit_policy: "Commit", repin_manifest: "Update manifest pin", set_model: "Save the model", reset_model: "Reset the model" };
   confirm.textContent = labels[action] || "Run checks";
   confirm.hidden = !result.ok; confirm.disabled = false;
   const blocked = { promote: "CI is not green on the validated commit, so promotion is not possible yet.", schedule: "Nothing can launch or resume: no task is ready, or the budget is exhausted.",

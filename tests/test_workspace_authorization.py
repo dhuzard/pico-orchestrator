@@ -250,7 +250,11 @@ class RecoveryTest(AuthorizationFixture):
         committed = controls.act({"action": "commit_policy", "repository": "beta", "confirm": commit["confirm"]})
         self.assertEqual(committed.get("status"), "POLICY_COMMITTED", committed)
         self.repos["beta"] = (self.repos["beta"][0], git("-C", str(self.repos["beta"][0]), "rev-parse", "HEAD"))
-        manifest = self.scientific_review()
+        repin = controls.act({"action": "repin_manifest", "repository": "beta"})
+        self.assertEqual(repin["stage"], "preview", repin)
+        repinned = controls.act({"action": "repin_manifest", "repository": "beta", "confirm": repin["confirm"]})
+        self.assertEqual((repinned["status"], repinned["pinned_commit"]),
+                         ("MANIFEST_REPINNED", self.repos["beta"][1]))
 
         second = self.schedule(manifest)
         states = self.states(second)

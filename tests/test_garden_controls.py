@@ -11,6 +11,8 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
+import yaml
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
@@ -227,6 +229,141 @@ class GardenControlsTest(unittest.TestCase):
         self.assertEqual((repos["alpha"]["issue_reference"], repos["beta"]["issue_reference"]), ("refs", "refs"))
         self.assertIn("claude", data["models"]["models"])
         self.assertNotIn("Interoperable claims", json.dumps(data))  # the workspace goal is never served
+
+    def test_repin_after_bounded_policy_commit_changes_one_manifest_pin(self):
+        self.drop_policy("alpha")
+        checkout = self.repos["alpha"][0]
+        git("-C", str(checkout), "config", "user.name", "t")
+        git("-C", str(checkout), "config", "user.email", "t@example.com")
+        before = self.path.read_text()
+        old = self.repos["alpha"][1]
+        _, panels = self.request("GET", "/api/controls")
+        alpha = next(row for row in panels["repositories"] if row["id"] == "alpha")
+        self.assertEqual(alpha["effective"]["policy_source"], "default")
+        self.assertEqual(set(alpha["effective"]["missing_local_permissions"]), {"create_worktrees", "commit"})
+        self.assertEqual(alpha["effective"]["publication"]["status"], "not_checked")
+        approve_action = next(row for row in panels["action_view"]["actions"]
+                              if row["action"] == "approve_mutation" and row["target"] == "alpha")
+        self.assertTrue(approve_action["available"], approve_action)
+        _, approval = self.act(action="approve_mutation", repository="alpha")
+        self.assertEqual(approval["stage"], "preview")
+        _, updated = self.act(action="approve_mutation", repository="alpha", confirm=approval["confirm"])
+        self.assertEqual(updated["status"], "POLICY_UPDATED")
+        _, commit_preview = self.act(action="commit_policy", repository="alpha")
+        _, committed = self.act(action="commit_policy", repository="alpha", confirm=commit_preview["confirm"])
+        head = committed["commit"]
+        self.assertNotEqual(head, old)
+        _, panels = self.request("GET", "/api/controls")
+        alpha = next(row for row in panels["repositories"] if row["id"] == "alpha")
+        self.assertEqual(alpha["effective"]["pinned_commit"], old)
+        self.assertEqual(alpha["effective"]["working_head"], head)
+        self.assertEqual(alpha["effective"]["policy_source"], "default")
+        approve_action = next(row for row in panels["action_view"]["actions"]
+                              if row["action"] == "approve_mutation" and row["target"] == "alpha")
+        self.assertEqual((approve_action["available"], approve_action["refusal_code"]), (False, "POLICY_UNCHANGED"))
+        action = next(row for row in panels["action_view"]["actions"]
+                      if row["action"] == "repin_manifest" and row["target"] == "alpha")
+        self.assertTrue(action["available"], action)
+        _, preview = self.act(action="repin_manifest", repository="alpha")
+        self.assertEqual((preview["stage"], preview["preview"]["old_pin"], preview["preview"]["new_pin"]),
+                         ("preview", old, head))
+        self.assertIn(f"-  pinned_commit: {old}", preview["preview"]["diff"])
+        self.assertIn(f"+  pinned_commit: {head}", preview["preview"]["diff"])
+        self.path.write_text(before + "# concurrent edit\n")
+        _, stale = self.act(action="repin_manifest", repository="alpha", confirm=preview["confirm"])
+        self.assertEqual(stale["error_code"], "CONTROL_PREVIEW_STALE")
+        self.path.write_text(before)
+        _, preview = self.act(action="repin_manifest", repository="alpha")
+        _, done = self.act(action="repin_manifest", repository="alpha", confirm=preview["confirm"])
+        self.assertEqual((done["status"], done["pinned_commit"]), ("MANIFEST_REPINNED", head))
+        old_doc = yaml.safe_load(before)
+        new_doc = yaml.safe_load(self.path.read_text())
+        self.assertEqual(new_doc["repositories"][0]["pinned_commit"], head)
+        self.assertEqual(new_doc["repositories"][1], old_doc["repositories"][1])
+        self.assertEqual(new_doc["tasks"], old_doc["tasks"])
+        _, repeated = self.act(action="repin_manifest", repository="alpha", confirm=preview["confirm"])
+        self.assertEqual(repeated["error_code"], "WORKSPACE_PIN_UNCHANGED")
+
+    def test_repin_refuses_existing_work_and_symlinked_manifest(self):
+        self.schedule(self.path)
+        checkout = self.repos["alpha"][0]
+        policy = checkout / ".pi" / "autonomy.yaml"
+        policy.write_text(policy.read_text() + "# policy review\n")
+        git("-C", str(checkout), "add", ".pi/autonomy.yaml")
+        git("-C", str(checkout), *COMMIT, "policy review")
+        before = self.path.read_text()
+        _, refused = self.act(action="repin_manifest", repository="alpha")
+        self.assertEqual(refused["error_code"], "WORKSPACE_REPIN_TASK_STARTED")
+        self.assertEqual(self.path.read_text(), before)
+        original = self.path.with_suffix(".original.yaml")
+        self.path.rename(original)
+        self.path.symlink_to(original)
+        _, refused = self.act(action="repin_manifest", repository="alpha")
+        self.assertEqual(refused["error_code"], "WORKSPACE_MANIFEST_PATH_UNSAFE")
+        self.assertEqual(original.read_text(), before)
+
+    def test_repin_refuses_symlinked_manifest_directory(self):
+        alias = self.path.parent / "alias"
+        alias.symlink_to(self.path.parent, target_is_directory=True)
+        controls = gc.Controls(alias / self.path.name, self.port, adapter=self.fake)
+        refused = controls.act({"action": "repin_manifest", "repository": "alpha"})
+        self.assertEqual(refused["error_code"], "WORKSPACE_MANIFEST_PATH_UNSAFE")
+
+    def test_repin_accepts_platform_style_symlinked_ancestor(self):
+        alias = self.path.parent / "outer_alias"
+        alias.symlink_to(self.path.parent.parent, target_is_directory=True)
+        manifest = alias / self.path.parent.name / self.path.name
+        controls = gc.Controls(manifest, self.port, adapter=self.fake)
+        refused = controls.act({"action": "repin_manifest", "repository": "alpha"})
+        self.assertEqual(refused["error_code"], "WORKSPACE_PIN_UNCHANGED")
+
+    def test_repin_refuses_unrelated_committed_change(self):
+        checkout = self.repos["alpha"][0]
+        (checkout / "README.md").write_text("new version\n")
+        git("-C", str(checkout), "add", "README.md")
+        git("-C", str(checkout), *COMMIT, "new version")
+        before = self.path.read_text()
+        _, refused = self.act(action="repin_manifest", repository="alpha")
+        self.assertEqual(refused["error_code"], "WORKSPACE_REPIN_SCOPE_CHANGED")
+        self.assertEqual(self.path.read_text(), before)
+
+    def test_repin_refuses_branch_move_during_manifest_save(self):
+        self.drop_policy("alpha")
+        checkout = self.repos["alpha"][0]
+        git("-C", str(checkout), "config", "user.name", "t")
+        git("-C", str(checkout), "config", "user.email", "t@example.com")
+        before = self.path.read_text()
+        _, approval = self.act(action="approve_mutation", repository="alpha")
+        self.act(action="approve_mutation", repository="alpha", confirm=approval["confirm"])
+        _, commit = self.act(action="commit_policy", repository="alpha")
+        self.act(action="commit_policy", repository="alpha", confirm=commit["confirm"])
+        _, preview = self.act(action="repin_manifest", repository="alpha")
+        write = gc.atomic_io.atomic_write_text
+
+        def move_branch(path, content, **kwargs):
+            if Path(path) == self.path:
+                git("-C", str(checkout), "checkout", "-q", "-b", "moved")
+            return write(path, content, **kwargs)
+
+        with patch.object(gc.atomic_io, "atomic_write_text", side_effect=move_branch):
+            _, refused = self.act(action="repin_manifest", repository="alpha", confirm=preview["confirm"])
+        self.assertEqual(refused["error_code"], "CONTROL_PREVIEW_STALE")
+        self.assertEqual(self.path.read_text(), before)
+
+    def test_bounded_approval_refuses_repository_without_mutating_task(self):
+        self.drop_policy("alpha")
+        manifest = yaml.safe_load(self.path.read_text())
+        next(task for task in manifest["tasks"] if task["id"] == "a1")["mutation"] = "none"
+        self.path.write_text(yaml.safe_dump(manifest))
+        policy = self.repos["alpha"][0] / ".pi" / "autonomy.yaml"
+        self.assertFalse(policy.exists())
+        _, result = self.act(action="approve_mutation", repository="alpha")
+        self.assertEqual((result["stage"], result["error_code"]), ("refused", "MUTATION_APPROVAL_TASKS_NONE"))
+        _, panels = self.request("GET", "/api/controls")
+        row = next(row for row in panels["action_view"]["actions"]
+                   if row["action"] == "approve_mutation" and row["target"] == "alpha")
+        self.assertEqual((row["available"], row["refusal_code"]), (False, "MUTATION_APPROVAL_TASKS_NONE"))
+        self.assertFalse(policy.exists())
 
     def test_validate_publish_ci_promote_flow(self):
         self.schedule(self.path)

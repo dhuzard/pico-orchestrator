@@ -346,6 +346,14 @@ includes planner blocker codes; a blocked plan returns `ok: false` and exit 1.
 `pico workspace cancel --task <id>` stops one child. Ordering and concurrency
 across tasks belong to the scheduler (`pico workspace schedule`).
 
+For a saved manifest, `pico watch --workspace workspace.yaml --controls` shows
+the working policy beside the policy effective at each repository's pinned
+commit. Its preparation guide previews local mutation approval, a policy-only
+commit, and a one-repository manifest repin as separate decisions. Rechecking
+then shows the new effective authority; scheduling remains a separate action.
+See [workspace preparation](docs/workspace-interactive-design.md#prepare-local-mutation-in-garden)
+for the safeguards and supported manifest layout.
+
 ### Run one bounded orchestration headless
 
 `pico exec start --repo owner/repository --execution-id <id> --objective "..."`

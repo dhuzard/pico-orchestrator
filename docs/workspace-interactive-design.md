@@ -29,6 +29,44 @@ states from Garden's workspace view. An existing workspace record is read from
 the watch state directory, so reopening shows recorded progress. Inspection
 does not edit or activate a manifest, run the scheduler, or perform Git writes.
 
+## Prepare local mutation in Garden
+
+Open a saved manifest with `pico watch --workspace <manifest> --controls`.
+Garden's **Authority by repository** panel separates the policy in the
+working checkout from the policy committed at the manifest's pinned commit.
+Only the pinned policy can authorize a local child run, and a mutating launch
+still needs the operator's explicit `allow mutation` choice. GitHub
+publication reads a different policy from the default branch on GitHub; the
+local preparation panel does not verify or grant that authority.
+
+For a repository with a task awaiting local mutation authorization, the guide
+offers separate, reviewed steps:
+
+1. Inspect the checkout, pinned commit, and missing local permissions.
+2. Preview and confirm **Approve local mutation**, which edits only
+   `.pi/autonomy.yaml` and grants only `create_worktrees` and `commit` when a
+   mutating implementation task needs them. The edit is not yet effective.
+3. Preview and confirm **Commit policy** on the repository's base branch. It
+   commits only that policy file and does not push.
+4. Preview and confirm **Repin manifest**. Garden shows the exact old and new
+   commit and the one-line manifest diff. It accepts only a clean checkout on
+   its base branch, with HEAD descended from the old pin, only
+   `.pi/autonomy.yaml` changed between the two commits, and a valid committed
+   policy that grants local mutation. It refuses repositories with running or
+   completed child work, ambiguous identity, and manifest layouts it cannot
+   edit precisely. It changes only the selected `pinned_commit`; it does not
+   launch a worker or grant GitHub rights.
+5. **Recheck state** to read the new plan and effective policy. Scheduling is
+   a separate preview and confirmation. A prior authorization-only stop can
+   then produce a linked new attempt without rewriting its run record.
+
+Every mutation repeats its checks at confirmation. A changed checkout,
+manifest, or relevant task history invalidates a preview. Existing custom
+manifests that do not use a plain block YAML repository list remain readable
+but must be repinned outside this guided action. Missing checkouts still need
+explicit preparation; Garden never clones, fetches, pulls, resets, or pushes
+them as part of this flow.
+
 `pico workspace init` builds a new workspace manifest
 (`schemas/workspace.schema.json`, `schema_version: 1`) from repositories the
 user selects, previews it with the planner's waves and blockers, and saves it
