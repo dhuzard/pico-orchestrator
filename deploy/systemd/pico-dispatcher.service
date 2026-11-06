@@ -1,0 +1,20 @@
+# TEMPLATE ONLY — not installed automatically. Review all paths and credentials.
+[Unit]
+Description=PICO opt-in GitHub Issues dispatcher
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=dhuzard
+Environment=HOME=/home/dhuzard
+Environment=PATH=/home/dhuzard/.local/bin:/usr/local/bin:/usr/bin:/bin
+WorkingDirectory=/home/dhuzard/src/pico-orchestrator
+ExecStart=/usr/bin/python3 /home/dhuzard/src/pico-orchestrator/tools/issue_dispatcher.py --config /home/dhuzard/.config/pi-coding-orchestrator/dispatcher.json serve
+Restart=on-failure
+RestartSec=10
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
