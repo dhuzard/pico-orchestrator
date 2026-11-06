@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Offline contract tests for the opt-in issue dispatcher; no GitHub or models."""
 import importlib.util
-import sqlite3
 import sys
 import tempfile
 import unittest
