@@ -33,6 +33,9 @@ def ok_access(repository: str) -> dict:
 class WorkspaceRunFixture(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
+        # unittest runs tearDown before addCleanup. Register resources first so
+        # later child-process cleanups run before this directory is removed.
+        self.addCleanup(self._tmp.cleanup)
         self.base = Path(self._tmp.name)
         self.repos = {}
         for name in ("alpha", "beta", "gamma"):
@@ -55,15 +58,15 @@ class WorkspaceRunFixture(unittest.TestCase):
         self.pi.write_text(FAKE_PI)
         self.pi.chmod(0o755)
         self._env = dict(os.environ)
+        self.addCleanup(self.restore_environment)
         os.environ[provenance.STATE_ENV] = str(self.state)
         os.environ["FAKE_PI_TOOLS"] = str(REPO_ROOT / "tools")
         os.environ["PI_CODING_AGENT_DIR"] = str(self.base / "agent")
         os.environ["FAKE_PI_BEHAVIOR"] = "finish"
 
-    def tearDown(self):
+    def restore_environment(self):
         os.environ.clear()
         os.environ.update(self._env)
-        self._tmp.cleanup()
 
     def manifest(self, tasks=None, pins=None) -> Path:
         pins = pins or {}
@@ -83,6 +86,29 @@ class WorkspaceRunFixture(unittest.TestCase):
 
     def snapshots(self):
         return {n: session_scope.snapshot(str(p))["digest"] for n, (p, _) in self.repos.items()}
+
+
+class WorkspaceFixtureCleanupTest(unittest.TestCase):
+    def test_child_cleanup_runs_before_state_and_environment_are_removed(self):
+        observed = []
+        original_environment = dict(os.environ)
+
+        class CleanupCase(WorkspaceRunFixture):
+            def runTest(self):
+                def reap_child():
+                    # A real background child can still write into this state.
+                    # Its registered cleanup must run before removing the tree.
+                    observed.append((self.base.exists(),
+                                     os.environ.get(provenance.STATE_ENV) == str(self.state)))
+                self.addCleanup(reap_child)
+
+        case = CleanupCase()
+        result = unittest.TestResult()
+        case.run(result)
+        self.assertTrue(result.wasSuccessful(), result.errors + result.failures)
+        self.assertEqual(observed, [(True, True)])
+        self.assertFalse(case.base.exists())
+        self.assertEqual(dict(os.environ), original_environment)
 
 
 class WorkspaceRunTest(WorkspaceRunFixture):

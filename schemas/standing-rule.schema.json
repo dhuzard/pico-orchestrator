@@ -1,0 +1,276 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "StandingRuleShadow",
+  "description": "Disabled-by-default standing-rule proposal and offline snapshots. Structural eligibility never grants execution or publication authority.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "rule_id",
+    "revision",
+    "enabled",
+    "task_kind",
+    "queue_repository",
+    "target_repository",
+    "source_author_ids",
+    "queue_author_ids",
+    "source_label",
+    "queue_label",
+    "allowed_files",
+    "runtime_revision",
+    "policy_sha256",
+    "guidance_sha256",
+    "valid_from",
+    "expires_at",
+    "limits",
+    "default_branch"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "rule_id": {"type": "string", "minLength": 1, "maxLength": 80, "pattern": "^[A-Z0-9][A-Z0-9_-]*$"},
+    "revision": {"type": "integer", "minimum": 1},
+    "enabled": {
+      "const": false,
+      "default": false,
+      "description": "Stage 1 supports shadow evaluation only. True is invalid; this rule cannot authorize execution."
+    },
+    "task_kind": {"const": "docs-prose"},
+    "queue_repository": {"$ref": "#/$defs/identity"},
+    "target_repository": {"$ref": "#/$defs/identity"},
+    "source_author_ids": {
+      "type": "array",
+      "items": {"type": "integer", "minimum": 1},
+      "minItems": 1,
+      "maxItems": 10,
+      "uniqueItems": true
+    },
+    "queue_author_ids": {
+      "type": "array",
+      "items": {"type": "integer", "minimum": 1},
+      "minItems": 1,
+      "maxItems": 10,
+      "uniqueItems": true
+    },
+    "source_label": {"type": "string", "minLength": 1, "maxLength": 100},
+    "queue_label": {"const": "pico:queued"},
+    "allowed_files": {"type": "array", "items": {"$ref": "#/$defs/path"}, "minItems": 1, "maxItems": 2, "uniqueItems": true},
+    "runtime_revision": {"$ref": "#/$defs/gitsha"},
+    "policy_sha256": {"$ref": "#/$defs/sha"},
+    "guidance_sha256": {"$ref": "#/$defs/sha"},
+    "valid_from": {"$ref": "#/$defs/timestamp"},
+    "expires_at": {"$ref": "#/$defs/timestamp"},
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "max_attempts",
+        "max_attempts_per_day",
+        "max_changed_lines",
+        "max_patch_bytes",
+        "max_duration_seconds",
+        "max_lead_calls",
+        "max_model_calls",
+        "max_consecutive_failures",
+        "max_snapshot_age_seconds",
+        "max_cost_per_run_cents",
+        "max_cost_per_day_cents",
+        "max_cost_total_cents"
+      ],
+      "properties": {
+        "max_attempts": {"type": "integer", "minimum": 1, "maximum": 3},
+        "max_attempts_per_day": {"type": "integer", "minimum": 1, "maximum": 1},
+        "max_changed_lines": {"type": "integer", "minimum": 1, "maximum": 40},
+        "max_patch_bytes": {"type": "integer", "minimum": 1, "maximum": 8192},
+        "max_duration_seconds": {"type": "integer", "minimum": 1, "maximum": 900},
+        "max_lead_calls": {"type": "integer", "minimum": 1, "maximum": 10},
+        "max_model_calls": {"type": "integer", "minimum": 1, "maximum": 30},
+        "max_consecutive_failures": {"type": "integer", "minimum": 1, "maximum": 2},
+        "max_snapshot_age_seconds": {"type": "integer", "minimum": 1, "maximum": 60},
+        "max_cost_per_run_cents": {"type": "integer", "minimum": 0, "maximum": 200},
+        "max_cost_per_day_cents": {"type": "integer", "minimum": 0, "maximum": 200},
+        "max_cost_total_cents": {"type": "integer", "minimum": 0, "maximum": 600}
+      }
+    },
+    "default_branch": {"type": "string", "minLength": 1, "maxLength": 100}
+  },
+  "$defs": {
+    "sha": {"type": "string", "minLength": 64, "maxLength": 64, "pattern": "^[a-f0-9]{64}$"},
+    "gitsha": {"type": "string", "minLength": 40, "maxLength": 40, "pattern": "^[a-f0-9]{40}$"},
+    "timestamp": {
+      "type": "string",
+      "minLength": 20,
+      "maxLength": 20,
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$",
+      "format": "date-time"
+    },
+    "path": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 240,
+      "pattern": "^docs/guide/(?:[A-Za-z0-9_-]+/)*[A-Za-z0-9_-]+\\.md$"
+    },
+    "identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "name"],
+      "properties": {
+        "id": {"type": "integer", "minimum": 1},
+        "name": {"type": "string", "minLength": 3, "maxLength": 100, "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"}
+      }
+    },
+    "repository": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "name", "private", "is_fork"],
+      "properties": {
+        "id": {"type": "integer", "minimum": 1},
+        "name": {"type": "string", "minLength": 3, "maxLength": 100, "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"},
+        "private": {"type": "boolean"},
+        "is_fork": {"type": "boolean"}
+      }
+    },
+    "issue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "number", "repository", "author_id", "is_pull_request", "state", "labels", "title", "body"],
+      "properties": {
+        "id": {"type": "integer", "minimum": 1},
+        "number": {"type": "integer", "minimum": 1},
+        "repository": {"$ref": "#/$defs/repository"},
+        "author_id": {"type": "integer", "minimum": 1},
+        "is_pull_request": {"type": "boolean"},
+        "state": {"enum": ["OPEN", "CLOSED"]},
+        "labels": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1, "maxLength": 100},
+          "minItems": 0,
+          "maxItems": 100,
+          "uniqueItems": true
+        },
+        "title": {"type": "string", "minLength": 1, "maxLength": 256},
+        "body": {"type": "string", "minLength": 0, "maxLength": 14000}
+      }
+    },
+    "candidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "rule_id",
+        "rule_revision",
+        "task_kind",
+        "source",
+        "queue",
+        "source_sha256",
+        "queue_sha256",
+        "files",
+        "estimated_changed_lines",
+        "estimated_patch_bytes"
+      ],
+      "properties": {
+        "rule_id": {"type": "string", "minLength": 1, "maxLength": 80},
+        "rule_revision": {"type": "integer", "minimum": 1},
+        "task_kind": {"const": "docs-prose"},
+        "source": {"$ref": "#/$defs/issue"},
+        "queue": {"$ref": "#/$defs/issue"},
+        "source_sha256": {"$ref": "#/$defs/sha"},
+        "queue_sha256": {"$ref": "#/$defs/sha"},
+        "files": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["path", "quoted_text", "change_kind", "replacement_intent"],
+            "properties": {
+              "path": {"$ref": "#/$defs/path"},
+              "quoted_text": {"type": "string", "minLength": 1, "maxLength": 2000},
+              "change_kind": {"enum": ["spelling", "grammar", "clarity"]},
+              "replacement_intent": {"type": "string", "minLength": 1, "maxLength": 700}
+            }
+          },
+          "minItems": 1,
+          "maxItems": 2
+        },
+        "estimated_changed_lines": {"type": "integer", "minimum": 1, "maximum": 40},
+        "estimated_patch_bytes": {"type": "integer", "minimum": 1, "maximum": 8192}
+      }
+    },
+    "context": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "observed_at",
+        "runtime_revision",
+        "policy_sha256",
+        "guidance_sha256",
+        "base_commit",
+        "default_branch",
+        "checkout_identity_verified",
+        "checkout_clean",
+        "revoked",
+        "active_jobs",
+        "attempts_total",
+        "attempts_today",
+        "attempts_day",
+        "seen_source_issue_ids",
+        "consecutive_failures",
+        "accounting_verified",
+        "cost_committed_today_cents",
+        "cost_committed_total_cents",
+        "policy_permissions",
+        "files"
+      ],
+      "properties": {
+        "observed_at": {"$ref": "#/$defs/timestamp"},
+        "runtime_revision": {"$ref": "#/$defs/gitsha"},
+        "policy_sha256": {"$ref": "#/$defs/sha"},
+        "guidance_sha256": {"$ref": "#/$defs/sha"},
+        "base_commit": {"$ref": "#/$defs/gitsha"},
+        "default_branch": {"type": "string", "minLength": 1, "maxLength": 100},
+        "checkout_identity_verified": {"type": "boolean"},
+        "checkout_clean": {"type": "boolean"},
+        "revoked": {"type": "boolean"},
+        "active_jobs": {"type": "integer", "minimum": 0},
+        "attempts_total": {"type": "integer", "minimum": 0},
+        "attempts_today": {"type": "integer", "minimum": 0},
+        "attempts_day": {"type": "string", "minLength": 10, "maxLength": 10, "format": "date"},
+        "seen_source_issue_ids": {
+          "type": "array",
+          "items": {"type": "integer", "minimum": 1},
+          "minItems": 0,
+          "maxItems": 10000,
+          "uniqueItems": true
+        },
+        "consecutive_failures": {"type": "integer", "minimum": 0},
+        "accounting_verified": {"type": "boolean"},
+        "cost_committed_today_cents": {"type": "integer", "minimum": 0},
+        "cost_committed_total_cents": {"type": "integer", "minimum": 0},
+        "policy_permissions": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["create_worktrees", "commit", "push_branch", "create_pr"],
+          "properties": {
+            "create_worktrees": {"type": "boolean"},
+            "commit": {"type": "boolean"},
+            "push_branch": {"type": "boolean"},
+            "create_pr": {"type": "boolean"}
+          }
+        },
+        "files": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["path", "mode", "content"],
+            "properties": {
+              "path": {"$ref": "#/$defs/path"},
+              "mode": {"enum": ["100644", "100755", "120000", "160000"]},
+              "content": {"type": "string", "minLength": 0, "maxLength": 100000}
+            }
+          },
+          "minItems": 1,
+          "maxItems": 2
+        }
+      }
+    }
+  }
+}

@@ -109,3 +109,10 @@ The unit has **no dependency on `moltis.service`**. It runs as `dhuzard`, so pro
 - `interrupted` is terminal for this prototype; no unattended retries, no resume, no automatic expansion of permissions. A new issue and new explicit approval is required for a new execution attempt.
 - `gh issue list` is not used for authorization; non-operator comments, labels and issue contents never grant execution.
 - Integrate #34, #63 and #87 before calling this a production unattended coding system. Add a real WSL/Windows sign-in and service restart pilot, with mock-agent tests first.
+
+## Standing-rule design work (shadow only)
+
+[Standing-rule shadow evaluation](standing-rule-shadow.md) provides an offline,
+disabled-only schema and structural eligibility evaluator. It is not wired into
+this dispatcher and cannot authorize execution or publication. Exact interactive
+approval above remains required; a shadow-eligible result never substitutes for it.

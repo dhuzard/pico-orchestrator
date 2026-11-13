@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import tempfile
 import time
 import unittest
 import unittest.mock
@@ -38,6 +39,24 @@ def partial_task(code: str = "APPROVED_INPUTS_UNAVAILABLE") -> list[dict]:
                blocker_kind="prerequisite"),
             ev(kind="phase", phase="$TASK", status="blocked", blocker_code=code),
             {"op": "finish", "status": "PARTIAL", "blocker": code}]
+
+
+class PeakOverlapTest(unittest.TestCase):
+    def test_monotonic_timestamps_are_sorted_numerically_across_digit_boundaries(self):
+        # New CI hosts can cross an uptime digit boundary during the scenario.
+        # Lexical ordering puts the first child's end before its start, hiding
+        # the actual overlap of the second wave and producing a negative count.
+        with tempfile.TemporaryDirectory() as tmp:
+            pilot = SyntheticPilot()
+            pilot.base = Path(tmp)
+            (pilot.base / "fake.log").write_text(
+                "9.000000 start synth-lib\n"
+                "10.000000 end synth-lib\n"
+                "11.000000 start synth-app\n"
+                "12.000000 start synth-lib\n"
+                "13.000000 end synth-lib\n"
+                "14.000000 end synth-app\n")
+            self.assertEqual(pilot.peak_overlap(), (2, {"synth-lib": 1, "synth-app": 1}))
 
 
 class HappyMultiRepoTest(SyntheticPilot):
