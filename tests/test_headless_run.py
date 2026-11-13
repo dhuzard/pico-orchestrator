@@ -161,6 +161,8 @@ class HeadlessFixture(unittest.TestCase):
         self.target.mkdir()
         git("-C", str(self.target), "init", "-q")
         git("-C", str(self.target), "remote", "add", "origin", "git@github.com:acme/target.git")
+        git("-C", str(self.target), "config", "user.name", "Test Operator")
+        git("-C", str(self.target), "config", "user.email", "operator@example.test")
         (self.target / "README.md").write_text("# target\n")
         git("-C", str(self.target), "add", "README.md")
         git("-C", str(self.target), "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "-m", "init")
@@ -189,6 +191,87 @@ class HeadlessFixture(unittest.TestCase):
 
     def status(self, execution_id="exec-1"):
         return hr.status(target=self.target, explicit_repo="acme/target", execution_id=execution_id)
+
+
+class GitIdentityPreflightTest(HeadlessFixture):
+    def setUp(self):
+        super().setUp()
+        os.environ["GIT_CONFIG_GLOBAL"] = os.devnull
+        os.environ["GIT_CONFIG_NOSYSTEM"] = "1"
+        for name in list(os.environ):
+            if name.startswith(("GIT_AUTHOR_", "GIT_COMMITTER_", "GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")):
+                os.environ.pop(name)
+        os.environ.pop("GIT_CONFIG_COUNT", None)
+
+    def test_missing_identity_refuses_before_backend_or_model_and_does_not_echo_values(self):
+        stage_mutation_policy(self.target)
+        for field in ("name", "email"):
+            with self.subTest(field=field):
+                git("-C", str(self.target), "config", "--unset", f"user.{field}")
+                os.environ["EMAIL"] = "fallback@example.test"
+                with unittest.mock.patch.object(hr, "_backend_identity") as backend:
+                    with self.assertRaises(hr.HeadlessError) as refused:
+                        self.start(allow_mutation=True)
+                    self.assertEqual(refused.exception.code, "GIT_IDENTITY_INVALID")
+                    self.assertNotIn("fallback@example.test", refused.exception.detail)
+                    backend.assert_not_called()
+                self.assertFalse(list(self.state.rglob("exec-1.json")))
+                git("-C", str(self.target), "config", f"user.{field}",
+                    "Test Operator" if field == "name" else "operator@example.test")
+
+    def test_malformed_values_refused_without_fallback(self):
+        for variable, value in (("GIT_AUTHOR_NAME", ""), ("GIT_AUTHOR_NAME", "Bad\nName"),
+                                ("GIT_COMMITTER_NAME", "Name <fake>"),
+                                ("GIT_AUTHOR_EMAIL", "bad email@example.test"),
+                                ("GIT_COMMITTER_EMAIL", "not-an-address")):
+            with self.subTest(variable=variable, value=value):
+                with self.assertRaises(hr.HeadlessError) as refused:
+                    hr.git_identity_environment(self.target, {**os.environ, variable: value})
+                self.assertEqual(refused.exception.code, "GIT_IDENTITY_INVALID")
+        git("-C", str(self.target), "config", "user.name", "Bad\nConfig")
+        with self.assertRaises(hr.HeadlessError):
+            hr.git_identity_environment(self.target, dict(os.environ))
+
+    def test_git_rejection_is_reported_without_echoing_git_stderr(self):
+        with self.assertRaises(hr.HeadlessError) as refused:
+            hr.git_identity_environment(self.target, {**os.environ, "GIT_AUTHOR_DATE": "invalid-private-value"})
+        self.assertEqual(refused.exception.code, "GIT_IDENTITY_INVALID")
+        self.assertNotIn("invalid-private-value", refused.exception.detail)
+
+    def test_explicit_role_precedence_and_spaced_names_make_real_local_commit(self):
+        git("-C", str(self.target), "config", "author.name", "Configured Author")
+        git("-C", str(self.target), "config", "committer.email", "committer@example.test")
+        env = {**os.environ, "GIT_AUTHOR_NAME": "Approved Author Name"}
+        resolved = hr.git_identity_environment(self.target, env)
+        self.assertEqual(resolved, {"GIT_AUTHOR_NAME": "Approved Author Name",
+                                   "GIT_AUTHOR_EMAIL": "operator@example.test",
+                                   "GIT_COMMITTER_NAME": "Test Operator",
+                                   "GIT_COMMITTER_EMAIL": "committer@example.test"})
+        # commit-tree uses no hooks, updates no refs and contacts no network.
+        tree = git("-C", str(self.target), "rev-parse", "HEAD^{tree}")
+        made = subprocess.run(["git", "-C", str(self.target), "commit-tree", tree, "-m", "identity probe"],
+                              env={**env, **resolved}, capture_output=True, text=True, check=True)
+        self.assertEqual(git("-C", str(self.target), "show", "-s", "--format=%an|%ae|%cn|%ce", made.stdout.strip()),
+                         "Approved Author Name|operator@example.test|Test Operator|committer@example.test")
+
+    def test_launch_receives_checked_identity_and_repeat_does_not_revalidate(self):
+        stage_mutation_policy(self.target)
+        with unittest.mock.patch.object(hr.subprocess, "Popen", wraps=subprocess.Popen) as spawn:
+            first = self.start(allow_mutation=True)
+        launches = [call for call in spawn.call_args_list if call.args[0][0] == str(self.pi)]
+        self.assertEqual(len(launches), 1)
+        self.assertEqual(launches[0].kwargs["env"]["GIT_AUTHOR_NAME"], "Test Operator")
+        self.assertEqual(launches[0].kwargs["env"]["GIT_COMMITTER_EMAIL"], "operator@example.test")
+        git("-C", str(self.target), "config", "--unset", "user.name")
+        again = self.start(allow_mutation=True)
+        self.assertEqual(again["outcome"], "already_finished")
+        self.assertEqual(again["run_id"], first["run_id"])
+        self.assertEqual(again["launches"], 1)
+
+    def test_read_only_launch_needs_no_git_identity(self):
+        git("-C", str(self.target), "config", "--unset", "user.name")
+        git("-C", str(self.target), "config", "--unset", "user.email")
+        self.assertEqual(self.start()["status"], "exited")
 
 
 class HeadlessRunTest(HeadlessFixture):

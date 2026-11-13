@@ -42,6 +42,9 @@ class WorkspaceRunFixture(unittest.TestCase):
             path = self.base / name
             path.mkdir()
             git("-C", str(path), "init", "-q")
+            # Fake mutating launches need an explicit identity independent of the operator's global config.
+            git("-C", str(path), "config", "user.name", "PICO Test Operator")
+            git("-C", str(path), "config", "user.email", "operator@example.test")
             git("-C", str(path), "remote", "add", "origin", f"git@github.com:acme/{name}.git")
             (path / "README.md").write_text(f"# {name}\n")
             git("-C", str(path), "add", "README.md")

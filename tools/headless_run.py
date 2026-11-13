@@ -231,9 +231,10 @@ def locked_record(path: Path):
 
 def build_prompt(objective: str, prompt_path: Path = PROMPT_PATH) -> str:
     template = re.sub(r"^---[\s\S]*?---\s*", "", prompt_path.read_text(encoding="utf-8"))
+    guidance = f"Pinned orchestration guidance: {ROOT / 'prompts' / 'orchestrate.md'}. Use this path if more guidance is needed.\n\n"
     if "$ARGUMENTS" in template:
-        return template.replace("$ARGUMENTS", objective)
-    return f"{template.rstrip()}\n\n{objective}\n"
+        return guidance + template.replace("$ARGUMENTS", objective)
+    return guidance + f"{template.rstrip()}\n\n{objective}\n"
 
 
 def mutation_permitted(worktree: Path) -> list[str]:
@@ -249,6 +250,54 @@ def mutation_permitted(worktree: Path) -> list[str]:
     if not isinstance(permissions, dict):
         return []
     return [name for name in MUTATING_PERMISSIONS if permissions.get(name) is True]
+
+
+def git_identity_environment(worktree: Path, env: dict[str, str]) -> dict[str, str]:
+    """Resolve explicit Git identities without host/account/EMAIL inference or config writes.
+
+    Pin the checked values in the child environment so worktree creation and later
+    config changes do not change the lead's default author/committer identity.
+    This is setup validation, not a security boundary against a mutating lead.
+    """
+    result = {}
+    for role in ("author", "committer"):
+        for field in ("name", "email"):
+            variable = f"GIT_{role.upper()}_{field.upper()}"
+            value = env.get(variable)
+            if value is None:
+                for key in (f"{role}.{field}", f"user.{field}"):
+                    try:
+                        read = subprocess.run(["git", "-C", str(worktree), "config", "--null", "--get", key],
+                                              env=env, capture_output=True, text=True, timeout=10)
+                    except (OSError, subprocess.TimeoutExpired, UnicodeError) as exc:
+                        raise HeadlessError("GIT_IDENTITY_INVALID", "cannot read explicit Git identity configuration") from exc
+                    if read.returncode == 1:
+                        continue
+                    if read.returncode != 0 or not read.stdout.endswith("\0"):
+                        raise HeadlessError("GIT_IDENTITY_INVALID", "cannot read explicit Git identity configuration")
+                    value = read.stdout[:-1]
+                    break
+            invalid = (not value or value != value.strip() or len(value) > 320
+                       or any(ord(c) < 32 or ord(c) == 127 or c in "<>" for c in value))
+            if not invalid and field == "email":
+                invalid = re.fullmatch(r"[^\s@]+@[^\s@]+", value) is None
+            if invalid:
+                raise HeadlessError("GIT_IDENTITY_INVALID",
+                                    f"explicit {variable} is missing or invalid; configure user.name/user.email "
+                                    "in the target checkout or provide explicit GIT_AUTHOR_* and GIT_COMMITTER_* "
+                                    "values before a mutating headless launch; identity values are not inferred")
+            result[variable] = value
+    for role in ("AUTHOR", "COMMITTER"):
+        try:
+            checked = subprocess.run(["git", "-C", str(worktree), "var", f"GIT_{role}_IDENT"],
+                                     env={**env, **result}, capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.TimeoutExpired, UnicodeError) as exc:
+            raise HeadlessError("GIT_IDENTITY_INVALID", "cannot validate explicit Git identity") from exc
+        prefix = f"{result[f'GIT_{role}_NAME']} <{result[f'GIT_{role}_EMAIL']}> "
+        if checked.returncode != 0 or not checked.stdout.startswith(prefix):
+            raise HeadlessError("GIT_IDENTITY_INVALID", "Git rejected or normalized the explicit identity; "
+                                "configure usable author and committer names/emails before launching")
+    return result
 
 
 # Children this process launched and is waiting for, by pid. Their liveness is read through the Popen
@@ -653,6 +702,10 @@ def _launch_locked(path: Path, *, worktree: Path, identity: str, common: Path, e
         raise HeadlessError("MUTATION_NOT_AUTHORIZED",
                             "autonomy policy permits " + ", ".join(granted) + "; pass --allow-mutation to run it headless")
 
+    env = dict(os.environ)
+    if granted:
+        env.update(git_identity_environment(worktree, env))
+
     session_dir = path.parent / "sessions"
     session_dir.mkdir(parents=True, exist_ok=True)
     if record is None:
@@ -663,7 +716,6 @@ def _launch_locked(path: Path, *, worktree: Path, identity: str, common: Path, e
                   "orchestrator_revision": workspace_plan.orchestrator_revision(ROOT), "created_at": _now(),
                   "launches": 0, "run_id": None, "run": None, "pid": None, "exit_code": None, "status": "created"}
     identity_env = _backend_identity(worktree, python)
-    env = dict(os.environ)
     # An explicit limit is handed to the child; otherwise the extension falls back to the repository policy.
     for name in (LEAD_LIMIT_ENV, LEAD_LIMIT_SOURCE_ENV, LEAD_WARN_ENV, FAILURE_BUDGET_ENV, FAILURE_BUDGET_SOURCE_ENV,
                  INPUTS_DIGEST_ENV):

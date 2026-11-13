@@ -988,6 +988,16 @@ For example, link an adapter record with an `event` containing
 Record a blocked worker with its stable blocker code and observed backend
 versions. At the end, call `orchestration_record` with `action: "finish"`
 and the actual `COMPLETED`, `BLOCKED`, `FAILED`, or `PARTIAL` status.
+Reserve calls for integration checks, publication evidence and final outcome;
+the call-limit warning is a request to converge. At the work-call limit only
+`status` and `finish` remain available during the bounded grace period.
+If the final wave was explicitly begun and its actual integration is complete,
+`{"action":"finish","status":"COMPLETED","integrate_wave_id":"<wave id>"}`
+performs the existing `integrate_end` checks followed by the normal completion
+checks in one tool call. Use `"auto"` only for one unambiguous implicit wave.
+This does not merge, push, create a PR, record missing reviews or infer completion
+from a published PR. A refusal requires an honest `PARTIAL` outcome when no
+budget remains. Normally close integration before publishing, as described below.
 `COMPLETED` is rejected with `PARENT_COMPLETION_INCOMPLETE` while a recorded
 phase or worker is unfinished, and with `PARENT_REVIEW_MISSING` when a routed
 phase lacks a completed worker event for each independent-review step of its

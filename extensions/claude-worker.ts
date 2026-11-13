@@ -67,7 +67,8 @@ export const FORBIDDEN_TOOLS: readonly string[] = ["Bash(git push:*)", "Bash(gh:
 export const WORKER_ENV_NAMES: readonly string[] = ["PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LANGUAGE",
   "TERM", "COLORTERM", "TZ", "TMPDIR", "TMP", "TEMP", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME",
   "XDG_STATE_HOME", "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR", "HTTPS_PROXY", "HTTP_PROXY",
-  "NO_PROXY", "ALL_PROXY", "https_proxy", "http_proxy", "no_proxy", "all_proxy"];
+  "NO_PROXY", "ALL_PROXY", "https_proxy", "http_proxy", "no_proxy", "all_proxy",
+  "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL"];
 /** Name prefixes a worker receives: locale categories and Anthropic / Claude Code configuration. */
 export const WORKER_ENV_PREFIXES: readonly string[] = ["LC_", "ANTHROPIC_", "CLAUDE_"];
 /**
@@ -276,7 +277,8 @@ export function sandboxDeniedReads(parentEnv: NodeJS.ProcessEnv, home: string,
   const state = [absoluteOrNull(parentEnv.PI_ORCHESTRATOR_STATE_DIR) ?? join(ORCHESTRATOR_ROOT, "provenance"),
     absoluteOrNull(parentEnv.PI_CODING_ORCHESTRATOR_STATE_DIR), join(xdgState, PICO_DIR_NAME)];
   const credentials = [...SANDBOX_CREDENTIAL_PATHS.map((path) => join(home, path)),
-    xdgConfig ? join(xdgConfig, "gh") : null, absoluteOrNull(parentEnv.GH_CONFIG_DIR)];
+    xdgConfig ? join(xdgConfig, "gh") : null, absoluteOrNull(parentEnv.GH_CONFIG_DIR),
+    absoluteOrNull(parentEnv.PI_DISPATCHER_QUEUE_CREDENTIAL_PATH)];
   return [...new Set([...state, ...credentials].filter((path): path is string => path !== null)
     .flatMap((path) => withRealPath(path, realpath)))];
 }
