@@ -280,7 +280,8 @@ class SyntheticPilot(unittest.TestCase):
 
     def peak_overlap(self) -> tuple[int, dict]:
         """Peak concurrent children overall and per repository, from the fake pi's start/end log."""
-        events = sorted(line.split() for line in (self.base / "fake.log").read_text().splitlines())
+        events = sorted((line.split() for line in (self.base / "fake.log").read_text().splitlines()),
+                        key=lambda fields: float(fields[0]))
         active, peak, per_repo, repo_peak = 0, 0, {}, {}
         for _, event, repo in events:
             delta = 1 if event == "start" else -1
