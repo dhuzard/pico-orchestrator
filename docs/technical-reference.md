@@ -654,6 +654,9 @@ not `$HOME`, other repositories, or the network.
 
 The worker process does not inherit Pi's environment. `buildWorkerEnv`
 forwards only `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `LANG`,
+the four Git identity values `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`,
+`GIT_COMMITTER_NAME`, `GIT_COMMITTER_EMAIL` (validated and pinned by mutating
+headless launches; no general `GIT_*` forwarding),
 `LANGUAGE`, `LC_*`, `TERM`, `COLORTERM`, `TZ`, `TMPDIR`/`TMP`/`TEMP`,
 `XDG_{CONFIG,DATA,CACHE,STATE}_HOME`, `NODE_EXTRA_CA_CERTS`,
 `SSL_CERT_FILE`, `SSL_CERT_DIR`, the proxy variables
