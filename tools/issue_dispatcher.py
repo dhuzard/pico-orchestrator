@@ -14,9 +14,12 @@ import json
 import os
 import re
 import sqlite3
+import stat
 import subprocess
 import sys
 import time
+
+import yaml
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -31,10 +34,64 @@ class DispatcherError(Exception):
     pass
 
 
-def command(argv: list[str], *, timeout: int = 40) -> dict | list:
+GITHUB_ENV = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "GH_CONFIG_DIR", "GH_HOST")
+
+
+def clean_github_env() -> dict:
+    return {k: v for k, v in os.environ.items() if k not in GITHUB_ENV}
+
+
+def require_private(path: Path, *, directory: bool = False) -> None:
+    try:
+        info = path.stat()
+        valid_type = stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode)
+        required = 0o700 if directory else 0o600
+        if not valid_type or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != required:
+            raise ValueError()
+    except (OSError, ValueError) as exc:
+        raise DispatcherError("credential path must be owned by the service user and have private permissions") from exc
+
+
+def queue_env(cfg: dict) -> dict | None:
+    if "queue_token_file" not in cfg:
+        return None  # legacy configuration
+    require_private(cfg["queue_token_file"])
+    try:
+        token = cfg["queue_token_file"].read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError) as exc:
+        raise DispatcherError("queue credential unavailable") from exc
+    if not token or "\n" in token or "\r" in token:
+        raise DispatcherError("queue credential unavailable")
+    env = clean_github_env()
+    env["GH_TOKEN"] = token
+    return env
+
+
+def target_env(cfg: dict) -> dict | None:
+    if "target_gh_config_dir" not in cfg:
+        return None
+    # Require file-based auth: a missing entry must not fall back to a shared
+    # system keychain or an inherited credential for the same GitHub host.
+    require_private(cfg["target_gh_config_dir"], directory=True)
+    require_private(cfg["target_gh_config_dir"] / "hosts.yml")
+    try:
+        hosts = yaml.safe_load((cfg["target_gh_config_dir"] / "hosts.yml").read_text(encoding="utf-8"))
+        token = hosts["github.com"]["oauth_token"]
+        if not isinstance(token, str) or not token.strip():
+            raise ValueError()
+    except (OSError, UnicodeError, yaml.YAMLError, KeyError, TypeError, ValueError) as exc:
+        raise DispatcherError("target credential unavailable in target gh config") from exc
+    env = clean_github_env()
+    env["GH_CONFIG_DIR"] = str(cfg["target_gh_config_dir"])
+    # The sandbox uses this path to deny worker reads; it is not a token.
+    env["PI_DISPATCHER_QUEUE_CREDENTIAL_PATH"] = str(cfg["queue_token_file"])
+    return env
+
+
+def command(argv: list[str], *, timeout: int = 40, env: dict | None = None) -> dict | list:
     """Execute one fixed-argument CLI operation; never use a shell."""
     try:
-        run = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, check=False)
+        run = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, check=False, env=env)
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise DispatcherError(f"command unavailable or timed out: {argv[0]}") from exc
     try:
@@ -74,7 +131,21 @@ def load_config(path: Path) -> dict:
     calls = int(data.get("max_lead_calls", 30))
     if duration < 1 or calls < 1:
         raise DispatcherError("execution limits must be positive")
-    return {"queue": data["queue_repository"], "targets": normalized, "state": state,
+    queue_file, target_dir = data.get("queue_token_file"), data.get("target_gh_config_dir")
+    if (queue_file is None) != (target_dir is None):
+        raise DispatcherError("queue_token_file and target_gh_config_dir must be configured together")
+    credentials = {}
+    if queue_file is not None:
+        if not isinstance(queue_file, str) or not isinstance(target_dir, str):
+            raise DispatcherError("credential paths must be absolute paths")
+        queue_path, target_path = Path(queue_file).expanduser(), Path(target_dir).expanduser()
+        if not queue_path.is_absolute() or not target_path.is_absolute():
+            raise DispatcherError("credential paths must be absolute paths")
+        queue_path, target_path = queue_path.resolve(), target_path.resolve()
+        if queue_path == target_path or target_path in queue_path.parents:
+            raise DispatcherError("queue credential must be outside the target gh config directory")
+        credentials = {"queue_token_file": queue_path, "target_gh_config_dir": target_path}
+    return {**credentials, "queue": data["queue_repository"], "targets": normalized, "state": state,
             "poll": poll, "duration": duration, "calls": calls,
             "gh": str(data.get("gh_executable", "gh")),
             "pico": str(data.get("pico_executable", "pico"))}
@@ -121,7 +192,7 @@ def parse_task(issue: dict, cfg: dict) -> Task:
 
 def issue_view(cfg: dict, number: int) -> dict:
     obj = command([cfg["gh"], "issue", "view", str(number), "--repo", cfg["queue"],
-                   "--json", "number,title,body,state,labels"])
+                   "--json", "number,title,body,state,labels"], env=queue_env(cfg))
     if not isinstance(obj, dict):
         raise DispatcherError("GitHub returned an invalid issue")
     return obj
@@ -130,7 +201,7 @@ def issue_view(cfg: dict, number: int) -> dict:
 def queued_issues(cfg: dict) -> list:
     result = command([cfg["gh"], "issue", "list", "--repo", cfg["queue"],
                       "--state", "open", "--label", "pico:queued", "--limit", "100",
-                      "--json", "number,title,body,state,labels"])
+                      "--json", "number,title,body,state,labels"], env=queue_env(cfg))
     if not isinstance(result, list):
         raise DispatcherError("GitHub returned an invalid issues list")
     return result
@@ -184,7 +255,26 @@ def pico_action(cfg: dict, row: sqlite3.Row, action: str, objective: str = "") -
                  "--max-lead-calls", str(cfg["calls"])]
         if row["mode"] == "local-mutation":
             args.append("--allow-mutation")
-    result = command(args, timeout=90)
+    # Status is local and enforces the duration limit; it must continue even
+    # when a credential is revoked or removed while a run is active.
+    env = target_env(cfg) if action == "start" else (clean_github_env() if "target_gh_config_dir" in cfg else None)
+    if action == "start" and env is not None:
+        try:
+            auth = subprocess.run([cfg["gh"], "auth", "status", "--hostname", "github.com"],
+                                  capture_output=True, text=True, timeout=40, check=False, env=env)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise DispatcherError("target GitHub authentication unavailable") from exc
+        if auth.returncode:
+            raise DispatcherError("target GitHub authentication unavailable")
+        try:
+            repo = subprocess.run([cfg["gh"], "repo", "view", row["repo"], "--json", "nameWithOwner"],
+                                  capture_output=True, text=True, timeout=40, check=False, env=env)
+            identity = json.loads(repo.stdout)["nameWithOwner"]
+            if repo.returncode or not isinstance(identity, str) or identity.casefold() != row["repo"].casefold():
+                raise ValueError()
+        except (OSError, subprocess.TimeoutExpired, ValueError, KeyError, TypeError) as exc:
+            raise DispatcherError("target GitHub repository access unavailable") from exc
+    result = command(args, timeout=90, env=env)
     if not isinstance(result, dict):
         raise DispatcherError("PICO returned an invalid execution record")
     return result
@@ -215,10 +305,10 @@ def report(cfg: dict, db: sqlite3.Connection, row: sqlite3.Row) -> None:
     try:
         result = subprocess.run([cfg["gh"], "issue", "comment", str(row["number"]),
                                  "--repo", cfg["queue"], "--body", body],
-                                capture_output=True, text=True, timeout=40, check=False)
+                                capture_output=True, text=True, timeout=40, check=False, env=queue_env(cfg))
         if result.returncode:
             return  # Reattempt on next poll. A crash can lead to duplicate comments.
-    except (OSError, subprocess.TimeoutExpired):
+    except (OSError, subprocess.TimeoutExpired, DispatcherError):
         return
     db.execute("UPDATE approvals SET reported=? WHERE number=?", (row["state"], row["number"]))
     db.commit()

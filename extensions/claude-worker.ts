@@ -276,7 +276,8 @@ export function sandboxDeniedReads(parentEnv: NodeJS.ProcessEnv, home: string,
   const state = [absoluteOrNull(parentEnv.PI_ORCHESTRATOR_STATE_DIR) ?? join(ORCHESTRATOR_ROOT, "provenance"),
     absoluteOrNull(parentEnv.PI_CODING_ORCHESTRATOR_STATE_DIR), join(xdgState, PICO_DIR_NAME)];
   const credentials = [...SANDBOX_CREDENTIAL_PATHS.map((path) => join(home, path)),
-    xdgConfig ? join(xdgConfig, "gh") : null, absoluteOrNull(parentEnv.GH_CONFIG_DIR)];
+    xdgConfig ? join(xdgConfig, "gh") : null, absoluteOrNull(parentEnv.GH_CONFIG_DIR),
+    absoluteOrNull(parentEnv.PI_DISPATCHER_QUEUE_CREDENTIAL_PATH)];
   return [...new Set([...state, ...credentials].filter((path): path is string => path !== null)
     .flatMap((path) => withRealPath(path, realpath)))];
 }
