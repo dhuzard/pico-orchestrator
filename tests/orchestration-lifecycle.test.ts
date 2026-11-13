@@ -2541,6 +2541,120 @@ test("reaching the limit blocks tools except status and finish; the lead's finis
   });
 });
 
+async function beginFinishWave(h: ReturnType<typeof harness>) {
+  await h.handlers.get("tool_result")!(routeFor("A"));
+  const record = h.tools.get("orchestration_record");
+  assert.equal((await record.execute("w", { action: "declare_wave", wave_id: "finish-wave",
+    tasks: [{ task_id: "A", write_scope: ["docs/**"] }] })).details.ok, true);
+  assert.equal((await record.execute("b", { action: "integrate_begin", wave_id: "finish-wave" })).details.ok, true);
+  h.checkout.head = "b".repeat(40);
+  h.checkout.digest = "merged";
+  return record;
+}
+const integratedFinish = { action: "finish", status: "COMPLETED", integrate_wave_id: "finish-wave" };
+
+test("explicit integrated finish closes the open wave at the cap or last grace call without opening other tools", async () => {
+  for (const calls of [3, 5]) {
+    await withLeadLimit({ PI_ORCHESTRATION_MAX_LEAD_CALLS: "3" }, {}, async (h, aborts) => {
+      const record = await beginFinishWave(h);
+      for (let i = 1; i <= calls; i++) await leadCall(h, i === calls
+        ? [{ type: "toolCall", name: "orchestration_record", arguments: integratedFinish }] : []);
+      assert.equal((await h.handlers.get("tool_call")!(bash)).block, true);
+      assert.equal((await h.handlers.get("tool_call")!({ toolName: "orchestration_record",
+        input: { action: "integrate_end", wave_id: "finish-wave" } })).block, true);
+      assert.equal(await h.handlers.get("tool_call")!({ toolName: "orchestration_record", input: integratedFinish }), undefined);
+      const before = h.calls.length;
+      const done = await record.execute("f", integratedFinish);
+      assert.equal(done.details.ok, true);
+      assert.deepEqual(waveStatuses(h).slice(-2), ["integrating", "integrated"]);
+      const effects = h.calls.slice(before);
+      assert.ok(effects.some((call) => call.script.endsWith("diff_floor_check.py") && call.input?.operation === "parent"));
+      assert.ok(effects.every((call) => ["diff_floor_check.py", "session_scope.py", "parent_orchestration.py"]
+        .some((name) => call.script.endsWith(name))), "finalization performs only existing local validation/recording");
+      assert.equal(h.parentCalls("finish").length, 1);
+      assert.deepEqual(aborts, []);
+    });
+  }
+});
+
+test("explicit integrated finish refuses unknown waves and non-COMPLETED requests without recording completion", async () => {
+  await withLeadLimit({ PI_ORCHESTRATION_MAX_LEAD_CALLS: "3" }, {}, async (h) => {
+    const record = await beginFinishWave(h);
+    assert.equal(Value.Check(record.parameters, integratedFinish), true);
+    assert.equal(Value.Check(record.parameters, { ...integratedFinish, status: "PARTIAL" }), false);
+    assert.equal(Value.Check(record.parameters, { ...integratedFinish, integrate_wave_id: "" }), false);
+    for (const request of [{ ...integratedFinish, integrate_wave_id: "missing" },
+                           { ...integratedFinish, status: "PARTIAL" }]) {
+      assert.equal((await record.execute("f", request)).details.ok, false);
+    }
+    assert.equal(h.parentCalls("finish").length, 0);
+    assert.equal(waveStatuses(h).includes("integrated"), false);
+  });
+});
+
+test("explicit integrated finish retains diff refusal and grace exhaustion when validation fails", async () => {
+  await withLeadLimit({ PI_ORCHESTRATION_MAX_LEAD_CALLS: "2" }, {
+    diffFloors: (input) => input.operation === "parent" ? { ok: false } : { ok: true, blocked: false },
+  }, async (h, aborts) => {
+    const record = await beginFinishWave(h);
+    for (let i = 0; i < 4; i++) await leadCall(h, [{ type: "toolCall", name: "orchestration_record", arguments: integratedFinish }]);
+    assert.equal((await record.execute("f", integratedFinish)).details.ok, false);
+    assert.equal(h.parentCalls("finish").length, 0);
+    assert.equal(waveStatuses(h).includes("integrated"), false);
+    await leadCall(h);
+    assert.equal(aborts.length, 1);
+    assert.equal(h.parentCalls("event").filter((call) => call.input?.kind === "lead_call_limit_reached").length, 1);
+  });
+});
+
+test("explicit integrated finish resolves auto only for an already-begun implicit wave", async () => {
+  await withLeadLimit({ PI_ORCHESTRATION_MAX_LEAD_CALLS: "2" }, {}, async (h) => {
+    await routeMutating(h, ["A"]);
+    const spawn = { toolName: "spawn_subagent", toolCallId: "a1",
+      input: { task: wtTask("A:codex_specifier"), label: "A:codex_specifier" } };
+    assert.equal(await h.handlers.get("tool_call")!(spawn), undefined);
+    await h.handlers.get("tool_result")!({ toolName: "spawn_subagent", toolCallId: "a1", content: [],
+      details: { subagent_id: "sub-a1" } });
+    const record = h.tools.get("orchestration_record");
+    const finish = { ...integratedFinish, integrate_wave_id: "auto" };
+    assert.equal((await record.execute("early", finish)).details.ok, false);
+    assert.equal(h.parentCalls("finish").length, 0);
+    assert.equal((await record.execute("b", { action: "integrate_begin", wave_id: "auto" })).details.ok, true);
+    await leadCall(h); await leadCall(h, finishCall);
+    assert.equal((await record.execute("f", finish)).details.ok, true);
+    assert.equal(waveStatuses(h).at(-1), "integrated");
+  });
+});
+
+test("explicit integrated finish cannot finish when integration provenance fails", async () => {
+  await withLeadLimit({ PI_ORCHESTRATION_MAX_LEAD_CALLS: "3" }, {
+    eventRefusal: (event) => event.kind === "wave" && event.status === "integrated"
+      ? { ok: false, error_code: "PARENT_STORAGE_UNAVAILABLE" } : null,
+  }, async (h) => {
+    const record = await beginFinishWave(h);
+    await leadCall(h); await leadCall(h); await leadCall(h, finishCall);
+    assert.equal((await record.execute("f", integratedFinish)).details.ok, false);
+    assert.equal(h.parentCalls("finish").length, 0);
+  });
+});
+
+test("explicit integrated finish preserves incomplete-phase and independent-review refusals", async () => {
+  for (const completionError of ["PARENT_COMPLETION_INCOMPLETE", "PARENT_REVIEW_MISSING"]) {
+    await withLeadLimit({ PI_ORCHESTRATION_MAX_LEAD_CALLS: "3" }, { completionError }, async (h) => {
+      const record = await beginFinishWave(h);
+      await leadCall(h); await leadCall(h); await leadCall(h, finishCall);
+      const result = await record.execute("f", integratedFinish);
+      assert.equal(result.details.ok, false);
+      assert.equal(result.details.result.error_code, completionError);
+      assert.equal(h.parentCalls("finish").length, 1);
+      assert.equal(waveStatuses(h).at(-1), "integrated");
+      // The wave already ended; a retry must not replay integration or fabricate a successful finish.
+      assert.equal((await record.execute("again", integratedFinish)).details.ok, false);
+      assert.equal(h.parentCalls("finish").length, 1);
+    });
+  }
+});
+
 test("grace exhausted: the run is stopped IN_PROGRESS with a checkpoint event, the lease released by its owner, the agent aborted", async () => {
   await withLeadLimit({ PI_ORCHESTRATION_MAX_LEAD_CALLS: "2", PI_ORCHESTRATION_MAX_LEAD_CALLS_SOURCE: "manifest" }, {}, async (h, aborts) => {
     await leadCall(h); await leadCall(h); await leadCall(h);

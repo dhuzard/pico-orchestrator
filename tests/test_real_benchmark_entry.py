@@ -124,6 +124,9 @@ class EntryPointRunTest(unittest.TestCase):
             (base / "signals").mkdir()
             env = {**clean_env(), "PICO_REAL_BENCHMARK": "1", "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
                    "EXPECTED_REF": head, "SHIM_TOOLS": str(ROOT / "tools"), "HOME": str(base),
+                   # This fake mutating run supplies its own identity; the launcher must never infer one.
+                   "GIT_AUTHOR_NAME": "Benchmark Author", "GIT_AUTHOR_EMAIL": "author@example.invalid",
+                   "GIT_COMMITTER_NAME": "Benchmark Committer", "GIT_COMMITTER_EMAIL": "committer@example.invalid",
                    "FAKE_PI_TOOLS": str(ROOT / "tools"), "FAKE_PI_BEHAVIOR": "scenario", "PI_CODING_AGENT_DIR": str(base / "agent"),
                    "FAKE_SCENARIO": str(base / "scenario.json"), "FAKE_SCENARIO_SIGNALS": str(base / "signals"),
                    "FAKE_SCENARIO_REFERENCE": str(ROOT / "benchmarks" / "synthetic-workspace" / "reference"),
