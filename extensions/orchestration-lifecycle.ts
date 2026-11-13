@@ -1869,7 +1869,7 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
   pi.registerTool({
     name: "orchestration_record",
     label: "Record parent orchestration outcome",
-    description: "Parent only: record phases, workers, child runs, mutation counts, concise numbered interaction summaries, or final status; bind mutating steps to prepared worktrees; declare waves; and bracket integration. Do not record directive or feedback interactions: the extension records each worker call itself, with task, step, route, a contract excerpt and digest, and a bounded result summary, digest and commit (the full text stays in the Pi session transcript). Record a decision interaction only for your own judgment, with task/step ids and optional reply_to. Never include prompts, raw outputs, transcripts, or issue bodies.",
+    description: "Parent only: record phases, workers, child runs, mutation counts, concise numbered interaction summaries, or final status; bind mutating steps to prepared worktrees; declare waves; and bracket integration. A COMPLETED finish may include integrate_wave_id to explicitly end an already-begun integration through its normal checks before the completion checks, in one call. Do not record directive or feedback interactions: the extension records each worker call itself, with task, step, route, a contract excerpt and digest, and a bounded result summary, digest and commit (the full text stays in the Pi session transcript). Record a decision interaction only for your own judgment, with task/step ids and optional reply_to. Never include prompts, raw outputs, transcripts, or issue bodies.",
     parameters: Type.Union([
       Type.Object({ action: Type.Literal("status") }, { additionalProperties: false }),
       Type.Object({ action: Type.Literal("bind_workspace"), task_id: Type.Optional(Type.String()),
@@ -1882,8 +1882,11 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
       Type.Object({ action: Type.Literal("integrate_end"), wave_id: Type.String() }, { additionalProperties: false }),
       Type.Object({ action: Type.Literal("integrate_abort"), wave_id: Type.String() }, { additionalProperties: false }),
       Type.Object({ action: Type.Literal("event"), event: EVENT }, { additionalProperties: false }),
+      Type.Object({ action: Type.Literal("finish"), status: Type.Literal("COMPLETED"),
+        integrate_wave_id: Type.Optional(Type.String({ minLength: 1 })),
+        blocker_code: Type.Optional(Type.String()) }, { additionalProperties: false }),
       Type.Object({ action: Type.Literal("finish"),
-        status: Type.Union([Type.Literal("COMPLETED"), Type.Literal("BLOCKED"),
+        status: Type.Union([Type.Literal("BLOCKED"),
                             Type.Literal("FAILED"), Type.Literal("PARTIAL")]),
         blocker_code: Type.Optional(Type.String()) }, { additionalProperties: false }),
     ]),
@@ -1943,6 +1946,16 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
       if (params.action === "declare_wave") return declareWave(params.wave_id, params.tasks);
       if (params.action === "integrate_begin" || params.action === "integrate_end" || params.action === "integrate_abort") {
         return integration(params.action, params.wave_id);
+      }
+      // An explicit combined end/finish saves a model turn, including during the existing lead-call grace.
+      // Never infer an integration from a published PR or bypass the ordinary diff and completion gates.
+      if (params.action === "finish" && "integrate_wave_id" in params) {
+        if (params.status !== "COMPLETED" || typeof params.integrate_wave_id !== "string"
+            || !params.integrate_wave_id.length) {
+          return reply(false, "BLOCKED: INTEGRATION_FINISH_INVALID: integrate_wave_id requires a COMPLETED finish and an open wave id.");
+        }
+        const ended = await integration("integrate_end", params.integrate_wave_id);
+        if (!ended.details.ok) return ended;
       }
       const args = params.action === "status" ? ["status", runId]
         : params.action === "event" ? ["event", runId, ...ownerArgs()]

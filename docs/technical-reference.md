@@ -581,6 +581,22 @@ per task, so a missing wave record cannot hide it). `phase.bound_epochs` lists t
 an escalation does not forget the old route's; a read-only task does not block COMPLETED.
 The extension never infers the integrate bracket: `integrated` would assert a merge it did not observe.
 
+To end an already-begun integration and request completion in one model call, use
+`orchestration_record {"action":"finish","status":"COMPLETED","integrate_wave_id":"<wave-id>"}`.
+The wave id may be `"auto"` for the single open implicit wave. This is an explicit
+`integrate_end` followed by the existing completion checks: it validates the parent
+checkout's merged diff, snapshots it and records integration before checking phases,
+workers and required independent reviews. A failure in integration prevents the finish;
+a later completion refusal leaves the integration recorded. Retry completion without
+`integrate_wave_id` after resolving that refusal. Other finish statuses reject this field.
+
+The combined request is available during the existing lead-call finalization grace;
+it neither raises that limit nor enables bash, workers, publication, a new integration
+or general events after the cap. No model call or remote mutation is performed by this
+finalization. It is not publication receipt reconciliation: a PR, a merge in a different
+batch checkout or a process restart does not prove the parent wave was integrated or
+reviewed. No wave is automatically begun, recovered or marked completed from a PR.
+
 Worker `activity` entries replace the lead's directive and feedback events. At start they carry `route`,
 `prompt_digest`, `goal` (the contract's `Goal:` line) and `prompt_excerpt` (first 300 characters after the task tag and
 goal line); on return `result_summary` (first 600 characters of the final text), `result_digest` and `commit_sha` when
