@@ -51,6 +51,24 @@ Set up `queue_token_file` as a mode 0600 file containing only a queue-scoped tok
 
 Queue issue reads and comments receive the queue token only in their `gh` process environment. The Pico process receives the target `GH_CONFIG_DIR` and no inherited GitHub token environment variables; target `gh` operations use that configuration. Git transport authentication must independently be configured for the target identity and remote. Neither configuration grants publication: the target autonomy policy and any applicable operator approval still govern push and PR operations.
 
+Before approving a mutating task, configure the intended Git author and committer
+identity for the service account. `pico exec start` now refuses a new mutating
+launch or resume with `GIT_IDENTITY_INVALID` before starting Pi if either identity
+is missing or malformed. It resolves each name/email from its explicit
+`GIT_AUTHOR_*` or `GIT_COMMITTER_*` environment value, then Git's `author.*` or
+`committer.*` config, then `user.name` / `user.email`. It never infers identity
+from commit history, the OS account, hostname or the fallback `EMAIL` variable.
+An explicit empty or malformed value is refused, not replaced by a fallback.
+Names may contain spaces; names/emails must not contain control characters or
+angle brackets, and emails must contain a nonempty local part and domain.
+
+The checked values are pinned in the lead's child environment. Claude workers
+receive exactly these four Git identity variables through the existing allowlist;
+Git credential helpers, SSH agents and arbitrary `GIT_*` overrides remain withheld.
+This validates setup, not the identity's ownership or model containment. No Git
+configuration is written and no commit is made by preflight. Read-only launches
+and already-running/finished execution lookups do not require a Git identity.
+
 This is credential routing, not process isolation. The queue token path is passed to Pico so its Claude worker sandbox can deny reads of that file. The target checkout must run a Pico revision that includes this dispatcher credential-scoping change: `pico exec` honors the target `.pi/orchestrator.lock`, and an older pinned runtime will ignore the path and will not provide this additional denial. Verify the effective revision before running; placing the token under the standard `~/.config/gh` credential directory also uses the existing worker deny rule. The Pi lead runs as the service user and can read the target config, and same-user processes may be able to read the queue token file. The lead can use its target authority, and unrestricted lead or Codex processes can reach same-user files; worker credential filtering does not protect against an unsandboxed lead. Restrict both credentials to their respective repositories, use a dedicated service account or stronger isolation where needed, and do not claim the queue credential is protected from a malicious lead.
 
 The allowlist paths must be real local Git checkouts, with matching GitHub remotes and a valid committed `.pi/autonomy.yaml` according to Pico's existing policy. This prototype does not create, clone, synchronize, repin or clean any target. Explicitly check repository dirtiness and the effective policy before enabling mutation. The `pico exec` preflight and autonomy policy are still authoritative. Because unattended Pi leads and Codex workers are not fully OS-contained, use an isolated service environment and restricted credentials for sensitive repositories.
