@@ -668,6 +668,12 @@ class SyntheticWorkspaceFakePi(unittest.TestCase):
 
     def test_launch_first_wave_and_collect_metrics_without_a_model(self):
         manifest = Path(load_setup().create(self.base / "ws")["manifest"])
+        from test_headless_run import git
+        # Benchmark baseline commits are deterministic; configure only these fake-launch checkouts.
+        for name in ("synth-lib", "synth-app"):
+            checkout = self.base / "ws" / name
+            git("-C", str(checkout), "config", "user.name", "PICO Test Operator")
+            git("-C", str(checkout), "config", "user.email", "operator@example.test")
         launched = wr.launch(manifest=manifest, task_id="lib-slugify", access_check=None, pi_executable=str(self.pi),
                              allow_mutation=True)
         self.assertEqual(launched["task"]["run_status"], "PARTIAL")  # the fake lead finishes PARTIAL
