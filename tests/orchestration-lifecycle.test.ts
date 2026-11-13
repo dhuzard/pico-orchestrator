@@ -2943,10 +2943,13 @@ test("a sandboxed worker may write only its worktree and declared caches, and re
   // XDG overrides move the protected and writable locations with them; GH_CONFIG_DIR is denied too.
   const moved = workerSandboxSettings({ cwd: SANDBOX_CWD, mode: "full", config, home: SANDBOX_HOME,
     parentEnv: { XDG_CACHE_HOME: "/xc", XDG_CONFIG_HOME: "/xg", XDG_STATE_HOME: "/xs", GH_CONFIG_DIR: "/ghc",
-      PI_CODING_ORCHESTRATOR_HOME: "/pico-cache", PI_ORCHESTRATOR_STATE_DIR: "/state/pico" } }) as any;
+      PI_CODING_ORCHESTRATOR_HOME: "/pico-cache", PI_ORCHESTRATOR_STATE_DIR: "/state/pico",
+      PI_DISPATCHER_QUEUE_CREDENTIAL_PATH: "/queue/token" } }) as any;
   assert.deepEqual(moved.sandbox.filesystem.allowWrite, ["/xc/pip"]);
   assert.deepEqual(moved.sandbox.filesystem.denyWrite, ["/pico-cache", "/xg/pi-coding-orchestrator"]);
-  for (const path of ["/xs/pi-coding-orchestrator", "/xg/gh", "/ghc"]) assert.ok(moved.sandbox.filesystem.denyRead.includes(path), path);
+  for (const path of ["/xs/pi-coding-orchestrator", "/xg/gh", "/ghc", "/queue/token"]) assert.ok(moved.sandbox.filesystem.denyRead.includes(path), path);
+  assert.ok(moved.permissions.deny.includes("Read(//queue/token)"));
+  assert.ok(moved.permissions.deny.includes("Read(//queue/token/**)"));
   // Without PI_ORCHESTRATOR_STATE_DIR, the state directory is this orchestrator checkout's provenance/.
   const local = workerSandboxSettings({ cwd: SANDBOX_CWD, mode: "full", config, home: SANDBOX_HOME, parentEnv: {} }) as any;
   assert.ok(local.sandbox.filesystem.denyRead.includes(realpathSync(join(import.meta.dirname, "..", "provenance"))),
