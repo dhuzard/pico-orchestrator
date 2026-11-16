@@ -180,6 +180,32 @@ class HeadlessFixture(unittest.TestCase):
         os.environ.pop("FAKE_PI_BEHAVIOR", None)
 
     def tearDown(self):
+        # No detached test supervisor may still be writing when the temporary
+        # state directory is removed. All workloads in this fixture are fakes.
+        supervisors = []
+        for path in (self.state / 'executions').glob('*/*.json'):
+            try:
+                record = json.loads(path.read_text())
+            except (OSError, ValueError):
+                continue
+            pid = record.get('pid')
+            if isinstance(pid, int) and pid > 0:
+                try:
+                    os.killpg(pid, 9)
+                except (ProcessLookupError, PermissionError):
+                    pass
+            supervisors.extend(pid for pid in (record.get('supervisor_pid'), record.get('watchdog_pid'))
+                               if isinstance(pid, int) and pid > 0)
+        end = time.monotonic() + 7
+        while time.monotonic() < end:
+            remaining = []
+            for pid in supervisors:
+                fields = run_lease._proc_stat(pid)
+                if hr.pid_alive(pid) and not (fields and fields[0] == 'Z'):
+                    remaining.append(pid)
+            if not remaining:
+                break
+            time.sleep(.05)
         os.environ.clear()
         os.environ.update(self._env)
         self._tmp.cleanup()
@@ -1055,16 +1081,19 @@ class SupervisionFaultTest(HeadlessFixture):
 
     def test_launch_intent_is_never_automatically_interrupted(self):
         record = self.start(behavior='hang', wait=False)
-        self.addCleanup(ExecutionTimeLimitTest.reap, record['pid'])
+        child_pid = record['pid']
         path = hr.execution_path(session_scope.common_dir(self.target), 'exec-1')
         with hr.locked_record(path):
             record = hr.load_record(path)
             record.update(status='launching', pid=None)
             hr.save_record(path, record)
-        observed = self.status()
-        self.assertEqual(observed['status'], 'launching')
-        with self.assertRaises(hr.HeadlessError):
-            hr.cancel(target=self.target, explicit_repo='acme/target', execution_id='exec-1')
+        try:
+            observed = self.status()
+            self.assertEqual(observed['status'], 'launching')
+            with self.assertRaises(hr.HeadlessError):
+                hr.cancel(target=self.target, explicit_repo='acme/target', execution_id='exec-1')
+        finally:
+            ExecutionTimeLimitTest.reap(child_pid)
 
     def test_legacy_live_pid_without_verifiable_birth_time_is_uncertain(self):
         record = {'status': 'launched', 'pid': 123, 'pid_start': '100',
