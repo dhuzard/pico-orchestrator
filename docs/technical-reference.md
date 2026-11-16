@@ -2280,7 +2280,9 @@ identity before signaling. A persistent session anchor holds that identity while
 members are stopped, frozen and terminated, including after a normal workload
 exit; a terminal record requires confirmed session emptiness. On Linux the
 supervisor requires pidfd support and signals members through pinned process
-handles. On macOS, secondary process groups in the session cause an uncertainty
+handles, using Python's wrappers or libc. It probes that capability before the
+workload starts; unavailable operations refuse the launch with
+`PIDFD_UNAVAILABLE`. On macOS, secondary process groups in the session cause an uncertainty
 barrier because there is no equivalent atomic process handle; the anchor's own
 group can be signaled while its identity remains verified.
 The watchdog and supervisor detect each other's

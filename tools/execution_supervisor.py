@@ -55,6 +55,52 @@ def same_process(pid, expected):
     return expected is not None and identity(pid) == expected
 
 
+def pidfd_open(pid):
+    """Open a Linux process handle, including on Python builds without wrappers."""
+    native = getattr(os, 'pidfd_open', None)
+    if callable(native):
+        return native(pid, 0)
+    libc = ctypes.CDLL(None, use_errno=True)
+    try:
+        call = libc.pidfd_open
+    except AttributeError as exc:
+        raise OSError('pidfd_open is unavailable') from exc
+    call.argtypes = [ctypes.c_int, ctypes.c_uint]
+    call.restype = ctypes.c_int
+    handle = call(pid, 0)
+    if handle < 0:
+        code = ctypes.get_errno()
+        raise OSError(code, os.strerror(code))
+    return handle
+
+
+def pidfd_send(handle, sig):
+    """Signal the pinned process rather than a recyclable numeric PID."""
+    native = getattr(signal, 'pidfd_send_signal', None)
+    if callable(native):
+        native(handle, sig)
+        return
+    libc = ctypes.CDLL(None, use_errno=True)
+    try:
+        call = libc.pidfd_send_signal
+    except AttributeError as exc:
+        raise OSError('pidfd_send_signal is unavailable') from exc
+    call.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint]
+    call.restype = ctypes.c_int
+    if call(handle, sig, None, 0) < 0:
+        code = ctypes.get_errno()
+        raise OSError(code, os.strerror(code))
+
+
+def require_linux_pidfd():
+    """Probe both operations without delivering a signal, before workload spawn."""
+    handle = pidfd_open(os.getpid())
+    try:
+        pidfd_send(handle, 0)
+    finally:
+        os.close(handle)
+
+
 def session_members(sid):
     """Return live (pid, process group, state) entries, or None if observation failed."""
     if type(sid) is not int or sid <= 0 or sid == os.getsid(0):
@@ -133,8 +179,7 @@ def stop(pid, expected, grace=0.3):
             time.sleep(.02)
         return False
 
-    linux_pidfd = (sys.platform.startswith('linux') and hasattr(os, 'pidfd_open')
-                   and hasattr(signal, 'pidfd_send_signal'))
+    linux_pidfd = sys.platform.startswith('linux')
     if not linux_pidfd and sys.platform != 'darwin':
         return False
 
@@ -168,7 +213,7 @@ def stop(pid, expected, grace=0.3):
                     return False
                 return False
             try:
-                handle = os.pidfd_open(member, 0)
+                handle = pidfd_open(member)
             except ProcessLookupError:
                 continue
             except OSError:
@@ -181,7 +226,7 @@ def stop(pid, expected, grace=0.3):
                         continue
                 except ProcessLookupError:
                     continue
-                signal.pidfd_send_signal(handle, sig)
+                pidfd_send(handle, sig)
             except ProcessLookupError:
                 continue
             except OSError:
@@ -298,6 +343,19 @@ def guard(fd, ready, pid, expected, deadline, path):
 
 def supervise(config):
     path = Path(config['path'])
+    if sys.platform.startswith('linux'):
+        try:
+            require_linux_pidfd()
+        except OSError:
+            # No workload has been spawned; missing kernel/libc capability is
+            # an explicit refusal, never a reason to fall back to PID signals.
+            with hr.locked_record(path):
+                record = hr.load_record(path)
+                if record and record.get('status') == 'launching':
+                    record.update(status='interrupted', pid=None, stop_reason='PIDFD_UNAVAILABLE',
+                                  outcome='supervision_unavailable')
+                    hr.save_record(path, record)
+            return 1
     gate_read, gate_write = os.pipe()
     watch_read, watch_write = os.pipe()
     ready_read, ready_write = os.pipe()

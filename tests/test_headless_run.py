@@ -682,9 +682,7 @@ class HeadlessRunTest(HeadlessFixture):
         run_id = hr.discover_run_id(Path(launched["session_dir"]), launched["session_id"])
         signals = []
         import execution_supervisor as supervisor
-        signal_owner, signal_name = ((supervisor.signal, 'pidfd_send_signal')
-                                     if sys.platform == 'linux' and hasattr(os, 'pidfd_open')
-                                     and hasattr(supervisor.signal, 'pidfd_send_signal') else (os, 'killpg'))
+        signal_owner, signal_name = ((supervisor, 'pidfd_send') if sys.platform == 'linux' else (os, 'killpg'))
         real_signal = getattr(signal_owner, signal_name)
         def observe(*args, **kwargs):
             # At signal time the run must already be terminal with the cancellation code.
@@ -1224,10 +1222,9 @@ while True: time.sleep(1)
                                   stdout=subprocess.PIPE, text=True, start_new_session=True)
         self.addCleanup(anchor.stdout.close)
         self.assertEqual(anchor.stdout.readline().strip(), 'ready')
-        original_proc_stat = run_lease._proc_stat
         def mac_identity(pid):
-            fields = original_proc_stat(pid)
-            return 'birth' if fields and fields[0] != 'Z' else None
+            probe = subprocess.run(['ps', '-o', 'stat=', '-p', str(pid)], capture_output=True, text=True)
+            return 'birth' if probe.returncode == 0 and not probe.stdout.strip().startswith('Z') else None
         try:
             with unittest.mock.patch.object(execution_supervisor.sys, 'platform', 'darwin'), \
                  unittest.mock.patch.object(execution_supervisor, 'identity', side_effect=mac_identity), \
@@ -1248,6 +1245,43 @@ while True: time.sleep(1)
              unittest.mock.patch.object(execution_supervisor.os, 'killpg') as killpg:
             self.assertFalse(execution_supervisor.stop(123, 'expected', grace=0))
             killpg.assert_not_called()
+
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'Linux pidfd capability')
+    def test_libc_pidfd_fallback_stops_real_session_without_python_wrappers(self):
+        import execution_supervisor
+        anchor = subprocess.Popen([sys.executable, '-c',
+                                   'import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); '
+                                   'print("ready", flush=True); time.sleep(30)'],
+                                  stdout=subprocess.PIPE, text=True, start_new_session=True)
+        self.addCleanup(anchor.stdout.close)
+        self.assertEqual(anchor.stdout.readline().strip(), 'ready')
+        token = execution_supervisor.identity(anchor.pid)
+        try:
+            with unittest.mock.patch.object(execution_supervisor.os, 'pidfd_open', None, create=True), \
+                 unittest.mock.patch.object(execution_supervisor.signal, 'pidfd_send_signal', None, create=True):
+                execution_supervisor.require_linux_pidfd()
+                self.assertTrue(execution_supervisor.stop(anchor.pid, token, grace=0))
+            self.assertLess(anchor.wait(timeout=5), 0)
+            self.assertEqual(execution_supervisor.session_members(anchor.pid), [])
+        finally:
+            if anchor.poll() is None:
+                os.killpg(anchor.pid, 9)
+                anchor.wait()
+
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'Linux pidfd capability')
+    def test_missing_pidfd_capability_refuses_before_workload_spawn(self):
+        import execution_supervisor
+        path = self.state / 'no-pidfd.json'
+        hr.save_record(path, {'record_version': hr.RECORD_VERSION, 'status': 'launching', 'launches': 0})
+        with unittest.mock.patch.object(execution_supervisor, 'require_linux_pidfd', side_effect=OSError('unavailable')), \
+             unittest.mock.patch.object(execution_supervisor.subprocess, 'Popen') as spawn:
+            self.assertEqual(execution_supervisor.supervise({'path': str(path)}), 1)
+        spawn.assert_not_called()
+        record = hr.load_record(path)
+        self.assertEqual(record['status'], 'interrupted')
+        self.assertEqual(record['stop_reason'], 'PIDFD_UNAVAILABLE')
+        self.assertEqual(record['outcome'], 'supervision_unavailable')
+        self.assertIsNone(record['pid'])
 
     def test_global_barrier_scans_records_and_fails_closed_on_corruption(self):
         directory = self.state / 'executions' / 'other-repository'
