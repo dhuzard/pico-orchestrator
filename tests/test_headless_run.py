@@ -421,11 +421,10 @@ class HeadlessRunTest(HeadlessFixture):
             record = json.loads(path.read_text())
             path.write_text(json.dumps({**record, "pid_start": "1"}))
             with unittest.mock.patch.object(hr.os, "killpg") as killpg:
-                cancelled = hr.cancel(target=self.target, explicit_repo="acme/target", execution_id="exec-1", grace=0.2)
+                with self.assertRaises(hr.HeadlessError) as refused:
+                    hr.cancel(target=self.target, explicit_repo="acme/target", execution_id="exec-1", grace=0.2)
             killpg.assert_not_called()
-            self.assertEqual((cancelled["status"], cancelled["outcome"]), ("cancelled", "cancelled"))
-            self.assertEqual(cancelled["child_gone_reason"], "PID_REUSED")
-            self.assertIsNone(cancelled["pid"])
+            self.assertEqual(refused.exception.code, "LAUNCH_UNCERTAIN")
             self.assertTrue(hr.pid_alive(launched["pid"]), "the process holding the pid was left alone")
         finally:
             try:
@@ -833,7 +832,8 @@ class ExecutionTimeLimitTest(HeadlessFixture):
         killpg.assert_not_called()
         self.assertNotEqual(observed["status"], "cancelled")
         self.assertEqual(observed["child_gone_reason"], "PID_REUSED")
-        self.assertNotIn("stop_reason", observed)
+        self.assertEqual(observed["status"], "launch_uncertain")
+        self.assertEqual(observed["stop_reason"], "SESSION_TERMINATION_UNCONFIRMED")
         self.assertTrue(hr.pid_alive(launched["pid"]), "the process holding the pid was left alone")
 
     def test_a_child_that_ended_before_the_deadline_keeps_its_own_outcome(self):
@@ -845,38 +845,17 @@ class ExecutionTimeLimitTest(HeadlessFixture):
         self.assertEqual(record["max_duration_seconds"], finished["max_duration_seconds"])
 
     def test_a_waiting_launcher_enforces_the_limit_itself(self):
-        # Pass the deadline only once the launcher can see the child's parent run: the run id in the child's
-        # session, which is what the launcher reads. The run file alone is not enough: it is written first, and
-        # under CPU contention (parallel CI) the limit could fire before the session links it, leaving no run.
-        stop = threading.Event()
-
-        def linked() -> bool:
-            for sessions in (self.state / "executions").glob("*/sessions"):
-                for file in sessions.glob("*_*.jsonl"):
-                    if hr.discover_run_id(sessions, file.stem.split("_", 1)[1]):
-                        return True
-            return False
-
-        def expire():
-            deadline = time.monotonic() + 20
-            while not stop.is_set() and time.monotonic() < deadline:
-                if linked():
-                    self.clock.now += 5
-                    return
-                time.sleep(0.05)
-
-        timer = threading.Thread(target=expire, daemon=True)
-        timer.start()
-        self.addCleanup(stop.set)
+        # Give the fake lifecycle a realistic startup budget. The independent
+        # watchdog must fire without advancing the launcher's patched clock.
         started = time.monotonic()
-        record = self.start(behavior="hang", max_duration_seconds=1)
-        self.assertLess(time.monotonic() - started, 5, "the launcher returned because of the limit, not the child's own end")
+        record = self.start(behavior="hang", max_duration_seconds=4)
+        self.assertLess(time.monotonic() - started, 8)
         self.assertEqual((record["status"], record["outcome"]), ("cancelled", "time_limit"))
         self.assertEqual(record["stop_reason"], "EXECUTION_TIME_LIMIT")
         self.assertEqual(record["run"]["status"], "BLOCKED")
         self.assertEqual(record["run"]["blocker_code"], "EXECUTION_TIME_LIMIT")
         self.assertIsNone(record["pid"])
-        self.assertLess(record["exit_code"], 0, "a killed child reports its signal, never 0")
+        self.assertLess(record["exit_code"], 0)
 
     def test_a_waiting_launcher_records_the_signal_when_cancelled_from_elsewhere(self):
         results = []
@@ -992,13 +971,16 @@ class SupervisionFaultTest(HeadlessFixture):
     def test_gate_exits_without_starting_work_after_owner_dies(self):
         marker = self.state / 'ran'
         read_fd, write_fd = os.pipe()
+        result_read, result_write = os.pipe()
         child = subprocess.Popen([sys.executable, str(REPO_ROOT / 'tools' / 'execution_supervisor.py'),
-                                  'gate', str(read_fd), sys.executable, '-c',
+                                  'gate', str(read_fd), str(result_write), sys.executable, '-c',
                                   f'from pathlib import Path; Path({str(marker)!r}).touch()'],
-                                 pass_fds=(read_fd,), start_new_session=True)
+                                 pass_fds=(read_fd, result_write), start_new_session=True)
         os.close(read_fd)
         os.close(write_fd)
+        os.close(result_write)
         self.assertEqual(child.wait(timeout=5), 125)
+        os.close(result_read)
         self.assertFalse(marker.exists())
 
     def test_supervisor_dies_after_spawn_before_pid_registration(self):
@@ -1110,6 +1092,101 @@ class SupervisionFaultTest(HeadlessFixture):
         with unittest.mock.patch.object(hr, 'pid_alive', return_value=True), \
              unittest.mock.patch.object(execution_supervisor, 'identity', return_value=None):
             self.assertEqual(hr.refresh(record)['status'], 'launch_uncertain')
+
+    def _forking_session(self, leader_exits, kill_anchor=False):
+        import execution_supervisor
+        marker = self.state / ('normal-worker.json' if leader_exits else 'deadline-worker.json')
+        path = self.state / ('normal-record.json' if leader_exits else 'deadline-record.json')
+        timeout = 4 if not leader_exits else 20
+        now = time.time()
+        record = {'record_version': hr.RECORD_VERSION, 'status': 'launching', 'launches': 0,
+                  'session_dir': str(self.state), 'session_id': 'fork-test', 'run_id': None,
+                  'max_duration_seconds': timeout, 'deadline_epoch': now + timeout,
+                  'deadline_at': hr._iso(now + timeout)}
+        hr.save_record(path, record)
+        script = """import json, os, signal, sys, time
+read_fd, write_fd = os.pipe()
+pid = os.fork()
+if pid == 0:
+    os.close(read_fd)
+    os.setpgid(0, 0)
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    with open(sys.argv[1] + '.tmp', 'w') as f:
+        json.dump({'pid': os.getpid(), 'pgid': os.getpgrp(), 'sid': os.getsid(0)}, f)
+    os.replace(sys.argv[1] + '.tmp', sys.argv[1])
+    os.write(write_fd, b'R')
+    while True: time.sleep(1)
+os.close(write_fd)
+os.read(read_fd, 1)
+if sys.argv[2] == 'exit':
+    sys.exit(0)
+while True: time.sleep(1)
+"""
+        config = {'path': str(path), 'log_path': str(self.state / 'fork-test.log'), 'cwd': str(self.target),
+                  'argv': [sys.executable, '-c', script, str(marker), 'exit' if leader_exits else 'wait'],
+                  'continuing': False, 'monotonic_deadline': time.monotonic() + timeout}
+        owner = subprocess.Popen([sys.executable, str(REPO_ROOT / 'tools' / 'execution_supervisor.py'),
+                                  'supervise'], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL, start_new_session=True)
+        worker = None
+        try:
+            owner.stdin.write(json.dumps(config).encode())
+            owner.stdin.close()
+            end = time.monotonic() + 5
+            while not marker.exists() and time.monotonic() < end:
+                time.sleep(.02)
+            self.assertTrue(marker.exists(), 'forking workload did not start')
+            worker = json.loads(marker.read_text())
+            self.assertNotEqual(worker['pgid'], worker['sid'], 'worker must exercise another group in the session')
+            if kill_anchor:
+                os.kill(worker['sid'], 9)
+            owner.wait(timeout=12)
+            final = hr.load_record(path)
+            if kill_anchor:
+                self.assertIn(final['status'], {'interrupted', 'launch_uncertain'})
+                members = execution_supervisor.session_members(worker['sid'])
+                if final['status'] == 'interrupted':
+                    self.assertEqual(members, [])
+                else:
+                    self.assertTrue(members)
+                return
+            self.assertEqual(final['status'], 'exited' if leader_exits else 'cancelled')
+            if not leader_exits:
+                self.assertEqual(final['stop_reason'], hr.TIME_LIMIT_CODE)
+            self.assertEqual(execution_supervisor.session_members(worker['sid']), [])
+            self.assertFalse(any(entry[0] == worker['pid'] for entry in
+                                 execution_supervisor.session_members(worker['sid'])))
+        finally:
+            if owner.poll() is None:
+                owner.kill()
+                owner.wait()
+            if worker:
+                try:
+                    os.kill(worker['pid'], 9)
+                except ProcessLookupError:
+                    pass
+
+    def test_killed_anchor_with_surviving_worker_keeps_uncertainty_barrier(self):
+        self._forking_session(False, kill_anchor=True)
+
+    def test_deadline_stops_term_ignoring_descendant_in_another_group(self):
+        self._forking_session(False)
+
+    def test_normal_workload_exit_stops_term_ignoring_descendant(self):
+        self._forking_session(True)
+
+    def test_session_inspection_refuses_own_session_and_unknown_access(self):
+        import execution_supervisor
+        self.assertIsNone(execution_supervisor.session_members(os.getsid(0)))
+        listing = subprocess.CompletedProcess([], 0, '999999 S\n', '')
+        with unittest.mock.patch.object(execution_supervisor.subprocess, 'run', return_value=listing), \
+             unittest.mock.patch.object(execution_supervisor.os, 'getsid', side_effect=[1, PermissionError()]):
+            self.assertIsNone(execution_supervisor.session_members(2))
+        with unittest.mock.patch.object(execution_supervisor, 'session_members', return_value=None), \
+             unittest.mock.patch.object(execution_supervisor.os, 'killpg') as killpg:
+            self.assertFalse(execution_supervisor.stop(123, 'unknown'))
+            killpg.assert_not_called()
 
     def test_global_barrier_scans_records_and_fails_closed_on_corruption(self):
         directory = self.state / 'executions' / 'other-repository'

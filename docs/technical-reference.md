@@ -2229,7 +2229,7 @@ common directory. `launching` and `launch_uncertain` are active uncertainty
 barriers: neither permits another mutation job or automatic resume. The
 supervisor gates the workload until its process identity is recorded and an
 independent watchdog is ready. If the supervisor or watchdog fails, the other
-stops the registered process group; unresolved launch intent remains blocked for
+stops the registered process session; unresolved launch intent remains blocked for
 operator reconciliation. `global_execution_barriers()` scans execution records
 across repositories and fails closed for unreadable records and interrupted
 records predating supervision. A dispatcher can perform that scan in the
@@ -2274,9 +2274,12 @@ host, heartbeat, expiry), as does Garden for each run.
 
 **Execution time limit.** `--max-duration SECONDS` is a positive integer,
 recorded as an execution-wide deadline before launch. The independent watchdog
-uses a monotonic timer and stops the registered process group even when the
+uses a monotonic timer and stops the registered process session even when the
 launcher, dispatcher and API are unavailable. Status/cancel also verify process
-identity before signaling. The watchdog and supervisor detect each other's
+identity before signaling. A persistent session anchor holds that identity while
+all member process groups are stopped, frozen and terminated, including after a
+normal workload exit; a terminal record requires confirmed session emptiness.
+The watchdog and supervisor detect each other's
 failure; if ownership or termination cannot be verified the launch remains an
 uncertainty barrier. On timeout the execution is `cancelled` with
 `EXECUTION_TIME_LIMIT`, and an open parent run is settled `BLOCKED` when its
@@ -2286,7 +2289,7 @@ A terminal run is never resumed. On a host without Linux `/proc`, status uses
 wall time; wall-clock changes may affect
 recovery decisions after interruption. On macOS process birth identity comes from
 `libproc`; launch fails closed when identity is unavailable. Detached descendants that create new
-sessions are not contained by process-group signaling; this is not a cgroup or
+sessions are not contained by session signaling; this is not a cgroup or
 sandbox boundary. Simultaneous supervisor and watchdog failure leaves a
 barrier requiring operator reconciliation, not an automatic guarantee that all
 descendants were killed. No duration limit is set by default.

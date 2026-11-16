@@ -55,35 +55,153 @@ def same_process(pid, expected):
     return expected is not None and identity(pid) == expected
 
 
-def stop(pid, expected):
-    if not same_process(pid, expected):
-        return False
+def session_members(sid):
+    """Return live (pid, process group, state) entries, or None if observation failed."""
+    if type(sid) is not int or sid <= 0 or sid == os.getsid(0):
+        return None
     try:
-        os.killpg(pid, signal.SIGTERM)
-    except ProcessLookupError:
+        # macOS ps may show an unusable zero session ID; getsid(2) provides
+        # the POSIX session identity on both Darwin and Linux.
+        result = subprocess.run(['ps', '-axo', 'pid=,stat='], capture_output=True, text=True, timeout=5)
+        if result.returncode:
+            return None
+        found = []
+        for line in result.stdout.splitlines():
+            parts = line.split()
+            if len(parts) != 2:
+                return None
+            pid = int(parts[0])
+            if parts[1].startswith('Z'):
+                continue
+            try:
+                if os.getsid(pid) == sid:
+                    found.append((pid, os.getpgid(pid), parts[1]))
+            except ProcessLookupError:
+                continue
+        return found
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+
+
+def stop(pid, expected, grace=0.3):
+    """Stop the entire anchored session; never signal after losing anchor identity.
+
+    Freeze every group before SIGKILL, repeating discovery until all members are
+    stopped. This closes the race in which a worker forks or changes group while
+    groups are being enumerated. Kill the anchor's group last.
+    """
+    members = session_members(pid)
+    if members == []:
         return True
-    end = time.monotonic() + 2
-    while time.monotonic() < end and same_process(pid, expected):
+    if members is None or not same_process(pid, expected):
+        return False
+
+    def empty_after_competing_stop():
+        end = time.monotonic() + 1
+        while time.monotonic() < end:
+            current = session_members(pid)
+            if current == []:
+                return True
+            if current is None:
+                return False
+            time.sleep(.02)
+        return False
+
+    def signal_groups(members, sig):
+        for pgid in sorted({entry[1] for entry in members}):
+            if not same_process(pid, expected):
+                return False
+            try:
+                os.killpg(pgid, sig)
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                return False
+        return True
+
+    if not signal_groups(members, signal.SIGTERM):
+        return empty_after_competing_stop()
+    end = time.monotonic() + max(0, grace)
+    while time.monotonic() < end:
+        members = session_members(pid)
+        if members is None:
+            return False
+        if not any(entry[0] != pid for entry in members):
+            break
         time.sleep(.05)
-    if same_process(pid, expected):
+    # Freeze before enumeration; SIGSTOP cannot be ignored. A process that
+    # cannot be observed stopped leaves the execution uncertain.
+    end = time.monotonic() + 3
+    while True:
+        members = session_members(pid)
+        if members == []:
+            return True
+        if members is None:
+            return False
+        if not same_process(pid, expected):
+            return empty_after_competing_stop()
+        if not signal_groups(members, signal.SIGSTOP):
+            return empty_after_competing_stop()
+        members = session_members(pid)
+        if members is None:
+            return False
+        if all(entry[2][0] in ('T', 't') for entry in members):
+            break
+        if time.monotonic() >= end:
+            return False
+        time.sleep(.02)
+    groups = {entry[1] for entry in members}
+    for pgid in sorted(groups - {pid}):
+        if not same_process(pid, expected):
+            return empty_after_competing_stop()
         try:
-            os.killpg(pid, signal.SIGKILL)
+            os.killpg(pgid, signal.SIGKILL)
         except ProcessLookupError:
             pass
-        end = time.monotonic() + 2
-        while time.monotonic() < end and same_process(pid, expected):
-            time.sleep(.05)
-    fields = run_lease._proc_stat(pid)
-    return not same_process(pid, expected) or bool(fields and fields[0] == 'Z')
+        except PermissionError:
+            return False
+    if not same_process(pid, expected):
+        return empty_after_competing_stop()
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except PermissionError:
+        return False
+    end = time.monotonic() + 3
+    while time.monotonic() < end:
+        members = session_members(pid)
+        if members == []:
+            return True
+        if members is None:
+            return False
+        time.sleep(.05)
+    return False
 
 
-def gate(fd, argv):
+def gate(fd, result_fd, argv):
     try:
         if os.read(fd, 1) != b'G':
             return 125
     finally:
         os.close(fd)
-    os.execvpe(argv[0], argv, os.environ)
+    # A caught signal handler is reset to its default by exec, unlike SIG_IGN.
+    # The anchor survives TERM while the workload receives it normally.
+    signal.signal(signal.SIGTERM, lambda *_: None)
+    try:
+        workload = subprocess.Popen(argv, stdin=subprocess.DEVNULL)
+        result = workload.wait()
+    except OSError:
+        result = 127
+    try:
+        os.write(result_fd, (str(result) + '\n').encode())
+    except BrokenPipeError:
+        pass
+    finally:
+        os.close(result_fd)
+    # Keep the session identity pinned until the supervisor cleans all members.
+    while True:
+        signal.pause()
 
 
 def guard(fd, ready, pid, expected, deadline, path):
@@ -123,14 +241,17 @@ def supervise(config):
     gate_read, gate_write = os.pipe()
     watch_read, watch_write = os.pipe()
     ready_read, ready_write = os.pipe()
+    result_read, result_write = os.pipe()
     child = watcher = None
     try:
         with open(config['log_path'], 'ab') as log:
-            child = subprocess.Popen([sys.executable, __file__, 'gate', str(gate_read), *config['argv']],
+            child = subprocess.Popen([sys.executable, __file__, 'gate', str(gate_read), str(result_write), *config['argv']],
                                      cwd=config['cwd'], stdin=subprocess.DEVNULL, stdout=log,
-                                     stderr=subprocess.STDOUT, start_new_session=True, pass_fds=(gate_read,))
+                                     stderr=subprocess.STDOUT, start_new_session=True, pass_fds=(gate_read, result_write))
         os.close(gate_read)
         gate_read = -1
+        os.close(result_write)
+        result_write = -1
         token = identity(child.pid)
         supervisor_token = identity(os.getpid())
         if token is None or supervisor_token is None:
@@ -166,10 +287,12 @@ def supervise(config):
             hr.save_record(path, record)
         os.write(gate_write, b'G')
         os.close(gate_write); gate_write = -1
-        while child.poll() is None:
+        workload_exit = None
+        while True:
             if watcher.poll() is not None:
                 stopped = stop(child.pid, token)
-                child.wait()
+                if stopped:
+                    child.wait()
                 with hr.locked_record(path):
                     record = hr.load_record(path)
                     if record and record.get('status') in {'launched', 'launch_uncertain'}:
@@ -179,38 +302,64 @@ def supervise(config):
                             record.update(status='launch_uncertain', stop_reason='WATCHDOG_LOST')
                         hr.save_record(path, record)
                 return 1
-            time.sleep(.05)
-        try:
-            os.write(watch_write, b'D')
-        except BrokenPipeError:
-            pass
+            readable, _, _ = select.select([result_read], [], [], .05)
+            if readable:
+                result = os.read(result_read, 32)
+                if result:
+                    try:
+                        workload_exit = int(result.strip())
+                    except ValueError:
+                        pass
+                break
+            if child.poll() is not None:
+                break
+        stopped = stop(child.pid, token)
+        if stopped:
+            child.wait()
+            try:
+                os.write(watch_write, b'D')
+            except BrokenPipeError:
+                pass
+        else:
+            os.close(watch_write)
+            watch_write = -1
         watcher.wait()
         with hr.locked_record(path):
             record = hr.load_record(path)
             if record:
-                record['exit_code'] = child.returncode
+                record['exit_code'] = workload_exit if workload_exit is not None else child.returncode
                 if record.get('status') in {'launched', 'launch_uncertain'}:
-                    record.update(status='exited', pid=None)
-                    hr.refresh(record)
+                    if stopped:
+                        record.update(status='exited', pid=None)
+                        hr.refresh(record)
+                        if workload_exit is None and (record.get('run') or {}).get('status') in {None, 'IN_PROGRESS'}:
+                            record['status'] = 'interrupted'
+                    else:
+                        record.update(status='launch_uncertain', stop_reason='TERMINATION_UNCONFIRMED')
                 hr.save_record(path, record)
-        return child.returncode or 0
+        return workload_exit or 0
     except BaseException as exc:
+        stopped = child is None
         if child is not None:
             if gate_write >= 0:
                 os.close(gate_write)
                 gate_write = -1
-            stop(child.pid, token if 'token' in locals() else None)
-            child.wait()
+            stopped = stop(child.pid, token if 'token' in locals() else None)
+            if child.poll() is not None:
+                child.wait()
         with hr.locked_record(path):
             record = hr.load_record(path)
             if record and record.get('status') == 'launching':
-                record.update(status='interrupted', pid=None, stop_reason='SUPERVISOR_START_FAILED')
+                if stopped:
+                    record.update(status='interrupted', pid=None, stop_reason='SUPERVISOR_START_FAILED')
+                else:
+                    record.update(status='launch_uncertain', stop_reason='SUPERVISOR_START_FAILED')
                 if isinstance(exc, run_lease.LeaseError):
                     record.update(lease_handoff_error=exc.code, outcome='lease_handoff_failed')
                 hr.save_record(path, record)
         raise
     finally:
-        for fd in (gate_read, gate_write, watch_read, watch_write, ready_read, ready_write):
+        for fd in (gate_read, gate_write, watch_read, watch_write, ready_read, ready_write, result_read, result_write):
             if fd >= 0:
                 try:
                     os.close(fd)
@@ -220,7 +369,7 @@ def supervise(config):
 
 if __name__ == '__main__':
     if sys.argv[1] == 'gate':
-        sys.exit(gate(int(sys.argv[2]), sys.argv[3:]))
+        sys.exit(gate(int(sys.argv[2]), int(sys.argv[3]), sys.argv[4:]))
     if sys.argv[1] == 'guard':
         sys.exit(guard(int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), sys.argv[5],
                        float(sys.argv[6]) if sys.argv[6] else None, Path(sys.argv[7])))

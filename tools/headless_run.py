@@ -362,6 +362,17 @@ _OWN_CHILDREN: dict[int, subprocess.Popen] = {}
 def pid_alive(pid: int | None) -> bool:
     if not isinstance(pid, int) or pid <= 0:
         return False
+    fields = run_lease._proc_stat(pid)
+    if fields and fields[0] == "Z":
+        return False
+    if fields is None and sys.platform == "darwin":
+        try:
+            probe = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True,
+                                   text=True, timeout=5)
+            if probe.returncode == 0 and probe.stdout.strip().startswith("Z"):
+                return False
+        except (OSError, subprocess.TimeoutExpired):
+            pass
     own = _OWN_CHILDREN.get(pid)
     if own is not None:
         return own.poll() is None
@@ -596,6 +607,11 @@ def refresh(record: dict) -> dict:
         # child is gone, and that pid is never signalled.
         if pid_alive(record.get("pid")):
             record["child_gone_reason"] = "PID_REUSED"
+        import execution_supervisor
+        if execution_supervisor.session_members(record.get("pid")) != []:
+            record["status"] = "launch_uncertain"
+            record["stop_reason"] = "SESSION_TERMINATION_UNCONFIRMED"
+            return record
         terminal = (record["run"] or {}).get("status") not in {None, "IN_PROGRESS"}
         record["status"] = "exited" if terminal else "interrupted"
         record["pid"] = None
@@ -1012,25 +1028,13 @@ def _stop_locked(record: dict, grace: float, code: str) -> None:
     # the parent finds it already terminal with the stop code.
     _finish_cancelled(record, code)
     pid = record.get("pid")
-    # Signal only the process this execution launched: the pid and its start time must both match.
-    child = {"pid": pid, "pid_start": record.get("pid_start"), "process_identity": record.get("process_identity")}
-    if record["status"] == "launched" and execution_alive(child):
-        try:
-            os.killpg(pid, signal.SIGTERM)
-        except (ProcessLookupError, PermissionError):
-            pass
-        deadline = time.monotonic() + grace
-        while execution_alive(child) and time.monotonic() < deadline:
-            time.sleep(0.05)
-        if execution_alive(child):
-            try:
-                os.killpg(pid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                pass
-            kill_deadline = time.monotonic() + 2
-            while execution_alive(child) and time.monotonic() < kill_deadline:
-                time.sleep(0.05)
-        if execution_alive(child):
+    if isinstance(pid, int) and pid > 0:
+        import execution_supervisor
+        expected = record.get("process_identity")
+        if expected is None and record.get("pid_start") is not None:
+            if run_lease.pid_start(pid) == record["pid_start"]:
+                expected = execution_supervisor.identity(pid)
+        if not execution_supervisor.stop(pid, expected, grace=grace):
             record.update(status="launch_uncertain", stop_reason=code,
                           outcome="termination_unconfirmed")
             return
