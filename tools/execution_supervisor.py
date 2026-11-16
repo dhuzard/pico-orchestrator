@@ -86,13 +86,37 @@ def session_members(sid):
 def stop(pid, expected, grace=0.3):
     """Stop the entire anchored session; never signal after losing anchor identity.
 
-    Freeze every group before SIGKILL, repeating discovery until all members are
-    stopped. This closes the race in which a worker forks or changes group while
-    groups are being enumerated. Kill the anchor's group last.
+    Freeze every member before SIGKILL, repeating discovery until all are
+    stopped. Linux uses PID handles to avoid reuse when signaling. Darwin
+    supports only the anchor group and fails closed for secondary groups.
     """
+    def anchor_dead_or_gone():
+        current = identity(pid)
+        if current is not None and current != expected:
+            return True
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            return False
+        if current is None or current != expected:
+            return False
+        fields = run_lease._proc_stat(pid)
+        if fields:
+            return fields[0] == 'Z'
+        if sys.platform == 'darwin':
+            try:
+                result = subprocess.run(['ps', '-o', 'stat=', '-p', str(pid)],
+                                        capture_output=True, text=True, timeout=5)
+                return result.returncode == 0 and result.stdout.strip().startswith('Z')
+            except (OSError, subprocess.TimeoutExpired):
+                return False
+        return False
+
     members = session_members(pid)
     if members == []:
-        return True
+        return anchor_dead_or_gone()
     if members is None or not same_process(pid, expected):
         return False
 
@@ -100,26 +124,71 @@ def stop(pid, expected, grace=0.3):
         end = time.monotonic() + 1
         while time.monotonic() < end:
             current = session_members(pid)
-            if current == []:
+            if current == [] and anchor_dead_or_gone():
                 return True
             if current is None:
                 return False
             time.sleep(.02)
         return False
 
-    def signal_groups(members, sig):
-        for pgid in sorted({entry[1] for entry in members}):
-            if not same_process(pid, expected):
+    linux_pidfd = (sys.platform.startswith('linux') and hasattr(os, 'pidfd_open')
+                   and hasattr(signal, 'pidfd_send_signal'))
+    if not linux_pidfd and sys.platform != 'darwin':
+        return False
+
+    def signal_members(entries, sig):
+        if not same_process(pid, expected):
+            return False
+        if not linux_pidfd:
+            # Darwin has no atomic process handles. Only the anchor's own
+            # group can be signalled safely while the anchor pins its ID.
+            if any(entry[1] != pid for entry in entries):
+                return False
+            if pid == os.getpgrp():
                 return False
             try:
-                os.killpg(pgid, sig)
+                os.killpg(pid, sig)
+                return True
             except ProcessLookupError:
-                pass
+                return True
             except PermissionError:
                 return False
+        for member, _, _ in entries:
+            if not same_process(pid, expected):
+                return False
+            before = identity(member)
+            if before is None:
+                try:
+                    os.kill(member, 0)
+                except ProcessLookupError:
+                    continue
+                except PermissionError:
+                    return False
+                return False
+            try:
+                handle = os.pidfd_open(member, 0)
+            except ProcessLookupError:
+                continue
+            except OSError:
+                return False
+            try:
+                if identity(member) != before:
+                    return False
+                try:
+                    if os.getsid(member) != pid:
+                        continue
+                except ProcessLookupError:
+                    continue
+                signal.pidfd_send_signal(handle, sig)
+            except ProcessLookupError:
+                continue
+            except OSError:
+                return False
+            finally:
+                os.close(handle)
         return True
 
-    if not signal_groups(members, signal.SIGTERM):
+    if not signal_members(members, signal.SIGTERM):
         return empty_after_competing_stop()
     end = time.monotonic() + max(0, grace)
     while time.monotonic() < end:
@@ -135,12 +204,12 @@ def stop(pid, expected, grace=0.3):
     while True:
         members = session_members(pid)
         if members == []:
-            return True
+            return anchor_dead_or_gone()
         if members is None:
             return False
         if not same_process(pid, expected):
             return empty_after_competing_stop()
-        if not signal_groups(members, signal.SIGSTOP):
+        if not signal_members(members, signal.SIGSTOP):
             return empty_after_competing_stop()
         members = session_members(pid)
         if members is None:
@@ -150,28 +219,17 @@ def stop(pid, expected, grace=0.3):
         if time.monotonic() >= end:
             return False
         time.sleep(.02)
-    groups = {entry[1] for entry in members}
-    for pgid in sorted(groups - {pid}):
-        if not same_process(pid, expected):
+    if linux_pidfd:
+        if not signal_members([entry for entry in members if entry[0] != pid], signal.SIGKILL):
             return empty_after_competing_stop()
-        try:
-            os.killpg(pgid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        except PermissionError:
-            return False
-    if not same_process(pid, expected):
+        if not signal_members([entry for entry in members if entry[0] == pid], signal.SIGKILL):
+            return empty_after_competing_stop()
+    elif not signal_members(members, signal.SIGKILL):
         return empty_after_competing_stop()
-    try:
-        os.killpg(pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    except PermissionError:
-        return False
     end = time.monotonic() + 3
     while time.monotonic() < end:
         members = session_members(pid)
-        if members == []:
+        if members == [] and anchor_dead_or_gone():
             return True
         if members is None:
             return False

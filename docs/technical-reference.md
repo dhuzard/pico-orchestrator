@@ -2277,8 +2277,12 @@ recorded as an execution-wide deadline before launch. The independent watchdog
 uses a monotonic timer and stops the registered process session even when the
 launcher, dispatcher and API are unavailable. Status/cancel also verify process
 identity before signaling. A persistent session anchor holds that identity while
-all member process groups are stopped, frozen and terminated, including after a
-normal workload exit; a terminal record requires confirmed session emptiness.
+members are stopped, frozen and terminated, including after a normal workload
+exit; a terminal record requires confirmed session emptiness. On Linux the
+supervisor requires pidfd support and signals members through pinned process
+handles. On macOS, secondary process groups in the session cause an uncertainty
+barrier because there is no equivalent atomic process handle; the anchor's own
+group can be signaled while its identity remains verified.
 The watchdog and supervisor detect each other's
 failure; if ownership or termination cannot be verified the launch remains an
 uncertainty barrier. On timeout the execution is `cancelled` with

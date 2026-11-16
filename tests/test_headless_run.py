@@ -1188,6 +1188,24 @@ while True: time.sleep(1)
             self.assertFalse(execution_supervisor.stop(123, 'unknown'))
             killpg.assert_not_called()
 
+    def test_empty_listing_does_not_clear_a_live_anchor(self):
+        import execution_supervisor
+        with unittest.mock.patch.object(execution_supervisor, 'session_members', return_value=[]), \
+             unittest.mock.patch.object(execution_supervisor, 'identity', return_value='expected'), \
+             unittest.mock.patch.object(execution_supervisor.os, 'kill', return_value=None), \
+             unittest.mock.patch.object(run_lease, '_proc_stat', return_value=['S']):
+            self.assertFalse(execution_supervisor.stop(123, 'expected'))
+
+    def test_macos_secondary_group_fails_closed_without_signalling(self):
+        import execution_supervisor
+        members = [(123, 123, 'S'), (124, 124, 'S')]
+        with unittest.mock.patch.object(execution_supervisor.sys, 'platform', 'darwin'), \
+             unittest.mock.patch.object(execution_supervisor, 'session_members', return_value=members), \
+             unittest.mock.patch.object(execution_supervisor, 'same_process', return_value=True), \
+             unittest.mock.patch.object(execution_supervisor.os, 'killpg') as killpg:
+            self.assertFalse(execution_supervisor.stop(123, 'expected', grace=0))
+            killpg.assert_not_called()
+
     def test_global_barrier_scans_records_and_fails_closed_on_corruption(self):
         directory = self.state / 'executions' / 'other-repository'
         directory.mkdir(parents=True)
