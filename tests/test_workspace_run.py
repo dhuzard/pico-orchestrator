@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import time
@@ -19,6 +20,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "tools"))
 sys.path.insert(0, str(REPO_ROOT / "tests"))
 
+import execution_supervisor  # noqa: E402
 import headless_run as hr  # noqa: E402
 import provenance  # noqa: E402
 import session_scope  # noqa: E402
@@ -61,9 +63,43 @@ class WorkspaceRunFixture(unittest.TestCase):
         os.environ["FAKE_PI_BEHAVIOR"] = "finish"
 
     def tearDown(self):
-        os.environ.clear()
-        os.environ.update(self._env)
+        try:
+            self._drain_fake_supervisors()
+        finally:
+            os.environ.clear()
+            os.environ.update(self._env)
         self._tmp.cleanup()
+
+    def _drain_fake_supervisors(self):
+        """Stop fake workloads and wait for their independent state writers."""
+        supervisors = []
+        for path in (self.state / 'executions').glob('*/*.json'):
+            try:
+                record = json.loads(path.read_text())
+            except (OSError, ValueError):
+                # Some tests deliberately create corrupt records without a process.
+                continue
+            pid, identity = record.get('pid'), record.get('process_identity')
+            if isinstance(pid, int) and pid > 0 and identity:
+                if not execution_supervisor.stop(pid, identity, grace=0):
+                    raise AssertionError(f'fake execution session {pid} did not stop')
+            for prefix in ('supervisor', 'watchdog'):
+                process, token = record.get(f'{prefix}_pid'), record.get(f'{prefix}_identity')
+                if isinstance(process, int) and process > 0 and token:
+                    supervisors.append((process, token))
+        deadline = time.monotonic() + 15
+        while supervisors and time.monotonic() < deadline:
+            pending = []
+            for process, token in supervisors:
+                if hr.pid_alive(process):
+                    identity = execution_supervisor.identity(process)
+                    if identity is None or identity == token:
+                        pending.append((process, token))
+            supervisors = pending
+            if supervisors:
+                time.sleep(.05)
+        if supervisors:
+            raise AssertionError(f'fake supervisors still writing state: {supervisors}')
 
     def manifest(self, tasks=None, pins=None) -> Path:
         pins = pins or {}
@@ -86,6 +122,25 @@ class WorkspaceRunFixture(unittest.TestCase):
 
 
 class WorkspaceRunTest(WorkspaceRunFixture):
+    def test_fixture_waits_for_supervisor_final_state_write(self):
+        record = self.state / 'executions' / 'fixture-test' / 'task.json'
+        record.parent.mkdir(parents=True)
+        marker = record.parent / 'final-write'
+        writer = subprocess.Popen([sys.executable, '-c',
+                                   'from pathlib import Path; import sys,time; '
+                                   'time.sleep(.4); Path(sys.argv[1]).write_text("finished")', str(marker)])
+        try:
+            token = execution_supervisor.identity(writer.pid)
+            self.assertIsNotNone(token)
+            record.write_text(json.dumps({'supervisor_pid': writer.pid, 'supervisor_identity': token}))
+            self._drain_fake_supervisors()
+            self.assertEqual(marker.read_text(), 'finished')
+            self.assertEqual(writer.wait(timeout=5), 0)
+        finally:
+            if writer.poll() is None:
+                writer.kill()
+                writer.wait()
+
     def test_manifest_repin_between_planning_and_spawn_refuses_the_child(self):
         manifest = self.manifest()
         spawned = unittest.mock.Mock()
@@ -709,31 +764,10 @@ class WorkspaceTimeLimitTest(WorkspaceRunFixture):
         for result in results:
             record = hr.load_record(hr.execution_path(
                 Path(session_scope.common_dir(self.repos[result["task"]["repository"]][0])), result["task"]["execution_id"]))
-            self.addCleanup(self.kill, record["pid"])
             # Let the child create its parent run, so the stop has a run to settle.
             deadline = time.monotonic() + 5
             while hr.discover_run_id(Path(record["session_dir"]), record["session_id"]) is None and time.monotonic() < deadline:
                 time.sleep(0.05)
-
-    @staticmethod
-    def kill(pid):
-        try:
-            os.killpg(pid, 9)
-        except (ProcessLookupError, PermissionError):
-            pass
-        try:
-            os.waitpid(pid, 0)
-        except ChildProcessError:
-            pass
-        # SIGKILL is delivered asynchronously: wait until the whole group is gone,
-        # so no grandchild still writes into the state directory during cleanup.
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline:
-            try:
-                os.killpg(pid, 0)
-            except (ProcessLookupError, PermissionError):
-                return
-            time.sleep(0.02)
 
     def test_no_limit_in_the_manifest_leaves_the_child_unlimited(self):
         manifest = self.limited_manifest()

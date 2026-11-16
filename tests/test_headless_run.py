@@ -469,7 +469,13 @@ class HeadlessRunTest(HeadlessFixture):
             os.waitpid(launched["pid"], 0)
         except ChildProcessError:
             pass
+        # The anchor can die before the independent supervisor has finished
+        # verifying the session and recording the interruption.
+        deadline = time.monotonic() + 12
         observed = self.status()
+        while observed['status'] in {'launched', 'launch_uncertain'} and time.monotonic() < deadline:
+            time.sleep(.05)
+            observed = self.status()
         self.assertEqual(observed["status"], "interrupted")
         blocked = self.start(behavior="finish")
         self.assertEqual(blocked["outcome"], "resume_required")
@@ -1096,10 +1102,10 @@ class SupervisionFaultTest(HeadlessFixture):
              unittest.mock.patch.object(execution_supervisor, 'identity', return_value=None):
             self.assertEqual(hr.refresh(record)['status'], 'launch_uncertain')
 
-    def _forking_session(self, leader_exits, kill_anchor=False):
+    def _forking_session(self, leader_exits, kill_anchor=False, separate_group=True):
         import execution_supervisor
         marker = self.state / ('normal-worker.json' if leader_exits else 'deadline-worker.json')
-        path = self.state / ('normal-record.json' if leader_exits else 'deadline-record.json')
+        path = self.state / 'executions' / 'fork-test' / 'record.json'
         timeout = 4 if not leader_exits else 20
         now = time.time()
         record = {'record_version': hr.RECORD_VERSION, 'status': 'launching', 'launches': 0,
@@ -1112,7 +1118,8 @@ read_fd, write_fd = os.pipe()
 pid = os.fork()
 if pid == 0:
     os.close(read_fd)
-    os.setpgid(0, 0)
+    if sys.argv[3] == 'separate':
+        os.setpgid(0, 0)
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
     signal.signal(signal.SIGHUP, signal.SIG_IGN)
     with open(sys.argv[1] + '.tmp', 'w') as f:
@@ -1127,12 +1134,14 @@ if sys.argv[2] == 'exit':
 while True: time.sleep(1)
 """
         config = {'path': str(path), 'log_path': str(self.state / 'fork-test.log'), 'cwd': str(self.target),
-                  'argv': [sys.executable, '-c', script, str(marker), 'exit' if leader_exits else 'wait'],
+                  'argv': [sys.executable, '-c', script, str(marker), 'exit' if leader_exits else 'wait',
+                           'separate' if separate_group else 'anchor'],
                   'continuing': False, 'monotonic_deadline': time.monotonic() + timeout}
         owner = subprocess.Popen([sys.executable, str(REPO_ROOT / 'tools' / 'execution_supervisor.py'),
                                   'supervise'], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
                                  stderr=subprocess.DEVNULL, start_new_session=True)
         worker = None
+        worker_identity = anchor_identity = None
         try:
             owner.stdin.write(json.dumps(config).encode())
             owner.stdin.close()
@@ -1141,7 +1150,12 @@ while True: time.sleep(1)
                 time.sleep(.02)
             self.assertTrue(marker.exists(), 'forking workload did not start')
             worker = json.loads(marker.read_text())
-            self.assertNotEqual(worker['pgid'], worker['sid'], 'worker must exercise another group in the session')
+            worker_identity = execution_supervisor.identity(worker['pid'])
+            anchor_identity = (hr.load_record(path) or {}).get('process_identity')
+            if separate_group:
+                self.assertNotEqual(worker['pgid'], worker['sid'], 'worker must exercise another group in the session')
+            else:
+                self.assertEqual(worker['pgid'], worker['sid'])
             if kill_anchor:
                 os.kill(worker['sid'], 9)
             owner.wait(timeout=12)
@@ -1154,6 +1168,16 @@ while True: time.sleep(1)
                 else:
                     self.assertTrue(members)
                 return
+            if sys.platform == 'darwin' and separate_group:
+                # macOS has no atomic per-process handle: leave a visible
+                # barrier instead of signaling an unpinned secondary group.
+                self.assertEqual(final['status'], 'launch_uncertain')
+                self.assertIsNotNone(worker_identity)
+                self.assertIsNotNone(anchor_identity)
+                self.assertTrue(any(entry[0] == worker['pid'] for entry in
+                                    execution_supervisor.session_members(worker['sid'])))
+                self.assertIn(str(path), {entry['path'] for entry in hr.global_execution_barriers(self.state)})
+                return
             self.assertEqual(final['status'], 'exited' if leader_exits else 'cancelled')
             if not leader_exits:
                 self.assertEqual(final['stop_reason'], hr.TIME_LIMIT_CODE)
@@ -1164,11 +1188,21 @@ while True: time.sleep(1)
             if owner.poll() is None:
                 owner.kill()
                 owner.wait()
-            if worker:
+            if worker and worker_identity and execution_supervisor.same_process(worker['pid'], worker_identity):
                 try:
                     os.kill(worker['pid'], 9)
                 except ProcessLookupError:
                     pass
+            if worker and anchor_identity and execution_supervisor.same_process(worker['sid'], anchor_identity):
+                try:
+                    os.killpg(worker['sid'], 9)
+                except ProcessLookupError:
+                    pass
+            if worker:
+                end = time.monotonic() + 10
+                while execution_supervisor.session_members(worker['sid']) != [] and time.monotonic() < end:
+                    time.sleep(.05)
+                self.assertEqual(execution_supervisor.session_members(worker['sid']), [])
 
     def test_killed_anchor_with_surviving_worker_keeps_uncertainty_barrier(self):
         self._forking_session(False, kill_anchor=True)
@@ -1178,6 +1212,12 @@ while True: time.sleep(1)
 
     def test_normal_workload_exit_stops_term_ignoring_descendant(self):
         self._forking_session(True)
+
+    def test_deadline_stops_term_ignoring_descendant_in_anchor_group(self):
+        self._forking_session(False, separate_group=False)
+
+    def test_normal_exit_stops_term_ignoring_descendant_in_anchor_group(self):
+        self._forking_session(True, separate_group=False)
 
     def test_session_inspection_refuses_own_session_and_unknown_access(self):
         import execution_supervisor
