@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pico.local/schemas/dispatcher-delivery.schema.json",
+  "title": "Dispatcher delivery observation",
+  "type": "object",
+  "required": ["issue", "execution_id", "execution", "repository", "publication", "checks", "review", "delivery", "reason", "next_action", "observed_at", "evidence"],
+  "properties": {
+    "issue": {"type": "integer", "minimum": 1},
+    "execution_id": {"type": "string"},
+    "execution": {"const": "completed"},
+    "repository": {"type": "string", "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"},
+    "publication": {"enum": ["none", "observed", "ambiguous", "unavailable"]},
+    "pr_number": {"type": ["integer", "null"], "minimum": 1},
+    "pr_url": {"type": ["string", "null"]},
+    "head_sha": {"type": ["string", "null"]},
+    "checks": {"enum": ["unknown", "running", "passed", "failed", "stale", "unavailable"]},
+    "review": {"enum": ["unknown", "not_requested", "requested", "changes_requested", "approved", "stale"]},
+    "delivery": {"enum": ["waiting_ci", "needs_human_review", "needs_decision", "merged", "closed"]},
+    "reason": {"type": "string"}, "next_action": {"type": "string"}, "actor": {"type": "string"},
+    "observed_at": {"type": "string"}, "first_seen": {"type": "string"}, "last_seen": {"type": "string"},
+    "evidence": {"type": "object"}
+  },
+  "additionalProperties": false
+}

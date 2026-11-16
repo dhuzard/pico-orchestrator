@@ -22,11 +22,14 @@ import time
 import yaml
 from dataclasses import dataclass
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import delivery_store
+import delivery_observer
 
 REPO = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 HEADING = re.compile(r"^## ([^\n]+)\s*$", re.MULTILINE)
 REQUIRED = ("Target repository", "Objective", "Acceptance criteria")
-ACTIVE = {"approved", "launching", "running"}
+ACTIVE = {"approved", "launching", "running", "launch_uncertain"}
 TERMINAL = {"completed", "partial", "blocked", "interrupted", "cancelled", "stale"}
 
 
@@ -145,7 +148,12 @@ def load_config(path: Path) -> dict:
         if queue_path == target_path or target_path in queue_path.parents:
             raise DispatcherError("queue credential must be outside the target gh config directory")
         credentials = {"queue_token_file": queue_path, "target_gh_config_dir": target_path}
-    return {**credentials, "queue": data["queue_repository"], "targets": normalized, "state": state,
+    expected = data.get("delivery_expected_checks", {})
+    if (not isinstance(expected, dict) or any(not isinstance(k, str) or k.casefold() not in normalized
+            or not isinstance(v, list) or not v or not all(isinstance(x, str) and 0 < len(x) <= 200 for x in v)
+            for k, v in expected.items())):
+        raise DispatcherError("delivery_expected_checks must map allowed repositories to nonempty check name lists")
+    return {**credentials, "delivery_expected_checks": {k.casefold(): v for k, v in expected.items()}, "queue": data["queue_repository"], "targets": normalized, "state": state,
             "poll": poll, "duration": duration, "calls": calls,
             "gh": str(data.get("gh_executable", "gh")),
             "pico": str(data.get("pico_executable", "pico"))}
@@ -218,6 +226,7 @@ def database(cfg: dict):
         checkout TEXT NOT NULL, execution_id TEXT NOT NULL, mode TEXT NOT NULL,
         state TEXT NOT NULL, reported TEXT)""")
     db.commit()
+    delivery_store.initialize(db)
     return db
 
 
@@ -284,6 +293,8 @@ def classify(record: dict) -> str:
     if record.get("error_code"):
         return "blocked"
     status = record.get("status")
+    if status in {"launching", "launch_uncertain"}:
+        return "launch_uncertain"
     if status == "launched":
         return "running"
     if status == "interrupted":
@@ -314,11 +325,72 @@ def report(cfg: dict, db: sqlite3.Connection, row: sqlite3.Row) -> None:
     db.commit()
 
 
+def reconcile_delivery(cfg: dict, db: sqlite3.Connection, row: sqlite3.Row) -> None:
+    try:
+        record = pico_action(cfg, row, "status")
+        if classify(record) != "completed":
+            raise DispatcherError("completed execution evidence unavailable")
+        if "target_gh_config_dir" not in cfg:
+            raise DispatcherError("separate target credentials required")
+        env = target_env(cfg)
+        def call(args):
+            return command([cfg["gh"], *args], env=env)
+        item = delivery_observer.observe(row, record, call, cfg.get("delivery_expected_checks", {}).get(row["repo"].casefold()))
+    except (DispatcherError, OSError, ValueError):
+        item = delivery_observer.observe(row, {}, lambda _: None)
+    previous = db.execute("SELECT projection FROM deliveries WHERE issue=?", (row["number"],)).fetchone()
+    if previous:
+        try:
+            old = json.loads(previous[0])
+            if old.get("execution_id") == row["execution_id"] and old.get("reason") == item["reason"]:
+                item["first_seen"] = old.get("first_seen") or item["first_seen"]
+        except (ValueError, TypeError):
+            pass
+    delivery_store.save(db, item)
+    handoff_comment(cfg, row, item)
+
+
+def handoff_comment(cfg: dict, row: sqlite3.Row, item: dict) -> None:
+    """Reconcile the marker before creating or updating; ambiguous matches stop."""
+    marker = f"<!-- pico-delivery:{row['execution_id']} -->"
+    body = (f"{marker}\nPICO delivery: **{item['delivery']}**\n\n"
+            f"Execution: `{row['execution_id']}` ({item['execution']}).\n"
+            f"Publication: {item['publication']}; checks: {item['checks']}; review: {item['review']}.\n"
+            f"Reason: {item['reason']}. Next action: {item['next_action']}.\n")
+    if item['pr_url']:
+        body += f"Pull request: {item['pr_url']}\nHead: `{item['head_sha'] or 'unknown'}`\n"
+    endpoint = f"repos/{cfg['queue']}/issues/{row['number']}/comments"
+    try:
+        env = queue_env(cfg)
+        pages = command([cfg['gh'], 'api', '--paginate', '--slurp', endpoint], env=env)
+        if not isinstance(pages, list) or any(not isinstance(page, list) for page in pages):
+            return
+        matches = [c for page in pages for c in page if isinstance(c, dict) and isinstance(c.get('body'), str) and marker in c['body']]
+        if len(matches) > 1:
+            return
+        if matches:
+            comment = matches[0]
+            if comment['body'] == body:
+                return
+            if type(comment.get('id')) is not int or comment['id'] < 1:
+                return
+            endpoint = f"repos/{cfg['queue']}/issues/comments/{comment['id']}"
+            method = 'PATCH'
+        else:
+            method = 'POST'
+        command([cfg['gh'], 'api', '--method', method, endpoint, '-f', f'body={body}'], env=env)
+    except (DispatcherError, OSError, ValueError):
+        return
+
+
 def tick(cfg: dict, db: sqlite3.Connection) -> None:
     rows = db.execute("SELECT * FROM approvals ORDER BY number").fetchall()
     for row in rows:
         if row["state"] not in ACTIVE:
-            report(cfg, db, row)
+            if row["state"] == "completed":
+                reconcile_delivery(cfg, db, row)
+            else:
+                report(cfg, db, row)
             continue
         if row["state"] == "approved":
             # Re-read immediately before dispatch; a changed issue invalidates approval.
@@ -333,7 +405,7 @@ def tick(cfg: dict, db: sqlite3.Connection) -> None:
                 db.commit()
                 continue
             # Never dispatch a second job while the first is launching or running.
-            running = db.execute("SELECT 1 FROM approvals WHERE state IN ('launching','running') LIMIT 1").fetchone()
+            running = db.execute("SELECT 1 FROM approvals WHERE state IN ('launching','running','launch_uncertain') LIMIT 1").fetchone()
             if running:
                 continue
             db.execute("UPDATE approvals SET state='launching' WHERE number=?", (row["number"],))
@@ -354,7 +426,11 @@ def tick(cfg: dict, db: sqlite3.Connection) -> None:
             continue  # transient errors are not terminal evidence
         db.execute("UPDATE approvals SET state=? WHERE number=?", (state, row["number"]))
         db.commit()
-        report(cfg, db, db.execute("SELECT * FROM approvals WHERE number=?", (row["number"],)).fetchone())
+        current = db.execute("SELECT * FROM approvals WHERE number=?", (row["number"],)).fetchone()
+        if state == "completed":
+            reconcile_delivery(cfg, db, current)
+        else:
+            report(cfg, db, current)
 
 
 def run_service(cfg: dict, once: bool) -> None:
@@ -390,7 +466,8 @@ def main(argv: list[str] | None = None) -> int:
             approve(cfg, args.issue, args.allow_mutation)
         elif args.action == "status":
             with database(cfg) as db:
-                print(json.dumps([dict(x) for x in db.execute("SELECT * FROM approvals ORDER BY number")], indent=2))
+                deliveries = {x["queue_issue"]: x for x in delivery_store.list_deliveries(cfg["state"])}
+                print(json.dumps([{**dict(x), "delivery": deliveries.get(x["number"])} for x in db.execute("SELECT * FROM approvals ORDER BY number")], indent=2))
         else:
             run_service(cfg, once=args.action == "once")
     except (DispatcherError, ValueError, OSError, sqlite3.Error) as exc:

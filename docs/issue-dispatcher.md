@@ -109,3 +109,19 @@ The unit has **no dependency on `moltis.service`**. It runs as `dhuzard`, so pro
 - `interrupted` is terminal for this prototype; no unattended retries, no resume, no automatic expansion of permissions. A new issue and new explicit approval is required for a new execution attempt.
 - `gh issue list` is not used for authorization; non-operator comments, labels and issue contents never grant execution.
 - Integrate #34, #63 and #87 before calling this a production unattended coding system. Add a real WSL/Windows sign-in and service restart pilot, with mock-agent tests first.
+
+## Delivery observation and human handoff
+
+Completed executions are reconciled on every service poll, including after restart. The execution outcome remains unchanged; a separate SQLite delivery projection records the observed publication, PR head, CI, human review, attention reason and next action. `status` includes this projection in each task's `delivery` field. The observer only reads GitHub and local provenance; it never starts a model, repairs code, approves, merges or deploys. Repairs require a separate explicitly authorized execution; no comment grants authority.
+
+Configure expected check names for each target, for example:
+
+```json
+"delivery_expected_checks": {"dhuzard/oratlas": ["build", "test"]}
+```
+
+A nonempty list is required to establish passing expected checks. It is an operator-maintained expectation, not a replacement for GitHub branch rules. The observer also reads branch protection and includes any accessible required contexts; inaccessible protection or rulesets leave merge readiness unknown. Passing expected checks invites a person to review the PR; it does not mean the PR is mergeable or satisfy unknown GitHub rules. Missing, skipped, neutral, cancelled or failed checks never count as passed. A changed head during polling invalidates the observation. Only reviews by GitHub `User` accounts at the observed head count as human decisions; a dismissed or older approval does not count as current.
+
+An applied PR creation must appear in a linked publication child for the approved target. The PR's base and head repositories must both match the target, and its current head must match a unique integrated commit in parent provenance. Publication records do not themselves retain the publication plan's head; multiple integrated heads, later commits, missing child provenance and cross-repository PRs therefore need human inspection. The observer requires the separate target credential configuration; legacy shared-auth configurations cannot produce a verified delivery. Target reads use target credentials, and queue notifications use queue credentials.
+
+A stable marker identifies one queue handoff comment per execution. Each poll searches all issue comments before creating or updating it; multiple marker matches stop reconciliation. After a timeout, the next poll searches again before retrying, reducing duplicates without promising exactly-once delivery. Existing terminal status comments are retained. No reminders are enabled. GitHub or local evidence unavailability produces an attention state rather than a fabricated success. Evidence timestamps describe the most recent poll, and no background observation runs when the service is stopped.
