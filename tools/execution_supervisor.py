@@ -26,7 +26,9 @@ def identity(pid):
         return None
     value = run_lease.pid_start(pid)
     if value is not None:
-        return 'proc:' + value
+        # Start ticks alone can repeat after reboot or in another PID namespace.
+        host = run_lease.host_id()
+        return f'proc:{host}:{value}' if host else None
     if sys.platform != 'darwin':
         return None
     # libproc reports microsecond process birth time; ps lstart has only
