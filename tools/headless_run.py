@@ -385,7 +385,7 @@ def execution_alive(record: dict) -> bool:
 
     Records launched by this version carry the child's `pid_start` (start time
     from /proc); a live pid with a different start time is another process.
-    Older records, and hosts without /proc, fall back to the plain pid probe.
+    A missing birth identity cannot safely identify a legacy process.
     """
     pid = record.get("pid")
     if not pid_alive(pid):
@@ -395,7 +395,7 @@ def execution_alive(record: dict) -> bool:
         recorded, current = record.get("pid_start"), run_lease.pid_start(pid)
         return (recorded is None or current is None or recorded == current) and execution_supervisor.same_process(pid, record["process_identity"])
     recorded, current = record.get("pid_start"), run_lease.pid_start(pid)
-    return recorded is None or current is None or recorded == current
+    return recorded is not None and current is not None and recorded == current
 
 
 def discover_run_id(session_dir: Path, session_id: str) -> str | None:
@@ -575,7 +575,8 @@ def refresh(record: dict) -> dict:
     record["run"] = run_status(record.get("run_id"))
     # A launching record remains an uncertainty barrier until its supervisor resolves it.
     if (record["status"] == "launched" and record.get("process_identity") is None
-            and record.get("pid_start") is None and pid_alive(record.get("pid"))):
+            and pid_alive(record.get("pid"))
+            and (record.get("pid_start") is None or run_lease.pid_start(record.get("pid")) is None)):
         # Old records without a birth identity cannot safely authorize a signal.
         record["status"] = "launch_uncertain"
     if record["status"] == "launched" and record.get("supervisor_identity"):

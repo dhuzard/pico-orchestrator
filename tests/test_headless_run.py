@@ -1066,6 +1066,14 @@ class SupervisionFaultTest(HeadlessFixture):
         with self.assertRaises(hr.HeadlessError):
             hr.cancel(target=self.target, explicit_repo='acme/target', execution_id='exec-1')
 
+    def test_legacy_live_pid_without_verifiable_birth_time_is_uncertain(self):
+        record = {'status': 'launched', 'pid': 123, 'pid_start': '100',
+                  'session_dir': str(self.state), 'session_id': 'old', 'run_id': None}
+        with unittest.mock.patch.object(hr, 'pid_alive', return_value=True), \
+             unittest.mock.patch.object(run_lease, 'pid_start', return_value=None):
+            self.assertEqual(hr.refresh(record)['status'], 'launch_uncertain')
+            self.assertFalse(hr.execution_alive(record))
+
     def test_global_barrier_scans_records_and_fails_closed_on_corruption(self):
         directory = self.state / 'executions' / 'other-repository'
         directory.mkdir(parents=True)
