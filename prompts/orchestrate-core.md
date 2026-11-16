@@ -27,7 +27,15 @@ Record a phase event only for a routed task's own phase (its route and its
 outcome): do not record optional phases such as `inspection`, which carry no
 route or outcome. A phase event looks like
 `{"action":"event","event":{"kind":"phase","phase":"<task id>","status":"completed"}}`.
-For a task with a bound worktree, complete its phase only after `integrate_end`.
+For a task with a bound worktree, complete its phase only after successful
+`integrate_end` and any required review. Before publication, record every routed
+phase as `completed` after its work, integration and required review succeed.
+Then dry-run and apply the reviewed publication plan with `--parent-run-id`
+while the parent is active; finish the parent afterwards. Publication requires
+all recorded phases completed and integrated evidence for the candidate commit.
+Choose publication branch names unique to the parent run and task or wave,
+for example `pico/<run-id>/batch-<n>`, to avoid PR conflicts across runs.
+A terminal `PARTIAL` run cannot be reopened to publish.
 The lifecycle extension already records each routed phase as `in_progress` with
 its route when `route_task` succeeds. The phase statuses are exactly
 `not_started`, `in_progress`, `completed`, `blocked`, `failed`, and `partial`;

@@ -827,7 +827,7 @@ integration. Once every worker of the wave has returned:
    with `INTEGRATION_WORKERS_IN_FLIGHT` while any worker call runs, and worker
    launches are refused with `INTEGRATION_IN_PROGRESS` until integration ends;
 2. inspect each returned diff and merge the task branches one at a time into
-   the local batch branch `pico/batch-<n>` (created from the base branch, or
+   a run-unique local batch branch such as `pico/<run-id>/batch-<n>` (created from the base branch, or
    from the newest batch branch when stacking), running the relevant
    validation after each merge. Do the merges in the bound integration
    worktree, and never
@@ -1128,8 +1128,11 @@ from the local checkout, and refuses any closing keyword
 (`Closes`/`Fixes`/`Resolves`, including in code or comments) that policy does
 not authorize, or that targets another repository (`PUBLICATION_BODY_INVALID`, `AUTONOMY_POLICY_PATH_UNSAFE`). Never
 edit `.pi/autonomy.yaml` to get past it.
-After integration, use the trusted adapter's publication mode: write the
-reviewed PR body to a local file, then call `python3
+After successful integration and required review, record every routed phase as
+`completed`. Publication requires all recorded phases completed and integrated
+evidence for the candidate commit. Before finishing the parent run, use the
+trusted adapter's publication mode: write the reviewed PR body to a local file,
+then call `python3
 "$ORCH_ROOT/tools/github_integration.py" --worktree <target> --publish --parent-run-id <run id>
 --base <base> --head <pico/branch> --title <title> --body-file <file>` for a
 dry run. Inspect its repository, commit, remote state, existing PR, and
@@ -1140,17 +1143,21 @@ non-force branch refspec and creates a draft PR; it never marks a PR ready,
 merges, or accepts arbitrary GitHub commands. Link its child run to the parent
 with an `orchestration_record` child event. If a push succeeds but PR creation
 fails, report the partial result and review a fresh dry run before retrying.
+A terminal `PARTIAL` run cannot be reopened to publish. Choose branch names
+unique to the parent run and task or wave, including task-granularity branches,
+to avoid conflicts with PRs from earlier runs.
 
-- `pr_granularity: batch` (the default): after `integrate_end`, push the
-  wave's `pico/batch-<n>` branch once and open one PR for it whose body
+- `pr_granularity: batch` (the default): once the publication prerequisites are
+  met, push the wave's `pico/<run-id>/batch-<n>` branch and open one PR for it whose body
   references every included issue (`Refs #N`, or `Closes #N` under
   `issue_reference: closes`). `pr_granularity: task`
   opens one PR per task branch instead.
 - CI never blocks the next wave. After pushing, record the batch as
-  `waiting_ci` (in the mission state when a mission drives the run) and
-  immediately continue with the next dependency-ready wave: stack it on the
-  batch branch when it depends on that batch, or start it from the base branch
-  when it is independent.
+  `waiting_ci` (in the mission state when a mission drives the run). Continue
+  with the next dependency-ready wave: stack it on the batch branch when it
+  depends on that batch, or start it from the base branch when it is independent.
+  If any recorded phase is still open, defer publication until all phases have
+  completed.
 - A CI result is an event, not something to poll for. A CI failure becomes a
   new `ci_fix` repair task, classified and routed like any other task, and
   scheduled into a later wave whose branch stacks on the failing batch.
