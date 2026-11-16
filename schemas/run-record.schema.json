@@ -709,6 +709,10 @@
                 "type": "string", "pattern": "^[0-9a-f]{64}$",
                 "description": "Digest of a verified clean checkout identity before integration."
               },
+              "integration_path": {
+                "type": "string", "minLength": 1,
+                "description": "Validated linked integration worktree outside the parent checkout."
+              },
               "status": {
                 "type": "string",
                 "enum": [

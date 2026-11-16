@@ -480,6 +480,25 @@ class DiffFloorCheckToolTest(Routed):
         self.assertEqual(self.run_tool({**payload([member]), "base": "0" * 40})["blocker_code"],
                          engine.CLASSIFICATION_DIFF_UNVERIFIABLE)
 
+    def test_external_integration_and_stacked_wave_use_actual_integration_base(self):
+        integration = self.repo.parent / "integration"
+        git("worktree", "add", "-q", "-b", "batch", str(integration), cwd=self.repo)
+        base = git("rev-parse", "HEAD", cwd=integration).strip()
+        (self.worktree / "src/settings.py").write_text("PUSH = True\n")
+        git("add", "-A", cwd=self.worktree)
+        git("commit", "-qm", "first", cwd=self.worktree)
+        git("merge", "-q", "task", cwd=integration)
+        first = git("rev-parse", "HEAD", cwd=integration).strip()
+        member = {"task_id": "one", "route_task_result": self.ran, "exclude_paths": []}
+        verdict = self.run_tool({"operation": "parent", "parent_checkout": str(integration), "base": base, "members": [member]})
+        self.assertEqual((verdict["blocked"], verdict["head"]), (False, first))
+        self.assertEqual(git("rev-parse", "HEAD", cwd=self.repo).strip(), base)
+        second = self.repo.parent / "second"
+        git("worktree", "add", "-q", "-b", "task2", str(second), first, cwd=self.repo)
+        (second / "src/another.py").write_text("x = 1\n")
+        checked = self.run_tool({"route_task_result": self.ran, "worktree": str(second), "parent_checkout": str(integration)})
+        self.assertEqual(checked["changed_paths"], ["src/another.py"])
+
 
 class DiffFloorReRouteTest(Routed):
     """An underrated diff is a required re-route of the parent run, never a terminal finish."""

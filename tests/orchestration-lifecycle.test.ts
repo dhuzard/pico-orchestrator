@@ -1734,10 +1734,10 @@ async function twoTaskRun(mode: "legacy" | "lean") {
       if (task === "A") await interaction("decision", "A", "codex_reviewer", "Review passed; start the next task");
       await lead({ action: "event", event: { kind: "worker", phase: task, step_id: "codex_reviewer",
         status: "completed", model: CODEX_HIGH } });
-      await lead({ action: "event", event: { kind: "phase", phase: task, status: "completed", route: "CODEX_CLAUDE_CODEX" } });
       const wave = mode === "legacy" ? `wave-${task}` : "auto";
       await lead({ action: "integrate_begin", wave_id: wave });
       await lead({ action: "integrate_end", wave_id: wave });
+      await lead({ action: "event", event: { kind: "phase", phase: task, status: "completed", route: "CODEX_CLAUDE_CODEX" } });
     }
     await lead({ action: "finish", status: "COMPLETED" });
     return { h, leadRecordCalls, replayed: replay(eventsOf(h), "COMPLETED") };
@@ -1882,6 +1882,41 @@ async function floorRun(options: Record<string, unknown> = {}) {
 }
 const diffChecks = (h: ReturnType<typeof harness>) => h.calls.filter((call) => call.script.endsWith("diff_floor_check.py"));
 const waveStatuses = (h: ReturnType<typeof harness>) => eventsOf(h).filter((item: any) => item.kind === "wave").map((item: any) => item.status);
+
+test("integration checks the selected external checkout and refuses an unchanged head", async () => {
+  let merged = false;
+  const h = await floorRun({ diffFloors: (input: Record<string, unknown>) => input.operation === "parent"
+    ? { ok: true, blocked: false, head: (merged ? "b" : "a").repeat(40), changed_path_count: merged ? 1 : 0,
+        verdicts: [{ task_id: "A", path_digests: ["1653a06856ec14bc20b4e1dcc951d601eda9f17d7af17cfd4a433cfe93a29b04"] }] }
+    : PASSED });
+  const record = h.tools.get("orchestration_record");
+  await routeMutating(h, ["A"]);
+  await record.execute("w", { action: "declare_wave", wave_id: "w1", tasks: [{ task_id: "A", write_scope: ["a/**"] }] });
+  h.checkout.status.push("?? .pi/unrelated");
+  assert.match((await record.execute("dirty", { action: "integrate_begin", wave_id: "w1", path: "/tmp/integration" })).content[0].text, /INTEGRATION_CHECKOUT_DIRTY/);
+  h.checkout.status.length = 0;
+  assert.equal((await record.execute("i", { action: "integrate_begin", wave_id: "w1", path: "/tmp/integration" })).details.ok, true);
+  assert.equal(diffChecks(h).at(-1)!.input?.parent_checkout, "/tmp/integration");
+  h.checkout.digest = "parent-changed";
+  assert.match((await record.execute("changed", { action: "integrate_end", wave_id: "w1" })).content[0].text, /INTEGRATION_PARENT_CHANGED/);
+  h.checkout.digest = "clean";
+  assert.match((await record.execute("e", { action: "integrate_end", wave_id: "w1" })).content[0].text, /INTEGRATION_COMMIT_REQUIRED/);
+  merged = true;
+  assert.equal((await record.execute("e2", { action: "integrate_end", wave_id: "w1" })).details.ok, true);
+  assert.equal(diffChecks(h).at(-1)!.input?.parent_checkout, "/tmp/integration");
+  assert.equal((eventsOf(h).find((e: any) => e.kind === "wave" && e.status === "integrating") as any).integration_path, "/tmp/integration");
+  assert.equal(h.checkout.head, "a".repeat(40));
+});
+
+test("premature phase completion is a recoverable refusal", async () => {
+  const h = await floorRun({ eventRefusal: (event: Record<string, unknown>) =>
+    event.kind === "phase" && event.status === "completed"
+      ? { ok: false, error_code: "PARENT_PHASE_INTEGRATION_REQUIRED" } : null });
+  const record = h.tools.get("orchestration_record");
+  const early = await record.execute("p", { action: "event", event: { kind: "phase", phase: "A", status: "completed" } });
+  assert.match(early.content[0].text, /PARENT_PHASE_INTEGRATION_REQUIRED.*run remains active/);
+  assert.equal((await record.execute("s", { action: "status" })).details.ok, true);
+});
 
 test("integrate_begin checks each bound worktree's diff against path floors and re-routes an underrated task", async () => {
   const h = await floorRun();
@@ -2255,7 +2290,7 @@ test("an unintegrated wave of a mutating task refuses COMPLETED; the contract go
     }
     await record.execute("p", { action: "event", event: { kind: "phase", phase: "A", status: "completed", route: "CODEX_CLAUDE_CODEX" } });
     const refused = replay(eventsOf(h), "COMPLETED");
-    assert.deepEqual(refused.errors.map((error) => error[1]), ["PARENT_WAVE_NOT_INTEGRATED"]);
+    assert.deepEqual(refused.errors.map((error) => error[1]), ["PARENT_PHASE_INTEGRATION_REQUIRED", "PARENT_COMPLETION_INCOMPLETE"]);
     const started = replay(eventsOf(h), null).parent.activity.find((entry: any) => entry.status === "started");
     assert.equal(started.goal, "Find the race in the save path.");
     assert.match(started.prompt_excerpt, /^Context: boilerplate/);
@@ -2264,7 +2299,8 @@ test("an unintegrated wave of a mutating task refuses COMPLETED; the contract go
     // Integrated, it completes.
     await record.execute("i", { action: "integrate_begin", wave_id: "auto" });
     await record.execute("i", { action: "integrate_end", wave_id: "auto" });
-    assert.deepEqual(replay(eventsOf(h), "COMPLETED").errors, []);
+    await record.execute("p2", { action: "event", event: { kind: "phase", phase: "A", status: "completed", route: "CODEX_CLAUDE_CODEX" } });
+    assert.deepEqual(replay(eventsOf(h), "COMPLETED").errors.map((error) => error[1]), ["PARENT_PHASE_INTEGRATION_REQUIRED"]);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -2426,7 +2462,7 @@ test("work after an integration with its wave write refused still refuses COMPLE
     }
     events.push({ kind: "phase", phase: "A", status: "completed", route: "CODEX_CLAUDE_CODEX" });
     const refused = replay(events, "COMPLETED");
-    assert.deepEqual(refused.errors.map((error) => error[1]), ["PARENT_WAVE_NOT_INTEGRATED"]);
+    assert.deepEqual(refused.errors.map((error) => error[1]), ["PARENT_PHASE_INTEGRATION_REQUIRED", "PARENT_COMPLETION_INCOMPLETE"]);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -3149,19 +3185,28 @@ test("sandbox prerequisites are detected per platform, and an unusable bwrap is 
   const env = { PATH: "/usr/bin:relative:/opt/bin" };
   const probes: { file: string; args: string[]; env: Record<string, string> }[] = [];
   const works = (file: string, args: string[], probeEnv: Record<string, string>) => { probes.push({ file, args, env: probeEnv }); return true; };
-  assert.deepEqual(detectWorkerSandbox(env, "linux", present(["/usr/bin/bwrap", "/opt/bin/socat"]), works),
-    { available: true, detail: "bubblewrap (namespaces probed) and socat" });
+  assert.deepEqual(detectWorkerSandbox(env, "linux", present(["/usr/bin/bwrap", "/opt/bin/socat", "/usr/bin/unshare"]), works),
+    { available: true, detail: "bubblewrap (outer and nested namespaces probed), unshare and socat" });
   // The probe runs the bwrap found on the worker PATH, with only that PATH, and needs the namespaces Claude Code uses.
-  assert.deepEqual(probes, [{ file: "/usr/bin/bwrap", args: [...BWRAP_PROBE_ARGS], env: { PATH: env.PATH } }]);
+  assert.deepEqual(probes, [
+    { file: "/usr/bin/bwrap", args: [...BWRAP_PROBE_ARGS], env: { PATH: env.PATH } },
+    { file: "/usr/bin/bwrap", args: [...BWRAP_PROBE_ARGS.slice(0, -1), "/usr/bin/unshare", "--user", "--map-root-user", "true"], env: { PATH: env.PATH } },
+  ]);
+  let probeCount = 0;
+  const nestedBlocked = detectWorkerSandbox(env, "linux", present(["/usr/bin/bwrap", "/opt/bin/socat", "/usr/bin/unshare"]), () => ++probeCount === 1);
+  assert.equal(nestedBlocked.available, false);
+  assert.match(nestedBlocked.detail, /cannot create and map a nested user namespace/);
+  assert.equal(probeCount, 2);
+  assert.match(detectWorkerSandbox(env, "linux", present(["/usr/bin/bwrap", "/opt/bin/socat"]), works).detail, /^unshare not found/);
   for (const flag of ["--unshare-user", "--unshare-pid", "--unshare-net", "--proc"]) assert.ok(BWRAP_PROBE_ARGS.includes(flag), flag);
   // bwrap installed but blocked (AppArmor user-namespace restriction, a locked-down container): unavailable.
-  const blocked = detectWorkerSandbox(env, "linux", present(["/usr/bin/bwrap", "/opt/bin/socat"]), () => false);
+  const blocked = detectWorkerSandbox(env, "linux", present(["/usr/bin/bwrap", "/opt/bin/socat", "/usr/bin/unshare"]), () => false);
   assert.equal(blocked.available, false);
   assert.match(blocked.detail, /^\/usr\/bin\/bwrap cannot create the sandbox namespaces/);
-  const noSocat = detectWorkerSandbox(env, "linux", present(["/usr/bin/bwrap", "relative/socat"]), works);
+  const noSocat = detectWorkerSandbox(env, "linux", present(["/usr/bin/bwrap", "relative/socat", "/usr/bin/unshare"]), works);
   assert.equal(noSocat.available, false);
   assert.match(noSocat.detail, /^socat not found on the worker PATH/);
-  assert.match(detectWorkerSandbox({}, "linux", present(["/usr/bin/bwrap"]), works).detail, /^bwrap and socat not found/);
+  assert.match(detectWorkerSandbox({}, "linux", present(["/usr/bin/bwrap"]), works).detail, /^bwrap and socat and unshare not found/);
   assert.equal(detectWorkerSandbox({}, "darwin", present(["/usr/bin/sandbox-exec"])).available, true);
   assert.equal(detectWorkerSandbox({}, "darwin", present([])).available, false);
   assert.deepEqual(detectWorkerSandbox(env, "win32", present(["/usr/bin/bwrap", "/opt/bin/socat"]), works),

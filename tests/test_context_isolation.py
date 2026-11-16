@@ -103,10 +103,31 @@ class WorkspaceAndSnapshotTest(_ReposFixture):
                 self.assertEqual(session_scope.check(str(self.examplelab), str(path))["ok"], True)
                 self.assertEqual(session_scope.worktree(str(self.examplelab), str(path)),
                                  {"ok": False, "blocker_code": "WORKER_WORKSPACE_PROTECTED_PATH"})
-        # Other dot directories inside the checkout remain bindable.
+        # Nested worktrees appear as untracked changes to the parent checkout.
         dotted = self.examplelab / ".pi/worktrees/s3"
         git("-C", str(self.examplelab), "worktree", "add", "-q", "-b", "s3", str(dotted))
-        self.assertTrue(session_scope.worktree(str(self.examplelab), str(dotted))["ok"])
+        self.assertEqual(session_scope.worktree(str(self.examplelab), str(dotted))["blocker_code"],
+                         "WORKER_WORKSPACE_NESTED")
+        alias = Path(self.tmp.name) / "alias"
+        alias.symlink_to(dotted, target_is_directory=True)
+        self.assertEqual(session_scope.worktree(str(self.examplelab), str(alias))["blocker_code"],
+                         "WORKER_WORKSPACE_NESTED")
+        self.assertEqual(session_scope.worktree(str(dotted), str(self.examplelab))["blocker_code"],
+                         "WORKER_WORKSPACE_NESTED")
+
+    def test_wave_snapshot_uses_external_integration_checkout(self):
+        parent = {"checkpoint": {"worktree": str(self.examplelab)}, "phases": [{"id": "s1"}], "waves": []}
+        po._wave_event(parent, {"wave_id": "w", "task_ids": ["s1"], "status": "declared"})
+        po._wave_event(parent, {"wave_id": "w", "task_ids": ["s1"], "status": "integrating",
+                                "integration_path": str(self.worktree)})
+        self.assertEqual(parent["waves"][0]["integration_path"], str(self.worktree))
+        self.assertIn("integration_snapshot", parent["waves"][0])
+        (self.worktree / "change").write_text("uncommitted")
+        with self.assertRaises(po.ParentRunError) as exc:
+            po._wave_event(parent, {"wave_id": "w", "task_ids": ["s1"], "status": "abandoned"})
+        self.assertEqual(exc.exception.error_code, "INTEGRATION_RESTORE_REQUIRED")
+        (self.worktree / "change").unlink()
+        po._wave_event(parent, {"wave_id": "w", "task_ids": ["s1"], "status": "abandoned"})
 
     def test_snapshot_changes_only_when_the_checkout_changes(self):
         before = session_scope.snapshot(str(self.examplelab))

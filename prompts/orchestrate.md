@@ -27,6 +27,8 @@ Record a phase event only for a routed task's own phase (its route and its
 outcome): do not record optional phases such as `inspection`, which carry no
 route or outcome. A phase event looks like
 `{"action":"event","event":{"kind":"phase","phase":"<task id>","status":"completed"}}`.
+For a task with a bound worktree, record completion only after its wave has
+passed `integrate_end`; the phase must remain open for a possible diff-floor reroute.
 The lifecycle extension already records each routed phase as `in_progress` with
 its route when `route_task` succeeds. The phase statuses are exactly
 `not_started`, `in_progress`, `completed`, `blocked`, `failed`, and `partial`;
@@ -746,10 +748,9 @@ edit implementation or integration worktrees.
    cancels it, and re-routing a task replaces only its own approval.
 3. For every step with `mutation_permission: allowed`, after its task's
    preflight succeeds: pin the exact starting commit, create a dedicated Git
-   worktree and dedicated branch from that commit (never inside `.git`, for
-   example `.pi/worktrees/<task id>`: Claude Code denies every edit under a
-   `.git` directory and binding refuses it with
-   `WORKER_WORKSPACE_PROTECTED_PATH`), then bind it with
+   worktree and dedicated branch from that commit outside the parent checkout
+   and outside `.git`, for example in a sibling directory. Claude Code denies
+   edits under `.git`; binding also refuses nested worktrees. Bind it with
    `orchestration_record`
    `{"action":"bind_workspace","task_id":"<task id>","step_id":"<step id>","path":"<worktree>"}`.
 4. Declare the wave when more than one task will run concurrently. A task
@@ -821,14 +822,15 @@ Each task is validated locally in its own worktree (targeted tests and lint
 from `project_constraints` and the repository's `AGENTS.md`); those checks gate
 integration. Once every worker of the wave has returned:
 
-1. call `{"action":"integrate_begin","wave_id":"wave-<n>"}`. It is refused
+1. Create the external integration worktree at the base commit, then call
+   `{"action":"integrate_begin","wave_id":"wave-<n>","path":"<integration worktree>"}`. It is refused
    with `INTEGRATION_WORKERS_IN_FLIGHT` while any worker call runs, and worker
    launches are refused with `INTEGRATION_IN_PROGRESS` until integration ends;
 2. inspect each returned diff and merge the task branches one at a time into
    the local batch branch `pico/batch-<n>` (created from the base branch, or
    from the newest batch branch when stacking), running the relevant
-   validation after each merge. Do the merges in a dedicated integration
-   worktree, `git worktree add <path> -b pico/batch-<n> <base>`, and never
+   validation after each merge. Do the merges in the bound integration
+   worktree, and never
    switch, check out or commit on the parent checkout's branch: it must end
    the run on the branch it started on. Resolve conflicts yourself or re-plan
    the conflicting task into a later wave;
@@ -1128,7 +1130,7 @@ not authorize, or that targets another repository (`PUBLICATION_BODY_INVALID`, `
 edit `.pi/autonomy.yaml` to get past it.
 After integration, use the trusted adapter's publication mode: write the
 reviewed PR body to a local file, then call `python3
-"$ORCH_ROOT/tools/github_integration.py" --worktree <target> --publish
+"$ORCH_ROOT/tools/github_integration.py" --worktree <target> --publish --parent-run-id <run id>
 --base <base> --head <pico/branch> --title <title> --body-file <file>` for a
 dry run. Inspect its repository, commit, remote state, existing PR, and
 `plan_hash`. If the policy and reviewed plan authorize publication, repeat

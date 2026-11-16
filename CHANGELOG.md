@@ -8,6 +8,9 @@ All notable changes to PICO are recorded here. The format follows
 
 ### Added
 
+- A pinned, offline Claude sandbox compatibility verifier and a dedicated AppArmor
+  profile candidate, with containment checks and explicit deployment/rollback instructions.
+
 - `pico workspace init` builds a workspace manifest: it discovers the Git checkouts below a root, lets
   you select 2 to 64 of them, verifies each read-only on GitHub, previews the manifest with the planner's
   waves and blockers, and writes a new file only after `yes` (or `--spec FILE --approve`). It never
@@ -19,6 +22,13 @@ All notable changes to PICO are recorded here. The format follows
   re-asked. See `docs/workspace-interactive-design.md`.
 
 ### Changed
+
+- Linux worker preflight now checks nested namespace mapping before inference.
+  Incompatible hosts fail closed; the dedicated compatibility candidate requires operator rollout.
+- Worker worktrees must live outside the parent checkout. Integration can bind a
+  verified external checkout, keeps the parent unchanged, and must finish before
+  a phase completes. Direct CLI publication requires `--parent-run-id` and validates
+  integrated content and required review before producing or applying its publication plan.
 
 - Workspace tasks are checked for mutation authorization before launch, and waiting for a human's
   approval is no longer reported as a failure. On scientific-review-four-repo-proposal-v1, two

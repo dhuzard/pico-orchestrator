@@ -92,10 +92,10 @@ def implement(*, tokens: int | None = None, cost: float | None = None, route: st
         ev(kind="worker", phase="$TASK", step_id="claude_worker", status="completed"),
         ev(kind="worker", phase="$TASK", step_id="codex_reviewer", status="completed", model="gpt-6.1-sol",
            backend="codex", backend_model="gpt-6.1-sol"),
-        ev(kind="phase", phase="$TASK", status="completed"),
         ev(kind="wave", wave_id="w-$TASK", task_ids=["$TASK"], status="declared"),
         ev(kind="wave", wave_id="w-$TASK", task_ids=["$TASK"], status="integrating"),
         ev(kind="wave", wave_id="w-$TASK", task_ids=["$TASK"], status="integrated"),
+        ev(kind="phase", phase="$TASK", status="completed"),
         {"op": "finish", "status": "COMPLETED"},
     ]
     return ops

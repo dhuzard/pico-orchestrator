@@ -442,7 +442,9 @@ ready.
 ### Publish an integrated batch
 
 The parent orchestrator can now publish a reviewed `pico/` branch through
-`tools/github_integration.py --publish`. It checks the target GitHub remote and
+`tools/github_integration.py --publish --parent-run-id <run-id>`. The CLI checks
+the parent run's integrated evidence and required review against the candidate
+commit before publication. It also checks the target GitHub remote and
 `.pi/autonomy.yaml` permissions, then produces a dry-run `plan_hash` covering
 the branch commit, remote state, title, and PR body. Applying that hash pushes
 one explicit branch ref without force and opens a draft PR. A stale plan or
@@ -854,7 +856,7 @@ checkpoints. Backend conversation history is never reused.
 | `WAVE_UNDECLARED` | Workers of different tasks would overlap outside one declared wave. |
 | `INTEGRATION_IN_PROGRESS` | A worker launch while the parent integrates a wave. |
 | `WORKER_CONFIG_INVALID` | `PI_ORCHESTRATOR_WORKER_ENV_ALLOW` names an invalid variable, `PI_ORCHESTRATOR_WORKER_SANDBOX` is not unset, `0` or `1`, or the worker sandbox cannot be expressed (the worktree, or a declared cache directory, overlaps a protected path). The worker is not started. |
-| `WORKER_SANDBOX_UNAVAILABLE` | A mutating Claude worker needs the OS sandbox (on by default) and it cannot start: no bubblewrap or socat on Linux, a bubblewrap that cannot create namespaces (for example AppArmor on Ubuntu 24.04+), an unsupported platform, or Claude Code's own `failIfUnavailable` refusal. The worker is not started. Install the prerequisites, or opt out explicitly with `PI_ORCHESTRATOR_WORKER_SANDBOX=0` (recorded on the run). |
+| `WORKER_SANDBOX_UNAVAILABLE` | A mutating Claude worker needs the OS sandbox (on by default) and it cannot start: no bubblewrap, socat or unshare on Linux, a bubblewrap that cannot create or map the tested namespaces (for example AppArmor on Ubuntu 24.04+), an unsupported platform, or Claude Code's own `failIfUnavailable` refusal. The worker is not started. Install the prerequisites, or opt out explicitly with `PI_ORCHESTRATOR_WORKER_SANDBOX=0` (recorded on the run). |
 | `WORKER_SCOPE_VIOLATION` | The parent checkout changed during a worker call. Further workers are blocked; nothing is reverted. |
 | `MUTATION_MODE_MISMATCH` | The `AskClaude` `mode` differs from the routed step's mutation permission. |
 | `WORKER_TIMEOUT` / `WORKER_ABORTED` / `WORKER_OUTPUT_LIMIT` | A `ClaudeWorker` run exceeded `PI_CLAUDE_WORKER_TIMEOUT_MS` (default 30 min), was aborted, or exceeded its output cap; its Claude Code process is killed. |
@@ -872,7 +874,7 @@ Agent. A read-only step gets only Read, Glob, and Grep. `git push`, `gh`,
 `git worktree`, and branch deletion are denied tools; other out-of-scope
 actions rely on the worker contract and the parent-checkout snapshot.
 A mutating Claude worker's shell commands also run in Claude Code's OS sandbox
-by default (bubblewrap and socat on Linux and WSL2, Seatbelt on macOS): they
+by default (bubblewrap, socat and unshare on Linux and WSL2, Seatbelt on macOS): they
 may write only in the bound worktree, its git metadata, the temp directory and
 cache directories the repository declares; they cannot read PICO's state
 directory, `~/.config/gh` or other credential files; and they have no network
@@ -883,7 +885,7 @@ The user's own `~/.claude/settings.json` (`excludedCommands`, `allowWrite`,
 `allowedDomains`) still merges in and can widen the sandbox; PICO records
 which of those keys it sets. Declared cache directories are the user's real
 caches, so a worker can poison them. Without the prerequisites (bubblewrap
-that can create namespaces, socat, Claude Code 2.1.285 or later) the worker
+that can create outer and nested namespaces, socat, unshare, Claude Code 2.1.285 or later) the worker
 fails closed with `WORKER_SANDBOX_UNAVAILABLE`;
 `PI_ORCHESTRATOR_WORKER_SANDBOX=0` is the explicit opt-out and is recorded on
 the run. Codex workers and the lead are not sandboxed by PICO. Details and

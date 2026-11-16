@@ -83,6 +83,8 @@ def worktree(target_cwd: str, path: str, *, run=subprocess.run) -> dict:
         return {"ok": False, "blocker_code": "WORKER_WORKSPACE_INVALID"}
     if in_git_dir(workspace_top):
         return {"ok": False, "blocker_code": "WORKER_WORKSPACE_PROTECTED_PATH"}
+    if target_top is None or workspace_top.is_relative_to(target_top) or target_top.is_relative_to(workspace_top):
+        return {"ok": False, "blocker_code": "WORKER_WORKSPACE_NESTED"}
     return {"ok": True, "blocker_code": None, "path": str(workspace_top)}
 
 

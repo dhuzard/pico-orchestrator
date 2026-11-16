@@ -860,7 +860,7 @@ def _usage_event(parent: dict, event: dict) -> None:
     usage["cost_complete"] = usage.get("cost_complete", True) and _event_priced(event, cost)
 
 
-def _clean_integration_snapshot(parent: dict) -> str | None:
+def _clean_integration_snapshot(parent: dict, path: str | None = None) -> str | None:
     """Commit and branch identity only when the entire visible checkout is clean and verifiable.
 
     A dirty or unreadable baseline may still integrate, but cannot be aborted automatically.
@@ -868,7 +868,7 @@ def _clean_integration_snapshot(parent: dict) -> str | None:
     prevent a clean-looking but unfinished merge or rebase from being accepted.
     """
     checkpoint = parent.get("checkpoint") or {}
-    path = checkpoint.get("worktree")
+    path = path or checkpoint.get("worktree")
     if not isinstance(path, str):
         return None
     root = Path(path)
@@ -913,6 +913,8 @@ def _wave_event(parent: dict, event: dict) -> None:
     status = event.get("status")
     if status not in WAVE_EVENT_STATUSES:
         raise ParentRunError("invalid wave status", error_code="PARENT_WAVE_STATUS_INVALID")
+    if "integration_path" in event and status != "integrating":
+        raise ParentRunError("integration path is only accepted at integration start", error_code="INTEGRATION_WORKTREE_INVALID")
     if status in {"integrating", "integrated"}:
         pending = [task_id for task_id in task_ids
                    if any(phase["id"] == task_id and phase.get("escalations")
@@ -933,13 +935,25 @@ def _wave_event(parent: dict, event: dict) -> None:
         raise ParentRunError("wave tasks conflict with prior event", error_code="PARENT_EVENT_CONFLICT")
     elif wave["status"] == "abandoned" or WAVE_STATUSES.index(status) < WAVE_STATUSES.index(wave["status"]):
         raise ParentRunError("wave cannot move backwards", error_code="PARENT_WAVE_TRANSITION_INVALID")
+    if status == "integrating" and wave["status"] == "integrating" and "integration_path" in event:
+        if event["integration_path"] != wave.get("integration_path"):
+            raise ParentRunError("integration checkout cannot change", error_code="INTEGRATION_WORKTREE_INVALID")
     if status == "abandoned":
-        current = _clean_integration_snapshot(parent)
+        current = _clean_integration_snapshot(parent, wave.get("integration_path"))
         if (wave["status"] != "integrating" or not wave.get("integration_snapshot")
                 or current is None or current != wave["integration_snapshot"]):
             raise ParentRunError("integration checkout cannot be verified as restored", error_code="INTEGRATION_RESTORE_REQUIRED")
     if status == "integrating" and wave["status"] != "integrating":
-        digest = _clean_integration_snapshot(parent)
+        path = event.get("integration_path")
+        if path is not None:
+            target = (parent.get("checkpoint") or {}).get("worktree")
+            if not isinstance(path, str) or not isinstance(target, str):
+                raise ParentRunError("invalid integration worktree", error_code="INTEGRATION_WORKTREE_INVALID")
+            checked = session_scope.worktree(target, path)
+            if not checked.get("ok"):
+                raise ParentRunError("invalid integration worktree", error_code="INTEGRATION_WORKTREE_INVALID")
+            wave["integration_path"] = checked["path"]
+        digest = _clean_integration_snapshot(parent, path)
         if digest is not None:
             wave["integration_snapshot"] = digest
     wave["status"] = status
@@ -1183,7 +1197,7 @@ def _record_event_unlocked(run_id: str, event: dict, *, repo_root: Path = ROOT) 
         "mutation": {"kind", "github", "code"},
         "context": {"kind", "starting_commit", "baseline_tokens", "context_tokens", "working_tokens", "compaction"},
         "usage": {"kind", "backend", "estimated_cost_usd", *USAGE_COUNTERS},
-        "wave": {"kind", "wave_id", "task_ids", "status"},
+        "wave": {"kind", "wave_id", "task_ids", "status", "integration_path"},
         "concurrency": {"kind", "peak_workers", "active_ms"},
         "spawn": {"kind"},
         "activity": {"kind", "status", "tool", "task_id", "step_id", "subagent_id", "route", "prompt_digest",
@@ -1251,6 +1265,9 @@ def _record_event_unlocked(run_id: str, event: dict, *, repo_root: Path = ROOT) 
         status = event.get("status")
         if status not in PHASE_STATUSES:
             raise ParentRunError("invalid phase status", error_code="PARENT_PHASE_STATUS_INVALID")
+        if status == "completed" and phase.get("workspace_bound"):
+            raise ParentRunError("integrate the task's wave before completing its phase",
+                                 error_code="PARENT_PHASE_INTEGRATION_REQUIRED")
         if phase["status"] in {"completed", "blocked", "failed", "partial"} and status != phase["status"]:
             raise ParentRunError("phase is already terminal", error_code="PARENT_PHASE_TRANSITION_INVALID")
         phase["status"] = status
