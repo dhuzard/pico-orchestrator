@@ -2210,6 +2210,11 @@ existing `TARGET_REPOSITORY_*` codes apply), then launches
 `pi --print --mode json --session-id <uuid> --session-dir <state>/executions/<repo-key>/sessions`
 with the four orchestrator extensions and the `/orchestrate` prompt built from
 `prompts/orchestrate-core.md` (frontmatter stripped, `$ARGUMENTS` replaced).
+A versioned launch brief includes the observed repository, base, runtime paths,
+policy digest and required workflow sequence. Worktrees are not represented as
+registered until the existing binding guard accepts them. The brief supplies
+context, not authority, and does not skip routing, preflight, review, integration
+or publication checks. Its effect on model-call counts has not been benchmarked.
 The environment carries `PI_TARGET_REPOSITORY`, the pinned Claude backend
 identity, and `PI_ORCHESTRATOR_STATE_DIR`, exactly as `pico run` sets them.
 The orchestration-lifecycle extension therefore creates the parent run, keeps
@@ -2220,7 +2225,17 @@ The parent run id is discovered from the lifecycle's
 
 **Idempotency and recovery.** Execution records live at
 `<state>/executions/<repo-key>/<execution-id>.json`, keyed by the target's Git
-common directory. Statuses: `launched` (process alive), `exited` (process
+common directory. `launching` and `launch_uncertain` are active uncertainty
+barriers: neither permits another mutation job or automatic resume. The
+supervisor gates the workload until its process identity is recorded and an
+independent watchdog is ready. If the supervisor or watchdog fails, the other
+stops the registered process group; unresolved launch intent remains blocked for
+operator reconciliation. `global_execution_barriers()` scans execution records
+across repositories and fails closed for unreadable records and interrupted
+records predating supervision. A dispatcher can perform that scan in the
+`before_spawn` admission callback: the callback and durable intent creation are
+serialized with other current-version headless launches by a shared lock.
+Processes launched outside this protocol are not covered. Statuses also include `launched` (process alive), `exited` (process
 ended and the run is terminal), `interrupted` (process gone while the run is
 still `IN_PROGRESS`, i.e. a crash or kill), `cancelled`. A repeated `start`
 returns `already_running`, `already_finished` or `resume_required` without
@@ -2257,42 +2272,24 @@ closed (`cancel_error_code`). The execution records the child's pid start time; 
 the lease holder (`run.lease`: state, stale reason, holder alive, owner, pid,
 host, heartbeat, expiry), as does Garden for each run.
 
-**Execution time limit.** `start --max-duration SECONDS` (`max_duration_seconds`,
-a positive integer; anything else is refused with `MAX_DURATION_INVALID` before
-a child exists) limits the wall-clock time of the child. The launch records
-`max_duration_seconds`, `deadline_at` (UTC, for people) and `deadline_epoch`
-(what the code compares). Without the flag nothing is recorded and nothing
-changes. The limit is enforced by the code that already looks at the child, not
-by a watchdog process: a launcher that waits slices its wait and checks the
-deadline, and `status` (hence `pico workspace status`, the scheduler's
-observation of children it did not start) checks it
-on every refresh. Both call the same stop path as `cancel`: the parent run is
-finished `BLOCKED` with `EXECUTION_TIME_LIMIT` as the lease owner (so a run
-another owner has taken over is not closed), then the child's process group
-gets SIGTERM and, after the grace period, SIGKILL, only while the pid and its
-recorded start time still match (`execution_alive`; a reused pid is never
-signalled). **Clock.** Where `/proc` is available, elapsed time is the boot-clock
-time since the child's recorded `pid_start` (against `/proc/uptime`), so a
-wall-clock jump (NTP step, WSL2 resuming from host sleep) does not stop a child
-early or late. Elsewhere it falls back to the wall clock (`deadline_epoch`), which
-can then be off by such a jump; displays computed from the workspace record
-always use `deadline_epoch`. A killed child records its real signal status
-as `exit_code` (negative), never 0. The execution ends `status: cancelled`, `outcome: time_limit`,
-`stop_reason: EXECUTION_TIME_LIMIT` with a `time_limit` block
-(`max_duration_seconds`, `elapsed_seconds`, `deadline_at`, `stopped_at`). A
-child that ended on its own before the check keeps its own outcome, and the
-limit is not claimed for it. Limits of a `--no-wait` child are only enforced
-when something looks at it (`status`, the scheduler, or a
-later `start` of the same id): there is deliberately no background process, so
-a detached child nobody observes keeps running until someone does. A child
-stopped before it created its parent run has no run to settle; the stop still
-ends the execution `cancelled` with the reason. **Resume and the limit.** A
-time-limit stop closes the run `BLOCKED`, a terminal state, so `start` and
-`--resume` of that execution id return `already_finished` and launch nothing;
-continuing the work is an explicit new launch with a new execution id (a new
-run). The limit is per launch and is not inherited: an interrupted (crashed)
-execution resumed with `--resume --max-duration N` gets a fresh N-second window
-starting at the resume, and a resume without `--max-duration` runs unlimited.
+**Execution time limit.** `--max-duration SECONDS` is a positive integer,
+recorded as an execution-wide deadline before launch. The independent watchdog
+uses a monotonic timer and stops the registered process group even when the
+launcher, dispatcher and API are unavailable. Status/cancel also verify process
+identity before signaling. The watchdog and supervisor detect each other's
+failure; if ownership or termination cannot be verified the launch remains an
+uncertainty barrier. On timeout the execution is `cancelled` with
+`EXECUTION_TIME_LIMIT`, and an open parent run is settled `BLOCKED` when its
+lease permits. Explicit resume of an interrupted run inherits the original
+deadline; it cannot extend or omit it, and an expired deadline cannot resume.
+A terminal run is never resumed. On a host without Linux `/proc`, status uses
+wall time; wall-clock changes may affect
+recovery decisions after interruption. On macOS process birth identity comes from
+`libproc`; launch fails closed when identity is unavailable. Detached descendants that create new
+sessions are not contained by process-group signaling; this is not a cgroup or
+sandbox boundary. Simultaneous supervisor and watchdog failure leaves a
+barrier requiring operator reconciliation, not an automatic guarantee that all
+descendants were killed. No duration limit is set by default.
 
 **Lead-call limit (`max_lead_calls`).** Optional, a positive integer (`MAX_LEAD_CALLS_INVALID`
 otherwise). Sources and precedence: `pico exec start --max-lead-calls N` or the workspace

@@ -372,7 +372,10 @@ reconciles the record against the live process and provenance, and
 `pico exec cancel` stops the process and closes the run as `EXECUTION_CANCELLED`.
 `--max-duration SECONDS` (or `max_duration_seconds` on a workspace task, with
 a manifest default) caps a child's wall-clock time: it is stopped and its run
-closed `BLOCKED` with `EXECUTION_TIME_LIMIT`. No limit is set by default.
+closed `BLOCKED` with `EXECUTION_TIME_LIMIT`. A separate watchdog enforces the
+deadline without dispatcher polling. An interrupted execution retains its
+original deadline on resume; a terminal run cannot resume. No limit is set by
+default.
 `--max-lead-calls N` (or `max_lead_calls` on a workspace task, a manifest default, or
 `limits.max_lead_calls` in `.pi/autonomy.yaml`) bounds the lead's model calls: the lead is
 warned once at 80% (`lead_calls_warn_at`), limited to `status` and `finish` at the limit,

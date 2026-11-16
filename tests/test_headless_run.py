@@ -258,7 +258,7 @@ class GitIdentityPreflightTest(HeadlessFixture):
         stage_mutation_policy(self.target)
         with unittest.mock.patch.object(hr.subprocess, "Popen", wraps=subprocess.Popen) as spawn:
             first = self.start(allow_mutation=True)
-        launches = [call for call in spawn.call_args_list if call.args[0][0] == str(self.pi)]
+        launches = [call for call in spawn.call_args_list if len(call.args[0]) > 2 and call.args[0][2] == "supervise"]
         self.assertEqual(len(launches), 1)
         self.assertEqual(launches[0].kwargs["env"]["GIT_AUTHOR_NAME"], "Test Operator")
         self.assertEqual(launches[0].kwargs["env"]["GIT_COMMITTER_EMAIL"], "operator@example.test")
@@ -509,7 +509,7 @@ class HeadlessRunTest(HeadlessFixture):
         pids = {r["pid"] for r in results if r.get("outcome") == "launched"}
         try:
             self.assertEqual(errors, [])
-            self.assertEqual(sorted(r["outcome"] for r in results), ["already_running", "launched"])
+            self.assertIn(sorted(r["outcome"] for r in results), (["already_running", "launched"], ["launch_uncertain", "launched"]))
             self.assertEqual(len(pids), 1)
             self.assertEqual(self.status()["launches"], 1)
         finally:
@@ -893,25 +893,26 @@ class ExecutionTimeLimitTest(HeadlessFixture):
             self.assertEqual(refused.exception.code, "MAX_DURATION_INVALID")
         self.assertEqual(list((self.state / "executions").rglob("*.json")), [])
 
-    def test_resume_after_a_crash_gets_a_fresh_window_from_its_own_argument(self):
+    def test_resume_preserves_original_deadline_and_refuses_extensions(self):
         crashed = self.start(behavior="crash", max_duration_seconds=50)
         self.assertEqual(crashed["status"], "interrupted")
-        self.clock.now += 500  # long past the first launch's deadline
-        resumed = self.start(behavior="hang", wait=False, resume=True, takeover=True, max_duration_seconds=70)
+        with self.assertRaises(hr.HeadlessError) as mismatch:
+            self.start(behavior="hang", wait=False, resume=True, takeover=True, max_duration_seconds=70)
+        self.assertEqual(mismatch.exception.code, "MAX_DURATION_MISMATCH")
+        self.clock.now += 10
+        resumed = self.start(behavior="hang", wait=False, resume=True, takeover=True)
         self.addCleanup(self.reap, resumed["pid"])
-        self.assertEqual(resumed["deadline_epoch"], self.clock.now + 70)
+        self.assertEqual(resumed["deadline_epoch"], crashed["deadline_epoch"])
+        self.assertEqual(resumed["max_duration_seconds"], 50)
         self.assertEqual(resumed["run_id"], crashed["run_id"])
-        self.assertEqual(self.status()["status"], "launched")
-        self.clock.now += 70
-        stopped = self.status()
-        self.assertEqual(stopped["stop_reason"], "EXECUTION_TIME_LIMIT")
-        # A resume without --max-duration does not inherit the earlier limit.
+        self.clock.now += 50
+        self.assertEqual(self.status()["stop_reason"], "EXECUTION_TIME_LIMIT")
         other = self.start(execution_id="exec-2", behavior="crash", max_duration_seconds=50)
-        self.assertEqual(other["status"], "interrupted")
-        again = self.start(execution_id="exec-2", behavior="hang", wait=False, resume=True, takeover=True)
-        self.addCleanup(self.reap, again["pid"])
-        self.assertNotIn("deadline_epoch", again)
-        self.assertNotIn("max_duration_seconds", again)
+        self.clock.now += 51
+        with self.assertRaises(hr.HeadlessError) as expired:
+            self.start(execution_id="exec-2", behavior="hang", wait=False, resume=True, takeover=True)
+        self.assertEqual(expired.exception.code, "EXECUTION_TIME_LIMIT")
+        self.assertEqual(other["max_duration_seconds"], 50)
 
     def test_resume_after_a_time_limit_stop_needs_a_new_execution(self):
         self.launch_hanging(max_duration_seconds=10)
@@ -959,6 +960,181 @@ class ExecutionTimeLimitTest(HeadlessFixture):
         self.assertEqual(data["stop_reason"], "EXECUTION_TIME_LIMIT")
         self.assertEqual(rc, 0)
 
+
+
+class SupervisionFaultTest(HeadlessFixture):
+    def test_gate_exits_without_starting_work_after_owner_dies(self):
+        marker = self.state / 'ran'
+        read_fd, write_fd = os.pipe()
+        child = subprocess.Popen([sys.executable, str(REPO_ROOT / 'tools' / 'execution_supervisor.py'),
+                                  'gate', str(read_fd), sys.executable, '-c',
+                                  f'from pathlib import Path; Path({str(marker)!r}).touch()'],
+                                 pass_fds=(read_fd,), start_new_session=True)
+        os.close(read_fd)
+        os.close(write_fd)
+        self.assertEqual(child.wait(timeout=5), 125)
+        self.assertFalse(marker.exists())
+
+    def test_supervisor_dies_after_spawn_before_pid_registration(self):
+        path = self.state / 'gate-test.json'
+        marker = self.state / 'started'
+        record = {'record_version': hr.RECORD_VERSION, 'status': 'launching', 'launches': 0}
+        hr.save_record(path, record)
+        config = {'path': str(path), 'log_path': str(self.state / 'gate.log'), 'cwd': str(self.target),
+                  'argv': [sys.executable, '-c', f'from pathlib import Path; Path({str(marker)!r}).touch()'],
+                  'continuing': False, 'monotonic_deadline': None}
+        with hr.locked_record(path):
+            owner = subprocess.Popen([sys.executable, str(REPO_ROOT / 'tools' / 'execution_supervisor.py'),
+                                      'supervise'], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.DEVNULL, start_new_session=True)
+            try:
+                owner.stdin.write(json.dumps(config).encode())
+                owner.stdin.close()
+                end = time.monotonic() + 5
+                spawned = False
+                while time.monotonic() < end:
+                    listing = subprocess.run(['ps', '-axo', 'pid=,ppid='], capture_output=True, text=True, check=True)
+                    spawned = any(len(parts) == 2 and parts[1] == str(owner.pid)
+                                  for parts in (line.split() for line in listing.stdout.splitlines()))
+                    if spawned:
+                        break
+                    time.sleep(.02)
+                self.assertTrue(spawned, 'supervisor never spawned its gated child')
+                os.kill(owner.pid, 9)
+                owner.wait(timeout=5)
+            finally:
+                if owner.poll() is None:
+                    owner.kill()
+                    owner.wait()
+        self.assertEqual(hr.load_record(path)['status'], 'launching')
+        self.assertFalse(marker.exists())
+
+    def test_supervisor_death_stops_the_registered_child(self):
+        launched = self.start(behavior='hang', wait=False, max_duration_seconds=30)
+        self.addCleanup(ExecutionTimeLimitTest.reap, launched['pid'])
+        os.kill(launched['supervisor_pid'], 9)
+        path = hr.execution_path(session_scope.common_dir(self.target), 'exec-1')
+        end = time.monotonic() + 8
+        while time.monotonic() < end:
+            record = hr.load_record(path)
+            if record['status'] == 'interrupted':
+                break
+            time.sleep(.05)
+        self.assertEqual(record['status'], 'interrupted')
+        self.assertEqual(record['stop_reason'], 'SUPERVISOR_LOST')
+        self.assertFalse(hr.execution_alive(launched))
+
+    def test_watchdog_death_stops_the_registered_child(self):
+        launched = self.start(behavior='hang', wait=False, max_duration_seconds=30)
+        self.addCleanup(ExecutionTimeLimitTest.reap, launched['pid'])
+        os.kill(launched['watchdog_pid'], 9)
+        path = hr.execution_path(session_scope.common_dir(self.target), 'exec-1')
+        end = time.monotonic() + 8
+        while time.monotonic() < end:
+            record = hr.load_record(path)
+            if record['status'] == 'interrupted':
+                break
+            time.sleep(.05)
+        self.assertEqual(record['status'], 'interrupted')
+        self.assertEqual(record['stop_reason'], 'WATCHDOG_LOST')
+        self.assertFalse(hr.execution_alive(launched))
+
+    def test_deadline_fires_without_status_or_dispatcher(self):
+        launched = self.start(behavior='hang', wait=False, max_duration_seconds=1)
+        self.addCleanup(ExecutionTimeLimitTest.reap, launched['pid'])
+        path = hr.execution_path(session_scope.common_dir(self.target), 'exec-1')
+        end = time.monotonic() + 8
+        while time.monotonic() < end:
+            record = hr.load_record(path)
+            if record['status'] == 'cancelled':
+                break
+            time.sleep(.05)
+        self.assertEqual(record['status'], 'cancelled')
+        self.assertEqual(record['stop_reason'], 'EXECUTION_TIME_LIMIT')
+        self.assertFalse(hr.execution_alive(launched))
+
+    def test_launch_intent_is_never_automatically_interrupted(self):
+        record = self.start(behavior='hang', wait=False)
+        self.addCleanup(ExecutionTimeLimitTest.reap, record['pid'])
+        path = hr.execution_path(session_scope.common_dir(self.target), 'exec-1')
+        with hr.locked_record(path):
+            record = hr.load_record(path)
+            record.update(status='launching', pid=None)
+            hr.save_record(path, record)
+        observed = self.status()
+        self.assertEqual(observed['status'], 'launching')
+        with self.assertRaises(hr.HeadlessError):
+            hr.cancel(target=self.target, explicit_repo='acme/target', execution_id='exec-1')
+
+    def test_global_barrier_scans_records_and_fails_closed_on_corruption(self):
+        directory = self.state / 'executions' / 'other-repository'
+        directory.mkdir(parents=True)
+        hr.save_record(directory / 'uncertain.json', {'record_version': 1, 'status': 'launching',
+                                                      'execution_id': 'u', 'launches': 0})
+        hr.save_record(directory / 'old.json', {'record_version': 1, 'status': 'interrupted',
+                                                'execution_id': 'old'})
+        hr.save_record(directory / 'resolved.json', {'record_version': 1, 'status': 'interrupted',
+                                                     'execution_id': 'done', 'supervision_version': 1})
+        (directory / 'corrupt.json').write_text('{')
+        barriers = hr.global_execution_barriers(self.state)
+        self.assertEqual({item['status'] for item in barriers}, {'launching', 'interrupted', 'unreadable'})
+        self.assertNotIn('done', {item['execution_id'] for item in barriers})
+
+    def test_global_launch_lock_makes_scan_and_intent_atomic(self):
+        results, failures = [], []
+        threads_start = threading.Barrier(2)
+        os.environ['FAKE_PI_BEHAVIOR'] = 'hang'
+
+        def launch(execution_id):
+            def admission():
+                if hr.global_execution_barriers():
+                    raise hr.HeadlessError('GLOBAL_BUSY', 'another launch owns the slot')
+            threads_start.wait()
+            try:
+                results.append(hr.start(target=self.target, explicit_repo='acme/target', execution_id=execution_id,
+                                        objective='Inspect the repository and report', pi_executable=str(self.pi),
+                                        wait=False, before_spawn=admission))
+            except hr.HeadlessError as exc:
+                failures.append(exc.code)
+
+        threads = [threading.Thread(target=launch, args=(f'parallel-{i}',)) for i in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(20)
+        try:
+            self.assertEqual(failures, ['GLOBAL_BUSY'])
+            self.assertEqual(len(results), 1)
+            self.assertEqual(results[0]['status'], 'launched')
+        finally:
+            for result in results:
+                ExecutionTimeLimitTest.reap(result['pid'])
+
+    def test_repeated_resumes_keep_one_original_deadline(self):
+        first = self.start(behavior='crash', max_duration_seconds=60)
+        second = self.start(behavior='crash', resume=True, takeover=True)
+        self.assertEqual(second['deadline_epoch'], first['deadline_epoch'])
+        third = self.start(behavior='hang', wait=False, resume=True, takeover=True)
+        self.addCleanup(ExecutionTimeLimitTest.reap, third['pid'])
+        self.assertEqual(third['deadline_epoch'], first['deadline_epoch'])
+        self.assertEqual(third['max_duration_seconds'], 60)
+        self.assertEqual(third['launches'], 3)
+
+    def test_launch_brief_contains_checked_paths_and_preserves_guards(self):
+        import launch_brief
+        brief = launch_brief.create(worktree=self.target, repository='acme/target',
+                                    common_dir=session_scope.common_dir(self.target),
+                                    session_id='123', executable=str(self.pi), python=sys.executable,
+                                    mutation_permissions=[])
+        self.assertTrue(brief.startswith('PICO_LAUNCH_BRIEF_V1\n'))
+        snapshot = json.loads(brief.splitlines()[1])
+        self.assertEqual(snapshot['runtime_executable'], str(self.pi))
+        self.assertEqual(snapshot['base_commit_observed'], git('-C', str(self.target), 'rev-parse', 'HEAD'))
+        self.assertTrue(Path(snapshot['publication_tool']).is_file())
+        self.assertIn('route_task', brief)
+        self.assertIn('independent review', brief)
+        self.assertIn('integrate_begin', brief)
+        self.assertIn('not authorization', brief)
 
 if __name__ == "__main__":
     unittest.main()
