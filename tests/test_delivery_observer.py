@@ -202,6 +202,7 @@ class DeliveryTest(unittest.TestCase):
 
     def test_uncertainty_with_error_is_still_an_active_barrier(self):
         self.assertEqual(dispatch.classify({'status': 'launch_uncertain', 'error_code': 'RECOVERY_REQUIRED'}), 'launch_uncertain')
+        self.assertEqual(dispatch.classify({'error_code': 'EXECUTION_GLOBAL_BARRIER'}), 'approved')
 
     def test_approval_cannot_overwrite_a_run_that_started_while_prompt_waited(self):
         cfg = {'state': self.path / 'approval-race.sqlite', 'queue': 'acme/queue', 'gh': 'gh', 'targets': {'acme/tool': '/tmp/x'}}
@@ -234,5 +235,18 @@ class DeliveryTest(unittest.TestCase):
             self.assertEqual(action.call_args.args[2], 'status')
             read_issue.assert_not_called()
             self.assertEqual(db.execute('SELECT state FROM approvals').fetchone()[0], 'running')
+
+    def test_partial_execution_remains_immutable_and_asks_for_human_decision(self):
+        cfg = {'state': self.path / 'partial.sqlite', 'queue': 'acme/queue', 'gh': 'gh'}
+        with dispatch.database(cfg) as db:
+            db.execute('INSERT INTO approvals VALUES (?,?,?,?,?,?,?,NULL)', (8, 'digest', 'acme/tool', '/tmp/x', 'issue-partial', 'local-mutation', 'partial'))
+            db.commit()
+            with patch.object(dispatch, 'pico_action', return_value={'status': 'exited', 'run': {'status': 'PARTIAL'}}) as action, \
+                    patch.object(dispatch, 'handoff_comment'):
+                dispatch.tick(cfg, db)
+            self.assertEqual(action.call_args.args[2], 'status')
+            self.assertEqual(db.execute('SELECT state FROM approvals').fetchone()[0], 'partial')
+        item = store.list_deliveries(cfg['state'])[0]
+        self.assertEqual((item['execution_state'], item['delivery_state']), ('partial', 'needs_decision'))
 
 if __name__ == '__main__': unittest.main()

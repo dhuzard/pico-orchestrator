@@ -354,6 +354,8 @@ def classify(record: dict) -> str:
     status = record.get("status")
     if status in {"launching", "launch_uncertain"}:
         return "launch_uncertain"
+    if record.get('error_code') == 'EXECUTION_GLOBAL_BARRIER':
+        return 'approved'  # No child was launched; retain the exact approval while the global slot is held.
     if record.get("error_code"):
         return "blocked"
     if status == "launched":
@@ -391,14 +393,18 @@ def report(cfg: dict, db: sqlite3.Connection, row: sqlite3.Row) -> None:
 def reconcile_delivery(cfg: dict, db: sqlite3.Connection, row: sqlite3.Row) -> None:
     try:
         record = pico_action(cfg, row, "status")
-        if classify(record) != "completed":
-            raise DispatcherError("completed execution evidence unavailable")
+        if classify(record) != row['state']:
+            raise DispatcherError("terminal execution evidence unavailable")
         if "target_gh_config_dir" not in cfg:
             raise DispatcherError("separate target credentials required")
         env = target_env(cfg)
         def call(args):
             return command([cfg["gh"], *args], env=env)
         item = delivery_observer.observe(row, record, call, cfg.get("delivery_expected_checks", {}).get(row["repo"].casefold()))
+        blocker = record.get('error_code') or (record.get('run') or {}).get('blocker_code')
+        if row['state'] != 'completed' and isinstance(blocker, str) and re.fullmatch(r'[A-Z][A-Z0-9_]{0,100}', blocker):
+            item['reason'] = f"Execution {row['state']}: {blocker}"
+            item['next_action'] = 'Inspect the blocker and execution evidence before approving any new attempt'
     except (DispatcherError, OSError, ValueError):
         item = delivery_observer.observe(row, {}, lambda _: None)
     previous = db.execute("SELECT projection FROM deliveries WHERE issue=?", (row["number"],)).fetchone()
@@ -456,7 +462,7 @@ def tick(cfg: dict, db: sqlite3.Connection) -> None:
     for row in rows:
         fresh_intent = row['state'] == 'approved'
         if row["state"] not in ACTIVE:
-            if row["state"] == "completed":
+            if row["state"] in {"completed", "partial", "blocked", "interrupted"}:
                 reconcile_delivery(cfg, db, row)
             else:
                 report(cfg, db, row)
@@ -521,7 +527,7 @@ def tick(cfg: dict, db: sqlite3.Connection) -> None:
         db.execute("UPDATE approvals SET state=? WHERE number=?", (state, row["number"]))
         db.commit()
         current = db.execute("SELECT * FROM approvals WHERE number=?", (row["number"],)).fetchone()
-        if state == "completed":
+        if state in {'completed', 'partial', 'blocked', 'interrupted'}:
             reconcile_delivery(cfg, db, current)
         else:
             report(cfg, db, current)

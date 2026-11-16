@@ -8,7 +8,7 @@
     "issue": {"type": "integer", "minimum": 1},
     "execution_id": {"type": "string"},
     "run_id": {"type": ["string", "null"], "pattern": "^run-[A-Za-z0-9-]+$"},
-    "execution": {"const": "completed"},
+    "execution": {"enum": ["completed", "partial", "blocked", "interrupted"]},
     "repository": {"type": "string", "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"},
     "publication": {"enum": ["none", "observed", "ambiguous", "unavailable"]},
     "pr_number": {"type": ["integer", "null"], "minimum": 1},

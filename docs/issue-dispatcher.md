@@ -126,7 +126,7 @@ The unit has **no dependency on `moltis.service`**. It runs as `dhuzard`, so pro
 
 ## Delivery observation and human handoff
 
-Completed executions are reconciled on every service poll, including after restart. The execution outcome remains unchanged; a separate SQLite delivery projection records the observed publication, PR head, CI, human review, attention reason and next action. `status` includes this projection in each task's `delivery` field. The observer only reads GitHub and local provenance; it never starts a model, repairs code, approves, merges or deploys. Repairs require a separate explicitly authorized execution; no comment grants authority.
+Completed, partial, blocked and interrupted executions are reconciled on every service poll, including after restart. The execution outcome remains unchanged; a separate SQLite delivery projection records the observed publication, PR head, CI, human review, attention reason and next action. `status` includes this projection in each task's `delivery` field. The observer only reads GitHub and local provenance; it never starts a model, repairs code, approves, merges or deploys. Repairs require a separate explicitly authorized execution; no comment grants authority.
 
 Configure expected check names for each target, for example:
 

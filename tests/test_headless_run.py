@@ -681,18 +681,23 @@ class HeadlessRunTest(HeadlessFixture):
             time.sleep(0.05)
         run_id = hr.discover_run_id(Path(launched["session_dir"]), launched["session_id"])
         signals = []
-        real_killpg = os.killpg
-        def observe(pid, sig):
+        import execution_supervisor as supervisor
+        signal_owner, signal_name = ((supervisor.signal, 'pidfd_send_signal')
+                                     if sys.platform == 'linux' and hasattr(os, 'pidfd_open')
+                                     and hasattr(supervisor.signal, 'pidfd_send_signal') else (os, 'killpg'))
+        real_signal = getattr(signal_owner, signal_name)
+        def observe(*args, **kwargs):
             # At signal time the run must already be terminal with the cancellation code.
             signals.append(hr.run_status(run_id)["blocker_code"])
-            real_killpg(pid, sig)
-        with unittest.mock.patch.object(hr.os, "killpg", side_effect=observe):
+            return real_signal(*args, **kwargs)
+        with unittest.mock.patch.object(signal_owner, signal_name, side_effect=observe):
             hr.cancel(target=self.target, explicit_repo="acme/target", execution_id="exec-1", grace=2)
         try:
             os.waitpid(launched["pid"], 0)
         except ChildProcessError:
             pass
         self.assertEqual(signals[0], "EXECUTION_CANCELLED")
+        self.assertTrue(all(code == 'EXECUTION_CANCELLED' for code in signals))
 
     def test_prompt_carries_marker_and_objective(self):
         prompt = hr.build_prompt("Review the parser")
