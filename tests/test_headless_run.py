@@ -1114,6 +1114,7 @@ class SupervisionFaultTest(HeadlessFixture):
                   'deadline_at': hr._iso(now + timeout)}
         hr.save_record(path, record)
         script = """import json, os, signal, sys, time
+signal.signal(signal.SIGHUP, signal.SIG_IGN)
 read_fd, write_fd = os.pipe()
 pid = os.fork()
 if pid == 0:
@@ -1123,7 +1124,8 @@ if pid == 0:
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
     signal.signal(signal.SIGHUP, signal.SIG_IGN)
     with open(sys.argv[1] + '.tmp', 'w') as f:
-        json.dump({'pid': os.getpid(), 'pgid': os.getpgrp(), 'sid': os.getsid(0)}, f)
+        json.dump({'pid': os.getpid(), 'leader_pid': os.getppid(),
+                   'pgid': os.getpgrp(), 'sid': os.getsid(0)}, f)
     os.replace(sys.argv[1] + '.tmp', sys.argv[1])
     os.write(write_fd, b'R')
     while True: time.sleep(1)
@@ -1142,6 +1144,7 @@ while True: time.sleep(1)
                                  stderr=subprocess.DEVNULL, start_new_session=True)
         worker = None
         worker_identity = anchor_identity = None
+        known_processes = {}
         try:
             owner.stdin.write(json.dumps(config).encode())
             owner.stdin.close()
@@ -1152,11 +1155,18 @@ while True: time.sleep(1)
             worker = json.loads(marker.read_text())
             worker_identity = execution_supervisor.identity(worker['pid'])
             anchor_identity = (hr.load_record(path) or {}).get('process_identity')
+            members = execution_supervisor.session_members(worker['sid'])
+            self.assertIsNotNone(members)
+            known_processes = {pid: execution_supervisor.identity(pid) for pid, _, _ in members}
+            known_processes[worker['pid']] = worker_identity
+            known_processes[worker['sid']] = anchor_identity
             if separate_group:
                 self.assertNotEqual(worker['pgid'], worker['sid'], 'worker must exercise another group in the session')
             else:
                 self.assertEqual(worker['pgid'], worker['sid'])
             if kill_anchor:
+                self.assertIsNotNone(known_processes.get(worker['leader_pid']))
+                self.assertIsNotNone(worker_identity)
                 os.kill(worker['sid'], 9)
             owner.wait(timeout=12)
             final = hr.load_record(path)
@@ -1188,21 +1198,31 @@ while True: time.sleep(1)
             if owner.poll() is None:
                 owner.kill()
                 owner.wait()
-            if worker and worker_identity and execution_supervisor.same_process(worker['pid'], worker_identity):
-                try:
-                    os.kill(worker['pid'], 9)
-                except ProcessLookupError:
-                    pass
-            if worker and anchor_identity and execution_supervisor.same_process(worker['sid'], anchor_identity):
-                try:
-                    os.killpg(worker['sid'], 9)
-                except ProcessLookupError:
-                    pass
+            self._kill_known_fixture_processes(known_processes)
             if worker:
                 end = time.monotonic() + 10
                 while execution_supervisor.session_members(worker['sid']) != [] and time.monotonic() < end:
                     time.sleep(.05)
                 self.assertEqual(execution_supervisor.session_members(worker['sid']), [])
+
+    @staticmethod
+    def _kill_known_fixture_processes(processes):
+        """Kill only captured fixture processes that still have the same birth identity."""
+        import execution_supervisor
+        for pid, token in processes.items():
+            if token and execution_supervisor.same_process(pid, token):
+                try:
+                    os.kill(pid, 9)
+                except ProcessLookupError:
+                    pass
+
+    def test_fixture_cleanup_signals_only_captured_live_identities(self):
+        import execution_supervisor
+        with unittest.mock.patch.object(execution_supervisor, 'same_process',
+                                        side_effect=lambda pid, token: pid == 123), \
+             unittest.mock.patch.object(os, 'kill') as kill:
+            self._kill_known_fixture_processes({123: 'known', 124: 'reused', 125: None})
+        kill.assert_called_once_with(123, 9)
 
     def test_killed_anchor_with_surviving_worker_keeps_uncertainty_barrier(self):
         self._forking_session(False, kill_anchor=True)
