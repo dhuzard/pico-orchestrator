@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -282,6 +283,42 @@ class UseLatestCacheTest(_CacheFixture):
         runtime = Path(path_proc.stdout.strip())
         self.assertEqual(runtime.parent.resolve(), (self.cache / "runtimes").resolve())
         self.assertEqual((runtime / ".pico-runtime").read_text().strip(), self.cache_head())
+
+    def test_runtime_archive_is_complete_before_extraction(self):
+        # Model an extractor that will not consume a producer's trailing bytes.
+        # Requiring a file here avoids a timing-dependent SIGPIPE in git archive.
+        tar = self.bin / "tar"
+        real_tar = shlex.quote(shutil.which("tar"))
+        tar.write_text(f"#!/bin/sh\n[ \"$1\" = '-xf' ] || exit 91\nexec {real_tar} \"$@\"\n")
+        tar.chmod(0o755)
+        proc = self.use_latest("path")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        runtime = Path(proc.stdout.strip())
+        self.assertEqual((runtime / ".pico-runtime").read_text().strip(), self.cache_head())
+        self.assertTrue((runtime / "scripts" / "run-local.sh").is_file())
+        self.assertEqual(list((self.cache / "runtimes").glob(".tmp.*")), [])
+
+    def test_runtime_archive_and_extraction_fail_closed(self):
+        real_git = shlex.quote(shutil.which("git"))
+        for failure in ("archive", "extract"):
+            with self.subTest(failure=failure):
+                if self.cache.exists():
+                    shutil.rmtree(self.cache)
+                git = self.bin / "git"
+                tar = self.bin / "tar"
+                if failure == "archive":
+                    git.write_text(f"#!/bin/sh\n[ \"$3\" != archive ] || exit 92\nexec {real_git} \"$@\"\n")
+                    git.chmod(0o755)
+                else:
+                    git.unlink(missing_ok=True)
+                    tar.write_text("#!/bin/sh\nexit 93\n")
+                    tar.chmod(0o755)
+                proc = self.use_latest("path")
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertIn("Could not materialize orchestrator runtime", proc.stderr)
+                self.assertEqual(list((self.cache / "runtimes").iterdir()), [])
+                tar.unlink(missing_ok=True)
+                git.unlink(missing_ok=True)
 
     def test_use_latest_pins_and_reaches_ready_from_external_target(self):
         proc = self.use_latest("run", str(self.target), "--repo", "Examplecorp/examplelab")

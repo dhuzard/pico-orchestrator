@@ -27,7 +27,8 @@ class SandboxCandidateTest(TestCase):
             calls.append(args[0])
             return SimpleNamespace(returncode=statuses[len(calls) - 1])
 
-        argv = ["verify", "--bwrap", "/bin/true", "--claude", "/bin/true"]
+        # Commands and digests are mocked; use an existing path on every host.
+        argv = ["verify", "--bwrap", sys.executable, "--claude", sys.executable]
         with mock.patch.object(sys, "argv", argv), mock.patch.object(module.os, "getuid", return_value=1001), \
                 mock.patch.object(module.sys, "platform", "linux"), \
                 mock.patch.object(module.os, "uname", return_value=SimpleNamespace(machine="x86_64")), \

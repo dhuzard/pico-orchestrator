@@ -422,13 +422,19 @@ materialize_runtime() {
     rm -rf "$RUNTIME"
     local tmp
     tmp="$(mktemp -d "$RUNTIMES_DIR/.tmp.XXXXXX")"
-    if ! git -C "$ORCH_REPO" archive --format=tar "$RESOLVED_SHA" | tar -x -C "$tmp"; then
+    # Some tar implementations stop reading at the end markers, before git
+    # finishes writing archive padding. With pipefail that can turn git's
+    # SIGPIPE into a spurious failure, so finish the archive before extracting.
+    mkdir "$tmp/tree"
+    if ! git -C "$ORCH_REPO" archive --format=tar -o "$tmp/runtime.tar" "$RESOLVED_SHA" ||
+       ! tar -xf "$tmp/runtime.tar" -C "$tmp/tree"; then
       rm -rf "$tmp"
       echo "Could not materialize orchestrator runtime $RESOLVED_SHA" >&2
       return 1
     fi
-    printf '%s\n' "$RESOLVED_SHA" > "$tmp/.pico-runtime"
-    mv "$tmp" "$RUNTIME"
+    printf '%s\n' "$RESOLVED_SHA" > "$tmp/tree/.pico-runtime"
+    mv "$tmp/tree" "$RUNTIME"
+    rm -rf "$tmp"
   fi
   release_lock
 }
