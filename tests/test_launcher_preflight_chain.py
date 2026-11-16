@@ -665,7 +665,8 @@ class ProjectPinReviewTest(_CacheFixture):
 
     def test_pin_change_from_last_approved_warns_and_update_records_approval(self):
         first = _git("rev-parse", "HEAD", cwd=self.seed)
-        self.assertEqual(self.use_latest("pin", str(self.target)).returncode, 0)
+        pin = self.use_latest("pin", str(self.target))
+        self.assertEqual(pin.returncode, 0, pin.stderr)
         approved = self.run_target()
         self.assertEqual(approved.returncode, 0, approved.stderr)
         self.assertNotIn("warning: project pin", approved.stderr)

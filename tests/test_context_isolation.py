@@ -120,7 +120,7 @@ class WorkspaceAndSnapshotTest(_ReposFixture):
         po._wave_event(parent, {"wave_id": "w", "task_ids": ["s1"], "status": "declared"})
         po._wave_event(parent, {"wave_id": "w", "task_ids": ["s1"], "status": "integrating",
                                 "integration_path": str(self.worktree)})
-        self.assertEqual(parent["waves"][0]["integration_path"], str(self.worktree))
+        self.assertEqual(parent["waves"][0]["integration_path"], str(self.worktree.resolve()))
         self.assertIn("integration_snapshot", parent["waves"][0])
         (self.worktree / "change").write_text("uncommitted")
         with self.assertRaises(po.ParentRunError) as exc:

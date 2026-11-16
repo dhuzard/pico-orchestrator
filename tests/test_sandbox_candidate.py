@@ -29,6 +29,9 @@ class SandboxCandidateTest(TestCase):
 
         argv = ["verify", "--bwrap", "/bin/true", "--claude", "/bin/true"]
         with mock.patch.object(sys, "argv", argv), mock.patch.object(module.os, "getuid", return_value=1001), \
+                mock.patch.object(module.sys, "platform", "linux"), \
+                mock.patch.object(module.os, "uname", return_value=SimpleNamespace(machine="x86_64")), \
+                mock.patch.object(module, "validate_bwrap"), \
                 mock.patch.object(module, "digest", side_effect=digests), \
                 mock.patch.object(module.tempfile, "TemporaryDirectory", side_effect=record_tempdir), \
                 mock.patch.object(module.subprocess, "run", side_effect=fake_run):
@@ -43,6 +46,14 @@ class SandboxCandidateTest(TestCase):
         self.assertIn("Unrecognized binary digest", result)
         self.assertEqual(calls, [])
         self.assertEqual(dirs, [])
+
+    def test_unsupported_platform_never_runs_a_command(self):
+        with mock.patch.object(sys, "argv", ["verify", "--claude", "/bin/true"]), \
+                mock.patch.object(module.sys, "platform", "darwin"), \
+                mock.patch.object(module.subprocess, "run") as run:
+            with self.assertRaisesRegex(SystemExit, "Linux x86-64"):
+                module.main()
+            run.assert_not_called()
 
     def test_failed_preflight_stops_before_helper_and_cleans_tempdir(self):
         result, calls, dirs = self.invoke([1], [module.BWRAP_SHA256, module.CLAUDE_SHA256])
@@ -71,7 +82,7 @@ class SandboxCandidateTest(TestCase):
                     module.validate_bwrap(target)
         def stat_path(path):
             return safe_file if path == target else safe_dir
-        with mock.patch.object(Path, 'stat', stat_path), mock.patch.object(module.os, 'getxattr', return_value=b'cap'):
+        with mock.patch.object(Path, 'stat', stat_path), mock.patch.object(module.os, 'getxattr', return_value=b'cap', create=True):
             with self.assertRaisesRegex(ValueError, 'no file capabilities'):
                 module.validate_bwrap(target)
         bad_dir = SimpleNamespace(st_mode=stat.S_IFDIR | 0o777, st_uid=0)
@@ -81,5 +92,5 @@ class SandboxCandidateTest(TestCase):
             with self.assertRaisesRegex(ValueError, 'parent directories'):
                 module.validate_bwrap(target)
         with mock.patch.object(Path, 'stat', stat_path), \
-                mock.patch.object(module.os, 'getxattr', side_effect=OSError(errno.ENODATA, 'absent')):
+                mock.patch.object(module.os, 'getxattr', side_effect=OSError(errno.ENODATA, 'absent'), create=True):
             module.validate_bwrap(target)
