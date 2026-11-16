@@ -137,6 +137,40 @@ class IntegrationTest(unittest.TestCase):
     def write(self, proposals):
         self.proposals.write_text(json.dumps(proposals))
 
+    def test_parent_publication_evidence_covers_exact_integrated_content(self):
+        def git(*args):
+            return subprocess.check_output(["git", "-C", str(self.worktree), *args], text=True).strip()
+        git("-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "--allow-empty", "-m", "base")
+        base = git("rev-parse", "HEAD")
+        (self.worktree / "doc.txt").write_text("integrated\n")
+        git("add", "doc.txt")
+        git("-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-m", "change")
+        head = git("rev-parse", "HEAD")
+        check = {"operation": "parent", "status": "passed", "route_epoch": 0, "route": "CLAUDE",
+                 "wave_id": "w", "base": base, "head": head,
+                 "path_digests": [hashlib.sha256(b"doc.txt").hexdigest()]}
+        phase = {"id": "task", "status": "completed", "route": "CLAUDE",
+                 "routing": {"assignments": [{"step_id": "worker"}]},
+                 "workers": [{"step_id": "worker", "status": "completed"}], "diff_floor_checks": [check]}
+        record = {"outcome": "in_progress", "parent_orchestration": {"target_repository": "owner/repo",
+                  "phases": [phase], "waves": [{"id": "w", "status": "integrated", "task_ids": ["task"]}]}}
+        with patch.object(provenance, "get_run", return_value=record):
+            gi._require_parent_evidence(self.records, "run-a", self.worktree, "owner/repo", base, head)
+            for mutation in (lambda current: current["parent_orchestration"]["phases"][0].update(status="in_progress"),
+                             lambda current: current["parent_orchestration"].update(target_repository="other/repo"),
+                             lambda current: current["parent_orchestration"]["phases"][0]["diff_floor_checks"][0].update(head=base)):
+                saved = json.loads(json.dumps(record))
+                mutation(record)
+                with self.assertRaises(gi.IntegrationError) as exc:
+                    gi._require_parent_evidence(self.records, "run-a", self.worktree, "owner/repo", base, head)
+                self.assertEqual(exc.exception.code, "PUBLICATION_INTEGRATION_REQUIRED")
+                record.clear(); record.update(saved)
+            (self.worktree / "doc.txt").write_text("changed after review\n")
+            git("add", "doc.txt")
+            git("-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-m", "drift")
+            with self.assertRaises(gi.IntegrationError):
+                gi._require_parent_evidence(self.records, "run-a", self.worktree, "owner/repo", base, git("rev-parse", "HEAD"))
+
     def run_batch(self, **kwargs):
         if kwargs.get("apply") and "expected_plan_hash" not in kwargs:
             preview = gi.execute(worktree=self.worktree, proposal_file=self.proposals, adapter=self.fake,

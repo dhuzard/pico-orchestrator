@@ -773,12 +773,74 @@ def _publication_state(worktree: Path, repo: str, base: str, head: str, adapter=
             "existing_pr": open_prs[0]["number"] if open_prs else None}
 
 
+def _require_parent_evidence(root: Path, run_id: str, worktree: Path, repo: str, base: str, commit: str) -> None:
+    """Require completed routed integration evidence for every published path."""
+    try:
+        record = provenance.get_run(root, run_id)
+        parent = record.get("parent_orchestration") or {}
+        if parent.get("target_repository") != repo or record.get("outcome") not in {"in_progress", "completed"}:
+            raise ValueError("wrong repository or terminal outcome")
+        phases = parent.get("phases") or []
+        if not phases or any(p.get("status") != "completed" or p.get("workspace_bound") for p in phases):
+            raise ValueError("phases are not complete")
+        if any(w.get("status") == "integrating" for w in parent.get("waves") or []):
+            raise ValueError("integration is still in progress")
+        import parent_orchestration  # lazy: the recorder imports this module
+        try:
+            missing_reviews = parent_orchestration._missing_reviews(phases)
+        except parent_orchestration.ParentRunError as exc:
+            raise ValueError("review policy unavailable") from exc
+        if missing_reviews:
+            raise ValueError("independent review is incomplete")
+        result = subprocess.run(["git", "-C", str(worktree), "diff", "--name-only", "--no-renames", "-z", base, commit, "--"], capture_output=True, timeout=60, check=True)
+        paths = [p for p in result.stdout.decode("utf-8").split("\0") if p]
+        if not paths:
+            raise ValueError("empty publication")
+        waves = {w.get("id"): w for w in parent.get("waves") or []}
+        covered = set()
+        for phase in phases:
+            escalations = phase.get("escalations") or []
+            if any(e.get("confirmed") is not True for e in escalations):
+                continue
+            epoch = len(escalations)
+            decision = escalations[-1] if escalations else phase
+            assignments = (decision.get("routing") or {}).get("assignments") or []
+            completed = {w.get("step_id") for w in phase.get("workers") or [] if w.get("route_epoch", 0) == epoch and w.get("status") == "completed"}
+            if not assignments or any(a.get("step_id") not in completed for a in assignments):
+                continue
+            route = decision.get("to_route") if escalations else phase.get("route")
+            for check in phase.get("diff_floor_checks") or []:
+                wave = waves.get(check.get("wave_id")) or {}
+                earlier, checked_head = check.get("base"), check.get("head")
+                if (check.get("operation") != "parent" or check.get("status") != "passed"
+                    or check.get("route_epoch") != epoch or check.get("route") != route
+                    or wave.get("status") != "integrated" or phase.get("id") not in wave.get("task_ids", [])
+                    or not all(isinstance(x, str) and re.fullmatch(r"[0-9a-f]{40,64}", x) for x in (earlier, checked_head))):
+                    continue
+                if any(subprocess.run(["git", "-C", str(worktree), "merge-base", "--is-ancestor", first, last],
+                                      timeout=60, capture_output=True).returncode
+                       for first, last in ((earlier, checked_head), (checked_head, commit))):
+                    continue
+                for path in paths:
+                    if hashlib.sha256(path.encode()).hexdigest() not in (check.get("path_digests") or []):
+                        continue
+                    changed = subprocess.run(["git", "-C", str(worktree), "--literal-pathspecs", "diff", "--quiet", earlier, checked_head, "--", path], timeout=60)
+                    same = subprocess.run(["git", "-C", str(worktree), "--literal-pathspecs", "diff", "--quiet", checked_head, commit, "--", path], timeout=60)
+                    if changed.returncode == 1 and same.returncode == 0:
+                        covered.add(path)
+        if covered != set(paths):
+            raise ValueError("candidate has paths without integrated evidence")
+    except (provenance.ProvenanceError, OSError, ValueError, UnicodeError, subprocess.SubprocessError, TypeError, AttributeError, KeyError):
+        raise IntegrationError("PUBLICATION_INTEGRATION_REQUIRED", "completed integration evidence for the repository and candidate commit is required") from None
+
+
 def publish(*, worktree: Path, base: str, head: str, title: str, body_file: Path,
             explicit_repo: str | None = None, apply: bool = False,
             expected_plan_hash: str | None = None, adapter=gh,
             provenance_root: Path = ORCHESTRATOR_ROOT,
             closes_issue: int | None = None, remote_head: str | None = None,
-            recorded_pr: dict | None = None, reserved: frozenset[str] = frozenset()) -> dict:
+            recorded_pr: dict | None = None, reserved: frozenset[str] = frozenset(),
+            parent_run_id: str | None = None) -> dict:
     """Dry-run and publish one reviewed pico branch through a fixed, non-force path.
 
     `remote_head`, when it differs from `head`, republishes the head after its PR was closed unmerged (#67):
@@ -838,6 +900,8 @@ def publish(*, worktree: Path, base: str, head: str, title: str, body_file: Path
                 raise IntegrationError("GITHUB_STATE_CONFLICT", "the republication branch changed; run the dry run again")
         state = _publication_state(worktree, repo, base, head, adapter, base_commit,
                                    remote_head=republished["remote_head"] if republished else None)
+        if parent_run_id is not None:
+            _require_parent_evidence(provenance_root, parent_run_id, worktree, repo, base_commit, state["commit"])
 
         def policy_closes() -> bool:
             return _issue_reference(policy) == "closes"
@@ -848,6 +912,8 @@ def publish(*, worktree: Path, base: str, head: str, title: str, body_file: Path
                 "authorization": "policy", **reference, "policy_branch": authority["branch"],
                 "policy_commit": authority["commit"], "policy_blob": policy_blob,
                 "publication_permissions": permissions}
+        if parent_run_id is not None:
+            plan["parent_run_id"] = parent_run_id
         if republished:
             plan.update({"remote_head": republished["remote_head"], "supersedes_prs": republished["supersedes"]})
         push_head = plan.get("remote_head", head)
@@ -907,6 +973,7 @@ def main() -> int:
     parser.add_argument("--issue", type=int, help="inspect one issue with --read")
     parser.add_argument("--apply", action="store_true", help="parent authorizes this batch")
     parser.add_argument("--plan-hash", help="SHA-256 plan_hash returned by the reviewed dry-run")
+    parser.add_argument("--parent-run-id", help="parent run providing integrated evidence")
     parser.add_argument("--allow-destructive", action="store_true", help="parent authorizes close/remove operations")
     parser.add_argument("--phase")
     parser.add_argument("--route", help="observed route from route_task")
@@ -918,9 +985,11 @@ def main() -> int:
             parser.error("--publish cannot be combined with issue mutation or read options")
         if not all((args.base, args.head, args.title, args.body_file)):
             parser.error("--publish requires --base, --head, --title, and --body-file")
+        if not args.parent_run_id:
+            parser.error("--publish requires --parent-run-id with completed integration evidence")
         result = publish(worktree=args.worktree, base=args.base, head=args.head, title=args.title,
                          body_file=args.body_file, explicit_repo=args.repo, apply=args.apply,
-                         expected_plan_hash=args.plan_hash)
+                         expected_plan_hash=args.plan_hash, parent_run_id=args.parent_run_id)
         print(json.dumps(result, indent=2, sort_keys=True))
         return 0 if result["status"] in ("COMPLETED", "DRY_RUN") else 1
     if args.read:

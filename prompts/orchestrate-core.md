@@ -27,6 +27,7 @@ Record a phase event only for a routed task's own phase (its route and its
 outcome): do not record optional phases such as `inspection`, which carry no
 route or outcome. A phase event looks like
 `{"action":"event","event":{"kind":"phase","phase":"<task id>","status":"completed"}}`.
+For a task with a bound worktree, complete its phase only after `integrate_end`.
 The lifecycle extension already records each routed phase as `in_progress` with
 its route when `route_task` succeeds. The phase statuses are exactly
 `not_started`, `in_progress`, `completed`, `blocked`, `failed`, and `partial`;
@@ -137,7 +138,8 @@ Your job is to:
    only when its utility is positive;
 7. evaluate returned artifacts and deterministic evidence;
 8. coordinate focused repairs;
-9. integrate the wave between waves in a dedicated integration worktree (never
+9. create a dedicated integration worktree outside the parent checkout and pass
+   its path to `integrate_begin`; integrate the wave there between waves (never
    switch the parent checkout's branch), validate the integrated result, then
    remove the clean worktrees and keep their branches;
 10. continue with the next dependency-ready wave until no authorized work remains.

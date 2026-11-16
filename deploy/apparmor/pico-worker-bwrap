@@ -1,0 +1,38 @@
+# Dedicated Pico bubblewrap candidate. Review docs/pilot-sandbox-compatibility.md
+# before installing. Never attach this profile to the system bubblewrap path.
+abi <abi/4.0>,
+include <tunables/global>
+profile pico_worker_bwrap /opt/pico-sandbox/bin/bwrap flags=(attach_disconnected) {
+  allow capability,
+  allow file rwlkm /{**,},
+  allow network,
+  allow unix,
+  allow ptrace,
+  allow signal,
+  allow mqueue,
+  allow io_uring,
+  allow userns,
+  allow mount,
+  allow umount,
+  allow pivot_root,
+  allow dbus,
+  allow px /** -> pico_worker_bwrap//&pico_worker_child,
+}
+profile pico_worker_child flags=(attach_disconnected) {
+  allow file rwlkm /{**,},
+  allow network,
+  allow unix,
+  allow ptrace,
+  allow signal,
+  allow mqueue,
+  allow io_uring,
+  allow userns,
+  allow mount,
+  allow umount,
+  allow pivot_root,
+  allow dbus,
+  allow pix /** -> &pico_worker_child,
+  # Other capabilities are implicitly denied. This differs from Ubuntu's
+  # unpriv_bwrap child: assess the resulting user-namespace attack surface.
+  allow capability sys_admin,
+}

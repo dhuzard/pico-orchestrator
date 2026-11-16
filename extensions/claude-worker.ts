@@ -224,8 +224,9 @@ const runProbe: ProbeRunner = (file, args, env) => {
  * Whether Claude Code's sandbox can start here. macOS: Seatbelt
  * (`/usr/bin/sandbox-exec`) exists. Linux (WSL2 included): `bwrap` and
  * `socat` are on the worker's PATH, and bwrap actually starts a namespaced
- * `true` (BWRAP_PROBE_ARGS, 5 s timeout), which Claude Code's own dependency
- * check does not try. Other platforms, native Windows among them, have no
+ * `true` (BWRAP_PROBE_ARGS), then a nested user namespace with uid/gid mapping,
+ * each with a 5 s timeout. This catches a common apply-seccomp prerequisite failure.
+ * It is a conservative approximation, not an invocation of Claude Code's bundled helper. Other platforms, native Windows among them, have no
  * sandbox. This is a prerequisite check, not proof that every sandboxed
  * command will work; Claude Code's `failIfUnavailable` stays the final word.
  */
@@ -241,15 +242,24 @@ export function detectWorkerSandbox(env: Record<string, string>, platform: NodeJ
     .map((dir) => dir !== "" && isAbsolute(dir) ? join(dir, name) : null)
     .find((path): path is string => path !== null && exists(path)) ?? null;
   const bwrap = locate("bwrap");
-  const missing = [bwrap ? null : "bwrap", locate("socat") ? null : "socat"].filter((name): name is string => name !== null);
+  const unshare = locate("unshare");
+  const missing = [bwrap ? null : "bwrap", locate("socat") ? null : "socat", unshare ? null : "unshare"]
+    .filter((name): name is string => name !== null);
   if (missing.length) {
-    return { available: false, detail: `${missing.join(" and ")} not found on the worker PATH (install bubblewrap and socat)` };
+    return { available: false, detail: `${missing.join(" and ")} not found on the worker PATH (install bubblewrap, socat and util-linux)` };
   }
   if (!run(bwrap!, [...BWRAP_PROBE_ARGS], { PATH: env.PATH ?? "" })) {
     return { available: false, detail: `${bwrap} cannot create the sandbox namespaces (on Ubuntu 24.04 and later, ` +
       "AppArmor may restrict unprivileged user namespaces; see Claude Code's sandboxing documentation)" };
   }
-  return { available: true, detail: "bubblewrap (namespaces probed) and socat" };
+  // Claude Code's bundled apply-seccomp creates a nested user namespace and maps ids.
+  // Probe the required operation, not only the outer namespace: this is not the helper itself.
+  const nestedArgs = [...BWRAP_PROBE_ARGS.slice(0, -1), unshare!, "--user", "--map-root-user", "true"];
+  if (!run(bwrap!, nestedArgs, { PATH: env.PATH ?? "" })) {
+    return { available: false, detail: `${bwrap} cannot create and map a nested user namespace; ` +
+      "Claude Code sandbox helper may be incompatible with this host (check bubblewrap and AppArmor configuration)" };
+  }
+  return { available: true, detail: "bubblewrap (outer and nested namespaces probed), unshare and socat" };
 }
 
 function absoluteOrNull(value: string | undefined): string | null {

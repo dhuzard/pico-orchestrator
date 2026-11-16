@@ -672,17 +672,20 @@ class LifecycleTest(unittest.TestCase):
         parent.event({"kind": "checkpoint", "phase": "rw", "reason": "worker_approval", "workspace_bound": True})
         parent.event({"kind": "escalation", "phase": "rw", "from_route": "CODEX", "to_route": "CODEX_CLAUDE_CODEX",
                       "reason": "REVIEW_FINDINGS"})
-        parent.event({"kind": "phase", "phase": "rw", "status": "completed", "route": "CODEX_CLAUDE_CODEX"})
+        parent.event({"kind": "phase", "phase": "rw", "status": "in_progress", "route": "CODEX_CLAUDE_CODEX"})
+        with self.assertRaises(po.ParentRunError) as early:
+            parent.event({"kind": "phase", "phase": "rw", "status": "completed"})
+        self.assertEqual(early.exception.error_code, "PARENT_PHASE_INTEGRATION_REQUIRED")
         # No wave was ever recorded (a refused implicit-wave write), and the old route's worktree is remembered.
         with self.assertRaises(po.ParentRunError) as refused:
             parent.finish("COMPLETED")
-        self.assertEqual(refused.exception.error_code, "PARENT_WAVE_NOT_INTEGRATED")
-        self.assertIn("rw (route epochs [0])", str(refused.exception))
+        self.assertEqual(refused.exception.error_code, "PARENT_COMPLETION_INCOMPLETE")
         parent.event({"kind": "checkpoint", "phase": "rw", "reason": "worker_approval", "workspace_bound": True})
         phase = provenance.get_run(self.records, parent.run_id)["parent_orchestration"]["phases"][0]
         self.assertEqual(phase["bound_epochs"], [0, 1])
         for status in ("declared", "integrating", "integrated"):
             parent.event({"kind": "wave", "wave_id": "w", "task_ids": ["rw"], "status": status})
+        parent.event({"kind": "phase", "phase": "rw", "status": "completed"})
         with self.assertRaises(po.ParentRunError) as past:   # integration done: the next check (review) now speaks
             parent.finish("COMPLETED")
         self.assertEqual(past.exception.error_code, "PARENT_REVIEW_MISSING")

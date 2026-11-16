@@ -397,6 +397,8 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
   const recordBound = new Set<string>();
   const checkedChanges = new Map<string, Set<string>>();
   let integrationBase: string | null = null;
+  let integrationPath: string | null = null;
+  let integrationParentSnapshot: string | null = null;
   let integrationSnapshot: string | null = null;
   let integrationNeedsAbort = false;
   const floorRerouted = new Set<string>();
@@ -627,7 +629,7 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
     currentTurn = null; messageStarts.clear(); leadLimit = null; failureBudget = null; workerSandbox = null;
     batchStart = 0; batchPeak = 0;
     pendingReroutes.clear();
-    boundPaths.clear(); flooredPaths.clear(); recordBound.clear(); checkedChanges.clear(); integrationBase = null; integrationSnapshot = null; integrationNeedsAbort = false; floorRerouted.clear(); floorCompleted.clear();
+    boundPaths.clear(); flooredPaths.clear(); recordBound.clear(); checkedChanges.clear(); integrationBase = null; integrationPath = null; integrationParentSnapshot = null; integrationSnapshot = null; integrationNeedsAbort = false; floorRerouted.clear(); floorCompleted.clear();
   }
   /**
    * Resolve this run's lead-call limit and warning threshold (explicit env from the launcher, else the repository
@@ -1682,7 +1684,7 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
    * nothing bound in this process, and anything unverifiable all refuse the integration. Returns the refusal reply, or
    * null when the wave may integrate.
    */
-  async function diffFloorGate(members: string[]) {
+  async function diffFloorGate(members: string[], comparisonPath: string | null = targetCwd) {
     const pending = members.filter((id) => pendingReroutes.has(id));
     if (pending.length > 0) {
       return reply(false, `NEXT STEP (PARENT_ROUTE_RECHECK_REQUIRED): the run is active and not stopped. Rerun route_task and complete backend preflight for ${pending.join(", ")} before its wave integrates.`,
@@ -1701,7 +1703,7 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
         return reply(false, `BLOCKED: ${DIFF_UNVERIFIABLE}: task ${taskId} was re-routed but its new route's worktree is not bound; bind it with bind_workspace before integrating.`);
       }
       const approval = approvals.get(taskId);
-      if (!approval || !targetCwd) {
+      if (!approval || !comparisonPath) {
         return reply(false, `BLOCKED: ${DIFF_UNVERIFIABLE}: task ${taskId} has a bound worktree but no route result to check its diff against.`);
       }
       if (floorRerouted.has(taskId)) {
@@ -1713,7 +1715,7 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
       for (const [path, allowMissing] of [...[...current].sort().map((path) => [path, false] as const),
                                           ...earlier.map((path) => [path, true] as const)]) {
         const verdict = await command(DIFF_FLOORS, [], { route_task_result: approval.result, worktree: path,
-          parent_checkout: targetCwd, ...(allowMissing ? { allow_missing: true } : {}) });
+          parent_checkout: comparisonPath, ...(allowMissing ? { allow_missing: true } : {}) });
         const matches = Array.isArray(verdict.diff_path_floor_matches) ? verdict.diff_path_floor_matches : [];
         if (verdict.ok !== true) {
           diagnose("diff_floors", { ...verdict, error_code: DIFF_UNVERIFIABLE });
@@ -1753,10 +1755,10 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
         { error_code: "PARENT_ROUTE_RECHECK_REQUIRED", tasks: pending });
     }
     const missing = members.filter((id) => !approvals.has(id));
-    if (!integrationBase || !targetCwd || missing.length > 0) {
+    if (!integrationBase || !integrationPath || missing.length > 0) {
       return reply(false, `BLOCKED: ${DIFF_UNVERIFIABLE}: the merged change of the wave cannot be checked${missing.length ? ` (no route result for ${missing.join(", ")})` : ""}; the integration did not end.`);
     }
-    const verdict = await command(DIFF_FLOORS, [], { operation: "parent", parent_checkout: targetCwd,
+    const verdict = await command(DIFF_FLOORS, [], { operation: "parent", parent_checkout: integrationPath,
       base: integrationBase, members: members.map((id) => ({ task_id: id, route_task_result: approvals.get(id)!.result,
         exclude_paths: [...new Set(members.filter((other) => other !== id)
           .flatMap((other) => [...(checkedChanges.get(other) ?? [])]))]
@@ -1766,6 +1768,17 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
       return reply(false, `BLOCKED: ${DIFF_UNVERIFIABLE}: the merged change of the wave could not be checked against the path floors; the integration did not end.`, verdict);
     }
     if (verdict.blocked !== true) {
+      if (integrationPath !== targetCwd && (typeof verdict.head !== "string" || verdict.head === integrationBase || verdict.changed_path_count === 0))
+        return reply(false, "BLOCKED: INTEGRATION_COMMIT_REQUIRED: commit the integrated changes in the integration worktree before ending the wave.");
+      if (integrationPath !== targetCwd) {
+        for (const id of members) {
+          const checked = checkedChanges.get(id) ?? new Set<string>();
+          const item = (Array.isArray(verdict.verdicts) ? verdict.verdicts : []).find((v: Json) => v.task_id === id) as Json | undefined;
+          const paths = new Set(Array.isArray(item?.path_digests) ? item.path_digests : []);
+          if ([...checked].some((path) => !paths.has(createHash("sha256").update(path).digest("hex"))))
+            return reply(false, `BLOCKED: INTEGRATION_CHANGES_MISSING: the integrated commit does not include every checked path for ${id}.`);
+        }
+      }
       if (typeof verdict.head === "string" && integrationBase && integrating) {
         for (const item of (Array.isArray(verdict.verdicts) ? verdict.verdicts : []) as Json[]) {
           const approval = approvals.get(String(item.task_id));
@@ -1791,7 +1804,7 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
       `The integration did not end: restore the parent checkout to ${integrationBase} (its HEAD before integrate_begin), then call integrate_abort to release the wave and run the replacement route. The merged change of`);
   }
 
-  async function integration(action: "integrate_begin" | "integrate_end" | "integrate_abort", requestedWaveId: string) {
+  async function integration(action: "integrate_begin" | "integrate_end" | "integrate_abort", requestedWaveId: string, requestedPath?: string) {
     // The lead names an implicitly recorded single-task wave as "auto".
     let waveId = requestedWaveId;
     if (requestedWaveId === "auto") {
@@ -1806,30 +1819,52 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
     const members = activeWave?.id === waveId ? [...activeWave.tasks.keys()] : implicitOpen.get(waveId);
     if (action === "integrate_begin") {
       if (!members) return reply(false, `BLOCKED: WAVE_UNKNOWN: ${waveId} is not an open wave.`);
-      if (integrating) return reply(true, `Wave ${waveId} is already integrating.`);
+      if (integrating) {
+        if (integrating !== waveId || (requestedPath && requestedPath !== integrationPath))
+          return reply(false, "BLOCKED: INTEGRATION_IN_PROGRESS: finish the current integration before changing its wave or checkout.");
+        return reply(true, `Wave ${waveId} is already integrating.`);
+      }
       if (inFlight.size > 0) {
         return reply(false, `BLOCKED: INTEGRATION_WORKERS_IN_FLIGHT: ${inFlight.size} worker call(s) are still running; integrate only between waves.`);
       }
-      const underrated = await diffFloorGate(members);
+      let path = targetCwd;
+      if (requestedPath && targetCwd) {
+        const checked = await command(SESSION_SCOPE, [], { operation: "worktree", target_cwd: targetCwd, path: requestedPath });
+        if (checked.ok !== true || typeof checked.path !== "string")
+          return reply(false, "BLOCKED: INTEGRATION_WORKTREE_INVALID: use an external linked worktree of the target repository.", checked);
+        path = checked.path;
+      }
+      const underrated = await diffFloorGate(members, path);
       if (underrated) return underrated;
-      const base = targetCwd ? await command(SESSION_SCOPE, [], { operation: "head", path: targetCwd }) : { ok: false };
+      const base = path ? await command(SESSION_SCOPE, [], { operation: "head", path }) : { ok: false };
       if (base.ok !== true || typeof base.head !== "string") {
         return reply(false, `BLOCKED: ${DIFF_UNVERIFIABLE}: the parent checkout has no HEAD to check the merged change against.`);
       }
-      const before = await snapshot();
-      if (!before) return reply(false, `BLOCKED: ${DIFF_UNVERIFIABLE}: cannot snapshot the parent checkout.`);
-      if (!await event({ kind: "wave", wave_id: waveId, task_ids: members, status: "integrating" })) {
+      const before = path ? await command(SESSION_SCOPE, [], { operation: "snapshot", path }) : { ok: false };
+      if (before.ok !== true || typeof before.digest !== "string") return reply(false, `BLOCKED: ${DIFF_UNVERIFIABLE}: cannot snapshot the integration checkout.`);
+      const parentBefore = await snapshot();
+      if (!parentBefore) return reply(false, `BLOCKED: ${DIFF_UNVERIFIABLE}: cannot snapshot the parent checkout.`);
+      if (path !== targetCwd && (parentBefore.status.length > 0 || (Array.isArray(before.status) && before.status.length > 0)))
+        return reply(false, "BLOCKED: INTEGRATION_CHECKOUT_DIRTY: the parent and integration checkouts must be clean before external integration, including untracked paths.");
+      if (!await event({ kind: "wave", wave_id: waveId, task_ids: members, status: "integrating", ...(requestedPath ? { integration_path: path } : {}) })) {
         return reply(false, "BLOCKED: parent provenance update failed; see diagnostic log.", parentFailure ?? {});
       }
       integrating = waveId;
+      integrationPath = path;
+      integrationParentSnapshot = parentBefore.digest;
       integrationBase = base.head;
       integrationSnapshot = before.digest;
       return reply(true, `Integration of wave ${waveId} (task${members.length === 1 ? "" : "s"} ${members.join(", ")}) started. Worker launches are refused until integrate_end.`);
     }
     if (integrating !== waveId || !members) return reply(false, `BLOCKED: INTEGRATION_NOT_STARTED: wave ${waveId} is not integrating.`);
+    if (integrationPath !== targetCwd) {
+      const parentNow = await snapshot();
+      if (!parentNow || parentNow.digest !== integrationParentSnapshot)
+        return reply(false, "BLOCKED: INTEGRATION_PARENT_CHANGED: restore the parent checkout to its state at integration start before ending or aborting the wave.");
+    }
     if (action === "integrate_abort") {
-      const restored = await snapshot();
-      if (!integrationSnapshot || !restored || restored.digest !== integrationSnapshot)
+      const restored = integrationPath ? await command(SESSION_SCOPE, [], { operation: "snapshot", path: integrationPath }) : { ok: false };
+      if (!integrationSnapshot || restored.ok !== true || restored.digest !== integrationSnapshot)
         return reply(false, `BLOCKED: INTEGRATION_RESTORE_REQUIRED: restore the parent checkout exactly to its state before integrate_begin (${integrationBase}) before aborting.`);
       const abandoned = await eventUnlessRefused({ kind: "wave", wave_id: waveId, task_ids: members, status: "abandoned" },
         new Set(["INTEGRATION_RESTORE_REQUIRED"]));
@@ -1838,7 +1873,7 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
           return reply(false, "BLOCKED: INTEGRATION_RESTORE_REQUIRED: the parent could not verify a clean restored baseline; finish PARTIAL and inspect the checkout.", abandoned);
         return reply(false, "BLOCKED: parent provenance update failed; see diagnostic log.", parentFailure ?? {});
       }
-      integrating = null; integrationBase = null; integrationSnapshot = null; integrationNeedsAbort = false;
+      integrating = null; integrationBase = null; integrationPath = null; integrationParentSnapshot = null; integrationSnapshot = null; integrationNeedsAbort = false;
       implicitOpen.delete(waveId); implicitEpoch.delete(waveId);
       if (activeWave?.id === waveId) activeWave = null;
       return reply(true, `Wave ${waveId} aborted after the parent checkout was restored. Start a new wave for replacement work.`);
@@ -1854,7 +1889,7 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
       return reply(false, "BLOCKED: parent provenance update failed; see diagnostic log.", parentFailure ?? {});
     }
     integrating = null;
-    integrationBase = null; integrationSnapshot = null;
+    integrationBase = null; integrationPath = null; integrationParentSnapshot = null; integrationSnapshot = null;
     for (const id of members) {
       // Integrated: the parent record no longer counts the task as bound, and its checked worktrees are covered.
       boundPaths.delete(id); flooredPaths.delete(id); checkedChanges.delete(id); recordBound.delete(id); floorRerouted.delete(id); floorCompleted.delete(id);
@@ -1878,7 +1913,7 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
         tasks: Type.Array(Type.Object({ task_id: Type.String({ pattern: `^${TAG_ID}$` }),
           write_scope: Type.Array(Type.String()) }, { additionalProperties: false }), { minItems: 1 }) },
         { additionalProperties: false }),
-      Type.Object({ action: Type.Literal("integrate_begin"), wave_id: Type.String() }, { additionalProperties: false }),
+      Type.Object({ action: Type.Literal("integrate_begin"), wave_id: Type.String(), path: Type.Optional(Type.String()) }, { additionalProperties: false }),
       Type.Object({ action: Type.Literal("integrate_end"), wave_id: Type.String() }, { additionalProperties: false }),
       Type.Object({ action: Type.Literal("integrate_abort"), wave_id: Type.String() }, { additionalProperties: false }),
       Type.Object({ action: Type.Literal("event"), event: EVENT }, { additionalProperties: false }),
@@ -1939,13 +1974,15 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
         return reply(ok, ok
           ? `Step ${params.step_id} of task ${taskId} is bound to worktree ${String(checked.path)}.`
           : checked.blocker_code === "WORKER_WORKSPACE_PROTECTED_PATH"
-            ? "BLOCKED: WORKER_WORKSPACE_PROTECTED_PATH: the worktree is inside a .git directory, where Claude Code denies every edit; create it outside .git (for example .pi/worktrees/<task>) and bind that path."
+            ? "BLOCKED: WORKER_WORKSPACE_PROTECTED_PATH: create the worktree outside .git and outside the parent checkout."
+            : checked.blocker_code === "WORKER_WORKSPACE_NESTED"
+            ? "BLOCKED: WORKER_WORKSPACE_NESTED: create the worktree outside the parent checkout and bind that path."
             : "BLOCKED: WORKER_WORKSPACE_INVALID: the path must be a linked worktree of the target repository, not the parent checkout.",
           checked);
       }
       if (params.action === "declare_wave") return declareWave(params.wave_id, params.tasks);
       if (params.action === "integrate_begin" || params.action === "integrate_end" || params.action === "integrate_abort") {
-        return integration(params.action, params.wave_id);
+        return integration(params.action, params.wave_id, params.action === "integrate_begin" ? params.path : undefined);
       }
       // An explicit combined end/finish saves a model turn, including during the existing lead-call grace.
       // Never infer an integration from a published PR or bypass the ordinary diff and completion gates.
@@ -1975,7 +2012,7 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
       const restated = params.action === "event" && params.event.kind === "worker"
         && autoWorkers.has(workspaceKey(params.event.phase, params.event.step_id));
       const harmless = params.action === "event" && result.ok === false
-        && (HARMLESS_REFUSALS.has(String(result.error_code)) || (restated && RESTATEMENT_REFUSALS.has(String(result.error_code))));
+        && (result.error_code === "PARENT_PHASE_INTEGRATION_REQUIRED" || HARMLESS_REFUSALS.has(String(result.error_code)) || (restated && RESTATEMENT_REFUSALS.has(String(result.error_code))));
       if (!ok && !harmless) {
         const failure = params.action === "status" && parentBlocked ? parentFailure ?? result : result;
         diagnose(params.action, failure);
@@ -2003,7 +2040,9 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
       const code = typeof effectiveResult.blocker_code === "string" ? effectiveResult.blocker_code
         : typeof effectiveResult.error_code === "string" ? effectiveResult.error_code : null;
       // The model reads only this text, never `details`, so the status line states ok/active explicitly.
-      const message = harmless ? `Worker override refused (${code}); nothing changed and the run is not blocked. Record a different judgment or leave the worker as recorded.`
+      const message = harmless ? (code === "PARENT_PHASE_INTEGRATION_REQUIRED"
+        ? `Phase completion refused (${code}); integrate its wave first. The run remains active.`
+        : `Worker override refused (${code}); nothing changed and the run is not blocked. Record a different judgment or leave the worker as recorded.`)
         : ok ? (params.action === "status"
           ? `Parent orchestration record ${observedRunId} is ready (ok: true, active: ${runId !== null}).` +
             (leadLimit && runId ? ` Lead calls: ${leadLimit.calls} of ${leadLimit.max}${leadLimit.reached ? " (limit reached: finish now)" : ""}.` : "")

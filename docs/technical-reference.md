@@ -411,15 +411,19 @@ path_floors:
   files_or_areas and call route_task again`; the run is not blocked. Adding
   the floored paths to `files_or_areas` makes `route_task` apply the same
   floors before the run, which confirms it.
-- **After integration.** `integrate_begin` records the parent's HEAD. At
-  `integrate_end` the tool checks the parent checkout's own change since then
+- **After integration.** `integrate_begin` records the selected integration
+  checkout's HEAD (the parent by default, or a verified external linked worktree
+  supplied as `path`). At `integrate_end` the tool checks that checkout's change since then
   (committed, working tree and untracked) against every member's route
   result: what was actually merged, including a branch merged from elsewhere
   or the lead's own edits. A path only another member's checked worktree
   changed is left to that member. An underrated merge is recorded and
   re-routed the same way, and the integration does not end: restore the
-  parent checkout to the recorded HEAD, call `integrate_abort`, run the new
+  integration checkout to the recorded HEAD, call `integrate_abort`, run the new
   route's workers in a fresh wave, then integrate again.
+  When using an external integration checkout, the parent must stay unchanged
+  throughout integration. Worker diffs are compared against the selected
+  integration checkout so previously integrated stacked waves are not recounted.
 - **Limit.** A phase may record at most 8 escalations of any reason
   (`MAX_ESCALATIONS_PER_PHASE`). Past it a lead escalation or an underrated
   diff is refused with `PARENT_ESCALATION_LIMIT`: nothing changes and nothing
@@ -564,10 +568,10 @@ The parent runs independent tasks in waves. Each task declares a write scope
 
 | Action | Effect | Blockers |
 | --- | --- | --- |
-| `bind_workspace {task_id?, step_id, path}` | Binds a mutating step of a task to its linked worktree (`task_id` may be omitted when one task is routed). A worktree inside a `.git` directory is refused: Claude Code denies every edit there, even in `acceptEdits` mode. | `WORKER_WORKSPACE_INVALID`, `WORKER_WORKSPACE_PROTECTED_PATH`, `WORKER_TASK_UNATTRIBUTED` |
+| `bind_workspace {task_id?, step_id, path}` | Binds a mutating step to its external linked worktree (`task_id` may be omitted when one task is routed). Worktrees inside `.git` or inside the target checkout are refused. | `WORKER_WORKSPACE_INVALID`, `WORKER_WORKSPACE_PROTECTED_PATH`, `WORKER_WORKSPACE_NESTED`, `WORKER_TASK_UNATTRIBUTED` |
 | `declare_wave {wave_id, tasks:[{task_id, write_scope}]}` | Declares routed tasks that may run concurrently; recorded as a `wave` event. | `WAVE_SCOPE_OVERLAP`, `WAVE_SCOPE_INVALID`, `WAVE_LIMIT_EXCEEDED`, `WAVE_TASK_UNROUTED`, `WAVE_WORKERS_IN_FLIGHT`, `AUTONOMY_POLICY_INVALID` |
-| `integrate_begin {wave_id}` | Starts integration; worker launches are refused until it ends. | `WAVE_UNKNOWN`, `INTEGRATION_WORKERS_IN_FLIGHT` |
-| `integrate_end {wave_id}` | Re-bases the parent-checkout snapshot after the parent's merges and closes the wave. | `INTEGRATION_NOT_STARTED`, `WORKER_SCOPE_UNVERIFIABLE` |
+| `integrate_begin {wave_id, path?}` | Starts integration in the parent or a verified external linked worktree; worker launches are refused until it ends. | `WAVE_UNKNOWN`, `INTEGRATION_WORKERS_IN_FLIGHT`, `INTEGRATION_WORKTREE_INVALID` |
+| `integrate_end {wave_id}` | Validates the selected checkout's committed changes and closes the wave; the parent must remain unchanged when integration is external. | `INTEGRATION_NOT_STARTED`, `WORKER_SCOPE_UNVERIFIABLE` |
 
 A routed task started while no worker runs and no wave is declared gets its own implicit single-task wave
 (`auto-<hex>-<task>`); it is never grown and never lets tasks overlap: only an explicit `declare_wave` does, after its
@@ -773,12 +777,16 @@ entry of `parent_orchestration.worker_sandbox` (`state`, `source`,
 never gets the sandbox block and never needs its prerequisites.
 
 **What PICO checks before starting a mutating worker** with the sandbox on:
-`/usr/bin/sandbox-exec` on macOS; on Linux, `bwrap` and `socat` on the
-worker's `PATH`, and a real bubblewrap probe (`bwrap --ro-bind / / --dev /dev
+`/usr/bin/sandbox-exec` on macOS; on Linux, `bwrap`, `socat` and `unshare` on the
+worker's `PATH`, and real bubblewrap probes (`bwrap --ro-bind / / --dev /dev
 --proc /proc --unshare-user --unshare-pid --unshare-net --die-with-parent
-true`, 5 s timeout). The probe catches a bwrap that is installed but cannot
-create namespaces, for example under AppArmor's unprivileged user-namespace
-restriction on Ubuntu 24.04 and later, or in a container that forbids them;
+true`, followed by the same outer sandbox running `unshare --user
+--map-root-user true`, each with a 5 s timeout). The second checks a nested
+user namespace and ID mapping needed by some Claude Code seccomp helpers. It
+is a conservative approximation and does not execute Claude Code's bundled
+helper; it may reject a runtime whose helper does not need that operation.
+The probes catch namespace restrictions, including the nested restriction
+observed under Ubuntu AppArmor, and may fail in containers that forbid them;
 Claude Code's own check only looks for the binaries. Other platforms, native
 Windows included, have no sandbox. A failed check means the worker is not
 started and the step fails closed with `WORKER_SANDBOX_UNAVAILABLE`, a
@@ -865,6 +873,13 @@ continues with the next wave, stacked on the batch branch or started from the
 base when independent. A CI failure becomes a `ci_fix` task in a later wave;
 only merge waits for CI. At `limits.open_prs` (default 2) open batch PRs, new
 waves stack on the newest batch branch instead of opening another PR.
+
+Direct CLI publication requires `--parent-run-id <run-id>` for both dry-run and
+apply. The parent must supply integrated evidence for the candidate's changes,
+with the required route steps and review complete and no wave still integrating.
+The publication plan binds this run ID so the apply step cannot substitute a
+different run. Workspace-managed publication continues through its own validated
+in-process contract.
 
 `issue_reference` (`refs` by default, or `closes`) decides whether a published
 PR closes its issue on merge. The publication gate in
