@@ -23,6 +23,8 @@ All notable changes to PICO are recorded here. The format follows
 
 ### Changed
 
+- Orchestration prompts now close all successful phases after integration and
+  required review before publication, and use run-unique publication branches.
 - Linux worker preflight now checks nested namespace mapping before inference.
   Incompatible hosts fail closed; the dedicated compatibility candidate requires operator rollout.
 - Worker worktrees must live outside the parent checkout. Integration can bind a
