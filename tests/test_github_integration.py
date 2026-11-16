@@ -156,17 +156,15 @@ class IntegrationTest(unittest.TestCase):
                   "phases": [phase], "waves": [{"id": "w", "status": "integrated", "task_ids": ["task"]}]}}
         with patch.object(provenance, "get_run", return_value=record):
             gi._require_parent_evidence(self.records, "run-a", self.worktree, "owner/repo", base, head)
-            for mutation in (lambda: phase.update(status="in_progress"),
-                             lambda: record["parent_orchestration"].update(target_repository="other/repo"),
-                             lambda: check.update(head=base)):
+            for mutation in (lambda current: current["parent_orchestration"]["phases"][0].update(status="in_progress"),
+                             lambda current: current["parent_orchestration"].update(target_repository="other/repo"),
+                             lambda current: current["parent_orchestration"]["phases"][0]["diff_floor_checks"][0].update(head=base)):
                 saved = json.loads(json.dumps(record))
-                mutation()
+                mutation(record)
                 with self.assertRaises(gi.IntegrationError) as exc:
                     gi._require_parent_evidence(self.records, "run-a", self.worktree, "owner/repo", base, head)
                 self.assertEqual(exc.exception.code, "PUBLICATION_INTEGRATION_REQUIRED")
                 record.clear(); record.update(saved)
-                phase = record["parent_orchestration"]["phases"][0]
-                check = phase["diff_floor_checks"][0]
             (self.worktree / "doc.txt").write_text("changed after review\n")
             git("add", "doc.txt")
             git("-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-m", "drift")
