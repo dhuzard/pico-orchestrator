@@ -1201,6 +1201,44 @@ while True: time.sleep(1)
              unittest.mock.patch.object(run_lease, '_proc_stat', return_value=['S']):
             self.assertFalse(execution_supervisor.stop(123, 'expected'))
 
+    def test_macos_zombie_without_libproc_identity_is_confirmed_dead(self):
+        import execution_supervisor
+        zombie = subprocess.CompletedProcess([], 0, 'Z\n', '')
+        alive = subprocess.CompletedProcess([], 0, 'S\n', '')
+        unreadable = subprocess.CompletedProcess([], 1, '', 'unavailable')
+        with unittest.mock.patch.object(execution_supervisor.sys, 'platform', 'darwin'), \
+             unittest.mock.patch.object(execution_supervisor, 'session_members', return_value=[]), \
+             unittest.mock.patch.object(execution_supervisor, 'identity', return_value=None), \
+             unittest.mock.patch.object(execution_supervisor.os, 'kill', return_value=None), \
+             unittest.mock.patch.object(run_lease, '_proc_stat', return_value=None), \
+             unittest.mock.patch.object(execution_supervisor.subprocess, 'run', side_effect=[zombie, alive, unreadable]):
+            self.assertTrue(execution_supervisor.stop(123, 'expected'))
+            self.assertFalse(execution_supervisor.stop(123, 'expected'))
+            self.assertFalse(execution_supervisor.stop(123, 'expected'))
+
+    def test_macos_cleanup_handles_live_to_zombie_anchor_transition(self):
+        import execution_supervisor
+        anchor = subprocess.Popen([sys.executable, '-c',
+                                   'import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); '
+                                   'print("ready", flush=True); time.sleep(30)'],
+                                  stdout=subprocess.PIPE, text=True, start_new_session=True)
+        self.addCleanup(anchor.stdout.close)
+        self.assertEqual(anchor.stdout.readline().strip(), 'ready')
+        original_proc_stat = run_lease._proc_stat
+        def mac_identity(pid):
+            fields = original_proc_stat(pid)
+            return 'birth' if fields and fields[0] != 'Z' else None
+        try:
+            with unittest.mock.patch.object(execution_supervisor.sys, 'platform', 'darwin'), \
+                 unittest.mock.patch.object(execution_supervisor, 'identity', side_effect=mac_identity), \
+                 unittest.mock.patch.object(run_lease, '_proc_stat', return_value=None):
+                self.assertTrue(execution_supervisor.stop(anchor.pid, 'birth', grace=0))
+            self.assertLess(anchor.wait(timeout=5), 0)
+        finally:
+            if anchor.poll() is None:
+                os.killpg(anchor.pid, 9)
+                anchor.wait()
+
     def test_macos_secondary_group_fails_closed_without_signalling(self):
         import execution_supervisor
         members = [(123, 123, 'S'), (124, 124, 'S')]

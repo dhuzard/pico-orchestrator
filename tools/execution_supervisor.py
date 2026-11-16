@@ -100,8 +100,10 @@ def stop(pid, expected, grace=0.3):
             return True
         except PermissionError:
             return False
-        if current is None or current != expected:
-            return False
+        # On macOS proc_pidinfo may stop reporting a zombie before the parent
+        # reaps it, even though kill(pid, 0) still succeeds. Check a separate
+        # process-state source before treating unavailable identity as live.
+        # This helper is only consulted after session_members returned empty.
         fields = run_lease._proc_stat(pid)
         if fields:
             return fields[0] == 'Z'
