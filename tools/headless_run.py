@@ -45,6 +45,7 @@ import atomic_io  # noqa: E402
 import autonomy_policy  # noqa: E402
 import github_integration  # noqa: E402
 import launch_brief  # noqa: E402
+import budget_ledger  # noqa: E402
 import parent_orchestration  # noqa: E402
 import provenance  # noqa: E402
 import run_lease  # noqa: E402
@@ -634,7 +635,8 @@ def start(*, target: Path, explicit_repo: str, execution_id: str, objective: str
           max_duration_seconds: int | None = None, max_lead_calls: int | None = None,
           max_lead_calls_source: str = "cli", lead_calls_warn_at: int | None = None,
           failure_retry_budget: int | None = None, failure_retry_budget_source: str = "cli",
-          inputs_digest: str | None = None) -> dict:
+          inputs_digest: str | None = None, aggregate_ledger: Path | None = None,
+          aggregate_task_id: str | None = None, serialize_global: bool = False) -> dict:
     max_duration_seconds = validate_max_duration(max_duration_seconds)
     failure_retry_budget, failure_retry_budget_source = validate_failure_retry_budget(
         failure_retry_budget, failure_retry_budget_source)
@@ -651,17 +653,40 @@ def start(*, target: Path, explicit_repo: str, execution_id: str, objective: str
     max_lead_calls, max_lead_calls_source, lead_calls_warn_at = resolve_lead_limit(
         worktree, max_lead_calls, max_lead_calls_source, lead_calls_warn_at)
     path = execution_path(common, execution_id)
+    ledger_path = aggregate_ledger or os.environ.get(budget_ledger.ENV)
+    admission_id = None
+    def admit():
+        nonlocal admission_id
+        if serialize_global and any(Path(item['path']) != path for item in global_execution_barriers()):
+            raise HeadlessError('EXECUTION_GLOBAL_BARRIER', 'Another execution is active or uncertain; inspect it before launching')
+        if before_spawn is not None:
+            before_spawn()
+        if ledger_path:
+            try:
+                admission_id = budget_ledger.reserve_launch(Path(ledger_path),
+                    task_id=aggregate_task_id or f'{identity}:{common}', attempt_id=execution_id)
+            except budget_ledger.BudgetError as exc:
+                raise HeadlessError(exc.code, exc.detail) from exc
     # Deciding and launching happen under the record lock, so two starts with
     # the same id cannot both see "not running" and both start Pi.
     with global_launch_lock(), locked_record(path):
         launched = _launch_locked(path, worktree=worktree, identity=identity, common=common,
                                   execution_id=execution_id, objective=objective, allow_mutation=allow_mutation,
                                   resume=resume, pi_executable=pi_executable, python=python,
-                                  before_spawn=before_spawn, takeover=takeover,
+                                  before_spawn=admit, takeover=takeover,
                                   max_duration_seconds=max_duration_seconds, max_lead_calls=max_lead_calls,
                                   max_lead_calls_source=max_lead_calls_source, lead_calls_warn_at=lead_calls_warn_at,
                                   failure_retry_budget=failure_retry_budget,
                                   failure_retry_budget_source=failure_retry_budget_source, inputs_digest=inputs_digest)
+        if admission_id and not isinstance(launched, dict):
+            launched[0]['aggregate_admission_id'] = admission_id
+            save_record(path, launched[0])
+            try:
+                budget_ledger.settle(Path(ledger_path), admission_id, actual={'launches': 1}, complete=True)
+            except budget_ledger.BudgetError:
+                # Registration has happened; retain the charged reservation.
+                # A settlement error must not hide the active child from its caller.
+                pass
     if isinstance(launched, dict):
         return launched
     record, child, log, before = launched
@@ -684,7 +709,7 @@ def start(*, target: Path, explicit_repo: str, execution_id: str, objective: str
         log.close()
         return record
     try:
-        exit_code = _wait_for_child(child, path, record)
+        _wait_for_child(child, path, record)
     finally:
         _OWN_CHILDREN.pop(child.pid, None)
         log.close()
@@ -1041,6 +1066,9 @@ def main(argv: list[str] | None = None) -> int:
             p.add_argument("--takeover-stale-lease", action="store_true",
                            help="with --resume: explicitly recover a stale run lease (recorded in provenance)")
             p.add_argument("--no-wait", action="store_true", help="return after launching instead of waiting for exit")
+            p.add_argument('--aggregate-ledger', type=Path, default=None, help='opt-in durable aggregate launch allowance')
+            p.add_argument('--budget-task-id', default=None, help='stable accounting task identity across attempts')
+            p.add_argument('--serialize-global', action='store_true', help='hold new launches while another execution is active or uncertain')
             p.add_argument("--max-duration", type=int, default=None, metavar="SECONDS",
                            help="stop the child after this many wall-clock seconds (EXECUTION_TIME_LIMIT); default: no limit")
             p.add_argument("--max-lead-calls", type=int, default=None, metavar="N",
@@ -1060,7 +1088,9 @@ def main(argv: list[str] | None = None) -> int:
                            objective=args.objective, allow_mutation=args.allow_mutation, resume=args.resume,
                            pi_executable=args.pi, wait=not args.no_wait, takeover=args.takeover_stale_lease,
                            max_duration_seconds=args.max_duration, max_lead_calls=args.max_lead_calls,
-                           lead_calls_warn_at=args.lead_calls_warn_at, failure_retry_budget=args.failure_retry_budget)
+                           lead_calls_warn_at=args.lead_calls_warn_at, failure_retry_budget=args.failure_retry_budget,
+                           aggregate_ledger=args.aggregate_ledger, aggregate_task_id=args.budget_task_id,
+                           serialize_global=args.serialize_global)
         elif args.command == "status":
             record = status(target=args.target, explicit_repo=args.repo, execution_id=args.execution_id)
         else:

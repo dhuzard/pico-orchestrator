@@ -1,7 +1,8 @@
 # Aggregate budget accounting
 
 The optional durable ledger enforces **attempted launch admission counts** at
-workspace launches, including scheduler launches, resumes and new attempts.
+headless and workspace launches, including dispatcher jobs, scheduler launches,
+resumes and new attempts. All use the central headless admission callback.
 It is disabled unless a ledger path is explicitly configured. These changes
 create no live ledger and activate no spending policy.
 
@@ -22,6 +23,11 @@ the option is absent. All participating launches must select the same ledger.
 Changing files or removing that configuration is outside this cooperative
 local admission boundary; this is not protection against a hostile operator
 or a compromised worker that can modify the ledger.
+
+Direct execution also accepts `pico exec start --aggregate-ledger PATH`.
+Dispatcher configuration can set `aggregate_ledger` to that same absolute path.
+No configured ledger means this optional aggregate launch gate is off. Existing
+per-execution time and call limits remain independent.
 
 The ledger's `task` limit applies to a stable workspace/task identity across
 attempts; `attempt` applies to one execution id, including all its resumes;

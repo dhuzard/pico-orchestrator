@@ -8,6 +8,12 @@ All notable changes to PICO are recorded here. The format follows
 
 ### Added
 
+- Durable post-execution delivery observations, human-review packets and a
+  read-only Garden attention view; explicit single-repair approval preserves
+  original run history and rechecks the parent PR head.
+- Independent headless supervision, execution-wide deadlines, launch briefs,
+  uncertain-launch barriers and opt-in atomic aggregate launch allowances.
+
 - A pinned, offline Claude sandbox compatibility verifier and a dedicated AppArmor
   profile candidate, with containment checks and explicit deployment/rollback instructions.
 
@@ -230,6 +236,9 @@ All notable changes to PICO are recorded here. The format follows
   `retry_succeeded`) within the existing bounds.
 
 ### Fixed
+
+- Missing usage records and incomplete prices now hold applicable workspace
+  budget gates; publication intent is persisted before remote side effects.
 
 - A task can be published again after its draft PR was closed without merging (#67). Its branch
   stayed refused with `PUBLICATION_PR_CONFLICT` for good, and the #4 pilot had to delete and recreate a

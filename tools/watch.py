@@ -38,6 +38,7 @@ ASSETS = {"/": ("index.html", "text/html; charset=utf-8"),
           "/setup.js": ("setup.js", "text/javascript; charset=utf-8"),
           "/app.js": ("app.js", "text/javascript; charset=utf-8"),
           "/issues.js": ("issues.js", "text/javascript; charset=utf-8"),
+          "/deliveries.js": ("deliveries.js", "text/javascript; charset=utf-8"),
           "/style.css": ("style.css", "text/css; charset=utf-8")}
 
 
@@ -515,12 +516,12 @@ class WorkspaceSource:
 
 # With --controls on, every data endpoint needs the session token; the static
 # page, script and stylesheet do not (the token arrives in the URL fragment).
-TOKEN_ENDPOINTS = frozenset({"/api/controls", "/api/branches", "/api/runs", "/api/workspace", "/api/issues"})
+TOKEN_ENDPOINTS = frozenset({"/api/controls", "/api/branches", "/api/runs", "/api/workspace", "/api/issues", "/api/deliveries"})
 
 
 def make_handler(directory: Path, repository: str | None, workspace: WorkspaceSource | None = None,
                  controls=None, port: int | None = None, issues: garden_issues.IssuesSource | None = None,
-                 setup: workspace_setup.SetupControls | None = None):
+                 setup: workspace_setup.SetupControls | None = None, dispatcher_state: Path | None = None):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, format, *args):
             if not self.path.startswith("/api/"):
@@ -652,7 +653,20 @@ def make_handler(directory: Path, repository: str | None, workspace: WorkspaceSo
                         payload = self._json(422, {"ok": False, "error_code": exc.code, "error": "branches unavailable"})
                 self._send(payload)
                 return
-            if path == "/api/runs":
+            if path == "/api/deliveries":
+                import delivery_store
+                try:
+                    rows = delivery_store.list_deliveries(dispatcher_state or directory.parent / "issue-dispatcher.sqlite3")
+                    if repository is not None:
+                        rows = [row for row in rows if str(row.get("repository", "")).casefold() == repository.casefold()]
+                    if workspace is not None:
+                        # Dispatcher deliveries are not workspace-manifest task records.
+                        rows = []
+                    payload = self._json(200, {"ok": True, "deliveries": rows})
+                except (OSError, ValueError):
+                    payload = self._json(503, {"ok": False, "error_code": "DELIVERY_STATE_UNAVAILABLE",
+                                               "error": "Delivery observations are unavailable."})
+            elif path == "/api/runs":
                 if workspace is None:
                     body = {"repository": repository, "workspace_mode": False, "workspace": None,
                             "runs": load_runs(directory, repository)}
@@ -704,6 +718,8 @@ def main() -> None:
     parser.add_argument("--workspace", metavar="ID_OR_MANIFEST",
                         help="Show one workspace across its repositories (workspace id or manifest path)")
     parser.add_argument("--state-dir", type=Path, default=None)
+    parser.add_argument("--dispatcher-state", type=Path, default=None,
+                        help="Read-only dispatcher database for delivery attention (default: state-dir/issue-dispatcher.sqlite3)")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--controls", action="store_true",
                         help="with --workspace <manifest>: enable validate, request PR, CI and promote actions")
@@ -752,14 +768,16 @@ def main() -> None:
         os.environ["PI_ORCHESTRATOR_STATE_DIR"] = str(state)
     if args.setup_root and not args.setup_root.is_dir():
         parser.error("--setup-root must be an existing directory")
-    server = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(directory, repository, workspace, issues=issues))
+    server = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(
+        directory, repository, workspace, issues=issues, dispatcher_state=args.dispatcher_state))
     setup = workspace_setup.SetupControls(args.setup_root, server.server_port, state=state) if args.setup_root else None
     if setup:
-        server.RequestHandlerClass = make_handler(directory, repository, port=server.server_port, setup=setup)
+        server.RequestHandlerClass = make_handler(directory, repository, port=server.server_port, setup=setup,
+                                                  dispatcher_state=args.dispatcher_state)
     if args.controls:
         controls = garden_controls.Controls(workspace.manifest, server.server_port, state_dir=state)
         server.RequestHandlerClass = make_handler(directory, repository, workspace, controls, server.server_port,
-                                                  issues=issues)
+                                                  issues=issues, dispatcher_state=args.dispatcher_state)
     label = f"workspace {workspace.workspace_id}" if workspace else repository or "all repositories"
     if setup:
         print(f"Pico setup: http://127.0.0.1:{server.server_port}/setup#token={setup.token}  (root {setup.root})", flush=True)

@@ -167,7 +167,7 @@ class FailClosedAccountingTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             runs = Path(tmp)
             (runs / "run-a.json").write_text(json.dumps({"parent_orchestration": parent(
-                {"model": "unknown", "input_tokens": 5, "cost_complete": False})}))
+                {"model": "unknown", "input_tokens": 5, "output_tokens": 0, "cost_complete": False})}))
             record = {"tasks": {"t": {"run_id": "run-a"}}}
             plan = {"workspace_id": "w", "budget": {"max_tokens": 100}}
             self.assertFalse(ws.budget_state(plan, record, runs)["incomplete"])
@@ -185,8 +185,21 @@ class FailClosedAccountingTest(unittest.TestCase):
         self.assertEqual(usage.spent(result), 0)
         self.assertEqual(result["estimated_cost_usd"], 0.25)
         self.assertTrue(result["cost_complete"])
+        self.assertFalse(result['token_work_complete'])
         for value in (float("inf"), float("nan")):
             self.assertFalse(usage.run_tokens(parent({"input_tokens": 1, "estimated_cost_usd": value}))["cost_complete"])
+
+    def test_missing_worker_counters_hold_token_gate_even_when_cost_known(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runs = Path(tmp)
+            context = parent({'input_tokens': 0, 'output_tokens': 0, 'estimated_cost_usd': 0})
+            context['context']['worker_usage'] = {'worker': {'invocations': 1, 'cached_tokens': 100, 'estimated_cost_usd': 1}}
+            (runs / 'run-a.json').write_text(json.dumps({'parent_orchestration': context}))
+            record = {'tasks': {'t': {'run_id': 'run-a'}}}
+            token_gate = ws.budget_state({'workspace_id': 'w', 'budget': {'max_tokens': 100}}, record, runs)
+            cost_gate = ws.budget_state({'workspace_id': 'w', 'budget': {'max_cost_usd': 10}}, record, runs)
+            self.assertTrue(token_gate['incomplete'])
+            self.assertFalse(cost_gate['incomplete'])
 
 
 if __name__ == "__main__":

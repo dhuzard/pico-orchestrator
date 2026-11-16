@@ -1,5 +1,4 @@
 """Offline fault/concurrency tests; these never contact a provider."""
-import json
 import multiprocessing
 from pathlib import Path
 import subprocess

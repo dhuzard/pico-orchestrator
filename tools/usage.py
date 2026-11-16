@@ -71,6 +71,7 @@ def run_tokens(parent: dict) -> dict:
     """
     context = parent.get("context") if isinstance(parent.get("context"), dict) else {}
     problems = []
+    token_work_complete = True
     for name in ("lead_usage", "worker_usage"):
         if not isinstance(context.get(name), dict):
             problems.append(f"missing or malformed {name}")
@@ -85,6 +86,9 @@ def run_tokens(parent: dict) -> dict:
             problems.append("invalid token counter")
         if (_count(part.get("invocations")) or 0) > 0 and not any(_count(part.get(field)) is not None for field in TOKEN_FIELDS):
             problems.append("invoked participant has no token telemetry")
+        active = (_count(part.get('invocations')) or 0) > 0 or _has_tokens(part)
+        if active and any(_count(part.get(field)) is None for field in ('input_tokens', 'output_tokens')):
+            token_work_complete = False
     tokens: dict = {}
     for field in COUNTED:
         observed = [_count(part.get(field)) for part in (lead, *workers)]
@@ -99,6 +103,8 @@ def run_tokens(parent: dict) -> dict:
         tokens["incomplete_reasons"] = problems
         tokens["incomplete"] = True
     tokens["cost_complete"] = not tokens["unpriced"] and not problems
+    if not token_work_complete:
+        tokens['token_work_complete'] = False
     return tokens
 
 
@@ -113,6 +119,8 @@ def sum_tokens(parts: list[dict]) -> dict:
     # Blocks from before these fields carry no `unpriced` list and add nothing to it.
     result["unpriced"] = sorted({name for part in parts for name in part.get("unpriced") or []})
     result["cost_complete"] = not result["unpriced"] and all(part.get("cost_complete") is not False for part in parts)
+    if any(part.get('token_work_complete') is False for part in parts):
+        result['token_work_complete'] = False
     return result
 
 

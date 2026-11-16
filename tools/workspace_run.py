@@ -585,6 +585,8 @@ def budget_state(plan: dict, record: dict | None = None, runs_dir: Path | None =
     problems = [*problems, *(extra_problems or [])]
     used = usage.workspace_usage(runs_dir or headless_run.state_root() / "runs", record, inflight)
     problems.extend(used.get("incomplete_reasons", []))
+    if budget.get('max_tokens') is not None and used.get('token_work_complete') is False:
+        problems.append('token-work accounting incomplete: missing input/output counters')
     if budget.get("max_cost_usd") is not None and not used["cost_complete"]:
         problems.append("monetary accounting incomplete: missing prices or telemetry")
     cost = used.get("estimated_cost_usd") or 0.0
@@ -726,14 +728,7 @@ def launch(*, manifest: Path, task_id: str, allow_mutation: bool = False, resume
                 save_workspace(path, record)
 
     def admit_spawn() -> None:
-        nonlocal admission_id
         before_spawn()
-        if aggregate_ledger:
-            try:
-                admission_id = budget_ledger.reserve_launch(
-                    aggregate_ledger, task_id=f"workspace:{plan['workspace_id']}:{task_id}", attempt_id=exec_id)
-            except budget_ledger.BudgetError as exc:
-                raise WorkspaceRunError(exc.code, exc.detail) from exc
 
     with locked_workspace(plan["workspace_id"]):
         prior = load_workspace(workspace_record_path(plan["workspace_id"]))
@@ -775,14 +770,11 @@ def launch(*, manifest: Path, task_id: str, allow_mutation: bool = False, resume
                                        max_duration_seconds=max_duration, max_lead_calls=max_lead_calls,
                                        max_lead_calls_source=lead_source, lead_calls_warn_at=lead_warn_at,
                                        failure_retry_budget=failure_budget, failure_retry_budget_source=failure_source,
-                                       inputs_digest=_inputs_digest(plan, task, repo))
+                                       inputs_digest=_inputs_digest(plan, task, repo), aggregate_ledger=aggregate_ledger,
+                                       aggregate_task_id=f"workspace:{plan['workspace_id']}:{task_id}")
     except headless_run.HeadlessError as exc:
         raise WorkspaceRunError(exc.code, exc.detail) from exc
-    if admission_id:
-        try:
-            budget_ledger.settle(aggregate_ledger, admission_id, actual={"launches": 1}, complete=True)
-        except budget_ledger.BudgetError as exc:
-            raise WorkspaceRunError(exc.code, exc.detail) from exc
+    admission_id = execution.get('aggregate_admission_id')
     with locked_workspace(plan["workspace_id"]):
         path, record = _workspace(plan, manifest, require_current_pins=True)
         entry = _entry(record, task, repo, execution, inputs)

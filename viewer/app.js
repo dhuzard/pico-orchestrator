@@ -1027,6 +1027,35 @@ window.addEventListener("hashchange", () => { applyMode(); render(state.label); 
 
 // Issues change slowly and the server caches gh for a minute, so they are polled every 30 seconds.
 const issueState = { fetchedAt: 0 };
+const deliveryState = { fetchedAt: 0, data: { ok: true, deliveries: [] }, filter: "attention" };
+function renderDeliveries() {
+  const data = deliveryState.data;
+  $("delivery-panel").hidden = state.workspaceMode || (data.ok && !data.deliveries?.length);
+  $("delivery-connection").textContent = data.ok ? "Observed state · read-only" : "Connection lost · evidence may be stale";
+  globalThis.PicoDeliveries.render($("delivery-list"), data, { filter: deliveryState.filter });
+}
+document.querySelectorAll("[data-delivery-filter]").forEach(button => {
+  button.addEventListener("click", () => {
+    deliveryState.filter = button.dataset.deliveryFilter;
+    document.querySelectorAll("[data-delivery-filter]").forEach(item => {
+      const selected = item === button;
+      item.classList.toggle("selected", selected); item.setAttribute("aria-pressed", String(selected));
+    });
+    renderDeliveries();
+  });
+});
+async function refreshDeliveries() {
+  if (Date.now() - deliveryState.fetchedAt < 10000) return;
+  deliveryState.fetchedAt = Date.now();
+  try {
+    const response = await fetch("/api/deliveries", { cache: "no-store", headers: tokenHeaders() });
+    if (!response.ok) throw new Error("Delivery observations unavailable");
+    deliveryState.data = await response.json();
+  } catch {
+    deliveryState.data = { ...deliveryState.data, ok: false };
+  }
+  renderDeliveries();
+}
 async function refreshIssues(force = false) {
   if (!force && Date.now() - issueState.fetchedAt < 30000) return;
   issueState.fetchedAt = Date.now();
@@ -1053,6 +1082,7 @@ async function refresh() {
     state.workspaceMode = Boolean(data.workspace_mode); state.workspaceId = data.workspace || null;
     if (state.workspaceMode) { await refreshWorkspace(); await refreshControls(); }
     refreshIssues();  // not awaited: a slow gh call must not hold up the live run view
+    refreshDeliveries();
     applyMode();
     state.label = state.workspaceMode ? `Child runs of workspace ${state.workspaceId || ""}` : data.repository;
     render(state.label);

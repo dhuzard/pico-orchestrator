@@ -149,11 +149,14 @@ def load_config(path: Path) -> dict:
             raise DispatcherError("queue credential must be outside the target gh config directory")
         credentials = {"queue_token_file": queue_path, "target_gh_config_dir": target_path}
     expected = data.get("delivery_expected_checks", {})
+    ledger = data.get('aggregate_ledger')
+    if ledger is not None and (not isinstance(ledger, str) or not Path(ledger).is_absolute()):
+        raise DispatcherError('aggregate_ledger must be an absolute path to an explicitly initialized ledger')
     if (not isinstance(expected, dict) or any(not isinstance(k, str) or k.casefold() not in normalized
             or not isinstance(v, list) or not v or not all(isinstance(x, str) and 0 < len(x) <= 200 for x in v)
             for k, v in expected.items())):
         raise DispatcherError("delivery_expected_checks must map allowed repositories to nonempty check name lists")
-    return {**credentials, "delivery_expected_checks": {k.casefold(): v for k, v in expected.items()}, "queue": data["queue_repository"], "targets": normalized, "state": state,
+    return {**credentials, 'aggregate_ledger': ledger, "delivery_expected_checks": {k.casefold(): v for k, v in expected.items()}, "queue": data["queue_repository"], "targets": normalized, "state": state,
             "poll": poll, "duration": duration, "calls": calls,
             "gh": str(data.get("gh_executable", "gh")),
             "pico": str(data.get("pico_executable", "pico"))}
@@ -227,10 +230,35 @@ def database(cfg: dict):
         state TEXT NOT NULL, reported TEXT)""")
     db.commit()
     delivery_store.initialize(db)
+    db.execute('''CREATE TABLE IF NOT EXISTS delivery_repairs (
+        repair_issue INTEGER PRIMARY KEY, parent_issue INTEGER NOT NULL,
+        root_issue INTEGER NOT NULL, parent_head TEXT NOT NULL, digest TEXT NOT NULL)''')
+    db.commit()
     return db
 
 
-def approve(cfg: dict, number: int, mutate: bool) -> None:
+def repair_parent(cfg: dict, db, parent_issue: int, task: Task) -> dict:
+    """Re-observe a failed delivery; a comment is never repair authority."""
+    parent = db.execute('SELECT * FROM approvals WHERE number=?', (parent_issue,)).fetchone()
+    if (parent is None or parent['state'] != 'completed' or parent['repo'] != task.repo
+            or parent['checkout'] != task.checkout or parent_issue == task.number):
+        raise DispatcherError('repair requires a completed delivery in the same target')
+    if 'target_gh_config_dir' not in cfg:
+        raise DispatcherError('repair requires separate target credentials')
+    record = pico_action(cfg, parent, 'status')
+    if classify(record) != 'completed':
+        raise DispatcherError('parent execution evidence unavailable')
+    item = delivery_observer.observe(parent, record,
+        lambda args: command([cfg['gh'], *args], env=target_env(cfg)),
+        cfg.get('delivery_expected_checks', {}).get(parent['repo'].casefold()))
+    if (item['publication'] != 'observed' or item['head_sha'] is None
+            or item['delivery'] in {'closed', 'merged'}
+            or not (item['checks'] == 'failed' or item['review'] == 'changes_requested')):
+        raise DispatcherError('repair requires fresh failed checks or a current human change request')
+    return item
+
+
+def approve(cfg: dict, number: int, mutate: bool, repair_of: int | None = None) -> None:
     if not sys.stdin.isatty():
         raise DispatcherError("approval requires an interactive local terminal")
     task = parse_task(issue_view(cfg, number), cfg)
@@ -238,12 +266,36 @@ def approve(cfg: dict, number: int, mutate: bool) -> None:
         current = db.execute("SELECT state FROM approvals WHERE number=?", (number,)).fetchone()
         if current and current["state"] not in {"approved", "stale"}:
             raise DispatcherError("task was already dispatched; create a new issue for a new attempt")
+        repair = None
+        if repair_of is not None:
+            if not mutate:
+                raise DispatcherError('repair approval requires --allow-mutation')
+            repair = repair_parent(cfg, db, repair_of, task)
+            print(f"Repair of queue #{repair_of}, exact head {repair['head_sha']}; one repair allowance per root delivery.")
         print(f"Issue #{number} in {cfg['queue']}\nTarget: {task.repo}\nCheckout: {task.checkout}")
         print(f"Mode: {'LOCAL CODE MUTATION' if mutate else 'READ-ONLY'}\n\n{task.objective}\n")
         print("PICO autonomy policy still applies; this is not an OS sandbox or merge authorization.")
         phrase = f"approve {task.digest[:12]}"
         if input(f"Type '{phrase}' to authorize this exact issue version: ").strip() != phrase:
             raise DispatcherError("approval cancelled")
+        # Serialize the one-attempt allowance with the normal exact approval.
+        # Consume on approval, retaining the charge across crashes or stale tasks.
+        db.execute('BEGIN IMMEDIATE')
+        current = db.execute('SELECT state FROM approvals WHERE number=?', (number,)).fetchone()
+        if current and current['state'] not in {'approved', 'stale'}:
+            raise DispatcherError('task changed while approval was pending; refusing to overwrite its execution state')
+        if repair is not None:
+            lineage = db.execute('SELECT root_issue FROM delivery_repairs WHERE repair_issue=?', (repair_of,)).fetchone()
+            root_issue = lineage[0] if lineage else repair_of
+            existing = db.execute('SELECT * FROM delivery_repairs WHERE repair_issue=?', (number,)).fetchone()
+            if existing:
+                if existing['digest'] != task.digest or existing['parent_issue'] != repair_of or existing['parent_head'] != repair['head_sha']:
+                    raise DispatcherError('repair approval changed; allowance cannot be reset')
+            elif db.execute('SELECT 1 FROM delivery_repairs WHERE root_issue=?', (root_issue,)).fetchone():
+                raise DispatcherError('repair allowance exhausted; inspect the delivery manually')
+            else:
+                db.execute('INSERT INTO delivery_repairs VALUES (?,?,?,?,?)',
+                           (number, repair_of, root_issue, repair['head_sha'], task.digest))
         db.execute("""INSERT INTO approvals
            (number,digest,repo,checkout,execution_id,mode,state,reported)
            VALUES (?,?,?,?,?,?,?,NULL)
@@ -261,7 +313,16 @@ def pico_action(cfg: dict, row: sqlite3.Row, action: str, objective: str = "") -
             "--repo", row["repo"], "--execution-id", row["execution_id"]]
     if action == "start":
         args += ["--objective", objective, "--no-wait", "--max-duration", str(cfg["duration"]),
-                 "--max-lead-calls", str(cfg["calls"])]
+                 "--max-lead-calls", str(cfg["calls"]), '--serialize-global']
+        root_issue = row['number'] if 'number' in row.keys() else row['execution_id']
+        if cfg.get('state') and Path(cfg['state']).is_file():
+            with sqlite3.connect(Path(cfg['state']).resolve().as_uri() + '?mode=ro', uri=True) as state_db:
+                lineage = state_db.execute('SELECT root_issue FROM delivery_repairs WHERE repair_issue=?', (root_issue,)).fetchone()
+                if lineage:
+                    root_issue = lineage[0]
+        args += ['--budget-task-id', f"dispatcher:{cfg['queue']}:{row['repo']}:{root_issue}"]
+        if cfg.get('aggregate_ledger'):
+            args += ['--aggregate-ledger', str(cfg['aggregate_ledger'])]
         if row["mode"] == "local-mutation":
             args.append("--allow-mutation")
     # Status is local and enforces the duration limit; it must continue even
@@ -290,11 +351,11 @@ def pico_action(cfg: dict, row: sqlite3.Row, action: str, objective: str = "") -
 
 
 def classify(record: dict) -> str:
-    if record.get("error_code"):
-        return "blocked"
     status = record.get("status")
     if status in {"launching", "launch_uncertain"}:
         return "launch_uncertain"
+    if record.get("error_code"):
+        return "blocked"
     if status == "launched":
         return "running"
     if status == "interrupted":
@@ -313,6 +374,8 @@ def report(cfg: dict, db: sqlite3.Connection, row: sqlite3.Row) -> None:
     body = (f"PICO dispatcher: **{row['state']}**\n\n"
             f"Execution ID: `{row['execution_id']}`. "
             "No automatic merge or deployment was requested by the dispatcher.")
+    if row['state'] in {'blocked', 'partial', 'interrupted', 'launch_uncertain'}:
+        body += '\n\nHuman action: inspect the execution evidence and resolve the blocker. A new attempt requires a fresh scoped approval.'
     try:
         result = subprocess.run([cfg["gh"], "issue", "comment", str(row["number"]),
                                  "--repo", cfg["queue"], "--body", body],
@@ -362,10 +425,15 @@ def handoff_comment(cfg: dict, row: sqlite3.Row, item: dict) -> None:
     endpoint = f"repos/{cfg['queue']}/issues/{row['number']}/comments"
     try:
         env = queue_env(cfg)
+        actor = command([cfg['gh'], 'api', 'user'], env=env)
+        actor_id = actor.get('id') if isinstance(actor, dict) else None
+        if type(actor_id) is not int or actor_id < 1:
+            return
         pages = command([cfg['gh'], 'api', '--paginate', '--slurp', endpoint], env=env)
         if not isinstance(pages, list) or any(not isinstance(page, list) for page in pages):
             return
-        matches = [c for page in pages for c in page if isinstance(c, dict) and isinstance(c.get('body'), str) and marker in c['body']]
+        matches = [c for page in pages for c in page if isinstance(c, dict) and isinstance(c.get('body'), str)
+                   and c['body'].startswith(marker + '\n') and (c.get('user') or {}).get('id') == actor_id]
         if len(matches) > 1:
             return
         if matches:
@@ -386,6 +454,7 @@ def handoff_comment(cfg: dict, row: sqlite3.Row, item: dict) -> None:
 def tick(cfg: dict, db: sqlite3.Connection) -> None:
     rows = db.execute("SELECT * FROM approvals ORDER BY number").fetchall()
     for row in rows:
+        fresh_intent = row['state'] == 'approved'
         if row["state"] not in ACTIVE:
             if row["state"] == "completed":
                 reconcile_delivery(cfg, db, row)
@@ -404,6 +473,17 @@ def tick(cfg: dict, db: sqlite3.Connection) -> None:
                 db.execute("UPDATE approvals SET state='stale' WHERE number=?", (row["number"],))
                 db.commit()
                 continue
+            repair = db.execute('SELECT * FROM delivery_repairs WHERE repair_issue=?', (row['number'],)).fetchone()
+            if repair is not None:
+                try:
+                    fresh = repair_parent(cfg, db, repair['parent_issue'], task)
+                    valid = fresh['head_sha'] == repair['parent_head'] and task.digest == repair['digest']
+                except DispatcherError:
+                    valid = False
+                if not valid:
+                    db.execute("UPDATE approvals SET state='stale' WHERE number=?", (row['number'],))
+                    db.commit()
+                    continue
             # Never dispatch a second job while the first is launching or running.
             running = db.execute("SELECT 1 FROM approvals WHERE state IN ('launching','running','launch_uncertain') LIMIT 1").fetchone()
             if running:
@@ -414,11 +494,25 @@ def tick(cfg: dict, db: sqlite3.Connection) -> None:
         try:
             if row["state"] == "launching":
                 # Idempotent start recovers a crash after launch without launching a duplicate.
+                existing = None if fresh_intent else pico_action(cfg, row, 'status')
+                if existing is not None and existing.get('error_code') != 'EXECUTION_UNKNOWN':
+                    state = 'launch_uncertain' if existing.get('error_code') else classify(existing)
+                    db.execute('UPDATE approvals SET state=? WHERE number=?', (state, row['number']))
+                    db.commit()
+                    continue
                 issue = parse_task(issue_view(cfg, row["number"]), cfg)
                 if issue.digest != row["digest"]:
                     state = "stale"
                 else:
-                    state = classify(pico_action(cfg, row, "start", issue.objective))
+                    repair = db.execute('SELECT * FROM delivery_repairs WHERE repair_issue=?', (row['number'],)).fetchone()
+                    if repair is None:
+                        state = classify(pico_action(cfg, row, "start", issue.objective))
+                    else:
+                        fresh = repair_parent(cfg, db, repair['parent_issue'], issue)
+                        if fresh['head_sha'] != repair['parent_head'] or issue.digest != repair['digest']:
+                            state = 'stale'
+                        else:
+                            state = classify(pico_action(cfg, row, 'start', issue.objective))
             else:
                 state = classify(pico_action(cfg, row, "status"))
         except DispatcherError as exc:
@@ -456,6 +550,7 @@ def main(argv: list[str] | None = None) -> int:
     a = sub.add_parser("approve", help="authorize one exact issue version from the local terminal")
     a.add_argument("--issue", type=int, required=True)
     a.add_argument("--allow-mutation", action="store_true")
+    a.add_argument("--repair-of", type=int, help="explicitly approve one new queue issue as the single bounded repair of a failed delivery")
     sub.add_parser("once", help="reconcile/dispatch one poll; no daemon installation")
     sub.add_parser("serve", help="poll indefinitely (suitable for systemd)")
     sub.add_parser("status", help="print durable local task states")
@@ -463,7 +558,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         cfg = load_config(args.config)
         if args.action == "approve":
-            approve(cfg, args.issue, args.allow_mutation)
+            if args.repair_of is None:
+                approve(cfg, args.issue, args.allow_mutation)
+            else:
+                approve(cfg, args.issue, args.allow_mutation, repair_of=args.repair_of)
         elif args.action == "status":
             with database(cfg) as db:
                 deliveries = {x["queue_issue"]: x for x in delivery_store.list_deliveries(cfg["state"])}

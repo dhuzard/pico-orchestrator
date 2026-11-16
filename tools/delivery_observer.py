@@ -30,6 +30,7 @@ def publication(record, repository):
             return 'unavailable', None, None
         numbers = set()
         heads = set()
+        published_heads = set()
         waves = {w.get('id'): w for w in orchestration.get('waves', []) if isinstance(w, dict)}
         for phase in orchestration.get('phases', []):
             for check in phase.get('diff_floor_checks', []):
@@ -44,16 +45,27 @@ def publication(record, repository):
                 if not isinstance(child_id, str) or not RUN.fullmatch(child_id):
                     return 'unavailable', None, None
                 child = json.loads((path.parent / (child_id + '.json')).read_text(encoding='utf-8'))
+                if child.get('run_id') != child_id:
+                    return 'unavailable', None, None
                 meta = child.get('github_integration') or {}
                 if str(meta.get('target_repository', '')).casefold() != repository.casefold():
                     continue
+                receipt = meta.get('publication_receipt') or {}
+                receipt_head = receipt.get('commit')
+                if (receipt.get('stage') == 'pr_observed' and receipt.get('parent_run_id') == run_id
+                        and str(receipt.get('repository', '')).casefold() == repository.casefold()
+                        and isinstance(receipt_head, str) and SHA.fullmatch(receipt_head)
+                        and receipt_head in heads and type(receipt.get('pr')) is int and receipt['pr'] > 0):
+                    numbers.add(receipt['pr'])
+                    published_heads.add(receipt_head)
                 for entry in meta.get('audit', []):
                     n = entry.get('pr')
                     if entry.get('operation') in ('create_pr', 'create_draft_pr') and entry.get('status') == 'applied' and type(n) is int and n > 0:
                         numbers.add(n)
         if len(numbers) > 1:
             return 'ambiguous', None, None
-        return ('observed', numbers.pop(), next(iter(heads)) if len(heads) == 1 else None) if numbers else ('none', None, None)
+        bound = published_heads if published_heads else heads
+        return ('observed', numbers.pop(), next(iter(bound)) if len(bound) == 1 else None) if numbers else ('none', None, None)
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         return 'unavailable', None, None
 
@@ -101,6 +113,8 @@ def review_state(reviews, head):
             latest[login.casefold()] = (state, review.get('commit_id'))
     if any(state == 'CHANGES_REQUESTED' and commit == head for state, commit in latest.values()):
         return 'changes_requested'
+    if any(state == 'CHANGES_REQUESTED' and commit != head for state, commit in latest.values()):
+        return 'stale'
     if any(state == 'APPROVED' and commit == head for state, commit in latest.values()):
         return 'approved'
     if any(state in ('APPROVED', 'CHANGES_REQUESTED') and commit != head for state, commit in latest.values()):
@@ -113,6 +127,7 @@ def observe(row, record, call, expected=None):
     stamp = now()
     repo = row['repo']
     item = dict(issue=row['number'], execution_id=row['execution_id'], execution=row['state'], repository=repo,
+                run_id=(record.get('run') or {}).get('run_id'),
                 publication='unavailable', pr_number=None, pr_url=None, head_sha=None, checks='unknown',
                 review='unknown', delivery='needs_decision', reason='Publication evidence unavailable',
                 next_action='Inspect execution and publication evidence', actor='operator', observed_at=stamp,
@@ -189,6 +204,9 @@ def observe(row, record, call, expected=None):
             item.update(reason='Checks failed or a human requested changes', next_action='Inspect checks and review findings')
         elif item['checks'] == 'running':
             item.update(delivery='waiting_ci', reason='Checks are running', next_action='Wait for checks', actor='github')
+        elif item['checks'] == 'passed' and item['review'] == 'approved':
+            item.update(reason='Current human approval observed; merge eligibility is not established',
+                        next_action='Check required reviews and branch rules in GitHub before deciding to merge', actor='human')
         elif item['checks'] == 'passed' and item['review'] != 'unknown':
             item.update(delivery='needs_human_review', reason='Expected checks passed; human review needed; merge rules may be incomplete', next_action='Review the pull request', actor='human')
         else:
