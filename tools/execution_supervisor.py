@@ -162,12 +162,6 @@ def stop(pid, expected, grace=0.3):
                 return False
         return False
 
-    members = session_members(pid)
-    if members == []:
-        return anchor_dead_or_gone()
-    if members is None or not same_process(pid, expected):
-        return False
-
     def empty_after_competing_stop():
         end = time.monotonic() + 1
         while time.monotonic() < end:
@@ -178,6 +172,17 @@ def stop(pid, expected, grace=0.3):
                 return False
             time.sleep(.02)
         return False
+
+    members = session_members(pid)
+    if members == []:
+        return anchor_dead_or_gone()
+    if members is None:
+        return False
+    if not same_process(pid, expected):
+        # Another owner may have killed the anchor while its siblings are
+        # still exiting. Never signal without the anchor; briefly observe
+        # whether the whole session becomes provably stopped instead.
+        return empty_after_competing_stop()
 
     linux_pidfd = sys.platform.startswith('linux')
     if not linux_pidfd and sys.platform != 'darwin':
