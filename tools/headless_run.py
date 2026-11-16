@@ -579,6 +579,10 @@ def refresh(record: dict) -> dict:
             and (record.get("pid_start") is None or run_lease.pid_start(record.get("pid")) is None)):
         # Old records without a birth identity cannot safely authorize a signal.
         record["status"] = "launch_uncertain"
+    if record["status"] == "launched" and record.get("process_identity") is not None:
+        import execution_supervisor
+        if pid_alive(record.get("pid")) and execution_supervisor.identity(record.get("pid")) is None:
+            record["status"] = "launch_uncertain"
     if record["status"] == "launched" and record.get("supervisor_identity"):
         import execution_supervisor
         if (not execution_supervisor.same_process(record.get("supervisor_pid"), record["supervisor_identity"])

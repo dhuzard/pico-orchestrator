@@ -1074,6 +1074,14 @@ class SupervisionFaultTest(HeadlessFixture):
             self.assertEqual(hr.refresh(record)['status'], 'launch_uncertain')
             self.assertFalse(hr.execution_alive(record))
 
+    def test_supervised_live_pid_with_unavailable_birth_time_is_uncertain(self):
+        import execution_supervisor
+        record = {'status': 'launched', 'pid': 123, 'process_identity': 'proc:100',
+                  'session_dir': str(self.state), 'session_id': 'new', 'run_id': None}
+        with unittest.mock.patch.object(hr, 'pid_alive', return_value=True), \
+             unittest.mock.patch.object(execution_supervisor, 'identity', return_value=None):
+            self.assertEqual(hr.refresh(record)['status'], 'launch_uncertain')
+
     def test_global_barrier_scans_records_and_fails_closed_on_corruption(self):
         directory = self.state / 'executions' / 'other-repository'
         directory.mkdir(parents=True)
