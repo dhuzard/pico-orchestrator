@@ -239,7 +239,7 @@ def _entries(plan: dict, manifest: Path) -> dict:
 
 def run(manifest: Path, *, max_parallel: int | None = None, allow_mutation: bool = False,
         resume_interrupted: bool = False, access_check=workspace_plan.gh_access, pi_executable: str = "pi",
-        poll_seconds: float = 2.0) -> dict:
+        poll_seconds: float = 2.0, aggregate_ledger: Path | None = None) -> dict:
     plan = workspace_run._plan(manifest, access_check=access_check)
     cap = plan["max_parallel"] if max_parallel is None else max(1, min(max_parallel, plan["max_parallel"]))
     repo_of = {t["id"]: t["repository"] for t in plan["tasks"]}
@@ -305,7 +305,8 @@ def run(manifest: Path, *, max_parallel: int | None = None, allow_mutation: bool
                         owned[tid] = pool.submit(workspace_run.launch, manifest=manifest, task_id=tid,
                                                  allow_mutation=allow_mutation, resume=resume, wait=True,
                                                  access_check=None, pi_executable=pi_executable,
-                                                 budget_checked=True,  # gated above
+                                                 aggregate_ledger=aggregate_ledger,
+                                                 budget_checked=True,  # observed usage gated above; aggregate admission always runs
                                                  takeover_stale_lease=resume)
                     running.add(tid)
                     busy.add(repo_of[tid])
@@ -365,7 +366,7 @@ def budget_lines(b: dict) -> list[str]:
         line += " — exhausted, nothing new was launched"
     lines = [line]
     if b.get("incomplete"):
-        lines.append("  In-flight spend is unknown, so nothing new was launched: " + "; ".join(b.get("incomplete_reasons") or []))
+        lines.append("  Usage or pricing is incomplete, so nothing new was launched: " + "; ".join(b.get("incomplete_reasons") or []))
     lines.append("  The budget is a launch gate: children already running can still overshoot it.")
     return lines
 
@@ -431,6 +432,7 @@ def main(argv: list[str] | None = None) -> int:
                         help="relaunch interrupted children into their existing parent runs")
     parser.add_argument("--no-access-check", action="store_true")
     parser.add_argument("--json", action="store_true")
+    parser.add_argument("--aggregate-ledger", type=Path, help="durable launch-admission ledger; defaults to PICO_AGGREGATE_BUDGET_LEDGER")
     parser.add_argument("--pi", default=os.environ.get("PI_EXECUTABLE", "pi"), help=argparse.SUPPRESS)
     parser.add_argument("--poll-seconds", type=float, default=2.0, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
@@ -438,7 +440,7 @@ def main(argv: list[str] | None = None) -> int:
         result = run(args.manifest, max_parallel=args.max_parallel, allow_mutation=args.allow_mutation,
                      resume_interrupted=args.resume_interrupted,
                      access_check=None if args.no_access_check else workspace_plan.gh_access,
-                     pi_executable=args.pi, poll_seconds=args.poll_seconds)
+                     pi_executable=args.pi, poll_seconds=args.poll_seconds, aggregate_ledger=args.aggregate_ledger)
     except workspace_run.WorkspaceRunError as exc:
         print(json.dumps({"ok": False, "error_code": exc.code, "error": exc.detail}, sort_keys=True))
         return 2 if exc.code == "WORKSPACE_MANIFEST_INVALID" else 1

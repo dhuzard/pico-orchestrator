@@ -21,7 +21,7 @@ def parent(lead=None, workers=None):
 
 
 class UsageTest(unittest.TestCase):
-    def test_cache_writes_are_billed_and_cache_reads_are_not(self):
+    def test_token_work_counts_cache_writes_and_excludes_cache_reads(self):
         claude = {"invocations": 1, "input_tokens": 22, "output_tokens": 1000, "cache_write_tokens": 30000,
                   "cached_tokens": 900000, "estimated_cost_usd": 1.5}
         tokens = usage.run_tokens(parent(workers={"claude-code": claude}))
@@ -136,6 +136,57 @@ class InflightTest(unittest.TestCase):
                 self.assertEqual(ws.inflight_usage(plan, {"t1"}, cache), (["run-x"], []))
                 self.assertEqual(ws.inflight_usage(plan, {"t1"}, cache), (["run-x"], []))
             self.assertEqual(found.call_count, 1)
+
+
+class FailClosedAccountingTest(unittest.TestCase):
+    def test_linked_missing_corrupt_and_malformed_usage_is_incomplete(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runs = Path(tmp)
+            for content in (None, "{bad", "[]", "{}", '{"parent_orchestration":{}}'):
+                with self.subTest(content=content):
+                    path = runs / "run-a.json"
+                    if content is not None:
+                        path.write_text(content)
+                    result = usage.workspace_usage(runs, {"tasks": {"t": {"run_id": "run-a"}}})
+                    self.assertTrue(result["incomplete"])
+                    self.assertFalse(result["cost_complete"])
+                    self.assertIn("run-a", result["incomplete_reasons"][0])
+
+    def test_prior_attempt_missing_is_not_erased_by_current_success(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runs = Path(tmp)
+            (runs / "run-current.json").write_text(json.dumps({"parent_orchestration": parent(
+                {"input_tokens": 1, "estimated_cost_usd": 0.1})}))
+            record = {"tasks": {"t": {"run_id": "run-current", "attempts": [{"run_id": "run-old"}]}}}
+            result = usage.workspace_usage(runs, record)
+            self.assertEqual(result["spent_tokens"], 1)
+            self.assertTrue(result["incomplete"])
+            self.assertFalse(result["cost_complete"])
+
+    def test_unpriced_usage_blocks_monetary_gate_but_not_token_work_gate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runs = Path(tmp)
+            (runs / "run-a.json").write_text(json.dumps({"parent_orchestration": parent(
+                {"model": "unknown", "input_tokens": 5, "cost_complete": False})}))
+            record = {"tasks": {"t": {"run_id": "run-a"}}}
+            plan = {"workspace_id": "w", "budget": {"max_tokens": 100}}
+            self.assertFalse(ws.budget_state(plan, record, runs)["incomplete"])
+            plan["budget"]["max_cost_usd"] = 10
+            state = ws.budget_state(plan, record, runs)
+            self.assertTrue(state["incomplete"])
+            self.assertFalse(state["cost_complete"])
+            self.assertIn("missing prices", state["incomplete_reasons"][0])
+
+    def test_explicit_incomplete_flag_survives_aggregation_without_names(self):
+        self.assertFalse(usage.sum_tokens([{"cost_complete": False, "estimated_cost_usd": 1}])["cost_complete"])
+
+    def test_cache_read_only_cost_counts_money_not_token_work(self):
+        result = usage.run_tokens(parent({"cached_tokens": 10000, "estimated_cost_usd": 0.25}))
+        self.assertEqual(usage.spent(result), 0)
+        self.assertEqual(result["estimated_cost_usd"], 0.25)
+        self.assertTrue(result["cost_complete"])
+        for value in (float("inf"), float("nan")):
+            self.assertFalse(usage.run_tokens(parent({"input_tokens": 1, "estimated_cost_usd": value}))["cost_complete"])
 
 
 if __name__ == "__main__":

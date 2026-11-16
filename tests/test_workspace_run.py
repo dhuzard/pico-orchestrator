@@ -576,7 +576,8 @@ class WorkspaceRunTest(WorkspaceRunFixture):
             self.launch(manifest, "a1")
         self.assertEqual(ctx.exception.code, "WORKSPACE_BUDGET_UNKNOWN")
         self.assertIn(str(broken), ctx.exception.detail)
-        self.assertIn("repair or delete", ctx.exception.detail)
+        self.assertIn("Restore missing accounting evidence", ctx.exception.detail)
+        self.assertNotIn("delete", ctx.exception.detail)
         self.assertEqual(self.launch(manifest, "a1", ignore_budget=True)["task"]["run_status"], "PARTIAL")
 
     def test_garden_budget_matches_the_direct_launch_gate(self):
@@ -795,6 +796,43 @@ class WorkspaceTimeLimitTest(WorkspaceRunFixture):
             self.assertEqual(again["task"]["outcome"], "already_finished")
             self.assertEqual(again["task"]["stop_reason"], "EXECUTION_TIME_LIMIT")
             self.assertEqual(again["task"]["launches"], 1)
+
+
+class AggregateBudgetTest(WorkspaceRunFixture):
+    def test_launch_boundary_enforces_aggregate_and_noop_does_not_charge(self):
+        import budget_ledger
+        ledger = self.base / "ledger.json"
+        budget_ledger.initialize(ledger, {"lifetime": {"launches": 1}})
+        manifest = self.manifest()
+        first = self.launch(manifest, "a1", aggregate_ledger=ledger)
+        self.assertEqual(first["task"]["run_status"], "PARTIAL")
+        self.assertEqual(self.launch(manifest, "a1", aggregate_ledger=ledger)["task"]["outcome"], "already_finished")
+        with self.assertRaisesRegex(wr.WorkspaceRunError, "AGGREGATE_BUDGET_EXHAUSTED"):
+            self.launch(manifest, "b1", aggregate_ledger=ledger, ignore_budget=True, budget_checked=True)
+        self.assertEqual(len(budget_ledger.inspect(ledger)["reservations"]), 1)
+
+    def test_environment_selects_ledger_and_provider_cap_refuses_before_spawn(self):
+        import budget_ledger
+        ledger = self.base / "ledger.json"
+        budget_ledger.initialize(ledger, {"lifetime": {"cost_usd": 5}})
+        os.environ[budget_ledger.ENV] = str(ledger)
+        with self.assertRaisesRegex(wr.WorkspaceRunError, "AGGREGATE_BUDGET_UNSUPPORTED"):
+            self.launch(self.manifest(), "a1")
+        self.assertFalse(budget_ledger.inspect(ledger)["reservations"])
+        self.assertFalse(list(self.state.rglob("*.log")))
+
+    def test_crashed_execution_resume_spends_another_aggregate_slot(self):
+        import budget_ledger
+        ledger = self.base / "ledger.json"
+        budget_ledger.initialize(ledger, {"attempt": {"launches": 1}})
+        manifest = self.manifest()
+        os.environ["FAKE_PI_BEHAVIOR"] = "crash"
+        first = self.launch(manifest, "a1", aggregate_ledger=ledger)
+        self.assertEqual(first["task"]["execution_status"], "interrupted")
+        os.environ["FAKE_PI_BEHAVIOR"] = "finish"
+        with self.assertRaisesRegex(wr.WorkspaceRunError, "AGGREGATE_BUDGET_EXHAUSTED"):
+            self.launch(manifest, "a1", aggregate_ledger=ledger, resume=True, takeover_stale_lease=True)
+        self.assertEqual(len(budget_ledger.inspect(ledger)["reservations"]), 1)
 
 
 if __name__ == "__main__":

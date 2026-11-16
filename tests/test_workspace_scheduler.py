@@ -396,5 +396,20 @@ class SchedulerEnforcesTimeLimitTest(SchedulerFixture):
             pass
 
 
+class AggregateSchedulerTest(SchedulerFixture):
+    def test_parallel_scheduled_launches_cannot_overbook_aggregate_limit(self):
+        import budget_ledger
+        ledger = self.base / "ledger.json"
+        budget_ledger.initialize(ledger, {"lifetime": {"launches": 1}})
+        os.environ["FAKE_PI_BEHAVIOR"] = "finish"
+        tasks = [{"id": f"{name}1", "repository": name, "title": name} for name in NAMES]
+        result = self.schedule(self.manifest(tasks), aggregate_ledger=ledger)
+        refused = [row for row in result["tasks"] if row["state"] == "refused"]
+        self.assertEqual(len(refused), 3)
+        self.assertTrue(all(row["refusal"]["code"] == "AGGREGATE_BUDGET_EXHAUSTED" for row in refused))
+        self.assertEqual(len(budget_ledger.inspect(ledger)["reservations"]), 1)
+        self.assertEqual(sum(bool(row["run_id"]) for row in result["tasks"]), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

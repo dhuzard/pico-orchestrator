@@ -3061,9 +3061,13 @@ running child.
 An optional manifest `budget` (`max_tokens` and/or `max_cost_usd`) limits
 spend across the workspace's child runs. `tools/usage.py` (shared by the
 Garden and the scheduler) sums each linked child run's recorded
-`parent_orchestration.context`: input plus output tokens of the lead and every
-worker backend, and the backend-reported `estimated_cost_usd`, which only
-Claude workers report today (so the cost limit is a lower bound). The
+`parent_orchestration.context`: input plus output plus cache-write tokens of
+the lead and every worker backend, and reported `estimated_cost_usd`. Cache
+reads are excluded from this token-work metric, but their reported monetary
+charges remain in cost. Missing/corrupt linked telemetry, including prior
+attempts, blocks admission. A monetary gate also blocks when any participant
+has missing prices or explicitly incomplete cost; a partial cost is only a
+lower bound. This is observed usage, not a provider billing verification. The
 scheduler recomputes spend before every launch; once either limit is reached
 it launches nothing new and reports those tasks as `held_by_budget` (amber; the
 session records them and the run exits 1). Running children are not stopped
@@ -3086,6 +3090,13 @@ internal `budget_checked=True`, which skips the check and records nothing
 (`ignore_budget` is reserved for explicit user overrides).
 The spend computation is `workspace_run.budget_state`
 (`workspace_scheduler.budget_state` remains as an alias).
+
+For atomic admission counts across retries, resumed executions, workspaces and
+process restarts, see [aggregate budget accounting](aggregate-budget-accounting.md).
+That opt-in ledger enforces launch counts at the launch boundary; configured
+provider request/token/dollar ceilings refuse there until a provider adapter
+can enforce them. It is separate from the observed-usage gate above, and
+`--ignore-budget` does not bypass its limits.
 
 **Committing a policy change.** The Garden's `commit_policy` action commits
 only `.pi/autonomy.yaml` (`git commit --only`), with the repository's own Git
