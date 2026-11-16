@@ -859,6 +859,10 @@ def _launch_locked(path: Path, *, worktree: Path, identity: str, common: Path, e
         claim_run_lease(record["run_id"], owner, takeover=takeover)
     env[LEASE_OWNER_ENV] = owner
     record["lease_owner"] = owner
+    if continuing and record.get('stop_reason') == LEAD_LIMIT_CODE:
+        # An explicitly authorized raised call limit supersedes only that
+        # suspension reason. Keep the original deadline and its history intact.
+        record.pop('stop_reason', None)
     # The original deadline is an execution-wide authorization, never a per-resume allowance.
     if not resume and max_duration_seconds is not None:
         record.update(max_duration_seconds=max_duration_seconds, deadline_epoch=clock() + max_duration_seconds)
