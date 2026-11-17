@@ -30,7 +30,7 @@ def test_benchmark_selector_fails_closed():
 
 
 def report(tokens=100, verified=True, complete=True):
-    return {"selector_observed": True, "elapsed_seconds": 2, "launch": {"exit_code": 0},
+    return {"selector_observed": True, "config_snapshots_unchanged": True, "elapsed_seconds": 2, "launch": {"exit_code": 0},
             "validation": [{"task": "pilot", "validation": "VALIDATED", "exit_code": 0}],
             "metrics": {"runs": [{"tokens": {"lead": {"model": "m"}}}],
                         "totals": {"tasks": {"runs": 1, "completed": 1, "verified": int(verified)},
@@ -133,3 +133,49 @@ def test_effort_observation_is_independent_of_other_metrics():
     evidence = {"provider_ledger": {"lead_effort_observations": [{"source": "gateway-request", "value": "high"}]}}
     assert analysis.effort_observation(evidence, "high")["status"] == "matches_configured"
     assert analysis.effort_observation(evidence, "low")["status"] == "differs_from_configured"
+
+
+def test_private_snapshots_and_runtime_fingerprint(tmp_path, monkeypatch):
+    spec = importlib.util.spec_from_file_location("efficiency_runner", ROOT / "benchmarks/efficiency/run.py")
+    runner = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(runner)
+    config = tmp_path / "config"
+    config.mkdir(mode=0o700)
+    snapshot, expected = runner.snapshot_config(config, "provider.json", b'{"a": 1}')
+    assert snapshot.stat().st_mode & 0o777 == 0o600
+    assert runner.digest(snapshot) == expected
+    snapshot.write_bytes(b'{"a": 2}')
+    assert runner.digest(snapshot) != expected
+    pi = tmp_path / "pi"
+    node = tmp_path / "node"
+    extension = tmp_path / "extension.ts"
+    for path in (pi, node, extension):
+        path.write_text(path.name)
+    monkeypatch.setattr(runner.shutil, "which", lambda name: str(node))
+    monkeypatch.setattr(runner.subprocess, "run", lambda *a, **kw: type("Result", (), {"stdout": "1.2.3\n"})())
+    before = runner.runtime_fingerprint(str(pi), {"extensions": [str(extension)]})
+    extension.write_text("changed")
+    after = runner.runtime_fingerprint(str(pi), {"extensions": [str(extension)]})
+    assert before["pi_target_sha256"] == after["pi_target_sha256"]
+    assert before["configured_extensions_sha256"] != after["configured_extensions_sha256"]
+
+
+def test_analysis_excludes_changed_snapshots_and_mismatched_runtime(tmp_path):
+    fixed = {k: "pin" for k in analysis.FIXED}
+    fixed.update(lead_model="m", lead_effort="high", task_id="pilot", provider_caps={"tokens": 1000},
+                 runtime_fingerprint={"pi_version": "1"})
+    for variant in ("baseline", "candidate"):
+        payload = report()
+        payload["provenance"] = {**fixed, "variant": variant, "pair": "one"}
+        if variant == "candidate":
+            payload["config_snapshots_unchanged"] = False
+        (tmp_path / (variant + ".json")).write_text(json.dumps(payload))
+    manifest = {"version": 1, "samples": [{"id": "one", "baseline": {"report": "baseline.json"},
+                                             "candidate": {"report": "candidate.json"}}]}
+    result = analysis.analyze(manifest, tmp_path)
+    assert result["summary"]["lead_calls"]["mean_delta"] is None
+    candidate = json.loads((tmp_path / "candidate.json").read_text())
+    candidate["provenance"]["runtime_fingerprint"] = {"pi_version": "2"}
+    (tmp_path / "candidate.json").write_text(json.dumps(candidate))
+    with pytest.raises(analysis.Invalid, match="runtime_fingerprint"):
+        analysis.analyze(manifest, tmp_path)

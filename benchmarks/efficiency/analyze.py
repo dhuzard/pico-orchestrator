@@ -13,7 +13,7 @@ from pathlib import Path
 # These fields describe fixed inputs, not assertions inferred from outcomes.
 FIXED = ("revision", "task_sha256", "base_commit", "routing_policy_sha256",
          "autonomy_policy_sha256", "model_config_sha256", "lead_model", "lead_effort",
-         "worker_model_config_sha256", "provider_config_sha256", "acceptance_sha256", "task_id", "provider_caps", "lead_call_limit", "duration_limit_seconds", "workspace_token_gate", "ledger_path")
+         "worker_model_config_sha256", "provider_config_sha256", "runtime_fingerprint", "acceptance_sha256", "task_id", "provider_caps", "lead_call_limit", "duration_limit_seconds", "workspace_token_gate", "ledger_path")
 VARIANTS = {"baseline", "candidate"}
 
 
@@ -117,6 +117,7 @@ def metric(report, task_id, lead_effort):
                 "tokens_by_participant": totals.get("tokens"),
                 "elapsed_seconds": elapsed if number(elapsed) else None,
                 "selector_observed": report.get("selector_observed") is True,
+                "config_snapshots_unchanged": report.get("config_snapshots_unchanged") is True,
                 "observed_lead_models": sorted({r["tokens"]["lead"].get("model") for r in runs
                                                if r["tokens"]["lead"].get("model")}),
                 "unpriced": cost.get("unpriced"), "runs": runs}
@@ -154,7 +155,7 @@ def analyze(manifest, directory):
         models = {v: arms[v]["metrics"]["observed_lead_models"] for v in VARIANTS}
         expected = arms["baseline"]["provenance"]["lead_model"]
         model_observed = all(models[v] == [expected] for v in VARIANTS)
-        valid = model_observed and all(arms[v]["metrics"]["verified"] and arms[v]["metrics"]["selector_observed"] for v in VARIANTS)
+        valid = model_observed and all(arms[v]["metrics"]["verified"] and arms[v]["metrics"]["selector_observed"] and arms[v]["metrics"]["config_snapshots_unchanged"] for v in VARIANTS)
         deltas = {}
         for name in ("tokens", "model_reported_estimated_cost_usd", "provider_contract_cost_ceiling_usd", "lead_calls", "elapsed_seconds"):
             if name == "provider_contract_cost_ceiling_usd":

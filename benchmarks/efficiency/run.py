@@ -5,6 +5,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -30,6 +31,37 @@ real = module("real_benchmark", HERE.parent / "synthetic-workspace/run_real.py")
 
 def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+
+def snapshot_config(directory, name, data):
+    """Write pre-read configuration bytes privately; never reread their original path."""
+    path = directory / name
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "wb") as stream:
+        stream.write(data)
+    return path, hashlib.sha256(data).hexdigest()
+
+
+def runtime_fingerprint(pi, config):
+    node = shutil.which("node")
+    if not node:
+        raise real.Refused("node is unavailable; runtime cannot be fingerprinted")
+    extensions = config.get("extensions")
+    if not isinstance(extensions, list) or any(not isinstance(p, str) or not Path(p).is_absolute() for p in extensions):
+        raise real.Refused("provider extension paths must be an explicit list of absolute paths")
+    def version(executable):
+        result = subprocess.run([executable, "--version"], capture_output=True, text=True, check=True, timeout=15)
+        value = result.stdout.strip()
+        if not value or len(value) > 500:
+            raise real.Refused("runtime returned an invalid version")
+        return value
+    return {"pi_version": version(pi), "node_version": version(node),
+            "pi_target_sha256": digest(Path(pi).resolve(strict=True)),
+            "node_target_sha256": digest(Path(node).resolve(strict=True)),
+            "host_platform": platform.platform(),
+            "configured_extensions_sha256": {p: digest(p) for p in sorted(extensions)},
+            "provider_package_lock_sha256": digest(ROOT / "package-lock.json")}
 
 
 def main():
@@ -60,22 +92,27 @@ def main():
         config, ledger = (os.environ.get(k, "") for k in ("PICO_PROVIDER_BUDGET_CONFIG", "PICO_AGGREGATE_BUDGET_LEDGER"))
         if not config or not ledger or not Path(config).is_absolute() or not Path(ledger).is_absolute():
             raise real.Refused("absolute provider config and aggregate ledger paths are required")
-        cfg = json.loads(Path(config).read_text())
+        provider_bytes = Path(config).read_bytes()
+        model_bytes = args.model_config.read_bytes()
+        cfg = json.loads(provider_bytes)
         limits = budget_ledger.inspect(ledger)["limits"]
         for scope in ("lifetime", "attempt"):
             if not {"tokens", "cost_usd"}.issubset(limits.get(scope, {})):
                 raise real.Refused(f"ledger requires {scope} token and dollar limits")
         if cfg.get("lead_model") != args.lead_model:
             raise real.Refused("lead model does not match provider configuration")
-        if not args.model_config.is_file():
-            raise real.Refused("explicit model configuration file required")
         pico, pi = shutil.which(args.pico), shutil.which("pi")
         if not pico or not pi:
             raise real.Refused("pico and pi must be available", code=3)
+        fingerprint = runtime_fingerprint(pi, cfg)
         out = args.output.expanduser().resolve()
         if out.exists() and any(out.iterdir()):
             raise real.Refused("use a fresh output directory for each arm; resume is not supported")
         out.mkdir(parents=True, exist_ok=True)
+        snapshots = out / "config"
+        snapshots.mkdir(mode=0o700)
+        provider_snapshot, provider_hash = snapshot_config(snapshots, "provider.json", provider_bytes)
+        model_snapshot, model_hash = snapshot_config(snapshots, "models.yaml", model_bytes)
         state = out / "state"
         state.mkdir()
         fixture = setup.create(out / "work", args.max_tokens, args.max_lead_calls, args.duration,
@@ -84,7 +121,8 @@ def main():
         env.update(PICO_BENCHMARK_VARIANT=args.variant, PICO_BENCHMARK_PAIR=args.pair,
                    PICO_BENCHMARK_REVISION=args.revision, PICO_BENCHMARK_LEAD_MODEL=args.lead_model,
                    PICO_BENCHMARK_LEAD_EFFORT=args.lead_effort,
-                   PI_ORCHESTRATOR_MODEL_CONFIG=str(args.model_config.resolve()))
+                   PI_ORCHESTRATOR_MODEL_CONFIG=str(model_snapshot),
+                   PICO_PROVIDER_BUDGET_CONFIG=str(provider_snapshot))
         started = real.now()
         start = time.monotonic()
         launch = real.execute([pico, "workspace", "schedule", fixture["manifest"], "--no-access-check", "--allow-mutation", "--json"], env, "launch")
@@ -98,8 +136,8 @@ def main():
                       "task_id": "one-line", "task_sha256": fixture["task_sha256"], "base_commit": fixture["base_commit"],
                       "acceptance_sha256": fixture["acceptance_sha256"], "autonomy_policy_sha256": fixture["autonomy_policy_sha256"],
                       "routing_policy_sha256": digest(ROOT / "routing/default-policy.yaml"),
-                      "model_config_sha256": digest(args.model_config), "worker_model_config_sha256": digest(args.model_config),
-                      "provider_config_sha256": digest(config), "lead_model": args.lead_model, "lead_effort": args.lead_effort,
+                      "model_config_sha256": model_hash, "worker_model_config_sha256": model_hash,
+                      "provider_config_sha256": provider_hash, "runtime_fingerprint": fingerprint, "lead_model": args.lead_model, "lead_effort": args.lead_effort,
                       "provider_caps": limits, "lead_call_limit": args.max_lead_calls, "duration_limit_seconds": args.duration,
                       "workspace_token_gate": args.max_tokens, "ledger_path": str(Path(ledger).resolve()),
                       "pi_path": pi, "pico_path": pico, "access_check": False, "publication": False}
@@ -122,7 +160,8 @@ def main():
                              "actual": item.get("actual")}
                             for item in ledger_after["reservations"].values()
                             if item.get("attempt_id") in execution_ids]
-        report = {"version": 1, "selector_observed": observed, "provenance": provenance, "started_at": started, "finished_at": real.now(),
+        snapshots_unchanged = digest(provider_snapshot) == provider_hash and digest(model_snapshot) == model_hash
+        report = {"version": 1, "selector_observed": observed, "config_snapshots_unchanged": snapshots_unchanged, "provenance": provenance, "started_at": started, "finished_at": real.now(),
                   "provider_ledger": {"entries": provider_entries,
                                       "all_entries_settled": bool(provider_entries) and all(e["state"] == "settled" for e in provider_entries)},
                   "elapsed_seconds": round(elapsed, 3), "launch": {"exit_code": launch["exit_code"], **launch["output"]},
