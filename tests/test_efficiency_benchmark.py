@@ -110,3 +110,26 @@ def test_real_runner_refuses_without_opt_in_and_creates_nothing(tmp_path):
     assert result.returncode == 2
     assert "PICO_REAL_BENCHMARK=1" in result.stderr
     assert not output.exists()
+
+
+def test_provider_cost_ceiling_excludes_launches_and_requires_settled_requests():
+    settled_launch = {"state": "settled", "reserved": {"requests": 0}, "actual": {"requests": 0, "cost_usd": "99"}}
+    settled_request = {"state": "settled", "reserved": {"requests": 1}, "actual": {"requests": 1, "cost_usd": "0.01234"}}
+    unresolved = {"state": "uncertain", "reserved": {"requests": 1}, "actual": None}
+    assert analysis.provider_contract_cost_ceiling({"entries": [settled_launch]})["ceiling_usd"] is None
+    priced = analysis.provider_contract_cost_ceiling({"entries": [settled_launch, settled_request]})
+    assert priced["coverage"] == "complete_observed_requests"
+    assert priced["ceiling_usd"] == .01234
+    incomplete = analysis.provider_contract_cost_ceiling({"entries": [settled_launch, settled_request, unresolved]})
+    assert incomplete["coverage"] == "incomplete"
+    assert incomplete["ceiling_usd"] is None
+    assert incomplete["unsettled_requests"] == 1
+    malformed = analysis.provider_contract_cost_ceiling({"entries": [settled_request, {"reserved": {}}]})
+    assert malformed["ceiling_usd"] is None
+
+
+def test_effort_observation_is_independent_of_other_metrics():
+    assert analysis.effort_observation({}, "high")["status"] == "unobserved"
+    evidence = {"provider_ledger": {"lead_effort_observations": [{"source": "gateway-request", "value": "high"}]}}
+    assert analysis.effort_observation(evidence, "high")["status"] == "matches_configured"
+    assert analysis.effort_observation(evidence, "low")["status"] == "differs_from_configured"

@@ -124,7 +124,7 @@ def main():
                             if item.get("attempt_id") in execution_ids]
         report = {"version": 1, "selector_observed": observed, "provenance": provenance, "started_at": started, "finished_at": real.now(),
                   "provider_ledger": {"entries": provider_entries,
-                                      "all_settled": bool(provider_entries) and all(e["state"] == "settled" for e in provider_entries)},
+                                      "all_entries_settled": bool(provider_entries) and all(e["state"] == "settled" for e in provider_entries)},
                   "elapsed_seconds": round(elapsed, 3), "launch": {"exit_code": launch["exit_code"], **launch["output"]},
                   "validation": validation, "metrics": metrics, "fixture": fixture}
         (out / "report.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")

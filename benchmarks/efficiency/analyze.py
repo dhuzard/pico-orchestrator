@@ -7,6 +7,7 @@ import json
 import math
 import statistics
 import sys
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 # These fields describe fixed inputs, not assertions inferred from outcomes.
@@ -34,7 +35,61 @@ def number(value):
     return type(value) in (int, float) and math.isfinite(value) and value >= 0
 
 
-def metric(report, task_id):
+
+def provider_contract_cost_ceiling(ledger):
+    """Sum settled request charges from this execution's ledger, never launch-only records.
+
+    This is a conservative rate-card ceiling for measured tokens, not a provider invoice. Empty, malformed, or
+    unsettled request observations do not establish complete coverage.
+    """
+    if not isinstance(ledger, dict) or not isinstance(ledger.get("entries"), list):
+        return {"ceiling_usd": None, "coverage": "unobserved", "request_entries": 0, "unsettled_requests": 0}
+    requests, unsettled, invalid = 0, 0, False
+    total = Decimal(0)
+    for entry in ledger["entries"]:
+        if not isinstance(entry, dict) or not isinstance(entry.get("reserved"), dict):
+            invalid = True
+            continue
+        count = entry["reserved"].get("requests")
+        if type(count) is not int or count < 0:
+            invalid = True
+            continue
+        if count == 0:
+            continue
+        requests += 1
+        if entry.get("state") != "settled":
+            unsettled += 1
+            continue
+        actual = entry.get("actual")
+        try:
+            if not isinstance(actual, dict) or type(actual.get("requests")) is not int or actual["requests"] != count:
+                raise ValueError("invalid request count")
+            amount = Decimal(str(actual["cost_usd"]))
+            if not amount.is_finite() or amount < 0:
+                raise ValueError("invalid cost")
+            total += amount
+        except (KeyError, ValueError, InvalidOperation):
+            invalid = True
+    complete = requests > 0 and unsettled == 0 and not invalid
+    return {"ceiling_usd": float(total) if complete else None,
+            "coverage": "complete_observed_requests" if complete else ("unobserved" if not requests and not invalid else "incomplete"),
+            "request_entries": requests, "unsettled_requests": unsettled}
+
+
+def effort_observation(report, expected):
+    """Only an explicit gateway observation counts; a configured flag is not evidence."""
+    ledger = report.get("provider_ledger") or {}
+    evidence = ledger.get("lead_effort_observations") if isinstance(ledger, dict) else None
+    if not isinstance(evidence, list) or not evidence:
+        return {"status": "unobserved", "values": []}
+    if any(not isinstance(item, dict) or not isinstance(item.get("value"), str)
+           or not isinstance(item.get("source"), str) or not item["source"] for item in evidence):
+        return {"status": "unobserved", "values": []}
+    values = sorted({item["value"] for item in evidence})
+    return {"status": "matches_configured" if values == [expected] else "differs_from_configured", "values": values}
+
+
+def metric(report, task_id, lead_effort):
     """Keep incomplete quantities unknown, not zero or apparently exact."""
     try:
         totals = report["metrics"]["totals"]
@@ -52,7 +107,11 @@ def metric(report, task_id):
         calls = totals["calls"].get("lead")
         elapsed = report.get("elapsed_seconds")
         return {"verified": valid, "tokens": tokens if number(tokens) else None,
-                "cost_usd": usd if number(usd) else None,
+                "model_reported_estimated_cost_usd": usd if number(usd) else None,
+                "model_reported_cost_coverage": {"complete": cost.get("cost_complete") is True and not cost.get("unpriced"),
+                                                 "unpriced": cost.get("unpriced")},
+                "provider_contract_cost_ceiling": provider_contract_cost_ceiling(report.get("provider_ledger")),
+                "lead_effort_observation": effort_observation(report, lead_effort),
                 "lead_calls": calls if number(calls) else None,
                 "worker_calls": totals["calls"].get("workers"),
                 "tokens_by_participant": totals.get("tokens"),
@@ -88,7 +147,7 @@ def analyze(manifest, directory):
             if p.get("variant") != variant or p.get("pair") != sample["id"]:
                 raise Invalid(f"{sample['id']}: variant provenance mismatch")
             arms[variant] = {"provenance": p, "report": str(arm["report"]),
-                             "metrics": metric(report, p["task_id"])}
+                             "metrics": metric(report, p["task_id"], p["lead_effort"])}
         differences = [k for k in FIXED if arms["baseline"]["provenance"][k] != arms["candidate"]["provenance"][k]]
         if differences:
             raise Invalid(f"{sample['id']}: unmatched fixed inputs: {', '.join(differences)}")
@@ -97,19 +156,22 @@ def analyze(manifest, directory):
         model_observed = all(models[v] == [expected] for v in VARIANTS)
         valid = model_observed and all(arms[v]["metrics"]["verified"] and arms[v]["metrics"]["selector_observed"] for v in VARIANTS)
         deltas = {}
-        for name in ("tokens", "cost_usd", "lead_calls", "elapsed_seconds"):
-            b, c = (arms[v]["metrics"][name] for v in ("baseline", "candidate"))
+        for name in ("tokens", "model_reported_estimated_cost_usd", "provider_contract_cost_ceiling_usd", "lead_calls", "elapsed_seconds"):
+            if name == "provider_contract_cost_ceiling_usd":
+                b, c = (arms[v]["metrics"]["provider_contract_cost_ceiling"]["ceiling_usd"] for v in ("baseline", "candidate"))
+            else:
+                b, c = (arms[v]["metrics"][name] for v in ("baseline", "candidate"))
             deltas[name] = c - b if valid and number(b) and number(c) else None
         paired.append({"id": sample["id"], "arms": arms, "model_pin_observed": model_observed,
                        "both_verified": valid, "candidate_minus_baseline": deltas})
     summary = {}
-    for name in ("tokens", "cost_usd", "lead_calls", "elapsed_seconds"):
+    for name in ("tokens", "model_reported_estimated_cost_usd", "provider_contract_cost_ceiling_usd", "lead_calls", "elapsed_seconds"):
         values = [p["candidate_minus_baseline"][name] for p in paired if p["candidate_minus_baseline"][name] is not None]
         summary[name] = {"paired_observations": len(values), "mean_delta": statistics.mean(values) if values else None,
                          "sample_stddev": statistics.stdev(values) if len(values) > 1 else None,
                          "min_delta": min(values) if values else None, "max_delta": max(values) if values else None}
     return {"version": 1, "samples": paired, "summary": summary,
-            "interpretation": "Descriptive paired deltas only; a single sample cannot quantify variability. Missing, failed or unverified observations are excluded, not zero. Configured pins do not prove worker model or effort was observed."}
+            "interpretation": "Descriptive paired deltas only; a single sample cannot quantify variability. Missing, failed or unverified observations are excluded, not zero. Configured pins do not prove worker model or effort was observed. Provider contract cost ceiling uses conservative rates for settled observed requests, not an invoice or proof that every backend was intercepted."}
 
 
 def main():
