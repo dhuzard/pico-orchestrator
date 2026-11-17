@@ -360,6 +360,18 @@ def settle_confirmed_deadline(record, stopped):
     return True
 
 
+def release_watchdog(watcher, watch_write, stopped):
+    """Release the watchdog after a confirmed stop ('D'), or hand it the stop (EOF), and reap it."""
+    try:
+        if stopped:
+            os.write(watch_write, b'D')
+    except BrokenPipeError:
+        pass
+    finally:
+        os.close(watch_write)
+    watcher.wait()
+
+
 def supervise(config):
     path = Path(config['path'])
     if sys.platform.startswith('linux'):
@@ -454,14 +466,20 @@ def supervise(config):
         stopped = stop(child.pid, token)
         if stopped:
             child.wait()
-            try:
-                os.write(watch_write, b'D')
-            except BrokenPipeError:
-                pass
-        else:
-            os.close(watch_write)
-            watch_write = -1
-        watcher.wait()
+        # After a confirmed stop that the watchdog cannot have caused, publish the terminal
+        # record while the watchdog is still alive and only then release it. Releasing it
+        # first would let a concurrent observer read the departed watchdog as WATCHDOG_LOST
+        # and persist a spurious launch_uncertain for a run that ended normally. The guard
+        # fires only once monotonic() >= deadline, so a deadline not yet reached here means
+        # the workload ended on its own. Otherwise the guard may already be settling the
+        # time limit: release (or, unconfirmed, abandon) it and let it settle first. A run
+        # ending within one guard poll after its deadline may still see the guard accept
+        # 'D' and exit before publication; observers then read it as uncertain, fail-closed.
+        deadline = config.get('monotonic_deadline')
+        publish_first = stopped and (deadline is None or time.monotonic() < deadline)
+        if not publish_first:
+            fd, watch_write = watch_write, -1  # the helper owns the close from here
+            release_watchdog(watcher, fd, stopped)
         with hr.locked_record(path):
             record = hr.load_record(path)
             if record:
@@ -476,6 +494,9 @@ def supervise(config):
                         else:
                             record.update(status='launch_uncertain', stop_reason='TERMINATION_UNCONFIRMED')
                 hr.save_record(path, record)
+        if publish_first:
+            fd, watch_write = watch_write, -1
+            release_watchdog(watcher, fd, True)
         return workload_exit or 0
     except BaseException as exc:
         stopped = child is None

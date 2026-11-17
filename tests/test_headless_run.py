@@ -1338,6 +1338,100 @@ os.kill(info['leader'], signal.SIGTERM)
         self.assertFalse(supervisor.settle_confirmed_deadline(other, True))
         self.assertEqual(other, {'status': 'launch_uncertain', 'stop_reason': 'SUPERVISOR_LOST'})
 
+    def test_normal_exit_is_published_before_the_watchdog_is_released(self):
+        """An observer that refreshes once the released watchdog is gone must see the terminal record.
+
+        Releasing the watchdog before publishing left a window in which a concurrent
+        status refresh read the departed watchdog as lost and persisted launch_uncertain
+        for a workload that exited normally (seen as needs_reconciliation by the scheduler).
+        """
+        import execution_supervisor as supervisor
+        self.state.mkdir(parents=True, exist_ok=True)
+        path = self.state / 'executions' / 'release-order' / 'record.json'
+        at_release = self.state / 'record-at-watchdog-release.json'
+        now = time.time()
+        hr.save_record(path, {'record_version': hr.RECORD_VERSION, 'status': 'launching', 'launches': 0,
+                              'session_dir': str(self.state), 'session_id': 'release-order', 'run_id': None,
+                              'max_duration_seconds': 60, 'deadline_epoch': now + 60, 'deadline_at': hr._iso(now + 60)})
+        # Stand-in guard: on release ('D') it snapshots the record exactly as the
+        # supervisor left it at that instant, then exits like the real guard.
+        fake_guard = """import json, os, sys
+sys.path.insert(0, sys.argv[1])
+import headless_run as hr
+from pathlib import Path
+fd, ready, path, out = int(sys.argv[2]), int(sys.argv[3]), Path(sys.argv[4]), sys.argv[5]
+os.write(ready, b'R')
+os.close(ready)
+if os.read(fd, 1) == b'D':
+    with hr.locked_record(path):
+        snapshot = hr.load_record(path)
+    with open(out + '.tmp', 'w') as dst:
+        json.dump(snapshot, dst)
+    os.replace(out + '.tmp', out)
+"""
+        original_popen = subprocess.Popen
+        guards = []
+        def launch(argv, *args, **kwargs):
+            if isinstance(argv, list) and len(argv) > 2 and argv[1] == str(REPO_ROOT / 'tools' / 'execution_supervisor.py') and argv[2] == 'guard':
+                argv = [sys.executable, '-c', fake_guard, str(REPO_ROOT / 'tools'), argv[3], argv[4], str(path), str(at_release)]
+                guards.append(original_popen(argv, *args, **kwargs))
+                return guards[-1]
+            return original_popen(argv, *args, **kwargs)
+        config = {'path': str(path), 'log_path': str(self.state / 'release-order.log'), 'cwd': str(self.target),
+                  'argv': [sys.executable, '-c', 'pass'], 'continuing': False,
+                  'monotonic_deadline': time.monotonic() + 60}
+        with unittest.mock.patch.object(supervisor.subprocess, 'Popen', side_effect=launch):
+            self.assertEqual(supervisor.supervise(config), 0)
+        self.assertEqual(len(guards), 1)
+        self.assertIsNotNone(guards[0].poll(), 'the released watchdog has exited')
+        self.assertTrue(at_release.exists(), 'the watchdog was released with D, not abandoned')
+        released = json.loads(at_release.read_text())
+        self.assertEqual((released['status'], released['pid'], released['exit_code']), ('exited', None, 0))
+        # The observer's view in that window: the watchdog is gone and the supervisor
+        # (this process) is alive. The published terminal record must stand.
+        observed = hr.refresh(dict(released))
+        self.assertEqual((observed['status'], observed.get('stop_reason')), ('exited', None))
+        self.assertEqual(hr.load_record(path)['status'], 'exited')
+
+    def test_deadline_stop_is_settled_by_the_watchdog_before_publication(self):
+        """A workload ended by the watchdog's deadline stays a time limit, even when the supervisor reaches the lock first."""
+        import execution_supervisor as supervisor
+        self.state.mkdir(parents=True, exist_ok=True)
+        path = self.state / 'executions' / 'deadline-order' / 'record.json'
+        now = time.time()
+        hr.save_record(path, {'record_version': hr.RECORD_VERSION, 'status': 'launching', 'launches': 0,
+                              'session_dir': str(self.state), 'session_id': 'deadline-order', 'run_id': None,
+                              'max_duration_seconds': 1, 'deadline_epoch': now + 1, 'deadline_at': hr._iso(now + 1)})
+        # The real guard, slowed between stopping the session and taking the record lock:
+        # the supervisor then observes the workload's exit and confirms the stop first.
+        slow_guard = """import sys, time
+sys.path.insert(0, sys.argv[1])
+import execution_supervisor as s
+from pathlib import Path
+real_stop = s.stop
+def stop(*args, **kwargs):
+    stopped = real_stop(*args, **kwargs)
+    time.sleep(.5)
+    return stopped
+s.stop = stop
+sys.exit(s.guard(int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), sys.argv[5],
+                 float(sys.argv[6]) if sys.argv[6] else None, Path(sys.argv[7])))
+"""
+        original_popen = subprocess.Popen
+        def launch(argv, *args, **kwargs):
+            if isinstance(argv, list) and len(argv) > 2 and argv[1] == str(REPO_ROOT / 'tools' / 'execution_supervisor.py') and argv[2] == 'guard':
+                argv = [sys.executable, '-c', slow_guard, str(REPO_ROOT / 'tools'), *argv[3:]]
+            return original_popen(argv, *args, **kwargs)
+        config = {'path': str(path), 'log_path': str(self.state / 'deadline-order.log'), 'cwd': str(self.target),
+                  'argv': [sys.executable, '-c', 'import time; time.sleep(60)'], 'continuing': False,
+                  'monotonic_deadline': time.monotonic() + 1}
+        with unittest.mock.patch.object(supervisor.subprocess, 'Popen', side_effect=launch):
+            supervisor.supervise(config)
+        final = hr.load_record(path)
+        self.assertEqual((final['status'], final['stop_reason'], final.get('outcome')),
+                         ('cancelled', hr.TIME_LIMIT_CODE, 'time_limit'))
+        self.assertIsNone(final['pid'])
+
     def test_deadline_stops_term_ignoring_descendant_in_anchor_group(self):
         self._forking_session(False, separate_group=False)
 
