@@ -3099,9 +3099,10 @@ The spend computation is `workspace_run.budget_state`
 
 For atomic admission counts across retries, resumed executions, workspaces and
 process restarts, see [aggregate budget accounting](aggregate-budget-accounting.md).
-That opt-in ledger enforces launch counts at the launch boundary; configured
-provider request/token/dollar ceilings refuse there until a provider adapter
-can enforce them. It is separate from the observed-usage gate above, and
+That opt-in ledger enforces launch counts at the launch boundary. The
+[provider gateway](provider-budget.md), selected with `PICO_PROVIDER_BUDGET_CONFIG`,
+adds per-HTTP-attempt admission for reviewed API models. Provider dimensions
+without that adapter remain refused. It is separate from the observed-usage gate above, and
 `--ignore-budget` does not bypass its limits.
 
 **Committing a policy change.** The Garden's `commit_policy` action commits

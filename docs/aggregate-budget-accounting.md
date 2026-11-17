@@ -65,14 +65,16 @@ which preserves the entire maximum. Settlements cannot be rewritten. An
 observed overrun is recorded truthfully and included in subsequent admission
 checks, never clamped to the reserved amount.
 
-**No provider interception is implemented here.** Workspace launch admission
-can bound launches, so it refuses a ledger configured with request, token or
-monetary ceilings using `AGGREGATE_BUDGET_UNSUPPORTED`. A lead-call work
-threshold does not bound all provider requests: workers, retries, grace and
-final responses must all be intercepted to promise that. Before a future
-provider adapter advertises hard dollars, it must bind conservative pricing,
-all input/output/cache-read/cache-write maxima, and every request path before
-spend. Subscription costs and provider billing remain independently unverified.
+The opt-in [provider gateway](provider-budget.md) reserves request, token and
+dollar ceilings before each supported API HTTP attempt, including nested
+Claude calls and Pi worker/summary calls. Set `PICO_PROVIDER_BUDGET_CONFIG`
+with the aggregate ledger to select it at headless/workspace launches. Without
+that adapter, launch admission still refuses provider dimensions with
+`AGGREGATE_BUDGET_UNSUPPORTED`. A lead-call work threshold cannot replace this
+transport boundary. API credentials are required; subscription OAuth routes
+are unsupported. Dollar figures bound a reviewed pricing model, not a vendor
+invoice. Read the gateway documentation for the supported contracts and
+cooperative runtime boundary.
 
 Existing manifest `budget.max_tokens` and `budget.max_cost_usd` remain
 observed-usage launch gates. Missing known linked telemetry blocks either;

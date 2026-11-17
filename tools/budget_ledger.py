@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 import fcntl
 import json
+import os
 from pathlib import Path
 import uuid
 
@@ -73,9 +74,13 @@ def _identity(value):
 @contextlib.contextmanager
 def _locked(path):
     path = Path(path).absolute()
+    # Canonical parent aliases share one lock; reject file aliases and hard links.
+    path = path.parent.resolve() / path.name
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         atomic_io.check_no_symlinks(path, path.parent)
+        if path.exists() and path.stat().st_nlink != 1:
+            _fail("hard-linked ledger is unsupported")
         lock_path = path.with_suffix(path.suffix + ".lock")
         atomic_io.check_no_symlinks(lock_path, path.parent)
         with open(lock_path, "a+") as lock:
@@ -120,6 +125,12 @@ def _load(path):
 
 def _save(path, data):
     atomic_io.atomic_write_json(path, data, indent=2, sort_keys=True, allow_nan=False)
+    # Unlike general UI state, an acknowledged admission must survive a crash.
+    fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def initialize(path, limits):
@@ -217,7 +228,18 @@ def settle(path, operation_id, *, actual=None, complete=False):
         return entry
 
 
-def reserve_launch(path, *, task_id, attempt_id, operation_id=None):
+def bind_provider_contract(path, digest):
+    """Pin the reviewed pricing/limit contract for the life of this ledger."""
+    with _locked(path) as path:
+        data = _load(path)
+        prior = data.get("provider_contract")
+        if prior is not None and prior != digest:
+            _fail("provider contract changed", "AGGREGATE_BUDGET_CONFLICT")
+        data["provider_contract"] = digest
+        _save(path, data)
+
+
+def reserve_launch(path, *, task_id, attempt_id, operation_id=None, provider_bound=False):
     """Charge one attempted launch. Provider ceilings are refused at this boundary.
 
     Every resume/new attempt charges again. A repeated/no-op headless start must
@@ -225,7 +247,9 @@ def reserve_launch(path, *, task_id, attempt_id, operation_id=None):
     """
     operation_id = operation_id or str(uuid.uuid4())
     _, created = reserve(path, operation_id=operation_id, task_id=task_id, attempt_id=attempt_id,
-                         maximum={"launches": 1}, supported={"launches"})
+                         maximum=({"launches": 1, "requests": 0, "tokens": 0, "cost_usd": "0"}
+                                  if provider_bound else {"launches": 1}),
+                         supported=DIMENSIONS if provider_bound else {"launches"})
     if not created:
         _fail("launch admission was already consumed", "AGGREGATE_BUDGET_REPLAY")
     return operation_id

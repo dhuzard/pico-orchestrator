@@ -1,0 +1,49 @@
+{
+  "version": 1,
+  "lead_model": "openai-codex/gpt-6-luna",
+  "models": [
+    {
+      "provider": "openai-codex",
+      "id": "gpt-6-luna",
+      "api": "openai-responses",
+      "context_window": 1050000,
+      "max_output_tokens": 4096,
+      "prices": {
+        "input": "0.20",
+        "output": "0.75",
+        "cache_read": "0.02",
+        "cache_write": "0.25"
+      },
+      "evidence": "Official model comparison and pricing reviewed 2026-11-17; see docs/provider-budget.md"
+    },
+    {
+      "provider": "openai-codex",
+      "id": "gpt-6.1-sol",
+      "api": "openai-responses",
+      "context_window": 1050000,
+      "max_output_tokens": 4096,
+      "prices": {
+        "input": "4",
+        "output": "15",
+        "cache_read": "0.20",
+        "cache_write": "5"
+      },
+      "evidence": "Official model comparison and pricing reviewed 2026-11-17; see docs/provider-budget.md"
+    },
+    {
+      "provider": "openai-codex",
+      "id": "gpt-6-astra",
+      "api": "openai-responses",
+      "context_window": 1050000,
+      "max_output_tokens": 4096,
+      "prices": {
+        "input": "20",
+        "output": "75",
+        "cache_read": "2",
+        "cache_write": "25"
+      },
+      "evidence": "Official model comparison and pricing reviewed 2026-11-17; see docs/provider-budget.md"
+    }
+  ],
+  "extensions": []
+}
