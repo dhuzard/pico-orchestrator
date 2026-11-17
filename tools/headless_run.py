@@ -760,7 +760,13 @@ def _launch_locked(path: Path, *, worktree: Path, identity: str, common: Path, e
                    failure_retry_budget_source: str | None = None, inputs_digest: str | None = None,
                    provider_config: str | None = None, aggregate_ledger=None, aggregate_task_id=None):
     """Return the settled record, or (record, child, log, checkout_before) for a new launch. Caller holds the lock."""
+    try:
+        benchmark = launch_brief.benchmark_selection(os.environ, workspace_plan.orchestrator_revision(ROOT))
+    except ValueError as exc:
+        raise HeadlessError("BENCHMARK_SELECTOR_INVALID", str(exc)) from exc
     record = load_record(path)
+    if record is not None and record.get("benchmark") != benchmark:
+        raise HeadlessError("BENCHMARK_SELECTOR_MISMATCH", "benchmark selection cannot change for an execution")
     if record is not None:
         if record["target_repository"].casefold() != identity.casefold():
             raise HeadlessError("EXECUTION_TARGET_MISMATCH", "execution id belongs to another repository")
@@ -833,6 +839,8 @@ def _launch_locked(path: Path, *, worktree: Path, identity: str, common: Path, e
                   "log_path": str(path.with_suffix(".log")), "mutation_allowed": bool(allow_mutation),
                   "orchestrator_revision": workspace_plan.orchestrator_revision(ROOT), "created_at": _now(),
                   "launches": 0, "run_id": None, "run": None, "pid": None, "exit_code": None, "status": "created"}
+    if benchmark is not None:
+        record["benchmark"] = benchmark
     identity_env = _backend_identity(worktree, python)
     # An explicit limit is handed to the child; otherwise the extension falls back to the repository policy.
     for name in (LEAD_LIMIT_ENV, LEAD_LIMIT_SOURCE_ENV, LEAD_WARN_ENV, FAILURE_BUDGET_ENV, FAILURE_BUDGET_SOURCE_ENV,
@@ -853,12 +861,15 @@ def _launch_locked(path: Path, *, worktree: Path, identity: str, common: Path, e
     continuing = resume and run.get("status") == "IN_PROGRESS"
     argv = [pi_executable, "--print", "--mode", "json", "--session-id", record["session_id"],
             "--session-dir", record["session_dir"]]
+    if benchmark is not None:
+        argv += ["--model", benchmark["lead_model"], "--thinking", benchmark["lead_effort"]]
     for extension in EXTENSIONS:
         argv += ["-e", str(ROOT / "extensions" / extension)]
     brief = launch_brief.create(worktree=worktree, repository=identity, common_dir=common,
                                 session_id=record["session_id"], executable=pi_executable, python=python,
                                 mutation_permissions=granted)
-    argv += ["--", RESUME_PROMPT if continuing else brief + build_prompt(record["objective"])]
+    prompt_brief = "" if benchmark and benchmark["variant"] == "baseline" else brief
+    argv += ["--", RESUME_PROMPT if continuing else prompt_brief + build_prompt(record["objective"])]
     if provider_config:
         if not aggregate_ledger:
             raise HeadlessError("PROVIDER_BUDGET_UNSUPPORTED", "provider mode requires an aggregate ledger")

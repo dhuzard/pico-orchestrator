@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -48,3 +49,19 @@ def create(*, worktree: Path, repository: str, common_dir: Path, session_id: str
         'the snapshot is not authorization or evidence of a registered worktree.'
     )
     return 'PICO_LAUNCH_BRIEF_V1\n' + json.dumps(data, sort_keys=True) + '\nRequired sequence: ' + sequence + '\n\n'
+
+
+def benchmark_selection(env: dict, revision: str | None) -> dict | None:
+    """Explicit benchmark-only prompt treatment; never modifies guard behavior."""
+    names = ("PICO_BENCHMARK_VARIANT", "PICO_BENCHMARK_PAIR", "PICO_BENCHMARK_REVISION",
+             "PICO_BENCHMARK_LEAD_MODEL", "PICO_BENCHMARK_LEAD_EFFORT")
+    if not any(name in env for name in names):
+        return None
+    variant, pair, pin, model, effort = (env.get(name, "") for name in names)
+    if (env.get("PICO_REAL_BENCHMARK") != "1" or variant not in {"baseline", "candidate"}
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", pair)
+            or not re.fullmatch(r"[0-9a-f]{40}", pin) or pin != revision
+            or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", model)
+            or effort not in {"off", "minimal", "low", "medium", "high", "xhigh", "max"}):
+        raise ValueError("benchmark selectors require explicit opt-in, variant, pair and matching full runtime revision")
+    return {"variant": variant, "pair": pair, "revision": pin, "lead_model": model, "lead_effort": effort}
