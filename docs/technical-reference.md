@@ -573,6 +573,18 @@ The parent runs independent tasks in waves. Each task declares a write scope
 | `integrate_begin {wave_id, path?}` | Starts integration in the parent or a verified external linked worktree; worker launches are refused until it ends. | `WAVE_UNKNOWN`, `INTEGRATION_WORKERS_IN_FLIGHT`, `INTEGRATION_WORKTREE_INVALID` |
 | `integrate_end {wave_id}` | Validates the selected checkout's committed changes and closes the wave; the parent must remain unchanged when integration is external. | `INTEGRATION_NOT_STARTED`, `WORKER_SCOPE_UNVERIFIABLE` |
 
+The recorder's tool schema retains its full action union for local validation and
+also derives root `properties` and common `required` fields from those same branches.
+Pi 1.3's non-strict Anthropic adapter otherwise drops a root `anyOf` and exposes an
+empty object schema to the model. Nested event schemas remain objects: send
+`{"action":"event","event":{"kind":"phase","phase":"<task id>","status":"completed"}}`,
+with no JSON-string encoding of `event`. Provider-visible properties do not replace
+the local per-action requirements or the integration and completion checks.
+Because this adapter strips the root union, action-dependent required combinations
+remain local checks; the tool description also states them for the caller.
+`tests/orchestration-tool-schema.test.ts` captures the actual native adapter payload
+before transport and checks both this shape and rejection of malformed calls.
+
 A routed task started while no worker runs and no wave is declared gets its own implicit single-task wave
 (`auto-<hex>-<task>`); it is never grown and never lets tasks overlap: only an explicit `declare_wave` does, after its
 write-scope, parallel-limit and routing checks. `integrate_begin` and `integrate_end` accept `"auto"` for the one open
