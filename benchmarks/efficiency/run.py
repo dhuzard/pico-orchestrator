@@ -114,7 +114,17 @@ def main():
         expected_selection = {"variant": args.variant, "pair": args.pair, "revision": args.revision,
                               "lead_model": args.lead_model, "lead_effort": args.lead_effort}
         observed = len(records) == 1 and records[0].get("benchmark") == expected_selection and records[0].get("orchestrator_revision") == args.revision
+        # Keep provider reservations distinct from model-reported cost. An unsettled
+        # reservation is not an actual charge; it remains explicit and conservative.
+        ledger_after = budget_ledger.inspect(ledger)
+        execution_ids = {r["execution_id"] for r in records}
+        provider_entries = [{"state": item.get("state"), "reserved": item.get("reserved"),
+                             "actual": item.get("actual")}
+                            for item in ledger_after["reservations"].values()
+                            if item.get("attempt_id") in execution_ids]
         report = {"version": 1, "selector_observed": observed, "provenance": provenance, "started_at": started, "finished_at": real.now(),
+                  "provider_ledger": {"entries": provider_entries,
+                                      "all_settled": bool(provider_entries) and all(e["state"] == "settled" for e in provider_entries)},
                   "elapsed_seconds": round(elapsed, 3), "launch": {"exit_code": launch["exit_code"], **launch["output"]},
                   "validation": validation, "metrics": metrics, "fixture": fixture}
         (out / "report.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
