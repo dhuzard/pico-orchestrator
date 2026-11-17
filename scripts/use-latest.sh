@@ -636,6 +636,10 @@ EOF
     python3 "$RUNTIME/tools/model_profiles.py" "$@"
     ;;
   run)
+    if [[ -n "${PICO_PROVIDER_BUDGET_CONFIG:-}" || -n "${PICO_AGGREGATE_BUDGET_LEDGER:-}" ]]; then
+      echo 'PROVIDER_BUDGET_UNSUPPORTED: budgeted runs require pico exec start or pico workspace launch/schedule.' >&2
+      exit 2
+    fi
     target=""
     pi_args=()
     while [[ $# -gt 0 ]]; do

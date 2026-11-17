@@ -125,6 +125,23 @@ class _ChainFixture(unittest.TestCase):
 
 
 class LauncherPreflightChainTest(_ChainFixture):
+    def test_interactive_launchers_refuse_configured_budgets_before_pi_or_fetch(self):
+        for script, arguments in (("run-local.sh", [str(self.target)]),
+                                  ("use-latest.sh", ["run", str(self.target)])):
+            for variable in ("PICO_PROVIDER_BUDGET_CONFIG", "PICO_AGGREGATE_BUDGET_LEDGER"):
+                with self.subTest(script=script, variable=variable):
+                    cache = self.base / "unused-cache"
+                    env = self.env(**{variable: str(self.base / "private-config"),
+                                      "PI_CODING_ORCHESTRATOR_HOME": str(cache)})
+                    result = subprocess.run(["bash", str(ROOT / "scripts" / script), *arguments],
+                                            cwd=self.base, env=env, capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn("PROVIDER_BUDGET_UNSUPPORTED", result.stderr)
+                    self.assertIn("pico exec start", result.stderr)
+                    self.assertFalse(self.capture.exists(), "Pi must not start")
+                    self.assertFalse(cache.exists(), "refusal must precede cache fetch")
+        self.assert_no_inference_and_clean_target()
+
     # -- supported chain ----------------------------------------------------
 
     def test_run_local_pin_external_target_route_preflight_ready(self):
