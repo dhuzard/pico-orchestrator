@@ -1233,6 +1233,111 @@ while True: time.sleep(1)
     def test_normal_workload_exit_stops_term_ignoring_descendant(self):
         self._forking_session(True)
 
+    def test_confirmed_cleanup_preserves_a_racing_watchdog_deadline(self):
+        import execution_supervisor as supervisor
+        marker = self.state / 'deadline-race-worker.json'
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        script = """import json, os, signal, sys, time
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+pid = os.fork()
+if pid == 0:
+    with open(sys.argv[1] + '.tmp', 'w') as out:
+        json.dump({'pid': os.getpid(), 'sid': os.getsid(0)}, out)
+    os.replace(sys.argv[1] + '.tmp', sys.argv[1])
+while True: time.sleep(1)
+"""
+        anchor = subprocess.Popen([sys.executable, '-c', script, str(marker)], start_new_session=True)
+        worker = worker_token = None
+        try:
+            deadline = time.monotonic() + 10
+            while not marker.exists() and time.monotonic() < deadline:
+                time.sleep(.02)
+            self.assertTrue(marker.exists())
+            worker = json.loads(marker.read_text())
+            token = supervisor.identity(anchor.pid)
+            worker_token = supervisor.identity(worker['pid'])
+            self.assertIsNotNone(token)
+            self.assertIsNotNone(worker_token)
+            now = time.time()
+            record = {'status': 'launch_uncertain', 'stop_reason': hr.TIME_LIMIT_CODE, 'pid': anchor.pid,
+                      'process_identity': token, 'session_dir': str(self.state), 'session_id': 'race', 'run_id': None,
+                      'max_duration_seconds': 4, 'deadline_epoch': now, 'deadline_at': hr._iso(now)}
+            # The watchdog cannot prove the stop yet; the uncertainty barrier
+            # and deadline must survive without treating it as a natural exit.
+            self.assertTrue(supervisor.settle_confirmed_deadline(record, False))
+            self.assertEqual((record['status'], record['stop_reason']), ('launch_uncertain', hr.TIME_LIMIT_CODE))
+            self.assertTrue(any(p == worker['pid'] for p, _, _ in supervisor.session_members(anchor.pid)))
+            # A competing supervisor then confirms the entire anchored session
+            # stopped; preserve the deadline and terminalize the parent.
+            self.assertTrue(supervisor.stop(anchor.pid, token))
+            anchor.wait(timeout=5)
+            self.assertEqual(supervisor.session_members(worker['sid']), [])
+            self.assertTrue(supervisor.settle_confirmed_deadline(record, True))
+            self.assertEqual((record['status'], record['stop_reason'], record['outcome']),
+                             ('cancelled', hr.TIME_LIMIT_CODE, 'time_limit'))
+            self.assertIsNone(record['pid'])
+        finally:
+            if worker and supervisor.same_process(worker['pid'], worker_token):
+                os.kill(worker['pid'], 9)
+            if anchor.poll() is None:
+                anchor.kill()
+                anchor.wait()
+
+    def test_supervisor_finalizes_persisted_watchdog_uncertainty(self):
+        import execution_supervisor as supervisor
+        self.state.mkdir(parents=True, exist_ok=True)
+        marker = self.state / 'interleaving-worker.json'
+        path = self.state / 'executions' / 'interleaving' / 'record.json'
+        now = time.time()
+        hr.save_record(path, {'record_version': hr.RECORD_VERSION, 'status': 'launching', 'launches': 0,
+                              'session_dir': str(self.state), 'session_id': 'interleaving', 'run_id': None,
+                              'max_duration_seconds': 60, 'deadline_epoch': now + 60, 'deadline_at': hr._iso(now + 60)})
+        workload = """import json, os, signal, sys, time
+pid = os.fork()
+if pid == 0:
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    with open(sys.argv[1] + '.tmp', 'w') as out:
+        json.dump({'pid': os.getpid(), 'leader': os.getppid(), 'sid': os.getsid(0)}, out)
+    os.replace(sys.argv[1] + '.tmp', sys.argv[1])
+while True: time.sleep(1)
+"""
+        # Stand-in guard persists the first, unconfirmed deadline result before
+        # ending the workload leader. The real supervisor must then stop the
+        # TERM-ignoring descendant and settle that persisted status.
+        fake_guard = """import json, os, signal, sys, time
+sys.path.insert(0, sys.argv[1])
+import headless_run as hr
+from pathlib import Path
+ready, path, marker = int(sys.argv[2]), Path(sys.argv[3]), sys.argv[4]
+os.write(ready, b'R')
+os.close(ready)
+end = time.monotonic() + 10
+while not os.path.exists(marker) and time.monotonic() < end: time.sleep(.02)
+with open(marker) as src: info = json.load(src)
+with hr.locked_record(path):
+    record = hr.load_record(path)
+    record.update(status='launch_uncertain', stop_reason=hr.TIME_LIMIT_CODE)
+    hr.save_record(path, record)
+os.kill(info['leader'], signal.SIGTERM)
+"""
+        original_popen = subprocess.Popen
+        def launch(argv, *args, **kwargs):
+            if isinstance(argv, list) and len(argv) > 2 and argv[1] == str(REPO_ROOT / 'tools' / 'execution_supervisor.py') and argv[2] == 'guard':
+                argv = [sys.executable, '-c', fake_guard, str(REPO_ROOT / 'tools'), argv[4], str(path), str(marker)]
+            return original_popen(argv, *args, **kwargs)
+        config = {'path': str(path), 'log_path': str(self.state / 'interleaving.log'), 'cwd': str(self.target),
+                  'argv': [sys.executable, '-c', workload, str(marker)], 'continuing': False,
+                  'monotonic_deadline': time.monotonic() + 60}
+        with unittest.mock.patch.object(supervisor.subprocess, 'Popen', side_effect=launch):
+            supervisor.supervise(config)
+        final = hr.load_record(path)
+        info = json.loads(marker.read_text())
+        self.assertEqual((final['status'], final['stop_reason']), ('cancelled', hr.TIME_LIMIT_CODE))
+        self.assertEqual(supervisor.session_members(info['sid']), [])
+        other = {'status': 'launch_uncertain', 'stop_reason': 'SUPERVISOR_LOST'}
+        self.assertFalse(supervisor.settle_confirmed_deadline(other, True))
+        self.assertEqual(other, {'status': 'launch_uncertain', 'stop_reason': 'SUPERVISOR_LOST'})
+
     def test_deadline_stops_term_ignoring_descendant_in_anchor_group(self):
         self._forking_session(False, separate_group=False)
 

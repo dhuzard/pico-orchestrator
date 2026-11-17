@@ -346,6 +346,20 @@ def guard(fd, ready, pid, expected, deadline, path):
     return 0
 
 
+def settle_confirmed_deadline(record, stopped):
+    """Preserve a watchdog deadline after a competing stop is confirmed."""
+    if record.get("stop_reason") != hr.TIME_LIMIT_CODE:
+        return False
+    if stopped:
+        # The caller has already confirmed the anchored session is empty and
+        # reaped the child. Do not signal a potentially reused numeric PID.
+        record["pid"] = None
+        hr._stop_locked(record, 0, hr.TIME_LIMIT_CODE)
+    else:
+        record.update(status="launch_uncertain", outcome="termination_unconfirmed")
+    return True
+
+
 def supervise(config):
     path = Path(config['path'])
     if sys.platform.startswith('linux'):
@@ -419,10 +433,11 @@ def supervise(config):
                 with hr.locked_record(path):
                     record = hr.load_record(path)
                     if record and record.get('status') in {'launched', 'launch_uncertain'}:
-                        if stopped:
-                            record.update(status='interrupted', pid=None, stop_reason='WATCHDOG_LOST')
-                        else:
-                            record.update(status='launch_uncertain', stop_reason='WATCHDOG_LOST')
+                        if not settle_confirmed_deadline(record, stopped):
+                            if stopped:
+                                record.update(status='interrupted', pid=None, stop_reason='WATCHDOG_LOST')
+                            else:
+                                record.update(status='launch_uncertain', stop_reason='WATCHDOG_LOST')
                         hr.save_record(path, record)
                 return 1
             readable, _, _ = select.select([result_read], [], [], .05)
@@ -452,13 +467,14 @@ def supervise(config):
             if record:
                 record['exit_code'] = workload_exit if workload_exit is not None else child.returncode
                 if record.get('status') in {'launched', 'launch_uncertain'}:
-                    if stopped:
-                        record.update(status='exited', pid=None)
-                        hr.refresh(record)
-                        if workload_exit is None and (record.get('run') or {}).get('status') in {None, 'IN_PROGRESS'}:
-                            record['status'] = 'interrupted'
-                    else:
-                        record.update(status='launch_uncertain', stop_reason='TERMINATION_UNCONFIRMED')
+                    if not settle_confirmed_deadline(record, stopped):
+                        if stopped:
+                            record.update(status='exited', pid=None)
+                            hr.refresh(record)
+                            if workload_exit is None and (record.get('run') or {}).get('status') in {None, 'IN_PROGRESS'}:
+                                record['status'] = 'interrupted'
+                        else:
+                            record.update(status='launch_uncertain', stop_reason='TERMINATION_UNCONFIRMED')
                 hr.save_record(path, record)
         return workload_exit or 0
     except BaseException as exc:
