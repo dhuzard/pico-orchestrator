@@ -1,9 +1,13 @@
 """Real fake-provider launches exercise central admission, not mocked start()."""
 import os
+import json
+from unittest import mock
 
 from test_headless_run import HeadlessFixture
 import budget_ledger
 import headless_run as hr
+import provider_budget
+from test_provider_budget import config
 
 
 class HeadlessAdmissionTest(HeadlessFixture):
@@ -33,6 +37,26 @@ class HeadlessAdmissionTest(HeadlessFixture):
         self.assertEqual(error.exception.code, 'AGGREGATE_BUDGET_UNSUPPORTED')
         self.assertEqual(budget_ledger.inspect(path)['reservations'], {})
         self.assertEqual(list((self.state / 'runs').glob('*.json')), [])
+
+    def test_provider_mode_missing_api_key_refuses_before_child_or_reservation(self):
+        path = self.state / 'provider-ledger.json'
+        config_path = self.state / 'provider-config.json'
+        budget_ledger.initialize(path, {'lifetime': {'tokens': 2000000, 'cost_usd': '1'}})
+        config_path.write_text(json.dumps(config()))
+        with mock.patch.dict(os.environ, {provider_budget.CONFIG_ENV: str(config_path)}), mock.patch.object(
+                provider_budget, 'catalog_today', return_value=provider_budget.date(2026, 11, 17)):
+            os.environ.pop('OPENAI_API_KEY', None)
+            with self.assertRaises(hr.HeadlessError) as error:
+                self.start(aggregate_ledger=path)
+        self.assertEqual(error.exception.code, 'PROVIDER_BUDGET_CREDENTIAL_UNAVAILABLE')
+        self.assertFalse(budget_ledger.inspect(path)['reservations'])
+        self.assertEqual(list((self.state / 'runs').glob('*.json')), [])
+
+    def test_provider_mode_without_ledger_is_structured_refusal(self):
+        with mock.patch.dict(os.environ, {provider_budget.CONFIG_ENV: '/unused/config.json'}):
+            with self.assertRaises(hr.HeadlessError) as error:
+                self.start()
+        self.assertEqual(error.exception.code, 'PROVIDER_BUDGET_UNSUPPORTED')
 
     def test_global_serialization_holds_other_execution_but_not_idempotent_lookup(self):
         first = self.start(behavior='hang', wait=False, serialize_global=True)

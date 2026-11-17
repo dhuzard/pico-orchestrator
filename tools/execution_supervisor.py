@@ -346,6 +346,32 @@ def guard(fd, ready, pid, expected, deadline, path):
     return 0
 
 
+def settle_confirmed_deadline(record, stopped):
+    """Preserve a watchdog deadline after a competing stop is confirmed."""
+    if record.get("stop_reason") != hr.TIME_LIMIT_CODE:
+        return False
+    if stopped:
+        # The caller has already confirmed the anchored session is empty and
+        # reaped the child. Do not signal a potentially reused numeric PID.
+        record["pid"] = None
+        hr._stop_locked(record, 0, hr.TIME_LIMIT_CODE)
+    else:
+        record.update(status="launch_uncertain", outcome="termination_unconfirmed")
+    return True
+
+
+def release_watchdog(watcher, watch_write, stopped):
+    """Release the watchdog after a confirmed stop ('D'), or hand it the stop (EOF), and reap it."""
+    try:
+        if stopped:
+            os.write(watch_write, b'D')
+    except BrokenPipeError:
+        pass
+    finally:
+        os.close(watch_write)
+    watcher.wait()
+
+
 def supervise(config):
     path = Path(config['path'])
     if sys.platform.startswith('linux'):
@@ -419,10 +445,11 @@ def supervise(config):
                 with hr.locked_record(path):
                     record = hr.load_record(path)
                     if record and record.get('status') in {'launched', 'launch_uncertain'}:
-                        if stopped:
-                            record.update(status='interrupted', pid=None, stop_reason='WATCHDOG_LOST')
-                        else:
-                            record.update(status='launch_uncertain', stop_reason='WATCHDOG_LOST')
+                        if not settle_confirmed_deadline(record, stopped):
+                            if stopped:
+                                record.update(status='interrupted', pid=None, stop_reason='WATCHDOG_LOST')
+                            else:
+                                record.update(status='launch_uncertain', stop_reason='WATCHDOG_LOST')
                         hr.save_record(path, record)
                 return 1
             readable, _, _ = select.select([result_read], [], [], .05)
@@ -439,27 +466,37 @@ def supervise(config):
         stopped = stop(child.pid, token)
         if stopped:
             child.wait()
-            try:
-                os.write(watch_write, b'D')
-            except BrokenPipeError:
-                pass
-        else:
-            os.close(watch_write)
-            watch_write = -1
-        watcher.wait()
+        # After a confirmed stop that the watchdog cannot have caused, publish the terminal
+        # record while the watchdog is still alive and only then release it. Releasing it
+        # first would let a concurrent observer read the departed watchdog as WATCHDOG_LOST
+        # and persist a spurious launch_uncertain for a run that ended normally. The guard
+        # fires only once monotonic() >= deadline, so a deadline not yet reached here means
+        # the workload ended on its own. Otherwise the guard may already be settling the
+        # time limit: release (or, unconfirmed, abandon) it and let it settle first. A run
+        # ending within one guard poll after its deadline may still see the guard accept
+        # 'D' and exit before publication; observers then read it as uncertain, fail-closed.
+        deadline = config.get('monotonic_deadline')
+        publish_first = stopped and (deadline is None or time.monotonic() < deadline)
+        if not publish_first:
+            fd, watch_write = watch_write, -1  # the helper owns the close from here
+            release_watchdog(watcher, fd, stopped)
         with hr.locked_record(path):
             record = hr.load_record(path)
             if record:
                 record['exit_code'] = workload_exit if workload_exit is not None else child.returncode
                 if record.get('status') in {'launched', 'launch_uncertain'}:
-                    if stopped:
-                        record.update(status='exited', pid=None)
-                        hr.refresh(record)
-                        if workload_exit is None and (record.get('run') or {}).get('status') in {None, 'IN_PROGRESS'}:
-                            record['status'] = 'interrupted'
-                    else:
-                        record.update(status='launch_uncertain', stop_reason='TERMINATION_UNCONFIRMED')
+                    if not settle_confirmed_deadline(record, stopped):
+                        if stopped:
+                            record.update(status='exited', pid=None)
+                            hr.refresh(record)
+                            if workload_exit is None and (record.get('run') or {}).get('status') in {None, 'IN_PROGRESS'}:
+                                record['status'] = 'interrupted'
+                        else:
+                            record.update(status='launch_uncertain', stop_reason='TERMINATION_UNCONFIRMED')
                 hr.save_record(path, record)
+        if publish_first:
+            fd, watch_write = watch_write, -1
+            release_watchdog(watcher, fd, True)
         return workload_exit or 0
     except BaseException as exc:
         stopped = child is None

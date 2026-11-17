@@ -6,7 +6,7 @@ import { hostname } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Type } from "typebox";
+import { Type, type TObject, type TSchema } from "typebox";
 import { classifyClaudeInvocationError, resolveClaudeBackendModel } from "./claude-backend-adapter.ts";
 import { detectWorkerSandbox, inGitDirectory, runClaudeWorker, WorkerConfigError, workerSandboxConfig } from "./claude-worker.ts";
 import type { ClaudeWorkerOutcome, ClaudeWorkerPlan, SandboxProbe, WorkerSandboxConfig } from "./claude-worker.ts";
@@ -149,6 +149,32 @@ const EVENT = Type.Union([
     subagent_id: Type.Optional(Type.String({ pattern: `^${TAG_ID}$` })),
     reply_to: Type.Optional(Type.Integer({ minimum: 1 })) }, { additionalProperties: false }),
 ]);
+
+/**
+ * Pi 1.3's non-strict Anthropic adapter forwards only root properties/required,
+ * dropping a bare anyOf. Project the object branches for the model while keeping
+ * the full union authoritative for local validation and TypeScript narrowing.
+ * Each projected property admits exactly its branch schemas; only fields required
+ * in every branch are globally required. Per-action requirements stay in anyOf.
+ */
+function providerObjectUnion<T extends TObject[]>(variants: [...T]) {
+  const fields = new Map<string, TSchema[]>();
+  for (const variant of variants) {
+    for (const [name, schema] of Object.entries(variant.properties)) {
+      const schemas = fields.get(name) ?? [];
+      if (!schemas.includes(schema)) schemas.push(schema);
+      fields.set(name, schemas);
+    }
+  }
+  return Type.Union(variants, {
+    type: "object",
+    properties: Object.fromEntries([...fields].map(([name, schemas]) =>
+      [name, schemas.length === 1 ? schemas[0] : Type.Union(schemas)])),
+    required: (variants[0]?.required ?? []).filter((name) =>
+      variants.every((variant) => variant.required?.includes(name))),
+    additionalProperties: false,
+  });
+}
 
 type Json = Record<string, unknown>;
 type Guard = { block: true; reason: string; terminate?: boolean } | undefined;
@@ -1904,8 +1930,8 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
   pi.registerTool({
     name: "orchestration_record",
     label: "Record parent orchestration outcome",
-    description: "Parent only: record phases, workers, child runs, mutation counts, concise numbered interaction summaries, or final status; bind mutating steps to prepared worktrees; declare waves; and bracket integration. A COMPLETED finish may include integrate_wave_id to explicitly end an already-begun integration through its normal checks before the completion checks, in one call. Do not record directive or feedback interactions: the extension records each worker call itself, with task, step, route, a contract excerpt and digest, and a bounded result summary, digest and commit (the full text stays in the Pi session transcript). Record a decision interaction only for your own judgment, with task/step ids and optional reply_to. Never include prompts, raw outputs, transcripts, or issue bodies.",
-    parameters: Type.Union([
+    description: "Parent only: record phases, workers, child runs, mutation counts, concise numbered interaction summaries, or final status; bind mutating steps to prepared worktrees; declare waves; and bracket integration. Required fields by action: bind_workspace needs step_id and path; declare_wave needs wave_id and nonempty tasks; integrate_begin, integrate_end and integrate_abort need wave_id; event needs a nested event object, never a JSON string; finish needs status; status needs no other fields. A COMPLETED finish may include integrate_wave_id to explicitly end an already-begun integration through its normal checks before the completion checks, in one call. Do not record directive or feedback interactions: the extension records each worker call itself, with task, step, route, a contract excerpt and digest, and a bounded result summary, digest and commit (the full text stays in the Pi session transcript). Record a decision interaction only for your own judgment, with task/step ids and optional reply_to. Never include prompts, raw outputs, transcripts, or issue bodies.",
+    parameters: providerObjectUnion([
       Type.Object({ action: Type.Literal("status") }, { additionalProperties: false }),
       Type.Object({ action: Type.Literal("bind_workspace"), task_id: Type.Optional(Type.String()),
         step_id: Type.String(), path: Type.String() }, { additionalProperties: false }),

@@ -45,6 +45,7 @@ import autonomy_policy  # noqa: E402
 import github_integration  # noqa: E402
 import launch_brief  # noqa: E402
 import budget_ledger  # noqa: E402
+import provider_budget  # noqa: E402
 import parent_orchestration  # noqa: E402
 import provenance  # noqa: E402
 import run_lease  # noqa: E402
@@ -669,6 +670,8 @@ def start(*, target: Path, explicit_repo: str, execution_id: str, objective: str
         worktree, max_lead_calls, max_lead_calls_source, lead_calls_warn_at)
     path = execution_path(common, execution_id)
     ledger_path = aggregate_ledger or os.environ.get(budget_ledger.ENV)
+    provider_config = os.environ.get(provider_budget.CONFIG_ENV)
+    budget_task = aggregate_task_id or f'{identity}:{common}'
     admission_id = None
     def admit():
         nonlocal admission_id
@@ -676,10 +679,18 @@ def start(*, target: Path, explicit_repo: str, execution_id: str, objective: str
             raise HeadlessError('EXECUTION_GLOBAL_BARRIER', 'Another execution is active or uncertain; inspect it before launching')
         if before_spawn is not None:
             before_spawn()
+        if provider_config and not ledger_path:
+            raise HeadlessError("PROVIDER_BUDGET_UNSUPPORTED", "provider mode requires an aggregate ledger")
         if ledger_path:
             try:
+                provider_contract = None
+                if provider_config:
+                    configured_provider = provider_budget.validate_launch(provider_config, ledger_path)
+                    provider_contract = provider_budget.contract_digest(configured_provider)
+                    provider_budget.validate_project(worktree)
                 admission_id = budget_ledger.reserve_launch(Path(ledger_path),
-                    task_id=aggregate_task_id or f'{identity}:{common}', attempt_id=execution_id)
+                    task_id=budget_task, attempt_id=execution_id, provider_bound=bool(provider_config),
+                    provider_contract=provider_contract)
             except budget_ledger.BudgetError as exc:
                 raise HeadlessError(exc.code, exc.detail) from exc
     # Deciding and launching happen under the record lock, so two starts with
@@ -692,12 +703,15 @@ def start(*, target: Path, explicit_repo: str, execution_id: str, objective: str
                                   max_duration_seconds=max_duration_seconds, max_lead_calls=max_lead_calls,
                                   max_lead_calls_source=max_lead_calls_source, lead_calls_warn_at=lead_calls_warn_at,
                                   failure_retry_budget=failure_retry_budget,
-                                  failure_retry_budget_source=failure_retry_budget_source, inputs_digest=inputs_digest)
+                                  failure_retry_budget_source=failure_retry_budget_source, inputs_digest=inputs_digest,
+                                  provider_config=provider_config, aggregate_ledger=ledger_path, aggregate_task_id=budget_task)
         if admission_id and not isinstance(launched, dict):
             launched[0]['aggregate_admission_id'] = admission_id
             save_record(path, launched[0])
             try:
-                budget_ledger.settle(Path(ledger_path), admission_id, actual={'launches': 1}, complete=True)
+                budget_ledger.settle(Path(ledger_path), admission_id,
+                    actual=({'launches': 1, 'requests': 0, 'tokens': 0, 'cost_usd': '0'}
+                            if provider_config else {'launches': 1}), complete=True)
             except budget_ledger.BudgetError:
                 # Registration has happened; retain the charged reservation.
                 # A settlement error must not hide the active child from its caller.
@@ -746,9 +760,16 @@ def _launch_locked(path: Path, *, worktree: Path, identity: str, common: Path, e
                    takeover: bool = False, max_duration_seconds: int | None = None,
                    max_lead_calls: int | None = None, max_lead_calls_source: str | None = None,
                    lead_calls_warn_at: int | None = None, failure_retry_budget: int | None = None,
-                   failure_retry_budget_source: str | None = None, inputs_digest: str | None = None):
+                   failure_retry_budget_source: str | None = None, inputs_digest: str | None = None,
+                   provider_config: str | None = None, aggregate_ledger=None, aggregate_task_id=None):
     """Return the settled record, or (record, child, log, checkout_before) for a new launch. Caller holds the lock."""
+    try:
+        benchmark = launch_brief.benchmark_selection(os.environ, workspace_plan.orchestrator_revision(ROOT))
+    except ValueError as exc:
+        raise HeadlessError("BENCHMARK_SELECTOR_INVALID", str(exc)) from exc
     record = load_record(path)
+    if record is not None and record.get("benchmark") != benchmark:
+        raise HeadlessError("BENCHMARK_SELECTOR_MISMATCH", "benchmark selection cannot change for an execution")
     if record is not None:
         if record["target_repository"].casefold() != identity.casefold():
             raise HeadlessError("EXECUTION_TARGET_MISMATCH", "execution id belongs to another repository")
@@ -821,6 +842,8 @@ def _launch_locked(path: Path, *, worktree: Path, identity: str, common: Path, e
                   "log_path": str(path.with_suffix(".log")), "mutation_allowed": bool(allow_mutation),
                   "orchestrator_revision": workspace_plan.orchestrator_revision(ROOT), "created_at": _now(),
                   "launches": 0, "run_id": None, "run": None, "pid": None, "exit_code": None, "status": "created"}
+    if benchmark is not None:
+        record["benchmark"] = benchmark
     identity_env = _backend_identity(worktree, python)
     # An explicit limit is handed to the child; otherwise the extension falls back to the repository policy.
     for name in (LEAD_LIMIT_ENV, LEAD_LIMIT_SOURCE_ENV, LEAD_WARN_ENV, FAILURE_BUDGET_ENV, FAILURE_BUDGET_SOURCE_ENV,
@@ -841,12 +864,23 @@ def _launch_locked(path: Path, *, worktree: Path, identity: str, common: Path, e
     continuing = resume and run.get("status") == "IN_PROGRESS"
     argv = [pi_executable, "--print", "--mode", "json", "--session-id", record["session_id"],
             "--session-dir", record["session_dir"]]
+    if benchmark is not None:
+        argv += ["--model", benchmark["lead_model"], "--thinking", benchmark["lead_effort"]]
     for extension in EXTENSIONS:
         argv += ["-e", str(ROOT / "extensions" / extension)]
     brief = launch_brief.create(worktree=worktree, repository=identity, common_dir=common,
                                 session_id=record["session_id"], executable=pi_executable, python=python,
                                 mutation_permissions=granted)
-    argv += ["--", RESUME_PROMPT if continuing else brief + build_prompt(record["objective"])]
+    prompt_brief = "" if benchmark and benchmark["variant"] == "baseline" else brief
+    argv += ["--", RESUME_PROMPT if continuing else prompt_brief + build_prompt(record["objective"])]
+    if provider_config:
+        if not aggregate_ledger:
+            raise HeadlessError("PROVIDER_BUDGET_UNSUPPORTED", "provider mode requires an aggregate ledger")
+        env[budget_ledger.ENV] = str(Path(aggregate_ledger).absolute())
+        record["provider_budget_config"] = str(provider_config)
+        record["provider_budget_underlying_backend_identity"] = json.loads(identity_env)
+        argv = [python, str(ROOT / "tools" / "provider_budget.py"), "--config", provider_config,
+                "--ledger", env[budget_ledger.ENV], "--task", aggregate_task_id, "--attempt", execution_id, "--", *argv]
     before = checkout_state(worktree)
     # The launched Pi takes the run lease under this owner id: on start for a
     # new run, and on resume through the lifecycle's restore. For a resume the

@@ -10,6 +10,10 @@ if [[ "${1:-}" == "workspace" && "${2:-}" == "init" ]]; then
   export PYTHONDONTWRITEBYTECODE=1
   exec python3 "$ORCH_REPO/tools/workspace_init.py" "$@"
 fi
+if [[ -n "${PICO_PROVIDER_BUDGET_CONFIG:-}" || -n "${PICO_AGGREGATE_BUDGET_LEDGER:-}" ]]; then
+  echo 'PROVIDER_BUDGET_UNSUPPORTED: budgeted runs require pico exec start or pico workspace launch/schedule.' >&2
+  exit 2
+fi
 target="${1:-.}"
 if [[ $# -gt 0 ]]; then shift; fi
 if [[ "${1:-}" == "--repo" ]]; then

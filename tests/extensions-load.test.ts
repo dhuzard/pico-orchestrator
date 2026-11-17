@@ -17,9 +17,11 @@ const EXTENSIONS_DIR = join(ROOT, "extensions");
 /** Helper modules imported by extensions; never passed to `pi -e`. */
 const LIBRARY_MODULES = new Set(["claude-backend-adapter.ts", "claude-worker.ts", "context-budget.ts"]);
 const LAUNCHERS = ["scripts/use-latest.sh", "scripts/run-local.sh"];
+const OPTIONAL_EXTENSIONS = new Set(["provider-budget-guard.ts"]);
 
 const EXPECTED_REGISTRATIONS: Record<string, { tools: string[]; commands: string[]; events: string[] }> = {
   "model-router.ts": { tools: ["route_task"], commands: [], events: [] },
+  "provider-budget-guard.ts": { tools: [], commands: [], events: ["tool_call"] },
   "workflow-commands.ts": { tools: [], commands: [...WORKFLOW_COMMANDS], events: [] },
   "mission-controller.ts": { tools: [],
     commands: ["deliver", "deliver-status", "deliver-link", "deliver-pause", "deliver-resume", "deliver-cancel"], events: [] },
@@ -94,7 +96,8 @@ test("canonical launchers load exactly the first-party extension set", () => {
   for (const launcher of LAUNCHERS) {
     const text = readFileSync(join(ROOT, launcher), "utf8");
     const loaded = [...text.matchAll(/-e "\$(?:ORCH_REPO|RUNTIME)\/extensions\/([^"]+)"/g)].map((match) => match[1]).sort();
-    assert.deepEqual(loaded, extensionModules(), `${launcher} must load every extension exactly once`);
+    assert.deepEqual(loaded, extensionModules().filter((name) => !OPTIONAL_EXTENSIONS.has(name)),
+      `${launcher} must load every default extension exactly once`);
     assert.match(text, /PI_ORCHESTRATOR_CLAUDE_BACKEND_IDENTITY/, `${launcher} must pin the Claude backend`);
   }
 });
