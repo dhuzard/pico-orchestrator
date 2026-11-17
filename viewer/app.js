@@ -1039,7 +1039,7 @@ function renderDeliveries() {
   const data = deliveryState.data;
   const feedback = Boolean(data.feedback && controlState.token);
   $("delivery-panel").hidden = state.workspaceMode || (data.ok && !data.deliveries?.length);
-  $("delivery-connection").textContent = !data.ok ? "Connection lost · evidence may be stale" : feedback ? "Observed state · feedback on" : "Observed state · read-only";
+  $("delivery-connection").textContent = data.tokenMissing ? "Session token missing" : !data.ok ? "Connection lost · evidence may be stale" : feedback ? "Observed state · feedback on" : "Observed state · read-only";
   globalThis.PicoDeliveries.render($("delivery-list"), data, { filter: deliveryState.filter, feedback: feedback ? deliveryFeedback : null });
 }
 document.querySelectorAll("[data-delivery-filter]").forEach(button => {
@@ -1057,8 +1057,13 @@ async function refreshDeliveries() {
   deliveryState.fetchedAt = Date.now();
   try {
     const response = await fetch("/api/deliveries", { cache: "no-store", headers: tokenHeaders() });
-    if (!response.ok) throw new Error("Delivery observations unavailable");
-    deliveryState.data = await response.json();
+    if (response.status === 403) {
+      // Started with --feedback (or --controls): reads need the session token from the launch URL.
+      deliveryState.data = { ok: false, tokenMissing: true, deliveries: [] };
+    } else {
+      if (!response.ok) throw new Error("Delivery observations unavailable");
+      deliveryState.data = await response.json();
+    }
   } catch {
     deliveryState.data = { ...deliveryState.data, ok: false };
   }

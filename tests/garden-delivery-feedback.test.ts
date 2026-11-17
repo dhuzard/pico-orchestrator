@@ -119,3 +119,12 @@ test("an empty draft is not previewed and an unverified posted URL is not linked
   assert.match(container.textContent, /Comment sent/);
   assert.equal(container.all().some(item => item.tagName === "A" && item.href.startsWith("https://evil.example")), false);
 });
+
+test("a page opened without the session token says so instead of hiding the feature", () => {
+  const render = renderer(); const container = new Element("div");
+  render(container, { ok: false, tokenMissing: true, deliveries: [] }, { feedback: null });
+  assert.match(container.textContent, /opened without it/);
+  assert.match(container.textContent, /#token=/);
+  assert.doesNotMatch(container.textContent, /Delivery observations unavailable/);
+  assert.equal(find(container, "TEXTAREA"), undefined);
+});

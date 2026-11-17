@@ -110,6 +110,13 @@
   }
   function render(container, data, options = {}) {
     container.replaceChildren();
+    if (data?.tokenMissing) {
+      // The server refused the read: this page was opened without the session token.
+      container.append(
+        node("p", "delivery-warning", "This Garden was started with a private session link, and this page was opened without it, so deliveries and feedback are hidden."),
+        node("p", "detail-note", "Open the full URL printed when pico watch started (it ends in #token=…). The page removes the token from the address bar, so reloading drops it: reopen that URL instead."));
+      return;
+    }
     if (!data?.ok) container.append(node("p", "delivery-warning", "Delivery observations unavailable. Last known evidence may be outdated; refresh before deciding."));
     const all = Array.isArray(data?.deliveries) ? data.deliveries : [];
     const rows = all.filter(row => {

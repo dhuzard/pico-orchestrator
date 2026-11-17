@@ -179,7 +179,9 @@ refuses if anything moved since the preview:
 `--feedback` cannot be combined with `--workspace` (dispatcher deliveries are not
 shown there). Like `--controls`, it prints a private URL with a session token; the
 token is required for every data read, and writes must come from the Garden page
-itself. Sends are recorded in `<state-dir>/garden-feedback.jsonl` with the author,
+itself. Opened without the token (for example by reloading, which drops it
+from the address bar), the delivery panel says so instead of showing deliveries;
+reopen the full URL printed at launch. Sends are recorded in `<state-dir>/garden-feedback.jsonl` with the author,
 PR, commit, outcome and a SHA-256 of the text (never the text itself).
 
 Optional `aggregate_ledger` in dispatcher configuration selects an explicitly
