@@ -8,6 +8,10 @@ All notable changes to PICO are recorded here. The format follows
 
 ### Added
 
+- Opt-in Garden delivery feedback (`pico watch --feedback`): a delivery card can
+  send a PR comment, or a change request pinned to the observed commit, as the
+  person's own `gh` account. Previewed and confirmed per send, refused when the PR
+  moved, closed or crossed repositories; never approves, merges or starts a model.
 - Opt-in provider HTTP admission for reviewed OpenAI/Anthropic API paths,
   with shared token/dollar reservations, isolated auth and conservative crash recovery.
 - Paired launch-brief efficiency benchmark with private input snapshots,

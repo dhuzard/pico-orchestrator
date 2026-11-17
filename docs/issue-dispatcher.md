@@ -148,6 +148,40 @@ History views. `--dispatcher-state /absolute/path/state.sqlite3` selects another
 database; the existing loopback and control-token protections still apply. GitHub
 links open the native review surface; Garden does not approve or merge a PR.
 
+### Quick feedback from the Garden
+
+`pico watch --all --feedback` (or `pico watch . --feedback` for one repository)
+adds a **Send feedback** box to each open delivery whose PR was verified. Write a
+note, choose *Comment on the pull request* or *Request changes (review)*, then
+**Preview**: the Garden shows the GitHub login that will author it (whatever `gh`
+is logged in as on this machine), the repository, PR, observed commit and exact
+text. **Send to GitHub** re-checks everything immediately before posting and
+refuses if anything moved since the preview:
+
+- The PR is always the one the observer verified for that queue issue; the
+  browser never supplies a repository, PR number or commit.
+- The live PR must still be open, in the same repository, and at the observed
+  head. A newer commit refuses the send until the next observation.
+- A change request is a `REQUEST_CHANGES` review pinned to the observed commit.
+  GitHub does not allow it on your own PR; send a comment instead. A comment is
+  not bound to a commit: a push landing in the instant between the check and the
+  post is not excluded. A change request on an older commit still blocks merging
+  unless the repository dismisses stale reviews.
+- Every GitHub call is pinned to github.com; `GH_HOST` is ignored, so the author
+  shown in the preview is the account that posts.
+- Sent feedback is remembered for the session: the same text cannot be sent the
+  same way (comment or change request) to the same commit twice. A GitHub timeout is reported as an unknown outcome:
+  check the PR before sending again.
+- There is no approve, merge or repair action. A comment grants no authority:
+  the observer reports a change request as a human decision, and a repair still
+  needs its own explicitly authorized execution.
+
+`--feedback` cannot be combined with `--workspace` (dispatcher deliveries are not
+shown there). Like `--controls`, it prints a private URL with a session token; the
+token is required for every data read, and writes must come from the Garden page
+itself. Sends are recorded in `<state-dir>/garden-feedback.jsonl` with the author,
+PR, commit, outcome and a SHA-256 of the text (never the text itself).
+
 Optional `aggregate_ledger` in dispatcher configuration selects an explicitly
 initialized launch-admission ledger (see `docs/aggregate-budget-accounting.md`).
 Direct `pico exec start` supports `--aggregate-ledger` or

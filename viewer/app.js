@@ -1028,11 +1028,19 @@ window.addEventListener("hashchange", () => { applyMode(); render(state.label); 
 // Issues change slowly and the server caches gh for a minute, so they are polled every 30 seconds.
 const issueState = { fetchedAt: 0 };
 const deliveryState = { fetchedAt: 0, data: { ok: true, deliveries: [] }, filter: "attention" };
+// pico watch --feedback: a card can send a PR comment or change request; the server previews and binds it first.
+async function sendDeliveryFeedback(payload) {
+  const response = await fetch("/api/delivery-feedback", { method: "POST", cache: "no-store",
+    headers: { "Content-Type": "application/json", ...tokenHeaders() }, body: JSON.stringify(payload) });
+  try { return await response.json(); } catch { return { ok: false, error: "The Garden returned no answer." }; }
+}
+const deliveryFeedback = { send: sendDeliveryFeedback, rerender: () => renderDeliveries() };
 function renderDeliveries() {
   const data = deliveryState.data;
+  const feedback = Boolean(data.feedback && controlState.token);
   $("delivery-panel").hidden = state.workspaceMode || (data.ok && !data.deliveries?.length);
-  $("delivery-connection").textContent = data.ok ? "Observed state · read-only" : "Connection lost · evidence may be stale";
-  globalThis.PicoDeliveries.render($("delivery-list"), data, { filter: deliveryState.filter });
+  $("delivery-connection").textContent = !data.ok ? "Connection lost · evidence may be stale" : feedback ? "Observed state · feedback on" : "Observed state · read-only";
+  globalThis.PicoDeliveries.render($("delivery-list"), data, { filter: deliveryState.filter, feedback: feedback ? deliveryFeedback : null });
 }
 document.querySelectorAll("[data-delivery-filter]").forEach(button => {
   button.addEventListener("click", () => {
@@ -1054,6 +1062,9 @@ async function refreshDeliveries() {
   } catch {
     deliveryState.data = { ...deliveryState.data, ok: false };
   }
+  // Do not re-render under someone typing feedback: the next poll shows the new data.
+  const active = document.activeElement;
+  if (active && $("delivery-list").contains(active) && (active.tagName === "TEXTAREA" || active.tagName === "SELECT")) return;
   renderDeliveries();
 }
 async function refreshIssues(force = false) {

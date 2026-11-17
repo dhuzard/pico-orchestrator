@@ -155,3 +155,11 @@ button.model-cell{border:0;background:none;padding:0;font:inherit;color:#3b878d;
 .delivery-evidence {margin-top:12px;font-size:12px}
 .delivery-evidence summary {cursor:pointer;padding:6px 0}
 .delivery-filters button {min-height:44px}
+.delivery-feedback {margin-top:12px;font-size:12px}
+.delivery-feedback summary {cursor:pointer;padding:6px 0;font-weight:700;color:#486f54}
+.delivery-feedback textarea {display:block;width:100%;min-height:84px;margin:8px 0;border:1px solid #dcdfd4;border-radius:10px;padding:9px;font:inherit;font-size:13px;color:#344139;background:#fff;resize:vertical}
+.delivery-feedback select {margin:0 10px 8px 0;border:1px solid #dcdfd4;border-radius:9px;padding:8px;background:#f9faf7;color:#425548}
+.delivery-feedback button {margin:4px 8px 4px 0;min-height:40px}
+.feedback-preview {border:1px solid #e3e9df;border-radius:12px;background:#f9faf7;padding:10px 14px;margin:8px 0;color:#405342}
+.feedback-quote {margin:8px 0;padding:8px 12px;border-left:3px solid #a7cda7;background:#fff;white-space:pre-wrap}
+.delivery-feedback textarea:focus-visible,.delivery-feedback select:focus-visible{outline:2px solid #438d91;outline-offset:2px}

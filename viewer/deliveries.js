@@ -1,4 +1,6 @@
-// A read-only view of durable delivery observations. Never interprets issue text as HTML or authority.
+// A view of durable delivery observations. Never interprets issue text as HTML or authority.
+// With `pico watch --feedback`, a card can also send a PR comment or a change request as the
+// person's own gh account: previewed first, confirmed second, and never an approval or merge.
 (function (root) {
   "use strict";
   const node = (tag, className, text) => {
@@ -17,6 +19,94 @@
     const anchor = node("a", "pr-link", "Review pull request ↗");
     anchor.href = row.pr_url; anchor.target = "_blank"; anchor.rel = "noopener noreferrer";
     return anchor;
+  }
+  const KINDS = { comment: "Comment on the pull request", request_changes: "Request changes (review)" };
+  const drafts = new Map(); // per delivery, survives the periodic re-render
+  const draftFor = row => {
+    const key = `${row.repository}#${row.queue_issue}`;
+    if (!drafts.has(key)) drafts.set(key, { open: false, kind: "comment", text: "", preview: null, confirm: null, busy: false, error: null, sent: null });
+    return drafts.get(key);
+  };
+  function postedLink(row, url) {
+    const prefix = `https://github.com/${row.repository}/pull/${row.pr_number}`;
+    if (typeof url !== "string" || !(url === prefix || url.startsWith(`${prefix}#`))) return null;
+    const anchor = node("a", "pr-link", "Open on GitHub ↗");
+    anchor.href = url; anchor.target = "_blank"; anchor.rel = "noopener noreferrer";
+    return anchor;
+  }
+  function button(className, text, onClick, disabled) {
+    const result = node("button", className, text);
+    result.type = "button"; result.disabled = Boolean(disabled);
+    result.addEventListener("click", onClick);
+    return result;
+  }
+  function composer(row, feedback) {
+    const draft = draftFor(row);
+    const box = node("details", "delivery-feedback");
+    box.open = draft.open;
+    box.addEventListener("toggle", () => { draft.open = box.open; });
+    box.append(node("summary", "", "Send feedback"));
+    const call = async (payload, onResult) => {
+      draft.busy = true; draft.error = null; feedback.rerender();
+      try {
+        const result = await feedback.send(payload);
+        onResult(result || {});
+      } catch {
+        draft.error = "The Garden did not answer; nothing was sent.";
+      }
+      draft.busy = false; feedback.rerender();
+    };
+    if (draft.sent) {
+      const done = node("p", "detail-note", draft.sent.status === "CHANGES_REQUESTED" ? "Change request sent. " : "Comment sent. ");
+      const link = postedLink(row, draft.sent.url);
+      if (link) done.append(link);
+      box.append(done);
+    }
+    const text = node("textarea", "feedback-text");
+    text.value = draft.text; text.maxLength = 4000; text.rows = 4; text.disabled = draft.busy || Boolean(draft.preview);
+    text.setAttribute("aria-label", "Your feedback");
+    text.placeholder = "What should change, or what looks good?";
+    text.addEventListener("input", () => { draft.text = text.value; draft.sent = null; });
+    const kind = node("select", "feedback-kind");
+    for (const [value, caption] of Object.entries(KINDS)) {
+      const option = node("option", "", caption); option.value = value; kind.append(option);
+    }
+    kind.value = draft.kind; kind.disabled = text.disabled;
+    kind.setAttribute("aria-label", "How to send it");
+    kind.addEventListener("change", () => { draft.kind = kind.value; });
+    box.append(text, kind);
+    if (!draft.preview) {
+      box.append(button("primary-button", draft.busy ? "Preparing…" : "Preview", () => {
+        if (!draft.text.trim()) { draft.error = "Write some feedback first."; feedback.rerender(); return; }
+        call({ issue: row.queue_issue, kind: draft.kind, body: draft.text }, result => {
+          if (result.ok && result.stage === "preview" && result.preview) { draft.preview = result.preview; draft.confirm = result.confirm; }
+          else draft.error = result.error || "The preview was refused.";
+        });
+      }, draft.busy));
+    } else {
+      const preview = draft.preview;
+      const summary = node("div", "feedback-preview");
+      summary.append(
+        node("p", "", `Posts as @${preview.author} on ${preview.repository} #${preview.pr_number} at commit ${String(preview.head_sha).slice(0, 12)}`),
+        node("p", "", `As: ${KINDS[preview.kind] || preview.kind}`),
+        node("blockquote", "feedback-quote", preview.body),
+        node("p", "detail-note", preview.note || ""));
+      box.append(summary,
+        button("primary-button", draft.busy ? "Sending…" : "Send to GitHub", () => {
+          call({ issue: row.queue_issue, kind: draft.kind, body: draft.text, confirm: draft.confirm }, result => {
+            if (result.ok && result.stage === "done") {
+              draft.sent = { status: result.status, url: result.url };
+              draft.text = ""; draft.preview = null; draft.confirm = null;
+            } else {
+              draft.error = result.error || "GitHub did not accept the feedback.";
+              draft.preview = null; draft.confirm = null;
+            }
+          });
+        }, draft.busy),
+        button("quiet-button", "Edit", () => { draft.preview = null; draft.confirm = null; feedback.rerender(); }, draft.busy));
+    }
+    if (draft.error) box.append(node("p", "delivery-warning", draft.error));
+    return box;
   }
   function render(container, data, options = {}) {
     container.replaceChildren();
@@ -46,7 +136,9 @@
       if (link) card.append(link);
       const details = node("details", "delivery-evidence");
       details.append(node("summary", "", "Evidence"), node("p", "detail-note", `Commit: ${row.head_sha || "unverified"} · Run: ${row.run_id || "unavailable"}`));
-      card.append(details); container.append(card);
+      card.append(details);
+      if (options.feedback && link && row.publication === "observed" && !finished.has(row.delivery_state)) card.append(composer(row, options.feedback));
+      container.append(card);
     }
   }
   root.PicoDeliveries = { render };
