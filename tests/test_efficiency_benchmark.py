@@ -221,3 +221,65 @@ def test_config_pilot_unmodified_route_engine_and_model_profile():
     assert [(a["step_id"], a["assigned_capacity_tier"]) for a in assignments] == [("claude_worker", "light")]
     assert all(assets.policy["model_profiles"]["claude"]["capacity_models"][tier]["model"] == "anthropic/claude-opus-5-5"
                for tier in ("light", "economy", "standard", "high", "max"))
+
+
+def test_validation_resolves_integrated_sha_not_task_branch_name(tmp_path):
+    import subprocess
+    spec = importlib.util.spec_from_file_location("efficiency_validation", ROOT / "benchmarks/efficiency/validation.py")
+    validation = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(validation)
+    import benchmark_metrics
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+                    "commit", "--allow-empty", "-qm", "base"], check=True)
+    subprocess.run(["git", "-C", str(repo), "checkout", "-qb", "pico/session/batch-1"], check=True)
+    (repo / "settings.json").write_text('{"display": {"max_results": 20}}\n')
+    subprocess.run(["git", "-C", str(repo), "add", "settings.json"], check=True)
+    subprocess.run(["git", "-C", str(repo), "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+                    "commit", "-qm", "work"], check=True)
+    sha = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
+    state = tmp_path / "state"
+    (state / "runs").mkdir(parents=True)
+    (state / "workspaces").mkdir()
+    (state / "workspaces" / "bench.json").write_text(json.dumps({"tasks": {"one-line": {"run_id": "run-1"}}}))
+    record = {"run_id": "run-1", "parent_orchestration": {"target_repository": "acme/pilot", "final_status": "COMPLETED",
+        "waves": [{"id": "w", "status": "integrated", "task_ids": ["phase"]}],
+        "phases": [{"id": "phase", "status": "completed", "diff_floor_checks": [
+            {"operation": "parent", "status": "passed", "wave_id": "w", "head": sha}]}]}}
+    (state / "runs" / "run-1.json").write_text(json.dumps(record))
+    head, reason = validation.find_head(state, "bench", "one-line", "acme/pilot", repo, benchmark_metrics)
+    assert reason is None and head["head"] == "pico/session/batch-1" and head["commit"] == sha
+    calls = []
+    class Real:
+        @staticmethod
+        def execute(argv, env, step):
+            calls.append(argv)
+            return {"exit_code": 0, "output": {"status": "VALIDATED", "observed": {"validated_commit": sha},
+                    "checks": [{"id": "acceptance", "status": "passed"}]}}
+    Real.benchmark_metrics = benchmark_metrics
+    workspace = {"id": "bench", "repositories": [{"id": "pilot", "path": "repo", "repository": "acme/pilot"}],
+                 "tasks": [{"id": "one-line", "repository": "pilot"}]}
+    result = validation.validate_completed("pico", {}, tmp_path / "workspace.yaml", workspace,
+                  {"tasks": [{"id": "one-line", "state": "completed"}]}, state, Real)
+    assert result[0]["validation"] == "VALIDATED" and calls[0][-1] == "pico/session/batch-1"
+    class Changed:
+        benchmark_metrics = Real.benchmark_metrics
+        @staticmethod
+        def execute(argv, env, step):
+            return {"exit_code": 0, "output": {"status": "VALIDATED", "observed": {"validated_commit": "b" * 40}}}
+    changed = validation.validate_completed("pico", {}, tmp_path / "workspace.yaml", workspace,
+                  {"tasks": [{"id": "one-line", "state": "completed"}]}, state, Changed)
+    assert changed[0]["validation"] == "unverified"
+    record["parent_orchestration"]["phases"][0]["diff_floor_checks"].append(
+        {"operation": "parent", "status": "passed", "wave_id": "w", "head": "c" * 40})
+    (state / "runs" / "run-1.json").write_text(json.dumps(record))
+    assert validation.find_head(state, "bench", "one-line", "acme/pilot", repo, benchmark_metrics)[0] is None
+    record["parent_orchestration"]["phases"][0]["diff_floor_checks"].pop()
+    (state / "runs" / "run-1.json").write_text(json.dumps(record))
+    subprocess.run(["git", "-C", str(repo), "branch", "pico/ambiguous", sha], check=True)
+    assert validation.find_head(state, "bench", "one-line", "acme/pilot", repo, benchmark_metrics)[0] is None
+    record["parent_orchestration"]["waves"][0]["status"] = "integrating"
+    (state / "runs" / "run-1.json").write_text(json.dumps(record))
+    assert validation.find_head(state, "bench", "one-line", "acme/pilot", repo, benchmark_metrics)[0] is None

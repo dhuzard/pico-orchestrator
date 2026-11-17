@@ -26,6 +26,7 @@ def module(name, path):
 
 
 setup = module("efficiency_setup", HERE / "setup.py")
+validation = module("efficiency_validation", HERE / "validation.py")
 real = module("real_benchmark", HERE.parent / "synthetic-workspace/run_real.py")
 
 
@@ -131,7 +132,7 @@ def main():
         if launch["output"] is None:
             raise real.Refused(f"schedule produced no JSON; exit {launch['exit_code']}; see execution state in {out}", code=1)
         workspace = __import__("yaml").safe_load(Path(fixture["manifest"]).read_text())
-        validation = real.validate_completed(pico, env, Path(fixture["manifest"]), workspace, launch["output"])
+        validations = validation.validate_completed(pico, env, Path(fixture["manifest"]), workspace, launch["output"], state, real)
         metrics = real.benchmark_metrics.workspace_report(state, fixture["workspace_id"], label=args.variant)
         provenance = {"variant": args.variant, "pair": args.pair, "revision": args.revision,
                       "task_id": "one-line", "task_kind": fixture["task_kind"], "task_sha256": fixture["task_sha256"], "base_commit": fixture["base_commit"],
@@ -166,7 +167,7 @@ def main():
                   "provider_ledger": {"entries": provider_entries,
                                       "all_entries_settled": bool(provider_entries) and all(e["state"] == "settled" for e in provider_entries)},
                   "elapsed_seconds": round(elapsed, 3), "launch": {"exit_code": launch["exit_code"], **launch["output"]},
-                  "validation": validation, "metrics": metrics, "fixture": fixture}
+                  "validation": validations, "metrics": metrics, "fixture": fixture}
         (out / "report.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
         print(json.dumps({"report": str(out / "report.json"), "launch_exit_code": launch["exit_code"]}))
         return 0
