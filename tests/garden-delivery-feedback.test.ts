@@ -117,7 +117,8 @@ test("an empty draft is not previewed and an unverified posted URL is not linked
   find(container, "BUTTON", "Preview")!.fire("click"); await settle();
   find(container, "BUTTON", "Send to GitHub")!.fire("click"); await settle();
   assert.match(container.textContent, /Comment sent/);
-  assert.equal(container.all().some(item => item.tagName === "A" && item.href.startsWith("https://evil.example")), false);
+  const hosts = container.all().filter(item => item.tagName === "A").map(item => new URL(item.href).hostname);
+  assert.deepEqual(hosts.filter(host => host !== "github.com"), [], "only the observed github.com PR may be linked");
 });
 
 test("a page opened without the session token says so instead of hiding the feature", () => {
