@@ -1,0 +1,10 @@
+# For the configuration-edit cohort: choose a capable Claude model for every
+# Claude tier; this does not alter route predicates, roles or required effort.
+schema_version: 1
+models:
+  claude:
+    light: {model: anthropic/claude-opus-5-5, ambiguity_capacity: 9}
+    economy: {model: anthropic/claude-opus-5-5, ambiguity_capacity: 9}
+    standard: {model: anthropic/claude-opus-5-5, ambiguity_capacity: 9}
+    high: {model: anthropic/claude-opus-5-5, ambiguity_capacity: 9}
+    max: {model: anthropic/claude-opus-5-5, ambiguity_capacity: 9}

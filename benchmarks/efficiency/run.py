@@ -73,6 +73,7 @@ def main():
     parser.add_argument("--max-tokens", type=int, required=True, help="workspace launch gate; provider limits remain authoritative")
     parser.add_argument("--max-lead-calls", type=int, required=True)
     parser.add_argument("--duration", type=int, required=True)
+    parser.add_argument("--task-kind", choices=("arithmetic", "config"), default="arithmetic")
     parser.add_argument("--lead-model", required=True)
     parser.add_argument("--lead-effort", required=True)
     parser.add_argument("--model-config", type=Path, required=True)
@@ -116,7 +117,7 @@ def main():
         state = out / "state"
         state.mkdir()
         fixture = setup.create(out / "work", args.max_tokens, args.max_lead_calls, args.duration,
-                               workspace_id=f"eff-{args.pair}-{args.variant}")
+                               workspace_id=f"eff-{args.pair}-{args.variant}", task_kind=args.task_kind)
         env = real.pico_env(args.revision, state)
         env.update(PICO_BENCHMARK_VARIANT=args.variant, PICO_BENCHMARK_PAIR=args.pair,
                    PICO_BENCHMARK_REVISION=args.revision, PICO_BENCHMARK_LEAD_MODEL=args.lead_model,
@@ -133,7 +134,7 @@ def main():
         validation = real.validate_completed(pico, env, Path(fixture["manifest"]), workspace, launch["output"])
         metrics = real.benchmark_metrics.workspace_report(state, fixture["workspace_id"], label=args.variant)
         provenance = {"variant": args.variant, "pair": args.pair, "revision": args.revision,
-                      "task_id": "one-line", "task_sha256": fixture["task_sha256"], "base_commit": fixture["base_commit"],
+                      "task_id": "one-line", "task_kind": fixture["task_kind"], "task_sha256": fixture["task_sha256"], "base_commit": fixture["base_commit"],
                       "acceptance_sha256": fixture["acceptance_sha256"], "autonomy_policy_sha256": fixture["autonomy_policy_sha256"],
                       "routing_policy_sha256": digest(ROOT / "routing/default-policy.yaml"),
                       "model_config_sha256": model_hash, "worker_model_config_sha256": model_hash,

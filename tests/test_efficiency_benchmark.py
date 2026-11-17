@@ -179,3 +179,45 @@ def test_analysis_excludes_changed_snapshots_and_mismatched_runtime(tmp_path):
     (tmp_path / "candidate.json").write_text(json.dumps(candidate))
     with pytest.raises(analysis.Invalid, match="runtime_fingerprint"):
         analysis.analyze(manifest, tmp_path)
+
+
+def test_config_pilot_reproducible_and_requires_exact_one_value_change(tmp_path):
+    import subprocess
+    spec = importlib.util.spec_from_file_location("config_setup", ROOT / "benchmarks/efficiency/setup.py")
+    setup = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(setup)
+    first = setup.create(tmp_path / "first", 10000, 20, 600, task_kind="config")
+    second = setup.create(tmp_path / "second", 10000, 20, 600, task_kind="config")
+    assert first["task_kind"] == "config"
+    assert first["base_commit"] == second["base_commit"]
+    assert first["task_sha256"] == second["task_sha256"]
+    repo = tmp_path / "first/pilot"
+    check = [sys.executable, str(ROOT / "benchmarks/efficiency/config_acceptance.py"), first["base_commit"]]
+    assert subprocess.run(check, cwd=repo, capture_output=True).returncode != 0
+    settings = repo / "settings.json"
+    settings.write_text(settings.read_text().replace('"max_results": 10', '"max_results": 20'))
+    assert subprocess.run(check, cwd=repo, capture_output=True).returncode == 0
+    settings.write_text(settings.read_text() + " ")
+    assert subprocess.run(check, cwd=repo, capture_output=True).returncode != 0
+
+
+def test_config_pilot_unmodified_route_engine_and_model_profile():
+    import routing_engine as engine
+    assets = engine.load_policy_assets(ROOT, ROOT / "benchmarks/efficiency/config-model-profile.yaml")
+    task = {"id": "one-line", "goal": "Set display.max_results to 20 in settings.json.",
+            "task_type": "config_edit", "failure_cost": "low", "semantic_correctness": "normal", "ambiguity": 2,
+            "implementation_scope": "small", "implementation_required": True, "cross_layer": False,
+            "behavior_preservation": "not_required", "diagnosis_required": False, "assumptions_must_be_explicit": False,
+            "many_routine_decisions": False, "production_feature": False, "security_sensitive": False,
+            "destructive_operation": False, "dependencies": [], "acceptance_criteria": ["The display limit is 20."],
+            "files_or_areas": ["settings.json"]}
+    resolution = engine.resolve_route(task, assets.policy, None, assets.task_schema)
+    assert resolution.selected_route == "CLAUDE"
+    assert resolution.effective_classification["ambiguity"] == 2
+    intent = engine.derive_primary_intent(resolution.effective_classification)
+    plan = engine.materialize_execution_plan(assets.policy, assets.execution_plan_schema, "CLAUDE", intent)
+    assignments = engine.assign_capacities(assets.policy, plan, resolution.effective_classification)
+    assert intent == "implementation"
+    assert [(a["step_id"], a["assigned_capacity_tier"]) for a in assignments] == [("claude_worker", "light")]
+    assert all(assets.policy["model_profiles"]["claude"]["capacity_models"][tier]["model"] == "anthropic/claude-opus-5-5"
+               for tier in ("light", "economy", "standard", "high", "max"))

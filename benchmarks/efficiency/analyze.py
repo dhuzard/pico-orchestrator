@@ -13,7 +13,7 @@ from pathlib import Path
 # These fields describe fixed inputs, not assertions inferred from outcomes.
 FIXED = ("revision", "task_sha256", "base_commit", "routing_policy_sha256",
          "autonomy_policy_sha256", "model_config_sha256", "lead_model", "lead_effort",
-         "worker_model_config_sha256", "provider_config_sha256", "runtime_fingerprint", "acceptance_sha256", "task_id", "provider_caps", "lead_call_limit", "duration_limit_seconds", "workspace_token_gate", "ledger_path")
+         "worker_model_config_sha256", "provider_config_sha256", "runtime_fingerprint", "acceptance_sha256", "task_id", "task_kind", "provider_caps", "lead_call_limit", "duration_limit_seconds", "workspace_token_gate", "ledger_path")
 VARIANTS = {"baseline", "candidate"}
 
 
