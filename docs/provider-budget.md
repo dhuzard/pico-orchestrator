@@ -54,8 +54,15 @@ There is no upstream retry or redirect following.
 
 Install and list reviewed plugins explicitly in configuration `extensions`:
 `/absolute/path/pi-subagent-workflows/extension/index.ts` for Codex workers and,
-when using Claude routes,
-`/absolute/path/pi-claude-bridge/src/index.ts`. There is no automatic package
+when using Claude routes, the extension that actually registers AskClaude.
+Legacy combined bridge 0.7.0 uses `pi-claude-bridge/src/index.ts`; provider-only
+bridge 0.11.0 moved that tool into `pi-claude-bridge-askclaude`. Companion 0.1.1
+was verified with Pi 1.3.0 in the offline fixture; its Pi peer range is >=0.86.1.
+Companion 0.1.2 requires Pi >=1.5.1 and is not a substitute for that verified
+combination. Pin compatible plugin versions with a lockfile. Run the optional
+real-plugin fixture against the exact selected
+extension before enabling it; a provider-only bridge does not supply AskClaude.
+There is no automatic package
 discovery. A missing required worker tool or unpriced route remains blocked by
 the existing routing/preflight guards. Those guards and mutation permissions
 are unchanged. A lead-only smoke can use `extensions: []`; normal orchestration
