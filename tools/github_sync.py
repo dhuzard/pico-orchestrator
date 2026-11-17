@@ -36,6 +36,17 @@ Safety properties, all enforced here:
     The branch is limited to `[A-Za-z0-9._-]` segments that start with a
     letter or digit, separated by `/`
     (no `..`), the ref to a full hex commit SHA, and nothing may follow.
+  - Garden delivery feedback (tools/delivery_feedback.py) adds four more fixed
+    `gh api` shapes, each pinned to `--hostname github.com` and run without
+    `GH_HOST`, so the author shown in a preview, the PR it checks and the PR
+    it writes to are all on github.com:
+      gh api -X GET user --hostname github.com
+      gh api -X GET repos/<owner>/<repo>/pulls/<n> --hostname github.com
+      gh api -X POST repos/<owner>/<repo>/issues/<n>/comments -f body=<b> --hostname github.com
+      gh api -X POST repos/<owner>/<repo>/pulls/<n>/reviews -f event=REQUEST_CHANGES
+         -f commit_id=<40-hex sha> -f body=<b> --hostname github.com
+    The only review event is REQUEST_CHANGES (never APPROVE); bodies are a
+    single raw-string `-f` field (no `@file` expansion) and must be non-empty.
   - No secrets/tokens are read, stored, or logged by this module. Whatever
     `gh` itself resolves from its own auth configuration is used implicitly
     by the `gh` binary; this module never inspects or forwards a token.
@@ -177,10 +188,13 @@ _GET_REPO_RE = re.compile(rf"repos/{_OWNER_REPO}")
 _GET_POLICY_RE = re.compile(rf"repos/{_OWNER_REPO}/contents/\.pi/autonomy\.yaml\?ref=([0-9a-f]{{40,64}})")
 POLICY_PATH = ".pi/autonomy.yaml"
 GITHUB_HOSTNAME = "github.com"
+_REVIEW_ENDPOINT_RE = re.compile(rf"repos/{_OWNER_REPO}/pulls/([1-9][0-9]*)/reviews")
+_COMMENT_ENDPOINT_RE = re.compile(rf"repos/{_OWNER_REPO}/issues/([1-9][0-9]*)/comments")
+_GET_PULL_RE = re.compile(rf"repos/{_OWNER_REPO}/pulls/([1-9][0-9]*)")
 
 
 def _validate_get_argv(argv: list[str]) -> None:
-    """Accept only `gh api -X GET <repository | branch ref | policy contents endpoint> --hostname github.com`."""
+    """Accept only `gh api -X GET <user | repository | pull request | branch ref | policy contents endpoint> --hostname github.com`."""
     def reject(reason: str) -> None:
         raise GithubSyncError(f"internal error: gh api argv rejected ({reason}): {argv!r}")
 
@@ -188,15 +202,60 @@ def _validate_get_argv(argv: list[str]) -> None:
         reject("unexpected length")
     if argv[5:] != ["--hostname", GITHUB_HOSTNAME]:
         reject("the host must be pinned with --hostname github.com")
-    match = _GET_BRANCH_RE.fullmatch(argv[4]) or _GET_POLICY_RE.fullmatch(argv[4]) or _GET_REPO_RE.fullmatch(argv[4])
+    if argv[4] == "user":  # the authenticated identity only; never another account
+        return
+    match = (_GET_BRANCH_RE.fullmatch(argv[4]) or _GET_POLICY_RE.fullmatch(argv[4]) or _GET_PULL_RE.fullmatch(argv[4])
+             or _GET_REPO_RE.fullmatch(argv[4]))
     if not match:
-        reject("endpoint must be the repository, a branch ref or the .pi/autonomy.yaml contents at a commit")
+        reject("endpoint must be the repository, a pull request, a branch ref or the .pi/autonomy.yaml contents at a commit")
     try:
         validate_repo(f"{match.group(1)}/{match.group(2)}")
     except ValueError:
         reject("invalid owner/repo")
     if match.lastindex >= 3 and ".." in match.group(3):
         reject("invalid branch")
+
+
+def _validate_post_argv(argv: list[str]) -> None:
+    """Accept only the exact argv built by post_pr_comment or request_changes:
+    gh api -X POST repos/<owner>/<repo>/issues/<n>/comments -f body=<text> --hostname github.com
+    gh api -X POST repos/<owner>/<repo>/pulls/<n>/reviews -f event=REQUEST_CHANGES
+       -f commit_id=<sha> -f body=<text> --hostname github.com
+    The reject message never includes argv, which carries the body."""
+    def reject(reason: str) -> None:
+        raise GithubSyncError(f"internal error: gh api argv rejected ({reason})")
+
+    if not all(isinstance(arg, str) for arg in argv):
+        reject("non-string element")
+    if argv[2:4] != ["-X", "POST"]:
+        reject("method must be exactly -X POST")
+    if len(argv) == 9 and (match := _COMMENT_ENDPOINT_RE.fullmatch(argv[4])):
+        try:
+            validate_repo(f"{match.group(1)}/{match.group(2)}")
+        except ValueError:
+            reject("invalid owner/repo")
+        if argv[5] != "-f" or not argv[6].startswith("body=") or not argv[6][5:].strip():
+            reject("the comment needs a non-empty raw-string body")
+        if argv[7:] != ["--hostname", GITHUB_HOSTNAME]:
+            reject("the host must be pinned with --hostname github.com")
+        return
+    if len(argv) != 13:
+        reject("unexpected length")
+    match = _REVIEW_ENDPOINT_RE.fullmatch(argv[4])
+    if not match:
+        reject("endpoint must be repos/<owner>/<repo>/pulls/<positive number>/reviews")
+    try:
+        validate_repo(f"{match.group(1)}/{match.group(2)}")
+    except ValueError:
+        reject("invalid owner/repo")
+    if argv[5] != "-f" or argv[6] != "event=REQUEST_CHANGES":
+        reject("the only review event is REQUEST_CHANGES")
+    if argv[7] != "-f" or not re.fullmatch(r"commit_id=[0-9a-f]{40}", argv[8]):
+        reject("the review must be pinned to a full commit id")
+    if argv[9] != "-f" or not argv[10].startswith("body=") or not argv[10][5:].strip():
+        reject("the review needs a non-empty raw-string body")
+    if argv[11:] != ["--hostname", GITHUB_HOSTNAME]:
+        reject("the host must be pinned with --hostname github.com")
 
 
 def validate_branch(branch: str) -> str:
@@ -290,6 +349,8 @@ def _validate_allowlisted(argv: list[str]) -> None:
     if argv[1] == "api":
         if len(argv) > 3 and argv[2:4] == ["-X", "GET"]:
             _validate_get_argv(argv)
+        elif len(argv) > 3 and argv[2:4] == ["-X", "POST"]:
+            _validate_post_argv(argv)
         else:
             _validate_pr_patch_argv(argv)
         return
@@ -747,6 +808,85 @@ def comment_pr(number: int, body: str, *, repo: str | None = None) -> None:
     argv = _with_repo(argv, repo)
     proc = _run(argv)
     _require_success(proc, argv)
+
+
+def current_login() -> str:
+    """The GitHub login that gh writes as. Raises GhAuthError when gh is not authenticated."""
+    argv = [GH_BINARY, "api", "-X", "GET", "user", "--hostname", GITHUB_HOSTNAME]
+    env = {name: value for name, value in os.environ.items() if name != "GH_HOST"}
+    proc = _run(argv, env=env)
+    _require_success(proc, argv)
+    data = _parse_json(proc, "gh api user")
+    login = data.get("login") if isinstance(data, dict) else None
+    if not isinstance(login, str) or not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})", login):
+        raise GhOutputError("gh api user: invalid login")
+    return login
+
+
+def pr_review_target(number: int, *, repo: str) -> dict:
+    """Live state of a github.com PR before writing feedback to it: state, head commit, author, cross-repository."""
+    _validate_pr_number(number)
+    repo = validate_repo(repo)
+    data = _get_or_none([GH_BINARY, "api", "-X", "GET", f"repos/{repo}/pulls/{number}", "--hostname", GITHUB_HOSTNAME],
+                        f"PR {number}")
+    if data is None:
+        raise GhOutputError(f"PR {number}: not found")
+    head, base, user = (data.get(key) if isinstance(data, dict) else None for key in ("head", "base", "user"))
+    sha = head.get("sha") if isinstance(head, dict) else None
+    author = user.get("login") if isinstance(user, dict) else None
+    head_repo = (head.get("repo") or {}).get("full_name") if isinstance(head, dict) else None
+    base_repo = ((base or {}).get("repo") or {}).get("full_name") if isinstance(base, dict) else None
+    if (data.get("number") != number or data.get("state") not in {"open", "closed"} or not isinstance(sha, str)
+            or not re.fullmatch(r"[0-9a-f]{40}", sha) or not isinstance(author, str) or not isinstance(base_repo, str)):
+        raise GhOutputError(f"PR {number}: unexpected PR shape")
+    state = "MERGED" if data.get("merged") is True else data["state"].upper()
+    # A deleted head fork reports no head repository: that is not this repository either.
+    cross = not isinstance(head_repo, str) or head_repo.casefold() != repo.casefold() or base_repo.casefold() != repo.casefold()
+    return {"number": number, "state": state, "head": sha, "cross_repository": cross, "author": author}
+
+
+def _created_url(proc: subprocess.CompletedProcess) -> str:
+    """html_url of something gh just created, or "" when its output is unreadable.
+
+    Called only after a successful POST: an odd response body must not turn a
+    write that happened into a reported failure (and a duplicate on retry)."""
+    try:
+        data = json.loads(proc.stdout or "")
+    except json.JSONDecodeError:
+        return ""
+    url = data.get("html_url") if isinstance(data, dict) else None
+    return url if isinstance(url, str) else ""
+
+
+def post_pr_comment(number: int, body: str, *, repo: str) -> str:
+    """Comment on a github.com PR's conversation; returns the comment's html_url (or "")."""
+    _validate_pr_number(number)
+    _validate_text(body, "body")
+    if not body.strip():
+        raise ValueError("body must be non-empty")
+    argv = [GH_BINARY, "api", "-X", "POST", f"repos/{validate_repo(repo)}/issues/{number}/comments",
+            "-f", f"body={body}", "--hostname", GITHUB_HOSTNAME]
+    env = {name: value for name, value in os.environ.items() if name != "GH_HOST"}
+    proc = _run(argv, env=env)
+    _require_success(proc, argv)
+    return _created_url(proc)
+
+
+def request_changes(number: int, body: str, *, repo: str, commit: str) -> str:
+    """Submit a REQUEST_CHANGES review pinned to `commit`; returns the review's html_url (or "")."""
+    _validate_pr_number(number)
+    _validate_text(body, "body")
+    if not body.strip():
+        raise ValueError("body must be non-empty")
+    if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise ValueError("commit must be a full lowercase commit id")
+    argv = [GH_BINARY, "api", "-X", "POST", f"repos/{validate_repo(repo)}/pulls/{number}/reviews",
+            "-f", "event=REQUEST_CHANGES", "-f", f"commit_id={commit}", "-f", f"body={body}",
+            "--hostname", GITHUB_HOSTNAME]
+    env = {name: value for name, value in os.environ.items() if name != "GH_HOST"}
+    proc = _run(argv, env=env)
+    _require_success(proc, argv)
+    return _created_url(proc)
 
 
 def edit_issue(

@@ -180,6 +180,32 @@ def host_allowed(host: str | None, port: int) -> bool:
     return host in {f"127.0.0.1:{port}", f"localhost:{port}"}
 
 
+def check_session_token(headers, token: str) -> None:
+    """Constant-time check of the session token sent as X-Pico-Token."""
+    supplied = headers.get("X-Pico-Token") or ""
+    if not hmac.compare_digest(supplied.encode(), token.encode()):
+        raise ControlError(403, "CONTROL_TOKEN_INVALID", "open the Garden from the URL printed at launch")
+
+
+def authorize_json(headers, body: bytes, *, port: int, token: str) -> dict:
+    """Same-origin, token-bearing, size-bounded JSON object, or ControlError."""
+    origin = headers.get("Origin")
+    if origin not in {f"http://127.0.0.1:{port}", f"http://localhost:{port}"}:
+        raise ControlError(403, "CONTROL_ORIGIN_REJECTED", "actions must come from this Garden page")
+    check_session_token(headers, token)
+    if (headers.get("Content-Type") or "").split(";")[0].strip() != "application/json":
+        raise ControlError(415, "CONTROL_BODY_INVALID", "actions take a JSON body")
+    if len(body) > MAX_BODY:
+        raise ControlError(413, "CONTROL_BODY_INVALID", "request body is too large")
+    try:
+        data = json.loads(body or b"{}")
+    except ValueError as exc:
+        raise ControlError(400, "CONTROL_BODY_INVALID", "request body is not JSON") from exc
+    if not isinstance(data, dict):
+        raise ControlError(400, "CONTROL_BODY_INVALID", "request body must be an object")
+    return data
+
+
 class Controls:
     def __init__(self, manifest: Path, port: int, *, adapter=None, token: str | None = None,
                  state_dir: Path | None = None):
@@ -196,27 +222,10 @@ class Controls:
 
     # -- request checks ----------------------------------------------------
     def check_token(self, headers) -> None:
-        """Constant-time check of the session token sent as X-Pico-Token."""
-        supplied = headers.get("X-Pico-Token") or ""
-        if not hmac.compare_digest(supplied.encode(), self.token.encode()):
-            raise ControlError(403, "CONTROL_TOKEN_INVALID", "open the Garden from the URL printed at launch")
+        check_session_token(headers, self.token)
 
     def authorize(self, headers, body: bytes) -> dict:
-        origin = headers.get("Origin")
-        if origin not in {f"http://127.0.0.1:{self.port}", f"http://localhost:{self.port}"}:
-            raise ControlError(403, "CONTROL_ORIGIN_REJECTED", "actions must come from this Garden page")
-        self.check_token(headers)
-        if (headers.get("Content-Type") or "").split(";")[0].strip() != "application/json":
-            raise ControlError(415, "CONTROL_BODY_INVALID", "actions take a JSON body")
-        if len(body) > MAX_BODY:
-            raise ControlError(413, "CONTROL_BODY_INVALID", "request body is too large")
-        try:
-            data = json.loads(body or b"{}")
-        except ValueError as exc:
-            raise ControlError(400, "CONTROL_BODY_INVALID", "request body is not JSON") from exc
-        if not isinstance(data, dict):
-            raise ControlError(400, "CONTROL_BODY_INVALID", "request body must be an object")
-        return data
+        return authorize_json(headers, body, port=self.port, token=self.token)
 
     # -- read-only panels --------------------------------------------------
     def _record_path(self, workspace_id: str) -> Path:

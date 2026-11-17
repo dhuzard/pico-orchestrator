@@ -551,14 +551,17 @@ class PublicationGateReadsTest(unittest.TestCase):
         with self.assertRaises(gh.GhCommandError):
             self.call(gh.default_branch, repo="acme/repo", returncode=1, stderr="HTTP 500")
 
-    def test_get_allowlist_accepts_only_the_repository_branch_and_policy_endpoints(self):
+    def test_get_allowlist_accepts_only_the_documented_endpoints(self):
         base = [gh.GH_BINARY, "api", "-X", "GET"]
         pin = ["--hostname", "github.com"]
+        # Repository, branch ref and policy file (publication gate); the authenticated user and one
+        # pull request by number (Garden delivery feedback).
         for endpoint in ("repos/acme/repo", "repos/acme/repo/git/ref/heads/main",
-                         f"repos/acme/repo/contents/.pi/autonomy.yaml?ref={'a' * 40}"):
+                         f"repos/acme/repo/contents/.pi/autonomy.yaml?ref={'a' * 40}", "user", "repos/acme/repo/pulls/12"):
             gh._validate_allowlisted(base + [endpoint] + pin)
-        for endpoint in ("repos/acme/repo/pulls", "repos/acme/repo/contents/README.md?ref=" + "a" * 40,
-                         "user", "repos/acme/repo/", "repos/acme"):
+        for endpoint in ("repos/acme/repo/pulls", "repos/acme/repo/pulls/0", "repos/acme/repo/pulls/12/files",
+                         "repos/acme/repo/contents/README.md?ref=" + "a" * 40, "users/someone", "user/repos",
+                         "repos/acme/repo/", "repos/acme"):
             with self.subTest(endpoint=endpoint), self.assertRaises(gh.GithubSyncError):
                 gh._validate_allowlisted(base + [endpoint] + pin)
         with self.assertRaises(gh.GithubSyncError):

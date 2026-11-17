@@ -521,7 +521,8 @@ TOKEN_ENDPOINTS = frozenset({"/api/controls", "/api/branches", "/api/runs", "/ap
 
 def make_handler(directory: Path, repository: str | None, workspace: WorkspaceSource | None = None,
                  controls=None, port: int | None = None, issues: garden_issues.IssuesSource | None = None,
-                 setup: workspace_setup.SetupControls | None = None, dispatcher_state: Path | None = None):
+                 setup: workspace_setup.SetupControls | None = None, dispatcher_state: Path | None = None,
+                 feedback=None):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, format, *args):
             if not self.path.startswith("/api/"):
@@ -570,6 +571,25 @@ def make_handler(directory: Path, repository: str | None, workspace: WorkspaceSo
                     payload = self._json(exc.status, {"ok": False, "error_code": exc.code, "error": exc.detail})
                 self._send(payload)
                 return
+            if path == "/api/delivery-feedback" and feedback is not None:
+                try:
+                    length = int(self.headers.get("Content-Length") or 0)
+                except ValueError:
+                    length = -1
+                if length < 0:
+                    self._send(self._json(400, {"ok": False, "error_code": "CONTROL_BODY_INVALID"}))
+                    return
+                body = self.rfile.read(min(length, garden_controls.MAX_BODY + 1)) if length else b""
+                try:
+                    payload = self._json(200, feedback.act(feedback.authorize(self.headers, body)))
+                except garden_controls.ControlError as exc:
+                    payload = self._json(exc.status, {"ok": False, "error_code": exc.code, "error": exc.detail})
+                self._send(payload)
+                return
+            if path == "/api/delivery-feedback":
+                self._send(self._json(404, {"ok": False, "error_code": "FEEDBACK_OFF",
+                                            "error": "start pico watch with --feedback (not with --workspace)"}))
+                return
             if path != "/api/action" or controls is None:
                 self._send(self._json(404, {"ok": False, "error_code": "CONTROLS_OFF",
                                             "error": "start pico watch with --workspace <manifest> --controls"}))
@@ -595,7 +615,7 @@ def make_handler(directory: Path, repository: str | None, workspace: WorkspaceSo
 
         def _token_ok(self) -> bool:
             # With controls on, every data endpoint needs the session token too (TOKEN_ENDPOINTS).
-            auth = controls or setup
+            auth = controls or setup or feedback
             if auth is None:
                 return True
             try:
@@ -662,7 +682,10 @@ def make_handler(directory: Path, repository: str | None, workspace: WorkspaceSo
                     if workspace is not None:
                         # Dispatcher deliveries are not workspace-manifest task records.
                         rows = []
-                    payload = self._json(200, {"ok": True, "deliveries": rows})
+                    body = {"ok": True, "deliveries": rows}
+                    if feedback is not None and workspace is None:
+                        body["feedback"] = True
+                    payload = self._json(200, body)
                 except (OSError, ValueError):
                     payload = self._json(503, {"ok": False, "error_code": "DELIVERY_STATE_UNAVAILABLE",
                                                "error": "Delivery observations are unavailable."})
@@ -724,13 +747,18 @@ def main() -> None:
     parser.add_argument("--controls", action="store_true",
                         help="with --workspace <manifest>: enable validate, request PR, CI and promote actions")
     parser.add_argument("--setup-root", type=Path, help="Open the workspace setup page for this directory")
+    parser.add_argument("--feedback", action="store_true",
+                        help="let this browser session send PR comments or change requests on observed deliveries, "
+                             "as the account gh is logged in as (not with --workspace)")
     args = parser.parse_args()
     if args.all and args.repo:
         parser.error("--all and --repo cannot be combined")
     if args.workspace and (args.all or args.repo):
         parser.error("--workspace cannot be combined with --all or --repo")
-    if args.setup_root and (args.workspace or args.all or args.repo or args.controls):
+    if args.setup_root and (args.workspace or args.all or args.repo or args.controls or args.feedback):
         parser.error("--setup-root cannot be combined with workspace, repository or control options")
+    if args.feedback and args.workspace:
+        parser.error("--feedback works on dispatcher deliveries, which are not shown with --workspace")
     if not 0 <= args.port <= 65535:
         parser.error("--port must be between 0 and 65535")
     default_state = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "pi-coding-orchestrator"
@@ -774,6 +802,14 @@ def main() -> None:
     if setup:
         server.RequestHandlerClass = make_handler(directory, repository, port=server.server_port, setup=setup,
                                                   dispatcher_state=args.dispatcher_state)
+    feedback = None
+    if args.feedback:
+        import delivery_feedback
+        feedback = delivery_feedback.DeliveryFeedback(
+            server.server_port, args.dispatcher_state or state / "issue-dispatcher.sqlite3",
+            repository=repository, audit_path=state / "garden-feedback.jsonl")
+        server.RequestHandlerClass = make_handler(directory, repository, port=server.server_port, issues=issues,
+                                                  dispatcher_state=args.dispatcher_state, feedback=feedback)
     if args.controls:
         controls = garden_controls.Controls(workspace.manifest, server.server_port, state_dir=state)
         server.RequestHandlerClass = make_handler(directory, repository, workspace, controls, server.server_port,
@@ -785,6 +821,9 @@ def main() -> None:
     elif controls:
         print(f"Pico watch: http://127.0.0.1:{server.server_port}/#token={controls.token}  ({label}, controls on)", flush=True)
         print("Keep this URL private: it authorizes actions for this session only.", flush=True)
+    elif feedback:
+        print(f"Pico watch: http://127.0.0.1:{server.server_port}/#token={feedback.token}  ({label}, feedback on)", flush=True)
+        print("Keep this URL private: it lets this session post to GitHub as your gh account.", flush=True)
     else:
         print(f"Pico watch: http://127.0.0.1:{server.server_port}  ({label})", flush=True)
     print(f"Reading: {state / 'workspaces' if workspace else directory}", flush=True)
