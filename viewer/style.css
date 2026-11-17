@@ -144,3 +144,14 @@ button.model-cell{border:0;background:none;padding:0;font:inherit;color:#3b878d;
 .setup-page #existing-name { display: block; width: min(100%, 32rem); box-sizing: border-box; padding: .55rem; border: 1px solid #a9a79f; border-radius: 7px; font: inherit; }
 .setup-import-repo { border-top: 1px solid #e5e5df; padding: .7rem 0; overflow-wrap: anywhere; }
 .setup-import-repo p { margin: .25rem 0; }
+/* Post-execution handoff: read-only, exact-commit evidence and human next steps. */
+.delivery-panel {margin-bottom:24px}
+.delivery-filters {display:flex;flex-wrap:wrap;margin-bottom:16px}
+.delivery-card {border-top:1px solid #dce6dd;padding:16px 0;overflow-wrap:anywhere}
+.delivery-heading {display:flex;justify-content:space-between;align-items:start;gap:12px;flex-wrap:wrap}
+.delivery-next {font-size:14px;color:#405342;line-height:1.6}
+.delivery-facts {display:flex;flex-wrap:wrap;gap:8px 18px;font-size:12px;color:#536656}
+.delivery-warning {color:#865e21;font-size:12px;line-height:1.6}
+.delivery-evidence {margin-top:12px;font-size:12px}
+.delivery-evidence summary {cursor:pointer;padding:6px 0}
+.delivery-filters button {min-height:44px}

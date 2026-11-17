@@ -924,7 +924,16 @@ def publish(*, worktree: Path, base: str, head: str, title: str, body_file: Path
         else:
             if expected_plan_hash != digest:
                 raise IntegrationError("GITHUB_STATE_CONFLICT", "publication plan changed since dry-run")
+            # Persist the identity of the intended side effect before contacting
+            # GitHub. A crash or lost response must be reconciled against this
+            # exact branch/commit; absence of an applied audit is not proof that
+            # no remote mutation happened.
+            receipt = {"repository": repo, "base": base, "head": push_head,
+                       "commit": state["commit"], "plan_hash": digest,
+                       "parent_run_id": parent_run_id, "stage": "push_intent", "pr": None}
+            meta["publication_receipt"] = receipt
             if state["remote_commit"] != state["commit"]:
+                provenance.update_github_integration(provenance_root, record["run_id"], meta)
                 proc = subprocess.run(["git", "-C", str(worktree), "push", "--porcelain", state["remote"],
                                        f"{state['commit']}:refs/heads/{push_head}"], capture_output=True, text=True, timeout=120)
                 if proc.returncode:
@@ -932,16 +941,25 @@ def publish(*, worktree: Path, base: str, head: str, title: str, body_file: Path
                 meta["mutations_applied"] += 1
                 meta["audit"].append({"operation": "push_branch", "issue": None, "pr": None,
                                       "label": None, "status": "applied"})
+                receipt["stage"] = "push_observed"
                 provenance.update_github_integration(provenance_root, record["run_id"], meta)
             if state["existing_pr"] is None:
+                receipt["stage"] = "pr_intent"
+                provenance.update_github_integration(provenance_root, record["run_id"], meta)
                 created = adapter.create_pr(title, body, base=base, head=push_head, repo=repo, draft=True)
                 pr_number = created["number"]
                 meta["mutations_applied"] += 1
                 meta["audit"].append({"operation": "create_draft_pr", "issue": None, "pr": pr_number,
                                       "label": None, "status": "applied"})
+                receipt.update({"stage": "pr_observed", "pr": pr_number})
                 provenance.update_github_integration(provenance_root, record["run_id"], meta)
             else:
                 pr_number = state["existing_pr"]
+                receipt.update({"stage": "pr_observed", "pr": pr_number})
+                # Reusing an existing PR is observed convergence, not a new mutation.
+                meta["audit"].append({"operation": "observe_draft_pr", "issue": None,
+                                      "pr": pr_number, "label": None, "status": "observed"})
+                provenance.update_github_integration(provenance_root, record["run_id"], meta)
             outcome = "completed"
     except IntegrationError as exc:
         meta["blocker_code"], meta["reason"] = exc.code, exc.detail

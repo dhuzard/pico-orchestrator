@@ -236,6 +236,50 @@ class IntegrationTest(unittest.TestCase):
         subprocess.run(["git", "-C", str(self.worktree), "remote", "set-url", "origin", "git@github.com:Examplecorp/examplelab.git"], check=True)
         self.assertEqual(gi.resolve_target(self.worktree), "Examplecorp/examplelab")
 
+    def test_publication_intent_survives_crash_before_remote_receipt(self):
+        self.remote("https://github.com/Examplecorp/examplelab.git")
+        body = Path(self.tmp.name) / "receipt-body.md"
+        body.write_text("Refs #401\n")
+        api = FakeGithubApi()
+        policy = (ROOT / "templates/autonomy.yaml").read_text().replace("push_branch: false", "push_branch: true").replace("create_pr: false", "create_pr: true")
+        base = api.merge("Examplecorp/examplelab", policy)
+        state = {"remote": "origin", "commit": "a" * 40, "remote_commit": None,
+                 "base_commit": base, "existing_pr": None}
+        real_run = subprocess.run
+        def latest_intent(stage):
+            matches = [r for r in provenance.list_runs(self.records)
+                       if (r.get("github_integration") or {}).get("publication_receipt", {}).get("stage") == stage]
+            self.assertEqual(len(matches), 1)
+            receipt = matches[0]["github_integration"]["publication_receipt"]
+            self.assertEqual(receipt["commit"], state["commit"])
+            self.assertEqual(receipt["head"], "pico/receipt-test")
+            self.assertEqual(matches[0]["outcome"], "in_progress")
+        for crash in ("push", "pr"):
+            with self.subTest(crash=crash):
+                # Isolate the attempt's provenance directory, retaining its state after the simulated crash.
+                if crash == "pr":
+                    self.records = self.records.parent / "second-receipt-attempt"
+                    (self.records / "schemas").mkdir(parents=True)
+                    shutil.copy(ROOT / "schemas/run-record.schema.json", self.records / "schemas/run-record.schema.json")
+                def run(argv, _crash=crash, **kwargs):
+                    if len(argv) > 3 and argv[3] == "push":
+                        latest_intent("push_intent")
+                        if _crash == "push":
+                            raise SystemExit("process died after remote side effect")
+                        return subprocess.CompletedProcess(argv, 0, "", "")
+                    return real_run(argv, **kwargs)
+                def create(*args, **kwargs):
+                    latest_intent("pr_intent")
+                    raise SystemExit("process died after PR creation")
+                with patch.object(gi, "_publication_state", return_value=state), \
+                        patch.object(gi, "_branch", side_effect=lambda _path, name, **_kwargs: name):
+                    preview = gi.publish(worktree=self.worktree, base="main", head="pico/receipt-test", title="Receipt test", body_file=body, adapter=api, provenance_root=self.records)
+                    with patch.object(gi.subprocess, "run", side_effect=run), \
+                            patch.object(api, "create_pr", side_effect=create, create=True):
+                        with self.assertRaises(SystemExit):
+                            gi.publish(worktree=self.worktree, base="main", head="pico/receipt-test", title="Receipt test", body_file=body, adapter=api, provenance_root=self.records, apply=True, expected_plan_hash=preview["plan_hash"])
+                latest_intent("push_intent" if crash == "push" else "pr_intent")
+
     def test_missing_ambiguous_and_conflicting_remotes_fail_closed(self):
         with self.assertRaises(gi.IntegrationError) as error:
             gi.resolve_target(self.worktree)

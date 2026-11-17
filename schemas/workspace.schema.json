@@ -268,7 +268,7 @@
       "description": "Optional default per-signature retry budget for each child execution; a task's own failure_retry_budget overrides it for how many times a worker step may be retried after a structured failure that repeats unchanged (same task, step, route epoch, failure code, worktree HEAD and declared-input digest) before the step is blocked with REPEATED_INEFFECTIVE_ACTION. 0 allows no retry. Prerequisite blockers never count. Omitted: the repository's .pi/autonomy.yaml limits.failure_retry_budget, else 2."
     },
     "budget": {
-      "description": "Optional spend limit across the workspace's child runs. The scheduler launches nothing once it is reached; running children are not stopped. max_cost_usd uses backend-reported cost, which only Claude workers report today, so it is a lower bound.",
+      "description": "Optional observed-usage launch gate across child runs, not a hard provider spending cap. Running children are not stopped. Missing linked telemetry blocks admission; max_cost_usd also blocks when reported pricing is incomplete. Provider-reported monetary estimates include cache-read charges when reported, and are not independently verified bills.",
       "type": "object",
       "additionalProperties": false,
       "minProperties": 1,
@@ -276,7 +276,7 @@
         "max_tokens": {
           "type": "integer",
           "minimum": 1,
-          "description": "Input plus output tokens across all child runs."
+          "description": "Input plus output plus cache-write tokens across all child runs. Cache reads are excluded only from this token-work metric, not from monetary accounting."
         },
         "max_cost_usd": {
           "type": "number",

@@ -1286,6 +1286,21 @@
           "type": "integer",
           "minimum": 0
         },
+        "publication_receipt": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["repository", "base", "head", "commit", "plan_hash", "stage"],
+          "properties": {
+            "repository": {"type": "string", "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"},
+            "base": {"type": "string"},
+            "head": {"type": "string"},
+            "commit": {"type": "string", "pattern": "^[0-9a-f]{40,64}$"},
+            "plan_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "parent_run_id": {"type": ["string", "null"]},
+            "stage": {"enum": ["push_intent", "push_observed", "pr_intent", "pr_observed"]},
+            "pr": {"type": ["integer", "null"], "minimum": 1}
+          }
+        },
         "mutations_applied": {
           "type": "integer",
           "minimum": 0

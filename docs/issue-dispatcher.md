@@ -1,5 +1,19 @@
 # Pico GitHub Issues dispatcher (opt-in prototype)
 
+## Bounded human-authorized repairs
+
+When a delivery has failed checks or a current human change request, create a
+fresh queue issue describing the exact repair scope and acceptance checks. Approve
+it with the normal interactive fingerprint command, adding `--repair-of <original
+queue issue> --allow-mutation`. This binds it to the re-observed PR head, stores
+lineage, and consumes one repair allowance for that root delivery. The allowance
+is durable across restart, stale issues and reapproval; it is not reset by a new
+queue number. The original execution record is unchanged. A changed PR head or
+resolved failure invalidates the queued repair before launch. Current duration
+and call caps apply; there is no automatic repair from a comment or label and no
+automatic merge. The fingerprint authorizes the exact new repair task; the
+dispatcher does not infer a code scope from a reviewer comment.
+
 **Status:** prototype; does not install, enable, or run anything by default. No Moltis integration yet. Only one active job globally. Queued issue contents are untrusted input. This adapter is NOT a security sandbox for the lead or Codex workers, and is not a substitute for `.pi/autonomy.yaml`.
 
 ## Why this lives in Pico
@@ -109,3 +123,39 @@ The unit has **no dependency on `moltis.service`**. It runs as `dhuzard`, so pro
 - `interrupted` is terminal for this prototype; no unattended retries, no resume, no automatic expansion of permissions. A new issue and new explicit approval is required for a new execution attempt.
 - `gh issue list` is not used for authorization; non-operator comments, labels and issue contents never grant execution.
 - Integrate #34, #63 and #87 before calling this a production unattended coding system. Add a real WSL/Windows sign-in and service restart pilot, with mock-agent tests first.
+
+## Delivery observation and human handoff
+
+Completed, partial, blocked and interrupted executions are reconciled on every service poll, including after restart. The execution outcome remains unchanged; a separate SQLite delivery projection records the observed publication, PR head, CI, human review, attention reason and next action. `status` includes this projection in each task's `delivery` field. The observer only reads GitHub and local provenance; it never starts a model, repairs code, approves, merges or deploys. Repairs require a separate explicitly authorized execution; no comment grants authority.
+
+Configure expected check names for each target, for example:
+
+```json
+"delivery_expected_checks": {"dhuzard/oratlas": ["build", "test"]}
+```
+
+A nonempty list is required to establish passing expected checks. It is an operator-maintained expectation, not a replacement for GitHub branch rules. The observer also reads branch protection and includes any accessible required contexts; inaccessible protection or rulesets leave merge readiness unknown. Passing expected checks invites a person to review the PR; it does not mean the PR is mergeable or satisfy unknown GitHub rules. Missing, skipped, neutral, cancelled or failed checks never count as passed. A changed head during polling invalidates the observation. Only reviews by GitHub `User` accounts at the observed head count as human decisions; a dismissed or older approval does not count as current.
+
+An applied PR creation or observed publication receipt must appear in a linked publication child for the approved target. The PR's base and head repositories must both match the target, and its current head must match integrated evidence in parent provenance. New publication receipts retain the exact commit, branch, parent run and operation stage before remote writes, allowing the final head to be identified across multiple waves. Legacy records without a receipt require one unique integrated head. Later commits, missing child provenance and cross-repository PRs need human inspection. The observer requires separate target credentials; legacy shared-auth configurations cannot produce a verified delivery. Target reads use target credentials, and queue notifications use queue credentials.
+
+A stable marker identifies one queue handoff comment per execution. Each poll searches all issue comments before creating or updating it; multiple marker matches stop reconciliation. After a timeout, the next poll searches again before retrying, reducing duplicates without promising exactly-once delivery. Existing terminal status comments are retained. No reminders are enabled. GitHub or local evidence unavailability produces an attention state rather than a fabricated success. Evidence timestamps describe the most recent poll, and no background observation runs when the service is stopped.
+
+Only comments authored by the authenticated queue identity are eligible for update.
+Corrupt observation storage is reported as unavailable rather than an empty task
+list. `pico watch --all` reads the default dispatcher database and shows a
+read-only Delivery attention panel with Needs attention, Waiting on checks and
+History views. `--dispatcher-state /absolute/path/state.sqlite3` selects another
+database; the existing loopback and control-token protections still apply. GitHub
+links open the native review surface; Garden does not approve or merge a PR.
+
+Optional `aggregate_ledger` in dispatcher configuration selects an explicitly
+initialized launch-admission ledger (see `docs/aggregate-budget-accounting.md`).
+Direct `pico exec start` supports `--aggregate-ledger` or
+`PICO_AGGREGATE_BUDGET_LEDGER`; workspaces and dispatcher runs use the same central
+admission path, so one actual launch is counted once. Dispatcher repairs retain
+their root delivery's task identity. `--serialize-global` holds dispatcher starts
+while any execution in the same state root is active or uncertain, using the
+shared headless launch lock. Workspace parallelism remains separately governed.
+This boundary is local cooperative admission, not isolation from a malicious
+same-user process. No live ledger or automatic repair policy is enabled by
+installing these changes.

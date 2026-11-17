@@ -30,7 +30,6 @@ import hashlib
 import json
 import os
 import re
-import signal
 import subprocess
 import sys
 import time
@@ -44,6 +43,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import atomic_io  # noqa: E402
 import autonomy_policy  # noqa: E402
 import github_integration  # noqa: E402
+import launch_brief  # noqa: E402
+import budget_ledger  # noqa: E402
 import parent_orchestration  # noqa: E402
 import provenance  # noqa: E402
 import run_lease  # noqa: E402
@@ -207,6 +208,45 @@ def load_record(path: Path) -> dict | None:
     return data
 
 
+def global_execution_barriers(root: Path | None = None) -> list[dict]:
+    """Read-only conservative global scan for a dispatcher admitting new work.
+
+    A stale live/uncertain record must be reconciled with its execution status
+    before releasing the slot. Unreadable records and interrupted pre-supervisor
+    records cannot prove that an unregistered child does not exist.
+    """
+    base = (Path(root) if root is not None else state_root()) / "executions"
+    try:
+        base.stat()
+    except FileNotFoundError:
+        return []
+    except OSError:
+        return [{'path': str(base), 'status': 'unreadable', 'execution_id': None}]
+    errors = []
+    barriers = []
+    for directory, _, files in os.walk(base, onerror=errors.append):
+        for name in sorted(files):
+            if not name.endswith('.json') or Path(directory).parent != base:
+                continue
+            path = Path(directory) / name
+            try:
+                record = load_record(path)
+                status = (record or {}).get('status')
+                legacy_interrupted = status == 'interrupted' and not (record or {}).get('supervision_version')
+                if status not in {'created', 'launching', 'launch_uncertain', 'launched', 'exited',
+                                  'interrupted', 'cancelled'}:
+                    barriers.append({'path': str(path), 'status': 'unreadable', 'execution_id': None})
+                    continue
+                if status in {'launching', 'launch_uncertain', 'launched'} or legacy_interrupted:
+                    barriers.append({'path': str(path), 'status': status,
+                                     'execution_id': (record or {}).get('execution_id')})
+            except (HeadlessError, OSError):
+                barriers.append({'path': str(path), 'status': 'unreadable', 'execution_id': None})
+    barriers.extend({'path': str(getattr(exc, 'filename', base)), 'status': 'unreadable', 'execution_id': None}
+                    for exc in errors)
+    return sorted(barriers, key=lambda entry: entry['path'])
+
+
 def save_record(path: Path, record: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     record["updated_at"] = _now()
@@ -222,6 +262,19 @@ def locked_record(path: Path):
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path.with_name(path.name + ".lock"), "a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+@contextlib.contextmanager
+def global_launch_lock():
+    """Serialize intent creation so admission callbacks can scan atomically."""
+    directory = state_root() / 'executions'
+    directory.mkdir(parents=True, exist_ok=True)
+    with open(directory / '.launch.lock', 'a+') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         try:
             yield
@@ -308,6 +361,17 @@ _OWN_CHILDREN: dict[int, subprocess.Popen] = {}
 def pid_alive(pid: int | None) -> bool:
     if not isinstance(pid, int) or pid <= 0:
         return False
+    fields = run_lease._proc_stat(pid)
+    if fields and fields[0] == "Z":
+        return False
+    if fields is None and sys.platform == "darwin":
+        try:
+            probe = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True,
+                                   text=True, timeout=5)
+            if probe.returncode == 0 and probe.stdout.strip().startswith("Z"):
+                return False
+        except (OSError, subprocess.TimeoutExpired):
+            pass
     own = _OWN_CHILDREN.get(pid)
     if own is not None:
         return own.poll() is None
@@ -332,13 +396,17 @@ def execution_alive(record: dict) -> bool:
 
     Records launched by this version carry the child's `pid_start` (start time
     from /proc); a live pid with a different start time is another process.
-    Older records, and hosts without /proc, fall back to the plain pid probe.
+    A missing birth identity cannot safely identify a legacy process.
     """
     pid = record.get("pid")
     if not pid_alive(pid):
         return False
+    if record.get("process_identity") is not None:
+        import execution_supervisor
+        recorded, current = record.get("pid_start"), run_lease.pid_start(pid)
+        return (recorded is None or current is None or recorded == current) and execution_supervisor.same_process(pid, record["process_identity"])
     recorded, current = record.get("pid_start"), run_lease.pid_start(pid)
-    return recorded is None or current is None or recorded == current
+    return recorded is not None and current is not None and recorded == current
 
 
 def discover_run_id(session_dir: Path, session_id: str) -> str | None:
@@ -516,10 +584,21 @@ def refresh(record: dict) -> dict:
     if record.get("run_id") is None:
         record["run_id"] = discover_run_id(session_dir, record["session_id"])
     record["run"] = run_status(record.get("run_id"))
-    if record["status"] == "launching":
-        # A launch whose process id was never recorded: the outcome is uncertain.
-        terminal = (record["run"] or {}).get("status") not in {None, "IN_PROGRESS"}
-        record["status"] = "exited" if terminal else "interrupted"
+    # A launching record remains an uncertainty barrier until its supervisor resolves it.
+    if (record["status"] == "launched" and record.get("process_identity") is None
+            and pid_alive(record.get("pid"))
+            and (record.get("pid_start") is None or run_lease.pid_start(record.get("pid")) is None)):
+        # Old records without a birth identity cannot safely authorize a signal.
+        record["status"] = "launch_uncertain"
+    if record["status"] == "launched" and record.get("process_identity") is not None:
+        import execution_supervisor
+        if pid_alive(record.get("pid")) and execution_supervisor.identity(record.get("pid")) is None:
+            record["status"] = "launch_uncertain"
+    if record["status"] == "launched" and record.get("supervisor_identity"):
+        import execution_supervisor
+        if (not execution_supervisor.same_process(record.get("supervisor_pid"), record["supervisor_identity"])
+                or not execution_supervisor.same_process(record.get("watchdog_pid"), record.get("watchdog_identity"))):
+            record["status"] = "launch_uncertain"
     if record["status"] == "launched" and not execution_alive(record):
         # Gone without this process observing the exit: terminal run means it
         # ended normally, an open run means it was interrupted. A live pid with
@@ -527,6 +606,11 @@ def refresh(record: dict) -> dict:
         # child is gone, and that pid is never signalled.
         if pid_alive(record.get("pid")):
             record["child_gone_reason"] = "PID_REUSED"
+        import execution_supervisor
+        if execution_supervisor.session_members(record.get("pid")) != []:
+            record["status"] = "launch_uncertain"
+            record["stop_reason"] = "SESSION_TERMINATION_UNCONFIRMED"
+            return record
         terminal = (record["run"] or {}).get("status") not in {None, "IN_PROGRESS"}
         record["status"] = "exited" if terminal else "interrupted"
         record["pid"] = None
@@ -566,7 +650,8 @@ def start(*, target: Path, explicit_repo: str, execution_id: str, objective: str
           max_duration_seconds: int | None = None, max_lead_calls: int | None = None,
           max_lead_calls_source: str = "cli", lead_calls_warn_at: int | None = None,
           failure_retry_budget: int | None = None, failure_retry_budget_source: str = "cli",
-          inputs_digest: str | None = None) -> dict:
+          inputs_digest: str | None = None, aggregate_ledger: Path | None = None,
+          aggregate_task_id: str | None = None, serialize_global: bool = False) -> dict:
     max_duration_seconds = validate_max_duration(max_duration_seconds)
     failure_retry_budget, failure_retry_budget_source = validate_failure_retry_budget(
         failure_retry_budget, failure_retry_budget_source)
@@ -583,65 +668,77 @@ def start(*, target: Path, explicit_repo: str, execution_id: str, objective: str
     max_lead_calls, max_lead_calls_source, lead_calls_warn_at = resolve_lead_limit(
         worktree, max_lead_calls, max_lead_calls_source, lead_calls_warn_at)
     path = execution_path(common, execution_id)
+    ledger_path = aggregate_ledger or os.environ.get(budget_ledger.ENV)
+    admission_id = None
+    def admit():
+        nonlocal admission_id
+        if serialize_global and any(Path(item['path']) != path for item in global_execution_barriers()):
+            raise HeadlessError('EXECUTION_GLOBAL_BARRIER', 'Another execution is active or uncertain; inspect it before launching')
+        if before_spawn is not None:
+            before_spawn()
+        if ledger_path:
+            try:
+                admission_id = budget_ledger.reserve_launch(Path(ledger_path),
+                    task_id=aggregate_task_id or f'{identity}:{common}', attempt_id=execution_id)
+            except budget_ledger.BudgetError as exc:
+                raise HeadlessError(exc.code, exc.detail) from exc
     # Deciding and launching happen under the record lock, so two starts with
     # the same id cannot both see "not running" and both start Pi.
-    with locked_record(path):
+    with global_launch_lock(), locked_record(path):
         launched = _launch_locked(path, worktree=worktree, identity=identity, common=common,
                                   execution_id=execution_id, objective=objective, allow_mutation=allow_mutation,
                                   resume=resume, pi_executable=pi_executable, python=python,
-                                  before_spawn=before_spawn, takeover=takeover,
+                                  before_spawn=admit, takeover=takeover,
                                   max_duration_seconds=max_duration_seconds, max_lead_calls=max_lead_calls,
                                   max_lead_calls_source=max_lead_calls_source, lead_calls_warn_at=lead_calls_warn_at,
                                   failure_retry_budget=failure_retry_budget,
                                   failure_retry_budget_source=failure_retry_budget_source, inputs_digest=inputs_digest)
+        if admission_id and not isinstance(launched, dict):
+            launched[0]['aggregate_admission_id'] = admission_id
+            save_record(path, launched[0])
+            try:
+                budget_ledger.settle(Path(ledger_path), admission_id, actual={'launches': 1}, complete=True)
+            except budget_ledger.BudgetError:
+                # Registration has happened; retain the charged reservation.
+                # A settlement error must not hide the active child from its caller.
+                pass
     if isinstance(launched, dict):
         return launched
     record, child, log, before = launched
+    registration_end = time.monotonic() + 15
+    while time.monotonic() < registration_end:
+        with locked_record(path):
+            current = load_record(path)
+        if current and current.get("status") != "launching":
+            record = current
+            break
+        if child.poll() is not None:
+            break
+        time.sleep(0.02)
+    if record.get("status") == "launching":
+        _OWN_CHILDREN.pop(child.pid, None)
+        log.close()
+        return record
     if not wait:
         _OWN_CHILDREN.pop(child.pid, None)
         log.close()
         return record
     try:
-        exit_code = _wait_for_child(child, path, record)
+        _wait_for_child(child, path, record)
     finally:
         _OWN_CHILDREN.pop(child.pid, None)
         log.close()
     with locked_record(path):
-        current = load_record(path) or {}
-        record["exit_code"] = exit_code
-        record["status"] = "exited"
-        record["pid"] = None
-        # Leave the checkout as the run found it, so the next task in this repository can launch.
+        record = load_record(path) or record
         record["checkout"] = restore_checkout(worktree, before)
-        refresh(record)  # downgrades to "interrupted" when the run is still open
-        if current.get("status") == "cancelled":
-            # A cancel (or time-limit stop) recorded while the child ran stays the outcome of this execution.
-            record["status"] = "cancelled"
-            record["outcome"] = current.get("outcome") or "cancelled"
-            for key in ("stop_reason", "time_limit"):
-                if key in current:
-                    record[key] = current[key]
+        refresh(record)
         save_record(path, record)
     return record
 
 
 def _wait_for_child(child, path: Path, record: dict) -> int:
-    """Wait for the child. Without a limit this is a plain wait; with one, the wait is sliced so the
-    launcher enforces the deadline itself (the same stop path `status` uses for children nobody waits on)."""
-    if record.get("deadline_epoch") is None:
-        return child.wait()
-    while True:
-        remaining = time_limit_remaining(record)
-        try:
-            return child.wait(timeout=min(WAIT_POLL_SECONDS, max(0.05, remaining or 0)))
-        except subprocess.TimeoutExpired:
-            pass
-        if time_limit_remaining(record) == 0:
-            with locked_record(path):
-                current = load_record(path)
-                if current is not None:
-                    enforce_time_limit(current)
-                    save_record(path, current)
+    """The independent supervisor owns deadline enforcement."""
+    return child.wait()
 
 
 def _launch_locked(path: Path, *, worktree: Path, identity: str, common: Path, execution_id: str, objective: str,
@@ -660,6 +757,10 @@ def _launch_locked(path: Path, *, worktree: Path, identity: str, common: Path, e
                                 "execution id has a different recorded objective; use a new task id for changed instructions")
         refresh(record)
         enforce_time_limit(record)  # a repeat start past the deadline stops the child rather than report it running
+        if record["status"] in {"launching", "launch_uncertain"}:
+            record["outcome"] = "launch_uncertain"
+            save_record(path, record)
+            return record
         if record["status"] == "launched":
             record["outcome"] = "already_running"
             save_record(path, record)
@@ -691,11 +792,16 @@ def _launch_locked(path: Path, *, worktree: Path, identity: str, common: Path, e
             record["outcome"] = "already_finished"
             save_record(path, record)
             return record
+        if resume and record.get("deadline_epoch") is not None:
+            if max_duration_seconds is not None and max_duration_seconds != record.get("max_duration_seconds"):
+                raise HeadlessError("MAX_DURATION_MISMATCH", "resume cannot change the authorized duration")
+            if time_limit_remaining(record, now=clock()) == 0:
+                raise HeadlessError("EXECUTION_TIME_LIMIT", "the original execution deadline has passed")
+            max_duration_seconds = record["max_duration_seconds"]
+        elif resume and max_duration_seconds is not None:
+            raise HeadlessError("MAX_DURATION_MISMATCH", "resume cannot change the original duration")
     elif resume:
         raise HeadlessError("EXECUTION_UNKNOWN", "nothing to resume for this execution id")
-
-    if before_spawn is not None:
-        before_spawn()  # a child will start or resume: callers may still refuse here
 
     granted = mutation_permitted(worktree)
     if granted and not allow_mutation:
@@ -733,87 +839,78 @@ def _launch_locked(path: Path, *, worktree: Path, identity: str, common: Path, e
                 provenance.STATE_ENV: str(state_root()), "PI_ORCHESTRATION_EXECUTION_ID": execution_id})
     run = run_status(record.get("run_id")) or {}
     continuing = resume and run.get("status") == "IN_PROGRESS"
+    argv = [pi_executable, "--print", "--mode", "json", "--session-id", record["session_id"],
+            "--session-dir", record["session_dir"]]
+    for extension in EXTENSIONS:
+        argv += ["-e", str(ROOT / "extensions" / extension)]
+    brief = launch_brief.create(worktree=worktree, repository=identity, common_dir=common,
+                                session_id=record["session_id"], executable=pi_executable, python=python,
+                                mutation_permissions=granted)
+    argv += ["--", RESUME_PROMPT if continuing else brief + build_prompt(record["objective"])]
+    before = checkout_state(worktree)
     # The launched Pi takes the run lease under this owner id: on start for a
     # new run, and on resume through the lifecycle's restore. For a resume the
     # run id is already known, so the lease is claimed here, before anything
     # launches; a live or stale lease of another owner refuses the resume.
     owner = lease_owner(execution_id)
+    if before_spawn is not None:
+        before_spawn()  # admission runs after preflight, while the global launch lock is held
     if continuing:
         claim_run_lease(record["run_id"], owner, takeover=takeover)
     env[LEASE_OWNER_ENV] = owner
     record["lease_owner"] = owner
-    # Persist intent before the process exists, so a crash in between is seen
-    # as an uncertain launch on restart rather than as never launched.
-    record.update({"status": "launching", "pid": None})
+    if continuing and record.get('stop_reason') == LEAD_LIMIT_CODE:
+        # An explicitly authorized raised call limit supersedes only that
+        # suspension reason. Keep the original deadline and its history intact.
+        record.pop('stop_reason', None)
+    # The original deadline is an execution-wide authorization, never a per-resume allowance.
+    if not resume and max_duration_seconds is not None:
+        record.update(max_duration_seconds=max_duration_seconds, deadline_epoch=clock() + max_duration_seconds)
+        record["deadline_at"] = _iso(record["deadline_epoch"])
+    for stale in ("max_lead_calls", "max_lead_calls_source", "lead_calls_warn_at",
+                  "failure_retry_budget", "failure_retry_budget_source", "inputs_digest"):
+        record.pop(stale, None)
+    if failure_retry_budget is not None:
+        record.update(failure_retry_budget=failure_retry_budget, failure_retry_budget_source=failure_retry_budget_source)
+    if inputs_digest is not None:
+        record["inputs_digest"] = inputs_digest
+    if max_lead_calls is not None:
+        record.update(max_lead_calls=max_lead_calls, max_lead_calls_source=max_lead_calls_source)
+        if lead_calls_warn_at is not None:
+            record["lead_calls_warn_at"] = lead_calls_warn_at
+    remaining = time_limit_remaining(record, now=clock())
+    monotonic_deadline = None if remaining is None else time.monotonic() + remaining
+    if remaining is not None:
+        record["launch_remaining_seconds"] = remaining
+    record.update(status="launching", pid=None, supervision_version=1)
     save_record(path, record)
-    argv = [pi_executable, "--print", "--mode", "json", "--session-id", record["session_id"],
-            "--session-dir", record["session_dir"]]
-    for extension in EXTENSIONS:
-        argv += ["-e", str(ROOT / "extensions" / extension)]
-    argv += ["--", RESUME_PROMPT if continuing else build_prompt(record["objective"])]
-    before = checkout_state(worktree)
     log = open(record["log_path"], "ab")
+    config = {"path": str(path), "log_path": record["log_path"], "cwd": str(worktree), "argv": argv,
+              "continuing": continuing,
+              "monotonic_deadline": monotonic_deadline}
     try:
-        child = subprocess.Popen(argv, cwd=str(worktree), env=env, shell=False, stdin=subprocess.DEVNULL,
+        child = subprocess.Popen([sys.executable, str(ROOT / "tools" / "execution_supervisor.py"), "supervise"],
+                                 cwd=str(worktree), env=env, shell=False, stdin=subprocess.PIPE,
                                  stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
         _OWN_CHILDREN[child.pid] = child
-    except OSError as exc:
-        log.close()
-        record["status"] = "created" if record["launches"] == 0 else "interrupted"
-        save_record(path, record)
         if continuing:
-            try:
-                run_lease.release(record["run_id"], owner)
-            except (run_lease.LeaseError, OSError):
-                pass
-        raise HeadlessError("PI_UNAVAILABLE", f"cannot launch {pi_executable}: {exc}") from exc
-    try:
-        if continuing:
-            # Hand the lease to the launched process, so its liveness is what keeps the lease live.
-            try:
-                run_lease.acquire(record["run_id"], owner, pid=child.pid, handoff=True)
-            except (run_lease.LeaseError, OSError) as exc:
-                # Never leave a child running under a lease it cannot hold: stop it and say so.
-                code = exc.code if isinstance(exc, run_lease.LeaseError) else "RUN_LEASE_STORAGE_UNAVAILABLE"
-                try:
-                    os.killpg(child.pid, signal.SIGKILL)
-                except (ProcessLookupError, PermissionError):
-                    pass
-                child.wait()
-                log.close()
-                record.update({"status": "interrupted", "pid": None, "lease_handoff_error": code,
-                               "launches": record["launches"] + 1, "outcome": "lease_handoff_failed"})
-                save_record(path, record)
-                raise HeadlessError("RUN_LEASE_HANDOFF_FAILED",
-                                    f"the run lease could not be handed to the launched process ({code}); it was stopped") from exc
-        # The limit belongs to this launch: a resume starts a fresh window from now and does not inherit an
-        # earlier launch's limit (the caller passes it again).
-        launched_at = clock()
-        for stale in ("max_duration_seconds", "deadline_at", "deadline_epoch", "stop_reason", "time_limit",
-                      "max_lead_calls", "max_lead_calls_source", "lead_calls_warn_at",
-                      "failure_retry_budget", "failure_retry_budget_source", "inputs_digest"):
-            record.pop(stale, None)
-        if failure_retry_budget is not None:
-            record.update({"failure_retry_budget": failure_retry_budget,
-                           "failure_retry_budget_source": failure_retry_budget_source})
-        if inputs_digest is not None:
-            record["inputs_digest"] = inputs_digest
-        if max_lead_calls is not None:
-            record.update({"max_lead_calls": max_lead_calls, "max_lead_calls_source": max_lead_calls_source})
-            if lead_calls_warn_at is not None:
-                record["lead_calls_warn_at"] = lead_calls_warn_at
-        if max_duration_seconds is not None:
-            record.update({"max_duration_seconds": max_duration_seconds, "deadline_epoch": launched_at + max_duration_seconds,
-                           "deadline_at": _iso(launched_at + max_duration_seconds)})
-        record.update({"status": "launched", "pid": child.pid, "pid_start": run_lease.pid_start(child.pid),
-                       "launches": record["launches"] + 1, "started_at": _now(), "exit_code": None,
-                       "outcome": "resumed" if resume else "launched"})
-        save_record(path, record)
-        return record, child, log, before
-    except BaseException:
-        # Every exit after registration that does not hand the child to start() drops it.
+            run_lease.acquire(record["run_id"], owner, pid=child.pid, handoff=True)
+        child.stdin.write(json.dumps(config).encode())
+        child.stdin.close()
+    except run_lease.LeaseError as exc:
+        child.stdin.close()
+        child.wait()
         _OWN_CHILDREN.pop(child.pid, None)
-        raise
+        log.close()
+        record.update(status="interrupted", pid=None, lease_handoff_error=exc.code,
+                      outcome="lease_handoff_failed")
+        save_record(path, record)
+        raise HeadlessError("RUN_LEASE_HANDOFF_FAILED", f"supervisor lease handoff failed ({exc.code})") from exc
+    except (OSError, BrokenPipeError) as exc:
+        log.close()
+        # Supervisor creation or registration may have succeeded; leave the durable barrier in place.
+        raise HeadlessError("SUPERVISOR_UNCERTAIN", str(exc)) from exc
+    return record, child, log, before
 
 
 def status(*, target: Path, explicit_repo: str, execution_id: str) -> dict:
@@ -838,10 +935,10 @@ def time_limit_remaining(record: dict, now: float | None = None) -> float | None
     deadline = record.get("deadline_epoch")
     if not isinstance(deadline, (int, float)) or isinstance(deadline, bool):
         return None
-    if now is None:
+    if now is None and record.get("launch_remaining_seconds") is not None:
         elapsed = boot_elapsed(record)
         if elapsed is not None:
-            return max(0.0, record["max_duration_seconds"] - elapsed)
+            return max(0.0, record["launch_remaining_seconds"] - elapsed)
     return max(0.0, deadline - (clock() if now is None else now))
 
 
@@ -905,6 +1002,8 @@ def cancel(*, target: Path, explicit_repo: str, execution_id: str, grace: float 
         if record["target_repository"].casefold() != identity.casefold():
             raise HeadlessError("EXECUTION_TARGET_MISMATCH", "execution id belongs to another repository")
         refresh(record)
+        if record["status"] in {"launching", "launch_uncertain"}:
+            raise HeadlessError("LAUNCH_UNCERTAIN", "cannot confirm child identity; launch remains blocked")
         if record["status"] not in {"exited", "cancelled"}:
             _stop_locked(record, grace, "EXECUTION_CANCELLED")
         save_record(path, record)
@@ -923,6 +1022,8 @@ def _stop_locked(record: dict, grace: float, code: str) -> None:
         elapsed = boot_elapsed(record)
         if elapsed is None:
             elapsed = clock() - (record["deadline_epoch"] - record["max_duration_seconds"])
+        elif record.get("launch_remaining_seconds") is not None:
+            elapsed += record["max_duration_seconds"] - record["launch_remaining_seconds"]
         elapsed = round(elapsed, 3)
     if record.get("run_id") is None:
         record["run_id"] = discover_run_id(Path(record["session_dir"]), record["session_id"])
@@ -930,21 +1031,16 @@ def _stop_locked(record: dict, grace: float, code: str) -> None:
     # the parent finds it already terminal with the stop code.
     _finish_cancelled(record, code)
     pid = record.get("pid")
-    # Signal only the process this execution launched: the pid and its start time must both match.
-    child = {"pid": pid, "pid_start": record.get("pid_start")}
-    if record["status"] == "launched" and execution_alive(child):
-        try:
-            os.killpg(pid, signal.SIGTERM)
-        except (ProcessLookupError, PermissionError):
-            pass
-        deadline = time.monotonic() + grace
-        while execution_alive(child) and time.monotonic() < deadline:
-            time.sleep(0.05)
-        if execution_alive(child):
-            try:
-                os.killpg(pid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                pass
+    if isinstance(pid, int) and pid > 0:
+        import execution_supervisor
+        expected = record.get("process_identity")
+        if expected is None and record.get("pid_start") is not None:
+            if run_lease.pid_start(pid) == record["pid_start"]:
+                expected = execution_supervisor.identity(pid)
+        if not execution_supervisor.stop(pid, expected, grace=grace):
+            record.update(status="launch_uncertain", stop_reason=code,
+                          outcome="termination_unconfirmed")
+            return
     record["pid"] = None
     if record.get("run_id") is None:
         # The process may have created its run between discovery and the signal.
@@ -977,6 +1073,9 @@ def main(argv: list[str] | None = None) -> int:
             p.add_argument("--takeover-stale-lease", action="store_true",
                            help="with --resume: explicitly recover a stale run lease (recorded in provenance)")
             p.add_argument("--no-wait", action="store_true", help="return after launching instead of waiting for exit")
+            p.add_argument('--aggregate-ledger', type=Path, default=None, help='opt-in durable aggregate launch allowance')
+            p.add_argument('--budget-task-id', default=None, help='stable accounting task identity across attempts')
+            p.add_argument('--serialize-global', action='store_true', help='hold new launches while another execution is active or uncertain')
             p.add_argument("--max-duration", type=int, default=None, metavar="SECONDS",
                            help="stop the child after this many wall-clock seconds (EXECUTION_TIME_LIMIT); default: no limit")
             p.add_argument("--max-lead-calls", type=int, default=None, metavar="N",
@@ -996,7 +1095,9 @@ def main(argv: list[str] | None = None) -> int:
                            objective=args.objective, allow_mutation=args.allow_mutation, resume=args.resume,
                            pi_executable=args.pi, wait=not args.no_wait, takeover=args.takeover_stale_lease,
                            max_duration_seconds=args.max_duration, max_lead_calls=args.max_lead_calls,
-                           lead_calls_warn_at=args.lead_calls_warn_at, failure_retry_budget=args.failure_retry_budget)
+                           lead_calls_warn_at=args.lead_calls_warn_at, failure_retry_budget=args.failure_retry_budget,
+                           aggregate_ledger=args.aggregate_ledger, aggregate_task_id=args.budget_task_id,
+                           serialize_global=args.serialize_global)
         elif args.command == "status":
             record = status(target=args.target, explicit_repo=args.repo, execution_id=args.execution_id)
         else:

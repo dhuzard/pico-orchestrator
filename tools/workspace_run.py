@@ -45,6 +45,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import budget_ledger  # noqa: E402
 import atomic_io  # noqa: E402
 import headless_run  # noqa: E402
 import usage  # noqa: E402
@@ -583,6 +584,11 @@ def budget_state(plan: dict, record: dict | None = None, runs_dir: Path | None =
     inflight, problems = inflight_usage(plan, running, run_cache) if running else ([], [])
     problems = [*problems, *(extra_problems or [])]
     used = usage.workspace_usage(runs_dir or headless_run.state_root() / "runs", record, inflight)
+    problems.extend(used.get("incomplete_reasons", []))
+    if budget.get('max_tokens') is not None and used.get('token_work_complete') is False:
+        problems.append('token-work accounting incomplete: missing input/output counters')
+    if budget.get("max_cost_usd") is not None and not used["cost_complete"]:
+        problems.append("monetary accounting incomplete: missing prices or telemetry")
     cost = used.get("estimated_cost_usd") or 0.0
     reasons = []
     if budget.get("max_tokens") is not None and used["spent_tokens"] >= budget["max_tokens"]:
@@ -598,7 +604,8 @@ def budget_state(plan: dict, record: dict | None = None, runs_dir: Path | None =
 
 def launch(*, manifest: Path, task_id: str, allow_mutation: bool = False, resume: bool = False, wait: bool = True,
            access_check=headless_run.workspace_plan.gh_access, pi_executable: str = "pi",
-           ignore_budget: bool = False, budget_checked: bool = False, takeover_stale_lease: bool = False) -> dict:
+           ignore_budget: bool = False, budget_checked: bool = False, takeover_stale_lease: bool = False,
+           aggregate_ledger: Path | None = None) -> dict:
     """ignore_budget is the explicit user override (recorded); budget_checked is for a caller that already
     gated the budget itself (the scheduler) and skips the check without recording anything.
     takeover_stale_lease, with resume, explicitly recovers a stale run lease (recorded in provenance)."""
@@ -621,6 +628,8 @@ def launch(*, manifest: Path, task_id: str, allow_mutation: bool = False, resume
         raise WorkspaceRunError("WORKSPACE_PIN_MISMATCH",
                                 f"checkout HEAD {head or 'unknown'} is not the pinned commit; check it out first")
     budget_override: dict | None = None
+    aggregate_ledger = aggregate_ledger or os.environ.get(budget_ledger.ENV)
+    admission_id = None
     # A task's own limit overrides the manifest default; neither set means no limit.
     max_duration = task.get("max_duration_seconds") or plan.get("max_duration_seconds")
     # Same precedence for the lead-call limit; the repository policy is the extension's fallback.
@@ -654,10 +663,10 @@ def launch(*, manifest: Path, task_id: str, allow_mutation: bool = False, resume
             if not ignore_budget:
                 raise WorkspaceRunError(
                     "WORKSPACE_BUDGET_UNKNOWN",
-                    "in-flight spend of running children cannot be resolved (" + "; ".join(spend["incomplete_reasons"])
-                    + "). If that task is not running, repair or delete the execution record named above; "
-                    "otherwise pass --ignore-budget (ignore_budget=True) to override explicitly")
-            budget_override = {"at": _now(), "reasons": ["unknown_in_flight_spend"], **{k: spend[k] for k in (
+                    "usage or pricing cannot be resolved (" + "; ".join(spend["incomplete_reasons"])
+                    + "). Restore missing accounting evidence, or pass --ignore-budget "
+                    "(ignore_budget=True) to override this observed-usage gate explicitly")
+            budget_override = {"at": _now(), "reasons": ["incomplete_accounting"], **{k: spend[k] for k in (
                 "spent_tokens", "max_tokens", "spent_cost_usd", "max_cost_usd")}}
             return
         if not ignore_budget:
@@ -718,6 +727,9 @@ def launch(*, manifest: Path, task_id: str, allow_mutation: bool = False, resume
                                              "pinned_commit": repo["pinned_commit"]}
                 save_workspace(path, record)
 
+    def admit_spawn() -> None:
+        before_spawn()
+
     with locked_workspace(plan["workspace_id"]):
         prior = load_workspace(workspace_record_path(plan["workspace_id"]))
         prior_entry = ((prior or {}).get("tasks") or {}).get(task_id) or {}
@@ -754,16 +766,20 @@ def launch(*, manifest: Path, task_id: str, allow_mutation: bool = False, resume
                                        execution_id=exec_id,
                                        objective=objective, allow_mutation=allow_mutation,
                                        resume=resume, wait=wait, pi_executable=pi_executable,
-                                       before_spawn=before_spawn, takeover=takeover_stale_lease,
+                                       before_spawn=admit_spawn, takeover=takeover_stale_lease,
                                        max_duration_seconds=max_duration, max_lead_calls=max_lead_calls,
                                        max_lead_calls_source=lead_source, lead_calls_warn_at=lead_warn_at,
                                        failure_retry_budget=failure_budget, failure_retry_budget_source=failure_source,
-                                       inputs_digest=_inputs_digest(plan, task, repo))
+                                       inputs_digest=_inputs_digest(plan, task, repo), aggregate_ledger=aggregate_ledger,
+                                       aggregate_task_id=f"workspace:{plan['workspace_id']}:{task_id}")
     except headless_run.HeadlessError as exc:
         raise WorkspaceRunError(exc.code, exc.detail) from exc
+    admission_id = execution.get('aggregate_admission_id')
     with locked_workspace(plan["workspace_id"]):
         path, record = _workspace(plan, manifest, require_current_pins=True)
         entry = _entry(record, task, repo, execution, inputs)
+        if admission_id:
+            entry["aggregate_admission_id"] = admission_id
         if budget_override is not None and execution.get("outcome") in {"launched", "resumed"}:
             entry["budget_override"] = budget_override
         if execution.get("outcome") in {"launched", "resumed"}:
@@ -942,6 +958,7 @@ def main(argv: list[str] | None = None) -> int:
             p.add_argument("--no-wait", action="store_true")
             p.add_argument("--ignore-budget", action="store_true",
                            help="launch although the workspace budget is exhausted; recorded as budget_override")
+            p.add_argument("--aggregate-ledger", type=Path, help="durable launch-admission ledger; defaults to PICO_AGGREGATE_BUDGET_LEDGER")
             p.add_argument("--pi", default=os.environ.get("PI_EXECUTABLE", "pi"), help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     access = None if args.no_access_check else headless_run.workspace_plan.gh_access
@@ -949,7 +966,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "launch":
             result = launch(manifest=args.manifest, task_id=args.task, allow_mutation=args.allow_mutation,
                             resume=args.resume, wait=not args.no_wait, access_check=access, pi_executable=args.pi,
-                            ignore_budget=args.ignore_budget, takeover_stale_lease=args.takeover_stale_lease)
+                            ignore_budget=args.ignore_budget, takeover_stale_lease=args.takeover_stale_lease,
+                            aggregate_ledger=args.aggregate_ledger)
             ok = result["task"]["execution_status"] == "launched" or result["task"]["run_status"] in {"COMPLETED", "PARTIAL"}
         elif args.command == "status":
             result = status(manifest=args.manifest, task_id=args.task, access_check=access)
