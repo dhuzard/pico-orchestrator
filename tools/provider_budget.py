@@ -121,8 +121,12 @@ def validate_launch(config_path, ledger_path, env=None):
         credential = env.get(APIS[api][2], "")
         if not credential:
             fail(f"API credential unavailable: {APIS[api][2]}", "PROVIDER_BUDGET_CREDENTIAL_UNAVAILABLE")
-        prefix = "sk-ant-api" if api == "anthropic-messages" else "sk-"
-        if not credential.startswith(prefix):
+        # Personal `usr` API keys also authenticate through x-api-key. Keep
+        # this structural allowlist narrow: OAuth `oat` and unverified key
+        # kinds are not admitted. The provider still authenticates the key.
+        supported_credential = (re.fullmatch(r"sk-ant-(?:api[0-9]*|usr)-[A-Za-z0-9_-]+", credential) is not None
+                                if api == "anthropic-messages" else credential.startswith("sk-"))
+        if not supported_credential:
             fail("only provider API-key credentials are supported; subscription/OAuth credentials are refused",
                  "PROVIDER_BUDGET_CREDENTIAL_UNSUPPORTED")
     limits = ledger.inspect(ledger_path)["limits"]

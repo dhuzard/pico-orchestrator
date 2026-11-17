@@ -214,6 +214,39 @@ class BudgetGatewayTest(unittest.TestCase):
         with self.assertRaisesRegex(ledger.BudgetError, "token and dollar ceilings"):
             gateway.validate_launch(path, launches, {"OPENAI_API_KEY": "sk-fake-key"})
 
+    def test_anthropic_personal_api_keys_are_accepted_but_oauth_and_malformed_keys_are_refused(self):
+        path = Path(self.temp.name) / "anthropic-config.json"
+        path.write_text(json.dumps(config("anthropic-messages")))
+        allowance = Path(self.temp.name) / "anthropic-ledger.json"
+        ledger.initialize(allowance, {"lifetime": {"tokens": 2000000, "cost_usd": "10"}})
+        for credential in ("sk-ant-api03-offline-fixture", "sk-ant-api-offline-fixture", "sk-ant-usr-offline-fixture"):
+            self.assertEqual(gateway.validate_launch(path, allowance, {"ANTHROPIC_API_KEY": credential}),
+                             config("anthropic-messages"))
+        before = allowance.read_bytes()
+        for credential in ("sk-ant-oat01-offline-fixture", "subscription-token", "sk-ant-svc-offline-fixture",
+                           "sk-ant-usr-", "sk-ant-api03-", "sk-ant-api", "sk-ant-usr-fake token",
+                           "sk-ant-usr-fake\n", "sk-ant-user-offline-fixture"):
+            with self.subTest(credential_kind=credential.split("-")[:3]):
+                with self.assertRaisesRegex(ledger.BudgetError, "CREDENTIAL_UNSUPPORTED") as refused:
+                    gateway.validate_launch(path, allowance, {"ANTHROPIC_API_KEY": credential})
+                self.assertNotIn(credential, str(refused.exception))
+                self.assertEqual(allowance.read_bytes(), before)
+        self.assertFalse(self.calls)
+        self.assertEqual(ledger.inspect(allowance)["reservations"], {})
+
+    def test_anthropic_personal_api_key_uses_x_api_key_header_only(self):
+        replacement = config("anthropic-messages")
+        ledger.rebind_empty_provider_contract(self.path, expected=gateway.contract_digest(self.server.config),
+            replacement=gateway.contract_digest(replacement), reason="Offline personal API-key fixture")
+        self.server.config = replacement
+        self.server.credentials["ANTHROPIC_API_KEY"] = "sk-ant-usr-offline-fixture"
+        self.body = json.dumps({"type": "message", "stop_reason": "end_turn", "usage": {"input_tokens": 10,
+            "output_tokens": 3, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}}).encode()
+        self.assertEqual(self.request({"model": "claude-opus-5-5", "messages": [{"role": "user", "content": "hi"}]},
+                                     path="/anthropic/v1/messages")[0], 200)
+        self.assertEqual(self.calls[0][2]["x-api-key"], "sk-ant-usr-offline-fixture")
+        self.assertNotIn("Authorization", self.calls[0][2])
+
     def test_catalog_rejects_understated_price_context_and_unknown_alias(self):
         path = Path(self.temp.name) / "config.json"
         for field, value in (("context_window", 1), ("id", "unknown-model"), ("prices", dict.fromkeys(gateway.PRICES, "0.000001"))):
