@@ -10,6 +10,11 @@ without both token and dollar limits in at least one common ledger scope is
 refused. Without the provider configuration, non-launch ledger dimensions
 continue to fail closed.
 
+Interactive `pico run` and `scripts/run-local.sh` refuse when either budget
+environment variable is set. Use `pico exec start` or workspace launch/schedule
+for capped orchestration. Plain Pi outside these entry points does not acquire
+the gateway automatically.
+
 This is a cooperative local runtime boundary, not an OS/network sandbox against
 hostile code. The gateway owns the real provider API keys; Pi, Claude Code and
 workers receive only a fresh local proxy credential. HOME, XDG directories,
@@ -165,3 +170,9 @@ drives its nested local-tool turn and final response through the fake upstream.
 These tests spend no model tokens and do not prove live provider entitlement or
 billing. Existing ledger tests cover process crashes, day rollover and aggregate
 scope accumulation; existing launch/workspace tests retain the no-adapter refusal.
+
+`tests/test_provider_workflows_integration.py` preserves optional tests of the
+actual installed AskClaude and subagent plugins, including the real hard-timeout
+summary. Its module documentation lists the explicit plugin-path variables and
+timeout opt-in. With those variables absent it skips clearly; with them set it
+still uses only fake local upstreams and fake credentials.

@@ -90,7 +90,7 @@ def load_config(path):
                 fail("model is absent from the reviewed provider catalog")
             if model["context_window"] < reviewed[1] or model["max_output_tokens"] > reviewed[2]:
                 fail("context bound cannot be lowered; output cannot exceed provider maximum")
-            for name, minimum in zip(("input", "output", "cache_read", "cache_write"), reviewed[3]):
+            for name, minimum in zip(("input", "output", "cache_read", "cache_write"), reviewed[3], strict=True):
                 if Decimal(model["prices"][name]) < Decimal(minimum):
                     fail("price is below the reviewed conservative ceiling")
             identity = (model["api"], model["id"])

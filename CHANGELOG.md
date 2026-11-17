@@ -8,6 +8,10 @@ All notable changes to PICO are recorded here. The format follows
 
 ### Added
 
+- Opt-in provider HTTP admission for reviewed OpenAI/Anthropic API paths,
+  with shared token/dollar reservations, isolated auth and conservative crash recovery.
+- Paired launch-brief efficiency benchmark with private input snapshots,
+  runtime fingerprints and independent acceptance checks; paid runs remain explicit.
 - Durable post-execution delivery observations, human-review packets and a
   read-only Garden attention view; explicit single-repair approval preserves
   original run history and rechecks the parent PR head.

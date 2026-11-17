@@ -79,6 +79,10 @@ PICO runs on Linux and macOS, and on Windows through WSL2. You need:
   schemas, routing semantics, execution plans, provenance and workspaces.
 - [Model and runtime configuration](docs/model-runtime-configuration.md):
   choosing concrete Claude and Codex models for each capacity tier.
+- [Provider request budgets](docs/provider-budget.md): opt-in API request
+  admission with token limits and conservative dollar reservations.
+- [Efficiency benchmark](benchmarks/efficiency/README.md): isolated paired
+  runs with fixed inputs, acceptance checks and explicit measurement coverage.
 - [Task ambiguity and model capacity](docs/ambiguity.md) and
   [evaluating model capacity](docs/model-ambiguity-evaluation.md).
 - [Work modes](docs/work-modes.md): how the lead decomposes mixed work.
@@ -1025,10 +1029,10 @@ Known limitations:
 
 - worker token telemetry depends on backend/provider support (`ClaudeWorker`
   and Pi subagents report token usage; `AskClaude` reports duration only);
-- mission and phase token budgets are planned (ORCH-025) and not yet enforced;
-- cost estimation is intentionally absent without a reviewed pricing table;
-  only Claude Code's own `total_cost_usd` is recorded, as
-  `estimated_cost_usd` in `worker_usage`;
+- mission and phase token budgets are planned (ORCH-025); the optional API
+  gateway instead enforces configured task/attempt/day/lifetime request budgets;
+- provider-gateway dollar accounting uses reviewed conservative pricing ceilings,
+  independently of model-reported cost estimates and vendor invoices;
 - merge and deploy actions are not autonomous.
 
 ## Technical reference
