@@ -234,6 +234,7 @@ def test_validation_resolves_integrated_sha_not_task_branch_name(tmp_path):
     subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
     subprocess.run(["git", "-C", str(repo), "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
                     "commit", "--allow-empty", "-qm", "base"], check=True)
+    subprocess.run(["git", "-C", str(repo), "branch", "pico/worker"], check=True)
     subprocess.run(["git", "-C", str(repo), "checkout", "-qb", "pico/session/batch-1"], check=True)
     (repo / "settings.json").write_text('{"display": {"max_results": 20}}\n')
     subprocess.run(["git", "-C", str(repo), "add", "settings.json"], check=True)
@@ -278,8 +279,16 @@ def test_validation_resolves_integrated_sha_not_task_branch_name(tmp_path):
     assert validation.find_head(state, "bench", "one-line", "acme/pilot", repo, benchmark_metrics)[0] is None
     record["parent_orchestration"]["phases"][0]["diff_floor_checks"].pop()
     (state / "runs" / "run-1.json").write_text(json.dumps(record))
-    subprocess.run(["git", "-C", str(repo), "branch", "pico/ambiguous", sha], check=True)
-    assert validation.find_head(state, "bench", "one-line", "acme/pilot", repo, benchmark_metrics)[0] is None
+    subprocess.run(["git", "-C", str(repo), "checkout", "-q", "pico/worker"], check=True)
+    subprocess.run(["git", "-C", str(repo), "merge", "--ff-only", "pico/session/batch-1"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "checkout", "-q", "pico/session/batch-1"], check=True)
+    same, reason = validation.find_head(state, "bench", "one-line", "acme/pilot", repo, benchmark_metrics)
+    assert reason is None and same["aliases"] == ["pico/session/batch-1", "pico/worker"]
+    assert same["head"] == "pico/session/batch-1"
+    record["parent_orchestration"]["waves"][0]["integration_path"] = str(repo)
+    (state / "runs" / "run-1.json").write_text(json.dumps(record))
+    same, reason = validation.find_head(state, "bench", "one-line", "acme/pilot", repo, benchmark_metrics)
+    assert reason is None and same["selection"] == "recorded_integration_worktree"
     record["parent_orchestration"]["waves"][0]["status"] = "integrating"
     (state / "runs" / "run-1.json").write_text(json.dumps(record))
     assert validation.find_head(state, "bench", "one-line", "acme/pilot", repo, benchmark_metrics)[0] is None

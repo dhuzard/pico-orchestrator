@@ -32,7 +32,7 @@ def integrated_heads(record, run_id, repository):
 
 
 def find_head(state, workspace_id, task_id, repository, checkout, metrics):
-    """A single persisted integrated SHA and one local pico branch at that exact SHA, or unknown."""
+    """Select a branch at the single recorded integrated SHA, or return unknown."""
     try:
         ws = metrics.load_workspace_record(state, workspace_id)
         entry = (ws.get("tasks") or {}).get(task_id) or {}
@@ -46,10 +46,37 @@ def find_head(state, workspace_id, task_id, repository, checkout, metrics):
         commit = next(iter(heads))
         result = subprocess.run(["git", "-C", str(checkout), "for-each-ref", "--format=%(refname:short) %(objectname)",
                                  "refs/heads/pico/"], capture_output=True, text=True, check=True, timeout=30)
-        branches = [parts[0] for line in result.stdout.splitlines() if len(parts := line.split()) == 2 and parts[1] == commit]
-        if len(branches) != 1:
-            return None, "no unique local pico branch points to the integrated commit"
-        return {"head": branches[0], "commit": commit, "run_id": run_id}, None
+        branches = sorted(parts[0] for line in result.stdout.splitlines() if len(parts := line.split()) == 2 and parts[1] == commit)
+        if not branches:
+            return None, "no local pico branch points to the integrated commit"
+        parent = record["parent_orchestration"]
+        waves = {w.get("id"): w for w in parent.get("waves", []) if isinstance(w, dict)}
+        wave_ids = {check.get("wave_id") for phase in parent.get("phases", []) if isinstance(phase, dict)
+                    and phase.get("status") == "completed" for check in phase.get("diff_floor_checks", [])
+                    if isinstance(check, dict) and check.get("head") == commit and check.get("operation") == "parent"
+                    and check.get("status") == "passed" and (waves.get(check.get("wave_id")) or {}).get("status") == "integrated"
+                    and phase.get("id") in (waves.get(check.get("wave_id")) or {}).get("task_ids", [])}
+        paths = {str(Path(w["integration_path"]).resolve()) for w in parent.get("waves", [])
+                 if isinstance(w, dict) and w.get("id") in wave_ids and w.get("status") == "integrated"
+                 and isinstance(w.get("integration_path"), str)}
+        worktrees = subprocess.run(["git", "-C", str(checkout), "worktree", "list", "--porcelain", "-z"],
+                                   capture_output=True, text=True, check=True, timeout=30).stdout.split("\0")
+        preferred, current = set(), {}
+        for field in worktrees:
+            if not field:
+                if (current.get("path") in paths and current.get("commit") == commit
+                        and current.get("branch") in branches):
+                    preferred.add(current["branch"])
+                current = {}
+            elif field.startswith("worktree "):
+                current["path"] = str(Path(field[9:]).resolve())
+            elif field.startswith("HEAD "):
+                current["commit"] = field[5:]
+            elif field.startswith("branch refs/heads/"):
+                current["branch"] = field[len("branch refs/heads/"):]
+        selected = sorted(preferred)[0] if preferred else branches[0]
+        return {"head": selected, "commit": commit, "run_id": run_id, "aliases": branches,
+                "selection": "recorded_integration_worktree" if preferred else "sorted_branch_at_integrated_commit"}, None
     except (metrics.MetricsError, OSError, subprocess.SubprocessError, ValueError, TypeError, AttributeError):
         return None, "workspace, run, or local branch evidence could not be read"
 
