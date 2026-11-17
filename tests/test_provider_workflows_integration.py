@@ -1,15 +1,16 @@
 """Optional real-plugin tests against a local fake provider; no provider account needed.
 
 Set PICO_TEST_SUBAGENT_EXTENSION to the installed pi-subagent-workflows
-extension/index.ts and PICO_TEST_CLAUDE_BRIDGE_EXTENSION to the installed
-pi-claude-bridge src/index.ts. Pi, Node and (for the bridge) Claude Code must
+extension/index.ts and PICO_TEST_CLAUDE_BRIDGE_EXTENSION to an installed
+extension registering AskClaude: either a legacy combined bridge or the newer
+pi-claude-bridge-askclaude companion. Pi, Node and (for the bridge) Claude Code must
 be on PATH. Tests skip individually when their plugin is not configured.
 Set PICO_TEST_PROVIDER_TIMEOUT=1 to additionally run the real hard-timeout
 path, which takes at least 60 seconds because the plugin clamps the timeout.
 
 Example (use absolute paths appropriate to your installation):
   PICO_TEST_SUBAGENT_EXTENSION=/absolute/path/pi-subagent-workflows/extension/index.ts \\
-  PICO_TEST_CLAUDE_BRIDGE_EXTENSION=/absolute/path/pi-claude-bridge/src/index.ts \\
+  PICO_TEST_CLAUDE_BRIDGE_EXTENSION=/absolute/path/askclaude-extension/src/index.ts \\
   PICO_TEST_PROVIDER_TIMEOUT=1 python3 -m unittest discover -s tests \\
     -p test_provider_workflows_integration.py -v
 
@@ -188,7 +189,25 @@ class RealPluginOfflineTest(unittest.TestCase):
                                         timeout=80 if timeout else 30)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn("OK", result.stdout)
-                self.assertEqual(len(calls), 4 if timeout else 3)
+                # A synthetic final "OK" is not proof that the worker tool ran:
+                # Pi can return a tool-not-found/error result to the lead and
+                # still process the fake final response. Inspect the actual tool
+                # result before checking the request count, with bounded output.
+                final_input = calls[-1][2].get("input", []) if calls else []
+                outputs = [item.get("output") for item in final_input
+                           if isinstance(item, dict) and item.get("type") == "function_call_output"
+                           and item.get("call_id") == "call_test"]
+                diagnostic = repr(outputs)[:2000]
+                self.assertEqual(len(outputs), 1, f"missing tool result; outputs={diagnostic}")
+                if bridge:
+                    self.assertEqual(outputs[0], "OK", f"AskClaude failed or is unavailable: {diagnostic}")
+                else:
+                    self.assertIn("OK", outputs[0], f"subagent failed or is unavailable: {diagnostic}")
+                    if timeout:
+                        self.assertIn("[hard timeout - session summarized]", outputs[0])
+                    else:
+                        self.assertIn("subagent_id:", outputs[0])
+                self.assertEqual(len(calls), 4 if timeout else 3, f"gateway calls={len(calls)}, tool={diagnostic}")
                 self.assertTrue(all(path == "/v1/responses" for host, path, _ in calls if host == "api.openai.com"))
                 if bridge:
                     self.assertEqual([host for host, _, _ in calls],
