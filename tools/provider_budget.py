@@ -274,6 +274,7 @@ class Gateway(ThreadingHTTPServer):
         self.config, self.ledger_path, self.task, self.attempt = config, path, task, attempt
         self.credentials, self.token = credentials, secrets.token_urlsafe(32)
         self.connection_factory = connection_factory or (lambda host: http.client.HTTPSConnection(host, timeout=180))
+        ledger.bind_provider_contract(path, contract_digest(config))
         super().__init__(("127.0.0.1", 0), Handler)
 
 
@@ -320,7 +321,8 @@ class Handler(BaseHTTPRequestHandler):
             # HTTP attempt (including client retry) gets its own durable UUID.
             operation = "provider:" + str(uuid.uuid4())
             _, created = ledger.reserve(gateway.ledger_path, operation_id=operation, task_id=gateway.task,
-                                        attempt_id=gateway.attempt, maximum=maximum, supported=ledger.DIMENSIONS)
+                                        attempt_id=gateway.attempt, maximum=maximum, supported=ledger.DIMENSIONS,
+                                        provider_contract=contract_digest(gateway.config))
             if not created:
                 fail("request reservation replay")
             host, path, key_env = APIS[api]
@@ -414,6 +416,7 @@ def client_environment(config, directory, gateway, parent):
             "apiKey": gateway.token, "models": []})
         provider["models"].append({"id": model["id"], "name": model["id"], "api": api, "input": ["text"],
                                   "reasoning": True, "contextWindow": model["context_window"],
+                                  **({"compat": {"forceAdaptiveThinking": True}} if model["id"] == "claude-opus-5-5" else {}),
                                   "maxTokens": model["max_output_tokens"], "cost": {"input": float(model["prices"]["input"]),
                                   "output": float(model["prices"]["output"]), "cacheRead": float(model["prices"]["cache_read"]),
                                   "cacheWrite": float(model["prices"]["cache_write"])}})
@@ -511,7 +514,30 @@ def run(config_path, ledger_path, task, attempt, command):
         gateway.server_close()
 
 
+def rebind_main(argv):
+    parser = argparse.ArgumentParser(description="Explicitly replace a provider contract only in a completely unused ledger")
+    parser.add_argument("--config", required=True, type=Path)
+    parser.add_argument("--ledger", required=True, type=Path)
+    parser.add_argument("--expected-contract", required=True)
+    parser.add_argument("--reason", required=True)
+    parser.add_argument("--attempt-cost-usd", help="explicitly adjust only the unused attempt dollar ceiling; lifetime stays fixed")
+    args = parser.parse_args(argv)
+    try:
+        config = load_config(args.config)
+        data = ledger.rebind_empty_provider_contract(args.ledger, expected=args.expected_contract,
+            replacement=contract_digest(config), reason=args.reason, attempt_cost_usd=args.attempt_cost_usd)
+        print(json.dumps({"ok": True, "provider_contract": data["provider_contract"],
+                          "limits": data["limits"], "provider_contract_history": data["provider_contract_history"]}))
+        return 0
+    except ledger.BudgetError as exc:
+        print(json.dumps({"ok": False, "error_code": exc.code, "error": exc.detail}), file=sys.stderr)
+        return 1
+
+
 def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv[:1] == ["rebind-empty"]:
+        return rebind_main(argv[1:])
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True, type=Path)
     parser.add_argument("--ledger", required=True, type=Path)

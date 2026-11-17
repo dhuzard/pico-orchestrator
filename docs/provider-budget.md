@@ -113,6 +113,41 @@ ledger; changing it cannot reuse the same allowance. Review a catalog update
 before extending the validity window. Expiry is checked when loading a configuration and before each request; this does not certify that a provider cannot change a mutable
 model alias or price during the review window.
 
+An explicit **unused-ledger recovery** command can replace that pin if provider
+metadata preflight found the original model unavailable and no operation has
+ever reserved capacity. It holds the same exclusive lock as admission, compares
+the caller's expected old digest, and refuses every nonempty reservation map,
+including settled or zero-usage launches. It preserves all existing limits and
+records the previous/new contract, timestamp and reason in an append-only
+`provider_contract_history`. This is not a budget reset or a release operation.
+
+```sh
+python3 tools/provider_budget.py rebind-empty \
+  --config /absolute/private/reviewed-replacement.json \
+  --ledger /absolute/private/existing-ledger.json \
+  --expected-contract OLD_SHA256_FROM_LEDGER_STATUS \
+  --reason 'Approved provider change after no-spend metadata preflight' \
+  --attempt-cost-usd 15
+```
+
+`--attempt-cost-usd` is optional and requires explicit authorization. It can
+change only an existing attempt dollar ceiling, never exceed the existing
+lifetime dollar ceiling, and records its old/new values. Every other limit is
+preserved exactly. For example, changing an unused attempt ceiling from $10 to
+$15 leaves an existing lifetime $30/8M-token/200-request/6-launch ceiling intact.
+No general limits replacement API is provided. The replacement configuration
+is validated without inference or access to API credentials. Stop any gateway
+from an older runtime before recovery; current gateways verify the pinned
+contract atomically on every request, so an idle gateway holding the old
+configuration is refused after the change. Replaying a stale expected digest
+cannot change the ledger again.
+
+The generated native Pi entry for `claude-opus-5-5` explicitly retains
+`compat.forceAdaptiveThinking`. This makes `--thinking high` send adaptive
+thinking and `output_config.effort=high`; it does not translate to a legacy token
+budget or silently discard effort. An offline real-Pi/fake-upstream regression
+checks the exact model ID, those fields, output clamping and complete settlement.
+
 | Model | Input context bound | Output maximum | Input | Output | Cache read | Cache write |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | gpt-6-luna | 1,050,000 | 128,000 | 0.20 | 0.75 | 0.02 | 0.25 |

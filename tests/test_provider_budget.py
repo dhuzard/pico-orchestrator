@@ -129,7 +129,10 @@ class BudgetGatewayTest(unittest.TestCase):
         self.assertFalse(ledger.inspect(self.path)["reservations"])
 
     def test_anthropic_cache_categories_and_terminal_event(self):
-        self.server.config = config("anthropic-messages")
+        replacement = config("anthropic-messages")
+        ledger.rebind_empty_provider_contract(self.path, expected=gateway.contract_digest(self.server.config),
+            replacement=gateway.contract_digest(replacement), reason="Offline fixture switches provider")
+        self.server.config = replacement
         self.streaming = True
         self.body = b'\n'.join(b'data: ' + json.dumps(event).encode() for event in [
             {"type": "message_start", "message": {"usage": {"input_tokens": 10, "output_tokens": 0,
@@ -170,6 +173,37 @@ class BudgetGatewayTest(unittest.TestCase):
         with self.assertRaisesRegex(ledger.BudgetError, "project Claude bridge"):
             gateway.validate_project(directory)
 
+    def test_idle_gateway_cannot_forward_after_explicit_empty_contract_rebind(self):
+        replacement = config("anthropic-messages")
+        ledger.rebind_empty_provider_contract(self.path, expected=gateway.contract_digest(self.contract),
+            replacement=gateway.contract_digest(replacement), reason="Offline unavailable-model recovery")
+        self.assertEqual(self.request()[0], 400)
+        self.assertFalse(self.calls)
+        self.assertFalse(ledger.inspect(self.path)["reservations"])
+
+    def test_explicit_rebind_command_validates_config_and_preserves_lifetime_limits(self):
+        from contextlib import redirect_stdout
+        path = Path(self.temp.name) / "unused-ledger.json"
+        replacement_path = Path(self.temp.name) / "replacement.json"
+        replacement_path.write_text(json.dumps(config("anthropic-messages")))
+        limits = {"lifetime": {"tokens": 8000000, "cost_usd": "30", "requests": 200, "launches": 6},
+                  "attempt": {"cost_usd": "10"}}
+        ledger.initialize(path, limits)
+        original = gateway.contract_digest(self.contract)
+        ledger.bind_provider_contract(path, original)
+        output = io.StringIO()
+        with redirect_stdout(output), mock.patch.dict(os.environ, {}, clear=True):
+            result = gateway.main(["rebind-empty", "--config", str(replacement_path), "--ledger", str(path),
+                "--expected-contract", original, "--reason", "Approved replacement after no-spend metadata preflight",
+                "--attempt-cost-usd", "15"])
+        self.assertEqual(result, 0)
+        self.assertTrue(json.loads(output.getvalue())["ok"])
+        data = ledger.inspect(path)
+        self.assertEqual(data["limits"]["lifetime"], limits["lifetime"])
+        self.assertEqual(data["limits"]["attempt"]["cost_usd"], "15")
+        self.assertEqual(data["reservations"], {})
+        self.assertEqual(len(data["provider_contract_history"]), 1)
+
     def test_oauth_credentials_and_launch_only_ledgers_cannot_enable_provider_mode(self):
         path = Path(self.temp.name) / "config.json"
         path.write_text(json.dumps(config()))
@@ -206,7 +240,10 @@ class BudgetGatewayTest(unittest.TestCase):
         binary = shutil.which("claude")
         if binary is None:
             self.skipTest("Claude CLI optional; fake transport tests still run")
-        self.server.config = config("anthropic-messages")
+        replacement = config("anthropic-messages")
+        ledger.rebind_empty_provider_contract(self.path, expected=gateway.contract_digest(self.server.config),
+            replacement=gateway.contract_digest(replacement), reason="Offline fixture switches provider")
+        self.server.config = replacement
         self.streaming = True
         def body():
             tool = len(self.calls) == 1
@@ -298,6 +335,33 @@ class BudgetGatewayTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(len(self.calls), 3)
         self.assertTrue(all(e["state"] == "settled" for e in ledger.inspect(self.path)["reservations"].values()))
+
+    def test_native_pi_anthropic_high_uses_adaptive_thinking_and_exact_model(self):
+        from test_provider_workflows_integration import _anthropic_response
+        binary = Path(__file__).resolve().parents[1] / "node_modules/.bin/pi"
+        if not binary.exists():
+            self.skipTest("npm ci required for native Anthropic runtime fixture")
+        replacement = config("anthropic-messages")
+        ledger.rebind_empty_provider_contract(self.path, expected=gateway.contract_digest(self.server.config),
+            replacement=gateway.contract_digest(replacement), reason="Offline native Anthropic high fixture")
+        self.server.config = replacement
+        self.streaming, self.body = True, _anthropic_response()
+        directory = Path(self.temp.name) / "native-anthropic"
+        directory.mkdir()
+        env = gateway.client_environment(replacement, directory, self.server, os.environ)
+        result = subprocess.run([str(binary), "--no-extensions", "--no-approve", "--no-session", "--no-tools",
+                                 "--thinking", "high", "--print", "hello"], env=env, cwd=directory,
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("OK", result.stdout)
+        self.assertEqual(len(self.calls), 1)
+        path, payload, _headers = self.calls[0]
+        self.assertEqual(path, "/v1/messages")
+        self.assertEqual(payload["model"], "claude-opus-5-5")
+        self.assertEqual(payload["thinking"]["type"], "adaptive")
+        self.assertEqual(payload["output_config"]["effort"], "high")
+        self.assertEqual(payload["max_tokens"], 64)
+        self.assertEqual(next(iter(ledger.inspect(self.path)["reservations"].values()))["state"], "settled")
 
 
 if __name__ == "__main__":

@@ -15,6 +15,7 @@ from decimal import Decimal, InvalidOperation
 import fcntl
 import json
 import os
+import re
 from pathlib import Path
 import uuid
 
@@ -71,6 +72,12 @@ def _identity(value):
     return value
 
 
+def _digest(value):
+    if not isinstance(value, str) or not re.fullmatch(r"[a-f0-9]{64}", value):
+        _fail("provider contract must be a SHA-256 digest")
+    return value
+
+
 @contextlib.contextmanager
 def _locked(path):
     path = Path(path).absolute()
@@ -102,6 +109,31 @@ def _load(path):
         required = set().union(*(set(limits) for limits in validated_limits.values()))
         if not isinstance(data["reservations"], dict):
             _fail("invalid reservations")
+        if "provider_contract" in data:
+            _digest(data["provider_contract"])
+        history = data.get("provider_contract_history", [])
+        if not isinstance(history, list):
+            _fail("invalid provider contract history")
+        previous = None
+        last_attempt_cost = None
+        for event in history:
+            old, new = _digest(event["previous"]), _digest(event["replacement"])
+            if previous is not None and old != previous:
+                _fail("provider contract history is discontinuous")
+            _identity(event["reason"])
+            datetime.fromisoformat(event["at"])
+            if "attempt_cost_usd" in event:
+                change = event["attempt_cost_usd"]
+                old_cost = _amounts({"cost_usd": change["previous"]})["cost_usd"]
+                new_cost = _amounts({"cost_usd": change["replacement"]})["cost_usd"]
+                if last_attempt_cost is not None and Decimal(old_cost) != Decimal(last_attempt_cost):
+                    _fail("attempt dollar limit history is discontinuous")
+                last_attempt_cost = new_cost
+            previous = new
+        if previous is not None and previous != data.get("provider_contract"):
+            _fail("provider contract differs from its history")
+        if last_attempt_cost is not None and Decimal(last_attempt_cost) != Decimal(str(data["limits"]["attempt"]["cost_usd"])):
+            _fail("attempt dollar limit differs from its history")
         for operation, entry in data["reservations"].items():
             _identity(operation)
             _identity(entry["task_id"])
@@ -161,7 +193,7 @@ def _matches(scope, entry, task_id, attempt_id, day):
     return True
 
 
-def reserve(path, *, operation_id, task_id, attempt_id, maximum, supported=None):
+def reserve(path, *, operation_id, task_id, attempt_id, maximum, supported=None, provider_contract=None):
     """Reserve an adapter-enforced upper bound before an external operation.
 
     Returns (reservation, created). Only created=True authorizes execution.
@@ -173,6 +205,8 @@ def reserve(path, *, operation_id, task_id, attempt_id, maximum, supported=None)
     supported = set(supported or ())
     with _locked(path) as path:
         data = _load(path)
+        if provider_contract is not None and data.get("provider_contract") != _digest(provider_contract):
+            _fail("provider contract changed before request admission", "AGGREGATE_BUDGET_CONFLICT")
         required = set().union(*(set(limits) for limits in data["limits"].values()))
         if required - supported or required - set(maximum):
             _fail("adapter cannot enforce configured dimensions: " + ", ".join(sorted(
@@ -230,6 +264,7 @@ def settle(path, operation_id, *, actual=None, complete=False):
 
 def bind_provider_contract(path, digest):
     """Pin the reviewed pricing/limit contract for the life of this ledger."""
+    digest = _digest(digest)
     with _locked(path) as path:
         data = _load(path)
         prior = data.get("provider_contract")
@@ -239,7 +274,42 @@ def bind_provider_contract(path, digest):
         _save(path, data)
 
 
-def reserve_launch(path, *, task_id, attempt_id, operation_id=None, provider_bound=False):
+def rebind_empty_provider_contract(path, *, expected, replacement, reason, attempt_cost_usd=None):
+    """Explicit compare-and-swap for an entirely unused ledger; never resets it.
+
+    ANY reservation, even a settled zero-usage launch, permanently forbids this
+    operation. Request admission checks the contract under this same lock, so
+    an idle old gateway cannot spend after its contract has been replaced.
+    """
+    expected, replacement, reason = _digest(expected), _digest(replacement), _identity(reason)
+    if expected == replacement:
+        _fail("replacement contract must differ")
+    with _locked(path) as path:
+        data = _load(path)
+        if data.get("provider_contract") != expected:
+            _fail("expected provider contract no longer matches", "AGGREGATE_BUDGET_CONFLICT")
+        if data["reservations"]:
+            _fail("provider contract rebind requires zero reservations of every kind", "AGGREGATE_BUDGET_CONFLICT")
+        event = {"previous": expected, "replacement": replacement, "reason": reason,
+                 "at": datetime.now(timezone.utc).isoformat()}
+        if attempt_cost_usd is not None:
+            amount = _amounts({"cost_usd": attempt_cost_usd})["cost_usd"]
+            lifetime = data["limits"].get("lifetime", {}).get("cost_usd")
+            prior_attempt = data["limits"].get("attempt", {}).get("cost_usd")
+            if lifetime is None or prior_attempt is None:
+                _fail("attempt dollar adjustment requires existing attempt and lifetime dollar ceilings")
+            if Decimal(amount) > Decimal(str(lifetime)):
+                _fail("attempt dollar ceiling cannot exceed the unchanged lifetime ceiling")
+            event["attempt_cost_usd"] = {"previous": str(prior_attempt), "replacement": amount}
+            # Deliberately narrow: no general limits replacement or reset API.
+            data["limits"]["attempt"]["cost_usd"] = amount
+        data.setdefault("provider_contract_history", []).append(event)
+        data["provider_contract"] = replacement
+        _save(path, data)
+        return data
+
+
+def reserve_launch(path, *, task_id, attempt_id, operation_id=None, provider_bound=False, provider_contract=None):
     """Charge one attempted launch. Provider ceilings are refused at this boundary.
 
     Every resume/new attempt charges again. A repeated/no-op headless start must
@@ -249,7 +319,7 @@ def reserve_launch(path, *, task_id, attempt_id, operation_id=None, provider_bou
     _, created = reserve(path, operation_id=operation_id, task_id=task_id, attempt_id=attempt_id,
                          maximum=({"launches": 1, "requests": 0, "tokens": 0, "cost_usd": "0"}
                                   if provider_bound else {"launches": 1}),
-                         supported=DIMENSIONS if provider_bound else {"launches"})
+                         supported=DIMENSIONS if provider_bound else {"launches"}, provider_contract=provider_contract)
     if not created:
         _fail("launch admission was already consumed", "AGGREGATE_BUDGET_REPLAY")
     return operation_id

@@ -683,11 +683,14 @@ def start(*, target: Path, explicit_repo: str, execution_id: str, objective: str
             raise HeadlessError("PROVIDER_BUDGET_UNSUPPORTED", "provider mode requires an aggregate ledger")
         if ledger_path:
             try:
+                provider_contract = None
                 if provider_config:
-                    provider_budget.validate_launch(provider_config, ledger_path)
+                    configured_provider = provider_budget.validate_launch(provider_config, ledger_path)
+                    provider_contract = provider_budget.contract_digest(configured_provider)
                     provider_budget.validate_project(worktree)
                 admission_id = budget_ledger.reserve_launch(Path(ledger_path),
-                    task_id=budget_task, attempt_id=execution_id, provider_bound=bool(provider_config))
+                    task_id=budget_task, attempt_id=execution_id, provider_bound=bool(provider_config),
+                    provider_contract=provider_contract)
             except budget_ledger.BudgetError as exc:
                 raise HeadlessError(exc.code, exc.detail) from exc
     # Deciding and launching happen under the record lock, so two starts with
