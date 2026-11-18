@@ -103,7 +103,9 @@ def command(argv: list[str], *, timeout: int = 40, env: dict | None = None) -> d
         raise DispatcherError(f"invalid JSON from {argv[0]} (exit {run.returncode})") from exc
     # `pico exec status` returns a structured BLOCKED result with exit 1.
     if run.returncode and argv[0].endswith("gh"):
-        raise DispatcherError(f"GitHub operation failed (exit {run.returncode})")
+        # gh never prints credentials; its first stderr line names the cause (e.g. an unsupported flag).
+        detail = (run.stderr or "").strip().splitlines()[0][:200] if (run.stderr or "").strip() else ""
+        raise DispatcherError(f"GitHub operation failed (exit {run.returncode})" + (f": {detail}" if detail else ""))
     if not isinstance(value, (dict, list)):
         raise DispatcherError("expected a JSON object or array")
     return value
@@ -405,7 +407,8 @@ def reconcile_delivery(cfg: dict, db: sqlite3.Connection, row: sqlite3.Row) -> N
         if row['state'] != 'completed' and isinstance(blocker, str) and re.fullmatch(r'[A-Z][A-Z0-9_]{0,100}', blocker):
             item['reason'] = f"Execution {row['state']}: {blocker}"
             item['next_action'] = 'Inspect the blocker and execution evidence before approving any new attempt'
-    except (DispatcherError, OSError, ValueError):
+    except (DispatcherError, OSError, ValueError) as exc:
+        notice(row['number'], 'delivery evidence unavailable', exc)
         item = delivery_observer.observe(row, {}, lambda _: None)
     previous = db.execute("SELECT projection FROM deliveries WHERE issue=?", (row["number"],)).fetchone()
     if previous:
@@ -417,6 +420,17 @@ def reconcile_delivery(cfg: dict, db: sqlite3.Connection, row: sqlite3.Row) -> N
             pass
     delivery_store.save(db, item)
     handoff_comment(cfg, row, item)
+
+
+_NOTICES: dict[tuple[int, str], str] = {}
+
+
+def notice(number: int, what: str, exc: Exception) -> None:
+    """Report a failure that is retried every poll once per distinct cause, not once per poll."""
+    text = str(exc)
+    if _NOTICES.get((number, what)) != text:
+        _NOTICES[(number, what)] = text
+        print(f"Issue #{number}: {what}: {text}", file=sys.stderr, flush=True)
 
 
 def handoff_comment(cfg: dict, row: sqlite3.Row, item: dict) -> None:
@@ -453,7 +467,9 @@ def handoff_comment(cfg: dict, row: sqlite3.Row, item: dict) -> None:
         else:
             method = 'POST'
         command([cfg['gh'], 'api', '--method', method, endpoint, '-f', f'body={body}'], env=env)
-    except (DispatcherError, OSError, ValueError):
+    except (DispatcherError, OSError, ValueError) as exc:
+        # Retried on the next poll; say why, so a persistent cause is visible in the service journal.
+        notice(row['number'], 'delivery handoff comment not written', exc)
         return
 
 
@@ -533,7 +549,23 @@ def tick(cfg: dict, db: sqlite3.Connection) -> None:
             report(cfg, db, current)
 
 
+MIN_GH = (2, 48, 0)  # first release with `gh api --paginate --slurp`, used by delivery observation
+
+
+def require_gh(cfg: dict) -> None:
+    """Refuse to serve with a gh that cannot observe deliveries; an unreadable version is left to the calls."""
+    try:
+        out = subprocess.run([cfg["gh"], "--version"], capture_output=True, text=True, timeout=40, check=False).stdout
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise DispatcherError(f"command unavailable or timed out: {cfg['gh']}") from exc
+    found = re.search(r"gh version (\d+)\.(\d+)\.(\d+)", out or "")
+    if found and tuple(map(int, found.groups())) < MIN_GH:
+        raise DispatcherError(f"gh {'.'.join(found.groups())} is too old: delivery observation needs gh >= "
+                              f"{'.'.join(map(str, MIN_GH))} (`gh api --slurp`)")
+
+
 def run_service(cfg: dict, once: bool) -> None:
+    require_gh(cfg)
     lock_path = cfg["state"].with_suffix(".lock")
     lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     with open(lock_path, "a+", encoding="utf-8") as lock:

@@ -1140,8 +1140,10 @@ dry run. Inspect its repository, commit, remote state, existing PR, and
 with `--apply --plan-hash <plan_hash>`. Pass `--repo owner/repository` when
 the target has multiple GitHub remotes. The adapter uses a single explicit,
 non-force branch refspec and creates a draft PR; it never marks a PR ready,
-merges, or accepts arbitrary GitHub commands. Link its child run to the parent
-with an `orchestration_record` child event. If a push succeeds but PR creation
+merges, or accepts arbitrary GitHub commands. An applied publication links its
+own run to the parent and reports `parent_linked`; only when that is `false`,
+link its child run to the parent yourself with an `orchestration_record` child
+event. If a push succeeds but PR creation
 fails, report the partial result and review a fresh dry run before retrying.
 A terminal `PARTIAL` run cannot be reopened to publish. Choose branch names
 unique to the parent run and task or wave, including task-granularity branches,

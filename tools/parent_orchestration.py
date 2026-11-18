@@ -1179,6 +1179,32 @@ def _phase(parent: dict, phase_id: str) -> dict:
     return phase
 
 
+def link_publication_child(run_id: str, phase_id: str, child_id: str, *, repo_root: Path = ROOT) -> None:
+    """Link the publication run the trusted adapter started for this parent; idempotent.
+
+    The adapter runs as a subprocess of the lead and holds no lease, so, like
+    step records, this write takes the run lock only. It can add nothing but a
+    child id to an existing phase, and only for a child whose own record names
+    this parent, so the link does not depend on the lead recording a child event.
+    """
+    child_id = _safe(child_id, ID_RE, "child run id")
+    with _run_lock(repo_root, run_id):
+        record = provenance.get_run(repo_root, run_id)
+        if record["outcome"] != "in_progress":
+            raise ParentRunError("parent run is terminal")
+        parent = _parent(record)
+        phase = next((p for p in parent["phases"] if p["id"] == phase_id), None)
+        if phase is None or child_id == run_id:
+            raise ParentRunError("unknown phase or self link")
+        child = provenance.get_run(repo_root, child_id)
+        receipt = (child.get("github_integration") or {}).get("publication_receipt") or {}
+        if receipt.get("parent_run_id") != run_id:
+            raise ParentRunError("child run does not publish for this parent")
+        if child_id not in phase.setdefault("child_run_ids", []):
+            phase["child_run_ids"].append(child_id)
+            provenance.update_parent_orchestration(repo_root, run_id, parent)
+
+
 def record_event(run_id: str, event: dict, *, owner_id: str | None = None, repo_root: Path = ROOT) -> dict:
     with _owned(run_id, owner_id, repo_root):
         return _record_event_unlocked(run_id, event, repo_root=repo_root)

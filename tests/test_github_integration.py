@@ -229,6 +229,75 @@ class IntegrationTest(unittest.TestCase):
         self.assertEqual(stale["mutations_applied"], 0)
         must_not_create.assert_not_called()
 
+    def publish_for_parent(self, parent_run_id, commit):
+        """Dry-run then apply one publication for a parent; integration evidence is covered by its own test."""
+        body = Path(self.tmp.name) / "linked-body.md"
+        body.write_text("Refs #401\n")
+        api = FakeGithubApi()
+        policy = (ROOT / "templates/autonomy.yaml").read_text().replace("push_branch: false", "push_branch: true").replace("create_pr: false", "create_pr: true")
+        state = {"remote": "origin", "commit": commit, "remote_commit": None,
+                 "base_commit": api.merge("Examplecorp/examplelab", policy), "existing_pr": None}
+        real_run = subprocess.run
+        def git_run(argv, **kwargs):
+            if len(argv) > 3 and argv[3] == "push":
+                return subprocess.CompletedProcess(argv, 0, "", "")
+            return real_run(argv, **kwargs)
+        common = dict(worktree=self.worktree, base="main", head="pico/linked", title="Linked", body_file=body,
+                      adapter=api, provenance_root=self.records, parent_run_id=parent_run_id)
+        with patch.object(gi, "_publication_state", return_value=state), \
+             patch.object(gi, "_branch", side_effect=lambda _worktree, name, **_kwargs: name), \
+             patch.object(gi, "_require_parent_evidence", return_value="task"), \
+             patch.object(gi.subprocess, "run", side_effect=git_run), \
+             patch.object(api, "create_pr", return_value={"number": 25}, create=True):
+            preview = gi.publish(**common)
+            self.assertEqual(preview["status"], "DRY_RUN")
+            self.assertIsNone(preview["parent_linked"])
+            return gi.publish(**common, apply=True, expected_plan_hash=preview["plan_hash"])
+
+    def test_applied_publication_links_itself_to_the_parent_for_delivery_observation(self):
+        # A headless lead that publishes and finishes without recording a child event (pilot run on 13fb575).
+        import delivery_observer
+        import parent_orchestration as po
+        self.remote("https://github.com/Examplecorp/examplelab.git")
+        commit = "a" * 40
+        with po.ParentRun(worktree=self.worktree, repo_root=self.records) as parent:
+            run_id = parent.run_id
+            parent.event({"kind": "phase", "phase": "task", "status": "in_progress"})
+            before = provenance.get_run(self.records, run_id)["parent_orchestration"]["phases"][0]["child_run_ids"]
+            self.assertEqual(before, [])
+            applied = self.publish_for_parent(run_id, commit)
+            self.assertEqual((applied["status"], applied["pr"], applied["parent_linked"]), ("COMPLETED", 25, True))
+            parent.event({"kind": "phase", "phase": "task", "status": "completed"})
+            parent.finish("COMPLETED")
+        record = provenance.get_run(self.records, run_id)
+        self.assertEqual(record["parent_orchestration"]["phases"][0]["child_run_ids"], [applied["run_id"]])
+        trace = provenance.run_path(self.records, run_id)
+        observed = delivery_observer.publication({"run": {"run_id": run_id, "trace_path": str(trace)}},
+                                                 "Examplecorp/examplelab")
+        self.assertEqual(observed[:2], ("observed", 25))
+        # Only a publication whose own receipt names this parent can be linked, and only to a known phase.
+        other = provenance.start_run(self.records, backlog_id=None, github_issue=None, user_objective="unrelated",
+                                     route_task_result=None, starting_commit=None)
+        with po.ParentRun(worktree=self.worktree, repo_root=self.records) as second:
+            second.event({"kind": "phase", "phase": "task", "status": "in_progress"})
+            for phase, child in (("task", other["run_id"]), ("task", applied["run_id"]), ("missing", applied["run_id"])):
+                with self.assertRaises(po.ParentRunError):
+                    po.link_publication_child(second.run_id, phase, child, repo_root=self.records)
+            second.finish("BLOCKED", blocker_code="TEST_DONE")
+
+    def test_publication_for_a_terminal_parent_still_applies_and_reports_the_missing_link(self):
+        import parent_orchestration as po
+        self.remote("https://github.com/Examplecorp/examplelab.git")
+        with po.ParentRun(worktree=self.worktree, repo_root=self.records) as parent:
+            run_id = parent.run_id
+            parent.event({"kind": "phase", "phase": "task", "status": "completed"})
+            parent.finish("COMPLETED")
+        with patch("sys.stderr") as stderr:
+            applied = self.publish_for_parent(run_id, "b" * 40)
+        self.assertEqual((applied["status"], applied["pr"], applied["parent_linked"]), ("COMPLETED", 25, False))
+        self.assertIn("could not be linked", "".join(call.args[0] for call in stderr.write.call_args_list))
+        self.assertEqual(provenance.get_run(self.records, run_id)["parent_orchestration"]["phases"][0]["child_run_ids"], [])
+
     def test_https_ssh_and_explicit_resolution(self):
         self.remote("https://github.com/Examplecorp/examplelab.git")
         self.assertEqual(gi.resolve_target(self.worktree), "Examplecorp/examplelab")

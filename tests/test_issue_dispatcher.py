@@ -219,6 +219,30 @@ class IssueDispatcherTest(unittest.TestCase):
             self.assertEqual(row["mode"], "local-mutation")
             self.assertEqual(row["state"], "approved")
 
+    def test_service_refuses_a_gh_without_slurp_and_reports_handoff_failures_once(self):
+        def version(text):
+            return patch.object(mod.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout=text, stderr=""))
+        with version("gh version 2.45.0 (2025-07-18 Ubuntu 2.45.0-1ubuntu0.3)\n"):
+            with self.assertRaisesRegex(mod.DispatcherError, "gh 2.45.0 is too old.*2.48.0"):
+                mod.run_service(self.cfg, once=True)
+        for accepted in ("gh version 2.48.0 (2024-04-17)\n", "gh version 2.103.3 (2026-10-26)\n", "unreadable\n"):
+            with version(accepted):
+                mod.require_gh(self.cfg)
+        # gh's own first stderr line reaches the journal, once per distinct cause rather than once per poll.
+        failed = SimpleNamespace(returncode=1, stdout="{}", stderr="unknown flag: --slurp\n\nUsage: ...\n")
+        self.configure_credentials()
+        row = {"number": 11, "execution_id": "issue-abc"}
+        item = {"delivery": "needs_decision", "execution": "blocked", "publication": "none", "checks": "unknown",
+                "review": "unknown", "reason": "r", "next_action": "n", "pr_url": None, "head_sha": None}
+        mod._NOTICES.clear()
+        with patch.object(mod.subprocess, "run", return_value=failed), patch("sys.stderr") as stderr:
+            mod.handoff_comment(self.cfg, row, item)
+            mod.handoff_comment(self.cfg, row, item)
+        written = "".join(call.args[0] for call in stderr.write.call_args_list)
+        self.assertEqual(written.count("Issue #11: delivery handoff comment not written"), 1)
+        self.assertIn("unknown flag: --slurp", written)
+        self.assertNotIn("queue-secret", written)
+
     def test_classification_is_conservative(self):
         self.assertEqual(mod.classify({"status": "exited", "run": {"status": "BLOCKED"}}), "blocked")
         self.assertEqual(mod.classify({"status": "exited", "run": {"status": "PARTIAL"}}), "partial")

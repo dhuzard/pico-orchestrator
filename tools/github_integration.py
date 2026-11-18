@@ -773,8 +773,8 @@ def _publication_state(worktree: Path, repo: str, base: str, head: str, adapter=
             "existing_pr": open_prs[0]["number"] if open_prs else None}
 
 
-def _require_parent_evidence(root: Path, run_id: str, worktree: Path, repo: str, base: str, commit: str) -> None:
-    """Require completed routed integration evidence for every published path."""
+def _require_parent_evidence(root: Path, run_id: str, worktree: Path, repo: str, base: str, commit: str) -> str:
+    """Require completed routed integration evidence for every published path; return the first phase providing it."""
     try:
         record = provenance.get_run(root, run_id)
         parent = record.get("parent_orchestration") or {}
@@ -798,6 +798,7 @@ def _require_parent_evidence(root: Path, run_id: str, worktree: Path, repo: str,
             raise ValueError("empty publication")
         waves = {w.get("id"): w for w in parent.get("waves") or []}
         covered = set()
+        evidence_phase = None
         for phase in phases:
             escalations = phase.get("escalations") or []
             if any(e.get("confirmed") is not True for e in escalations):
@@ -828,10 +829,24 @@ def _require_parent_evidence(root: Path, run_id: str, worktree: Path, repo: str,
                     same = subprocess.run(["git", "-C", str(worktree), "--literal-pathspecs", "diff", "--quiet", checked_head, commit, "--", path], timeout=60)
                     if changed.returncode == 1 and same.returncode == 0:
                         covered.add(path)
-        if covered != set(paths):
+                        evidence_phase = evidence_phase or phase["id"]
+        if covered != set(paths) or not isinstance(evidence_phase, str):
             raise ValueError("candidate has paths without integrated evidence")
+        return evidence_phase
     except (provenance.ProvenanceError, OSError, ValueError, UnicodeError, subprocess.SubprocessError, TypeError, AttributeError, KeyError):
         raise IntegrationError("PUBLICATION_INTEGRATION_REQUIRED", "completed integration evidence for the repository and candidate commit is required") from None
+
+
+def _link_parent(root: Path, parent_run_id: str, phase_id: str, child_run_id: str) -> bool:
+    """Best effort: a parent that is already terminal or busy stays publishable, and the caller reports it."""
+    import parent_orchestration  # lazy: the recorder imports this module
+    try:
+        parent_orchestration.link_publication_child(parent_run_id, phase_id, child_run_id, repo_root=root)
+        return True
+    except (parent_orchestration.ParentRunError, provenance.ProvenanceError, OSError, ValueError, KeyError, TypeError):
+        print(f"warning: publication run {child_run_id} could not be linked to parent {parent_run_id}; "
+              "record an orchestration_record child event for it", file=sys.stderr)
+        return False
 
 
 def publish(*, worktree: Path, base: str, head: str, title: str, body_file: Path,
@@ -869,6 +884,7 @@ def publish(*, worktree: Path, base: str, head: str, title: str, body_file: Path
     plan = None
     drift: list[str] = []
     outcome = "blocked"
+    parent_linked = None
     try:
         repo = resolve_target(worktree, explicit_repo)
         meta["target_repository"] = repo
@@ -900,8 +916,10 @@ def publish(*, worktree: Path, base: str, head: str, title: str, body_file: Path
                 raise IntegrationError("GITHUB_STATE_CONFLICT", "the republication branch changed; run the dry run again")
         state = _publication_state(worktree, repo, base, head, adapter, base_commit,
                                    remote_head=republished["remote_head"] if republished else None)
+        evidence_phase = None
         if parent_run_id is not None:
-            _require_parent_evidence(provenance_root, parent_run_id, worktree, repo, base_commit, state["commit"])
+            evidence_phase = _require_parent_evidence(provenance_root, parent_run_id, worktree, repo,
+                                                      base_commit, state["commit"])
 
         def policy_closes() -> bool:
             return _issue_reference(policy) == "closes"
@@ -932,6 +950,11 @@ def publish(*, worktree: Path, base: str, head: str, title: str, body_file: Path
                        "commit": state["commit"], "plan_hash": digest,
                        "parent_run_id": parent_run_id, "stage": "push_intent", "pr": None}
             meta["publication_receipt"] = receipt
+            if parent_run_id is not None:
+                # Link this run into the parent before any remote write, so delivery observation can
+                # find the PR without relying on the lead to record a child event afterwards.
+                provenance.update_github_integration(provenance_root, record["run_id"], meta)
+                parent_linked = _link_parent(provenance_root, parent_run_id, evidence_phase, record["run_id"])
             if state["remote_commit"] != state["commit"]:
                 provenance.update_github_integration(provenance_root, record["run_id"], meta)
                 proc = subprocess.run(["git", "-C", str(worktree), "push", "--porcelain", state["remote"],
@@ -973,7 +996,9 @@ def publish(*, worktree: Path, base: str, head: str, title: str, body_file: Path
             "plan": plan, "plan_hash": digest if plan else None,
             "policy_drift": drift,
             "pr": pr_number if outcome == "completed" else None,
-            "mutations_applied": meta["mutations_applied"]}
+            "mutations_applied": meta["mutations_applied"],
+            # True/False once an applied publication for a parent tried to link itself; None otherwise.
+            "parent_linked": parent_linked}
 
 
 def main() -> int:
