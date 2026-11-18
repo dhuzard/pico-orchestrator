@@ -56,10 +56,67 @@ class DeliveryTest(unittest.TestCase):
         self.end = {**self.pr, 'head': {**self.pr['head'], 'sha': 'b' * 40}}
         self.assertEqual(self.observe()['checks'], 'stale')
 
+    def actions_call(self, runs, jobs, statuses=()):
+        """A fine-grained token: the check rollup is refused; Actions and commit statuses are readable."""
+        def call(args):
+            if args[0] == 'pr':
+                raise RuntimeError('GraphQL: Resource not accessible by personal access token')
+            if '/actions/runs?head_sha=' in args[-1]:
+                return [{'total_count': len(runs), 'workflow_runs': runs}]
+            if '/jobs?' in args[-1]:
+                return [{'jobs': jobs[int(args[-1].split('/runs/')[1].split('/')[0])]}]
+            if args[-1].endswith('/status'):
+                return {'sha': self.sha, 'statuses': list(statuses)}
+            return self.call(args)
+        return call
+
+    def observe_with(self, call):
+        self.__dict__.pop('seen', None)
+        return obs.observe(self.row, self.record, call, ['test'])
+
+    def test_checks_fall_back_to_actions_jobs_when_the_token_cannot_read_checks(self):
+        def job(name, status='completed', conclusion='success', sha=None):
+            return {'name': name, 'status': status, 'conclusion': conclusion, 'head_sha': sha or self.sha}
+        runs = [{'id': 1, 'event': 'pull_request', 'head_sha': self.sha},
+                # Copilot review runs are not checks in the PR rollup; a failure there must not fail delivery.
+                {'id': 2, 'event': 'dynamic', 'head_sha': self.sha}]
+        jobs = {1: [job('test'), job('docs', conclusion='success')], 2: [job('copilot', conclusion='failure')]}
+        result = self.observe_with(self.actions_call(runs, jobs))
+        self.assertEqual((result['delivery'], result['checks']), ('needs_human_review', 'passed'))
+        self.assertEqual(result['evidence']['checks_source'], 'actions')
+        self.assertEqual(result['evidence']['observed_checks'], ['docs', 'test'])
+        jobs[1][0] = job('test', status='in_progress', conclusion=None)
+        self.assertEqual(self.observe_with(self.actions_call(runs, jobs))['delivery'], 'waiting_ci')
+        for conclusion in ('failure', 'skipped', 'cancelled', 'neutral'):
+            jobs[1][0] = job('test', conclusion=conclusion)
+            self.assertEqual(self.observe_with(self.actions_call(runs, jobs))['checks'], 'failed')
+        # A commit status counts like a rollup status context; a failing one fails the observation.
+        jobs[1][0] = job('test')
+        failing = [{'context': 'external/ci', 'state': 'failure'}]
+        self.assertEqual(self.observe_with(self.actions_call(runs, jobs, failing))['checks'], 'failed')
+        # An expected check that no Actions job reports (e.g. another app's check) stays missing, never passes.
+        jobs[1] = [job('docs')]
+        self.assertEqual(self.observe_with(self.actions_call(runs, jobs))['checks'], 'unknown')
+        # Evidence for any other commit is refused rather than attributed to the pull request head.
+        jobs[1] = [job('test', sha='b' * 40)]
+        self.assertEqual(self.observe_with(self.actions_call(runs, jobs))['checks'], 'unavailable')
+        stale_run = [{'id': 1, 'event': 'pull_request', 'head_sha': 'b' * 40}]
+        self.assertEqual(self.observe_with(self.actions_call(stale_run, {1: [job('test')]}))['checks'], 'unavailable')
+        # The rollup stays the primary source whenever the token can read it.
+        self.assertEqual(self.observe()['evidence']['checks_source'], 'check_rollup')
+
     def test_checks_fail_closed(self):
         for verdict, expected in [('SKIPPED', 'failed'), ('NEUTRAL', 'failed'), ('CANCELLED', 'failed')]:
             self.checks['statusCheckRollup'][0]['conclusion'] = verdict
             self.assertEqual(self.observe()['checks'], expected)
+        # Conditional jobs skipped on pull requests do not fail delivery; a real failure of any check does.
+        self.checks['statusCheckRollup'] = [{'name': 'test', 'status': 'COMPLETED', 'conclusion': 'SUCCESS'},
+                                            {'name': 'Publish to GitHub Pages', 'status': 'COMPLETED', 'conclusion': 'SKIPPED'}]
+        self.assertEqual(self.observe()['checks'], 'passed')
+        self.checks['statusCheckRollup'][1]['conclusion'] = 'FAILURE'
+        self.assertEqual(self.observe()['checks'], 'failed')
+        self.checks['statusCheckRollup'][1].update(status='IN_PROGRESS', conclusion=None)
+        self.assertEqual(self.observe()['checks'], 'passed')
         self.checks['statusCheckRollup'] = []
         self.assertEqual(self.observe()['checks'], 'unknown')
         self.checks['statusCheckRollup'] = [{'name': 'test', 'status': 'IN_PROGRESS'}]

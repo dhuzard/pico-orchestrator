@@ -88,13 +88,72 @@ def classify_checks(checks, required):
             result = 'passed'
         elif conclusion in ('PENDING', 'EXPECTED', 'QUEUED', 'IN_PROGRESS', ''):
             result = 'running'
+        elif conclusion in ('SKIPPED', 'NEUTRAL'):
+            result = 'not_run'
         else:
             result = 'failed'
         outcomes.setdefault(name, []).append(result)
     if not checks or any(name not in outcomes for name in required):
         return 'unknown', sorted(outcomes)
-    flattened = [v for group in outcomes.values() for v in group]
-    return ('failed' if 'failed' in flattened else 'running' if 'running' in flattened else 'passed'), sorted(outcomes)
+    # Expected checks must each pass; skipped or neutral never counts as passed. Any other check fails the
+    # observation only by actually failing: conditional jobs skipped on pull requests are not failures.
+    expected = [v for name in required for v in outcomes[name]]
+    others = [v for name, group in outcomes.items() if name not in required for v in group]
+    if 'failed' in expected or 'not_run' in expected or 'failed' in others:
+        return 'failed', sorted(outcomes)
+    return ('running' if 'running' in expected else 'passed'), sorted(outcomes)
+
+
+def _pages(value, key=None):
+    """Flatten `gh api --paginate --slurp` output: a list of pages, each a list or an object holding `key`."""
+    if not isinstance(value, list):
+        raise ValueError('pagination unavailable')
+    items = []
+    for page in value:
+        if key is not None and isinstance(page, dict):
+            page = page.get(key)
+        if not isinstance(page, list):
+            raise ValueError('pagination unavailable')
+        items.extend(page)
+    return items
+
+
+def actions_checks(repo, head, call):
+    """Checks for one commit from the Actions and commit-status APIs, shaped like statusCheckRollup.
+
+    Fine-grained personal access tokens cannot hold the Checks permission that
+    `statusCheckRollup` needs, but can read Actions and commit statuses. Each job
+    of the latest attempt of every workflow run for the exact commit becomes one
+    check named like the job, which is the name the rollup shows. Runs GitHub
+    starts outside the commit's checks (event `dynamic`, e.g. Copilot review) are
+    not checks there and are left out. Checks reported by other apps are not
+    visible here, so an expected check from one stays missing and never passes.
+    """
+    runs = _pages(call(['api', '--paginate', '--slurp', f'repos/{repo}/actions/runs?head_sha={head}&per_page=100']),
+                  'workflow_runs')
+    checks = []
+    for run in runs:
+        if not isinstance(run, dict) or run.get('head_sha') != head:
+            raise ValueError('workflow run does not match the pull request head')
+        if run.get('event') == 'dynamic':
+            continue
+        if type(run.get('id')) is not int:
+            raise ValueError('workflow run identity unavailable')
+        jobs = _pages(call(['api', '--paginate', '--slurp', f'repos/{repo}/actions/runs/{run["id"]}/jobs?filter=latest&per_page=100']),
+                      'jobs')
+        for job in jobs:
+            if not isinstance(job, dict) or job.get('head_sha') != head:
+                raise ValueError('job does not match the pull request head')
+            checks.append({'name': job.get('name'), 'status': str(job.get('status') or '').upper(),
+                           'conclusion': str(job.get('conclusion') or '').upper()})
+    status = call(['api', f'repos/{repo}/commits/{head}/status'])
+    if not isinstance(status, dict) or status.get('sha') != head or not isinstance(status.get('statuses'), list):
+        raise ValueError('commit status unavailable')
+    for entry in status['statuses']:
+        if not isinstance(entry, dict):
+            raise ValueError('commit status unavailable')
+        checks.append({'context': entry.get('context'), 'state': str(entry.get('state') or '').upper()})
+    return checks
 
 
 def review_state(reviews, head):
@@ -182,7 +241,12 @@ def observe(row, record, call, expected=None):
                 rules_status = 'unknown'
         except Exception:
             rules_status = 'unknown'
-        checks = call(['pr', 'view', str(number), '--repo', repo, '--json', 'number,headRefOid,statusCheckRollup'])
+        try:
+            checks = call(['pr', 'view', str(number), '--repo', repo, '--json', 'number,headRefOid,statusCheckRollup'])
+            rollup, checks_source = (checks.get('statusCheckRollup') if isinstance(checks, dict) else None), 'check_rollup'
+        except Exception:
+            # Typically a fine-grained token without Checks permission; the fallback is bound to `head`.
+            checks, rollup, checks_source = {'number': number, 'headRefOid': head}, actions_checks(repo, head, call), 'actions'
         reviews = call(['api', '--paginate', '--slurp', f'{endpoint}/reviews'])
         if isinstance(reviews, list) and all(isinstance(page, list) for page in reviews):
             reviews = [r for page in reviews for r in page]
@@ -193,12 +257,12 @@ def observe(row, record, call, expected=None):
         if not isinstance(checks, dict) or checks.get('number') != number or checks.get('headRefOid') != head:
             item.update(checks='stale', review='stale', reason='Check head does not match pull request', next_action='Wait for a fresh observation')
             return item
-        item['checks'], names = classify_checks(checks.get('statusCheckRollup'), required)
+        item['checks'], names = classify_checks(rollup, required)
         item['review'] = review_state(reviews, head)
         if item['review'] == 'not_requested' and any(isinstance(r, dict) and r.get('type') == 'User' for r in pr.get('requested_reviewers', [])):
             item['review'] = 'requested'
         item['evidence'] = {'required_checks': sorted(required) if isinstance(required, list) and all(isinstance(x, str) for x in required) else [],
-                            'observed_checks': names, 'base': base, 'rules': rules_status,
+                            'observed_checks': names, 'checks_source': checks_source, 'base': base, 'rules': rules_status,
                             'merge_readiness': 'unknown', 'publication_head': 'not recorded'}
         if item['checks'] == 'failed' or item['review'] == 'changes_requested':
             item.update(reason='Checks failed or a human requested changes', next_action='Inspect checks and review findings')
