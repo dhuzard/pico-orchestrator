@@ -33,6 +33,9 @@ phase as `completed` after its work, integration and required review succeed.
 Then dry-run and apply the reviewed publication plan with `--parent-run-id`
 while the parent is active; finish the parent afterwards. Publication requires
 all recorded phases completed and integrated evidence for the candidate commit.
+An applied publication links its own run to the parent and reports
+`parent_linked`; only when that is `false`, record the link yourself with a
+child event for the publication `run_id` before finishing.
 Choose publication branch names unique to the parent run and task or wave,
 for example `pico/<run-id>/batch-<n>`, to avoid PR conflicts across runs.
 A terminal `PARTIAL` run cannot be reopened to publish.
