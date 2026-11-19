@@ -438,6 +438,9 @@ def run_status(run_id: str | None) -> dict | None:
         parent = record.get("parent_orchestration") or {}
         summary = {"run_id": run_id, "status": parent.get("final_status"), "blocker_code": parent.get("blocker_code"),
                    "trace_path": str(provenance.run_path(ROOT, run_id)), "lease": run_lease.summary(run_id)}
+        lead_stop = parent.get("lead_stop")
+        if isinstance(lead_stop, dict):
+            summary["lead_stop"] = {"cause": lead_stop.get("cause"), "retry_after": lead_stop.get("retry_after")}
         context = parent.get("context") or {}
         limit = context.get("lead_call_limit")
         if isinstance(limit, dict):

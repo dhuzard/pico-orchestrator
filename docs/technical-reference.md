@@ -2231,7 +2231,12 @@ The environment carries `PI_TARGET_REPOSITORY`, the pinned Claude backend
 identity, and `PI_ORCHESTRATOR_STATE_DIR`, exactly as `pico run` sets them.
 The orchestration-lifecycle extension therefore creates the parent run, keeps
 every guard, and settles the run as `BLOCKED` /
-`ORCHESTRATION_OUTCOME_UNRECORDED` when the process exits without `finish`.
+`ORCHESTRATION_OUTCOME_UNRECORDED` when the process exits without `finish`,
+or as `BLOCKED` / `MODEL_QUOTA_EXHAUSTED` when the lead model's last call
+failed on a usage quota or rate limit. A blocker recorded by a phase wins in
+both cases. A quota stop records `lead_stop: {cause: "model_quota",
+retry_after}` (UTC, or null when the provider gave no plausible reset time);
+the provider's text is never stored.
 The parent run id is discovered from the lifecycle's
 `pi-orchestration-parent-v1` session entry; nothing is written to the target.
 

@@ -328,6 +328,38 @@ function workerBlocker(outcome: ClaudeWorkerOutcome): string {
   }
 }
 
+/** Why the lead process stopped, classified from the lead model's final error; the provider text is never kept. */
+export type LeadStop = { cause: "model_quota"; retryAfter: string | null };
+
+// Quota, usage-limit and rate-limit wording, as pi's providers report it (see pi-ai's retry classifier). A
+// rate limit only ends the run after pi's own retries are spent, so it is reported with the quota stop.
+// "overloaded" (HTTP 529) is provider load, not the account's quota, and is not matched.
+const LEAD_QUOTA = /usage.?limit|quota|insufficient_quota|rate.?limit|too many requests|\b429\b|out of budget|credit balance is too low|subscription_sharing_usage_limit_exceeded/i;
+const MAX_RETRY_HORIZON_MS = 8 * 24 * 3600 * 1000;
+
+/** UTC second-precision timestamp of a provider reset time, or null when none is stated or it is implausible. */
+function resetTime(text: string, now: number): string | null {
+  let at: number | null = null;
+  const epoch = /usage limit reached\|(\d{10})\b/i.exec(text);
+  const iso = /\b(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2}))/.exec(text);
+  const relative = /\b(?:try again|retry|resets?)\s+(?:in|after)\s+(\d+(?:\.\d+)?)\s*(seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h)\b/i.exec(text);
+  if (epoch) at = Number(epoch[1]) * 1000;
+  else if (iso) at = Date.parse(iso[1]);
+  else if (relative) {
+    const unit = relative[2].toLowerCase();
+    const scale = unit.startsWith("h") ? 3600_000 : unit.startsWith("m") ? 60_000 : 1000;
+    at = now + Number(relative[1]) * scale;
+  }
+  if (at === null || !Number.isFinite(at) || at <= now || at > now + MAX_RETRY_HORIZON_MS) return null;
+  return new Date(Math.ceil(at / 1000) * 1000).toISOString().replace(/\.\d{3}Z$/, "Z");
+}
+
+/** Classify the lead model's final error; null when it is not a quota or rate-limit stop. */
+export function classifyLeadStop(errorMessage: unknown, now: number): LeadStop | null {
+  if (typeof errorMessage !== "string" || !LEAD_QUOTA.test(errorMessage)) return null;
+  return { cause: "model_quota", retryAfter: resetTime(errorMessage, now) };
+}
+
 /**
  * Task/step a worker call claims. spawn_subagent uses `label: "<task_id>:<step_id>"`;
  * ClaudeWorker and AskClaude (which have no label) start their prompt with
@@ -466,6 +498,7 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
   let recordedPeak = 0;
   let compactionFailed = false;
   // Lead-call limit of the active run; null when none is configured (then nothing below applies).
+  let leadStop: LeadStop | null = null;
   let leadLimit: { max: number; source: string; calls: number; warnAt: number | null; warned: boolean; reached: boolean } | null = null;
   // Set once the extension itself stopped the run at the limit (left IN_PROGRESS for a resume): every later tool call is refused.
   let limitStopped: string | null = null;
@@ -652,7 +685,7 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
     approvals.clear(); pendingRoutes.clear(); workspaces.clear(); snapshots.clear();
     subagentTasks.clear(); inFlight.clear(); claudeCalls.clear(); workerPlans.clear();
     scopeViolation = null; activeWave = null; integrating = null; implicitOpen.clear(); routeEpochs.clear(); implicitEpoch.clear(); autoWorkers.clear(); lastPhase = "routing";
-    currentTurn = null; messageStarts.clear(); leadLimit = null; failureBudget = null; workerSandbox = null;
+    currentTurn = null; messageStarts.clear(); leadLimit = null; leadStop = null; failureBudget = null; workerSandbox = null;
     batchStart = 0; batchPeak = 0;
     pendingReroutes.clear();
     boundPaths.clear(); flooredPaths.clear(); recordBound.clear(); checkedChanges.clear(); integrationBase = null; integrationPath = null; integrationParentSnapshot = null; integrationSnapshot = null; integrationNeedsAbort = false; floorRerouted.clear(); floorCompleted.clear();
@@ -1022,7 +1055,8 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
   }
   async function settle(): Promise<void> {
     if (!runId) return;
-    const result = await command(PARENT, ["settle", runId, ...ownerArgs()]);
+    const stop = leadStop ? ["--stop-cause", leadStop.cause, ...(leadStop.retryAfter ? ["--retry-after", leadStop.retryAfter] : [])] : [];
+    const result = await command(PARENT, ["settle", runId, ...ownerArgs(), ...stop]);
     if (result.ok === false) {
       diagnose("settle", result);
       parentBlocked = true;
@@ -2162,6 +2196,8 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
   pi.on("message_end", async (event) => {
     if (!runId || event.message.role !== "assistant") return;
     const message = event.message;
+    // Only the run's last word counts: a later successful call (after pi's own retries) clears an earlier error.
+    leadStop = message.stopReason === "error" ? classifyLeadStop(message.errorMessage, clock()) : null;
     const model = `${message.provider}/${message.model}`;
     // The limit counts every assistant call, including one whose model string fails validation.
     if (leadLimit) leadLimit.calls += 1;

@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Value } from "typebox/value";
-import { createOrchestrationLifecycle, leaseOwner, leaseProcessState, runJson, scopesOverlap } from "../extensions/orchestration-lifecycle.ts";
+import { classifyLeadStop, createOrchestrationLifecycle, leaseOwner, leaseProcessState, runJson, scopesOverlap } from "../extensions/orchestration-lifecycle.ts";
 import { hostname } from "node:os";
 import { classifyClaudeInvocationError, resolveClaudeBackendModel } from "../extensions/claude-backend-adapter.ts";
 import { buildWorkerEnv, BWRAP_PROBE_ARGS, claudeWorkerArgs, describeDenials, detectWorkerSandbox, inGitDirectory, parseClaudeResult,
@@ -3394,4 +3394,51 @@ test("the real Claude Code refuses to start without its sandbox (opt-in: PICO_RE
     assert.equal(outcome.exitCode, 1);
     assert.deepEqual([outcome.usage.input_tokens, outcome.usage.output_tokens], [null, null], "no model call");
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("lead quota errors are classified with a plausible reset time and no provider text (#110)", () => {
+  const now = Date.parse("2026-11-18T09:46:00Z");
+  assert.deepEqual(classifyLeadStop("Claude AI usage limit reached|1795017600", now),
+    { cause: "model_quota", retryAfter: "2026-11-18T16:00:00Z" });
+  assert.deepEqual(classifyLeadStop('429 {"type":"error","error":{"type":"rate_limit_error","message":"This request would exceed your account\'s rate limit. Please try again later."}}', now),
+    { cause: "model_quota", retryAfter: null });
+  assert.deepEqual(classifyLeadStop("You exceeded your current quota (insufficient_quota). Try again in 2 hours.", now),
+    { cause: "model_quota", retryAfter: "2026-11-18T11:46:00Z" });
+  assert.deepEqual(classifyLeadStop("Usage limit reached; resets at 2026-11-18T14:46:00+01:00", now),
+    { cause: "model_quota", retryAfter: "2026-11-18T13:46:00Z" });
+  // A reset time in the past or implausibly far ahead is dropped, not trusted.
+  assert.deepEqual(classifyLeadStop("usage limit reached|1700000000", now), { cause: "model_quota", retryAfter: null });
+  assert.deepEqual(classifyLeadStop("quota exceeded, resets at 2027-06-01T00:00:00Z", now), { cause: "model_quota", retryAfter: null });
+  assert.equal(classifyLeadStop("529 overloaded_error: Overloaded", now), null);
+  assert.equal(classifyLeadStop("socket hang up", now), null);
+  assert.equal(classifyLeadStop(undefined, now), null);
+});
+
+test("a lead quota error settles the run as a quota stop; a silent exit does not (#110)", async () => {
+  const now = Date.parse("2026-11-18T09:46:00Z");
+  const quota = { role: "assistant", provider: "anthropic", model: "claude-opus-5-5", timestamp: 1,
+    stopReason: "error", errorMessage: "Claude AI usage limit reached|1795017600", usage: {} };
+  const ok = { ...quota, timestamp: 2, stopReason: "stop", errorMessage: undefined };
+
+  const stopped = harness({ ok: true, status: "READY" }, false, true, { clock: () => now });
+  await startRun(stopped, "/tmp/target");
+  await stopped.handlers.get("message_end")!({ message: quota });
+  await stopped.handlers.get("session_shutdown")!({ reason: "quit" });
+  const settled = stopped.parentCalls("settle");
+  assert.equal(settled.length, 1);
+  assert.deepEqual(settled[0].args.slice(-4), ["--stop-cause", "model_quota", "--retry-after", "2026-11-18T16:00:00Z"]);
+  assert.equal(JSON.stringify(settled[0].args).includes("usage limit"), false);
+
+  const silent = harness({ ok: true, status: "READY" }, false, true, { clock: () => now });
+  await startRun(silent, "/tmp/target");
+  await silent.handlers.get("session_shutdown")!({ reason: "quit" });
+  assert.equal(silent.parentCalls("settle")[0].args.includes("--stop-cause"), false);
+
+  // pi retried and a later call succeeded: the earlier error is not the run's stop cause.
+  const recovered = harness({ ok: true, status: "READY" }, false, true, { clock: () => now });
+  await startRun(recovered, "/tmp/target");
+  await recovered.handlers.get("message_end")!({ message: quota });
+  await recovered.handlers.get("message_end")!({ message: ok });
+  await recovered.handlers.get("session_shutdown")!({ reason: "quit" });
+  assert.equal(recovered.parentCalls("settle")[0].args.includes("--stop-cause"), false);
 });

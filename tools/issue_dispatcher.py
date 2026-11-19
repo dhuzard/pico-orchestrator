@@ -418,6 +418,9 @@ def reconcile_delivery(cfg: dict, db: sqlite3.Connection, row: sqlite3.Row) -> N
         if row['state'] != 'completed' and isinstance(blocker, str) and re.fullmatch(r'[A-Z][A-Z0-9_]{0,100}', blocker):
             item['reason'] = f"Execution {row['state']}: {blocker}"
             item['next_action'] = 'Inspect the blocker and execution evidence before approving any new attempt'
+            if blocker == QUOTA_CODE:
+                item['reason'] += ' (the lead model hit its usage quota or rate limit)'
+                item['next_action'] = quota_next_action(record)
     except (DispatcherError, OSError, ValueError) as exc:
         notice(row['number'], 'delivery evidence unavailable', exc)
         item = delivery_observer.observe(row, {}, lambda _: None)
@@ -431,6 +434,19 @@ def reconcile_delivery(cfg: dict, db: sqlite3.Connection, row: sqlite3.Row) -> N
             pass
     delivery_store.save(db, item)
     handoff_comment(cfg, row, item)
+
+
+QUOTA_CODE = 'MODEL_QUOTA_EXHAUSTED'
+RETRY_AFTER = re.compile(r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$')
+
+
+def quota_next_action(record: dict) -> str:
+    """A quota stop is retried by a person, after the provider's reset; nothing retries automatically."""
+    stop = (record.get('run') or {}).get('lead_stop')
+    retry = stop.get('retry_after') if isinstance(stop, dict) else None
+    when = f'after {retry}' if isinstance(retry, str) and RETRY_AFTER.fullmatch(retry) else \
+        "after the provider's usage limit resets (reset time not reported)"
+    return f'Retry {when}: open a new queue issue and approve it'
 
 
 _NOTICES: dict[tuple[int, str], str] = {}
