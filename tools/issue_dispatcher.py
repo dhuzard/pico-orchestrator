@@ -95,17 +95,20 @@ def command(argv: list[str], *, timeout: int = 40, env: dict | None = None) -> d
     """Execute one fixed-argument CLI operation; never use a shell."""
     try:
         run = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, check=False, env=env)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise DispatcherError(f"command unavailable or timed out: {argv[0]}") from exc
-    try:
-        value = json.loads(run.stdout)
-    except ValueError as exc:
-        raise DispatcherError(f"invalid JSON from {argv[0]} (exit {run.returncode})") from exc
-    # `pico exec status` returns a structured BLOCKED result with exit 1.
+    except subprocess.TimeoutExpired as exc:
+        raise DispatcherError(f"command timed out: {argv[0]}") from exc
+    except OSError as exc:
+        raise DispatcherError(f"command unavailable: {argv[0]}") from exc
+    # Checked before parsing: a failed gh often prints nothing on stdout, and its stderr names the cause.
+    # `pico exec status` returns a structured BLOCKED result with exit 1, so this applies to gh only.
     if run.returncode and argv[0].endswith("gh"):
         # gh never prints credentials; its first stderr line names the cause (e.g. an unsupported flag).
         detail = (run.stderr or "").strip().splitlines()[0][:200] if (run.stderr or "").strip() else ""
         raise DispatcherError(f"GitHub operation failed (exit {run.returncode})" + (f": {detail}" if detail else ""))
+    try:
+        value = json.loads(run.stdout)
+    except ValueError as exc:
+        raise DispatcherError(f"invalid JSON from {argv[0]} (exit {run.returncode})") from exc
     if not isinstance(value, (dict, list)):
         raise DispatcherError("expected a JSON object or array")
     return value
@@ -403,6 +406,14 @@ def reconcile_delivery(cfg: dict, db: sqlite3.Connection, row: sqlite3.Row) -> N
         def call(args):
             return command([cfg["gh"], *args], env=env)
         item = delivery_observer.observe(row, record, call, cfg.get("delivery_expected_checks", {}).get(row["repo"].casefold()))
+        cause = item['evidence'].get('observation_error')
+        if cause:
+            # Classified fields only: never the gh message, which can carry URLs or response text.
+            notice(row['number'], 'GitHub observation unavailable',
+                   f"{cause} (gh {item['evidence']['observation_operation']}, "
+                   f"HTTP {item['evidence']['observation_http_status']})")
+        else:
+            _NOTICES.pop((row['number'], 'GitHub observation unavailable'), None)
         blocker = record.get('error_code') or (record.get('run') or {}).get('blocker_code')
         if row['state'] != 'completed' and isinstance(blocker, str) and re.fullmatch(r'[A-Z][A-Z0-9_]{0,100}', blocker):
             item['reason'] = f"Execution {row['state']}: {blocker}"
@@ -425,7 +436,7 @@ def reconcile_delivery(cfg: dict, db: sqlite3.Connection, row: sqlite3.Row) -> N
 _NOTICES: dict[tuple[int, str], str] = {}
 
 
-def notice(number: int, what: str, exc: Exception) -> None:
+def notice(number: int, what: str, exc: Exception | str) -> None:
     """Report a failure that is retried every poll once per distinct cause, not once per poll."""
     text = str(exc)
     if _NOTICES.get((number, what)) != text:

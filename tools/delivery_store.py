@@ -62,7 +62,8 @@ def list_deliveries(state_path):
                     safe[key] = value[:300] if isinstance(value, str) else None
                 evidence = safe.get('evidence')
                 safe['evidence'] = {key: ([x[:200] for x in value[:100] if isinstance(x, str)] if isinstance(value, list) else value[:200] if isinstance(value, str) else None)
-                                    for key, value in evidence.items() if key in ('required_checks', 'observed_checks', 'checks_source', 'base', 'rules', 'merge_readiness', 'publication_head')} if isinstance(evidence, dict) else {}
+                                    for key, value in evidence.items() if key in ('required_checks', 'observed_checks', 'checks_source', 'base', 'rules', 'merge_readiness', 'publication_head',
+                                                                                    'observation_error', 'observation_operation', 'observation_http_status')} if isinstance(evidence, dict) else {}
                 safe.update(queue_issue=safe['issue'], execution_state=safe['execution'], delivery_state=safe['delivery'], checks_state=safe['checks'], review_state=safe['review'])
                 result.append(safe)
             else:

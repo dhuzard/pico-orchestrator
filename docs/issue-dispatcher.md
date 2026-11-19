@@ -140,6 +140,21 @@ A nonempty list is required to establish passing expected checks. Each expected 
 
 An applied PR creation or observed publication receipt must appear in a linked publication child for the approved target. An applied `github_integration.py --publish --parent-run-id` links its own run to the parent before any remote write and reports `parent_linked`, so the link does not depend on the lead recording a child event; a publication for a parent that is already terminal cannot be linked and needs human inspection. The PR's base and head repositories must both match the target, and its current head must match integrated evidence in parent provenance. New publication receipts retain the exact commit, branch, parent run and operation stage before remote writes, allowing the final head to be identified across multiple waves. Legacy records without a receipt require one unique integrated head. Later commits, missing child provenance and cross-repository PRs need human inspection. The observer requires separate target credentials; legacy shared-auth configurations cannot produce a verified delivery. Target reads use target credentials, and queue notifications use queue credentials.
 
+When GitHub cannot be read, the delivery records `checks: unavailable` with one of a fixed set of causes. The cause goes in `evidence.observation_error`, together with `observation_operation` (the `gh` subcommand: `api` or `pr view`) and `observation_http_status` (or `none`). The reason and next action shown in `pico watch` and in the queue comment depend on the cause:
+
+| Cause | Typical trigger | Next action |
+| --- | --- | --- |
+| `auth` | HTTP 401/403, bad credentials, resource not accessible by the token | Check the target token's permissions and expiry |
+| `not_found` | HTTP 404, or GraphQL cannot resolve the pull request | Check the pull request still exists and the target token can see the repository |
+| `rate_limited` | HTTP 429, or a primary or secondary rate limit (also reported as 403) | Wait for the rate limit to reset; the next poll retries |
+| `gh_too_old` | `gh` rejects a flag or subcommand, such as `--slurp` | Upgrade gh on the dispatcher host (delivery observation needs gh >= 2.48.0) |
+| `gh_missing` | The configured `gh` cannot be started | Install gh or fix the configured gh path |
+| `network` | Timeout, DNS or connection failure, or HTTP 5xx | Check network access to GitHub; the next poll retries |
+| `invalid_response` | GitHub answered, but the data does not match the pull request | Inspect the pull request in GitHub, then wait for a fresh observation |
+| `unexpected` | Anything else | Restore target access and retry |
+
+Classification fails closed: an unmatched failure is `unexpected`. The `gh` message is never stored or shown, because it can contain URLs or response text; only the three fields above are kept. The service journal logs each distinct cause once per issue, for example `Issue #7: GitHub observation unavailable: auth (gh api, HTTP 401)`. It logs again when the cause changes, or when the cause comes back after a successful observation.
+
 A stable marker identifies one queue handoff comment per execution. Each poll searches all issue comments before creating or updating it; multiple marker matches stop reconciliation. After a timeout, the next poll searches again before retrying, reducing duplicates without promising exactly-once delivery. Existing terminal status comments are retained. No reminders are enabled. GitHub or local evidence unavailability produces an attention state rather than a fabricated success. Evidence timestamps describe the most recent poll, and no background observation runs when the service is stopped.
 
 Only comments authored by the authenticated queue identity are eligible for update.
