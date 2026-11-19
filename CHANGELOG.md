@@ -8,6 +8,10 @@ All notable changes to PICO are recorded here. The format follows
 
 ### Added
 
+- A lead process that stops on its model's usage quota or rate limit settles as
+  `MODEL_QUOTA_EXHAUSTED`, not `ORCHESTRATION_OUTCOME_UNRECORDED`, with the provider's
+  reset time when it states one. The dispatcher shows "Retry after <time>";
+  nothing retries automatically (#110).
 - Unavailable GitHub delivery observation is classified (`auth`, `not_found`,
   `rate_limited`, `gh_too_old`, `gh_missing`, `network`, `invalid_response`,
   `unexpected`), with a matching next action and one journal line per cause; the

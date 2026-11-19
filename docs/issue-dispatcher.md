@@ -130,6 +130,8 @@ Completed, partial, blocked and interrupted executions are reconciled on every s
 
 The service needs GitHub CLI 2.48 or newer (`gh api --paginate --slurp`); `serve` and `once` refuse to start with an older `gh` (Ubuntu 24.04 packages 2.45). Evidence or handoff-comment failures are written to the service journal once per distinct cause.
 
+A blocked, partial or interrupted execution shows its blocker code as `Execution <state>: <CODE>`. When the lead process exits without recording an outcome, the run settles as `BLOCKED`. If no phase recorded a blocker and the lead model's last call failed on a usage quota or rate limit (after pi's own retries), the code is `MODEL_QUOTA_EXHAUSTED`. The next action is `Retry after <UTC time>: open a new queue issue and approve it`, using the reset time when the provider's error states one. Otherwise it says the reset time was not reported. Any other silent exit stays `ORCHESTRATION_OUTCOME_UNRECORDED`. Only the cause and the reset time are stored, in the parent record's `lead_stop`; the provider's error text never is. Nothing retries automatically.
+
 Configure expected check names for each target, for example:
 
 ```json

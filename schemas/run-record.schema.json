@@ -63,6 +63,29 @@
             "null"
           ]
         },
+        "lead_stop": {
+          "description": "Why the lead process stopped without recording an outcome, classified from the lead model's final error. Provider text is never stored.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "cause",
+            "retry_after"
+          ],
+          "properties": {
+            "cause": {
+              "enum": [
+                "model_quota"
+              ]
+            },
+            "retry_after": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$"
+            }
+          }
+        },
         "worker_overrides": {
           "type": "array",
           "maxItems": 200,

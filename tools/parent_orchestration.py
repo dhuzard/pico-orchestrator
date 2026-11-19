@@ -1628,17 +1628,18 @@ def _record_event_unlocked(run_id: str, event: dict, *, repo_root: Path = ROOT) 
 
 
 def finish(run_id: str, status: str, *, blocker_code: str | None = None, owner_id: str | None = None,
-           repo_root: Path = ROOT) -> dict:
+           repo_root: Path = ROOT, lead_stop: dict | None = None) -> dict:
     """Finalize the run as its owner; the explicit outcome releases that owner's lease."""
     with _owned(run_id, owner_id, repo_root) as held:
-        record = _finish_unlocked(run_id, status, blocker_code=blocker_code, repo_root=repo_root)
+        record = _finish_unlocked(run_id, status, blocker_code=blocker_code, repo_root=repo_root,
+                                  lead_stop=lead_stop)
         if record.get("outcome") != "in_progress" and held.lease is not None:
             held.release()
     return record
 
 
 def _finish_unlocked(run_id: str, status: str, *, blocker_code: str | None = None,
-                     repo_root: Path = ROOT) -> dict:
+                     repo_root: Path = ROOT, lead_stop: dict | None = None) -> dict:
     if status not in STATUSES:
         raise ParentRunError("invalid final status")
     record = provenance.get_run(repo_root, run_id)
@@ -1689,6 +1690,8 @@ def _finish_unlocked(run_id: str, status: str, *, blocker_code: str | None = Non
         _reconcile_open(parent, status)
     parent["final_status"] = status
     parent["blocker_code"] = _safe(blocker_code, CODE_RE, "blocker code")
+    if lead_stop is not None:
+        parent["lead_stop"] = lead_stop
     return provenance.finish_run(repo_root, run_id, outcome=status.lower(),
                                  parent_orchestration=parent,
                                  orchestration_metrics=delegation_metrics(record, parent))
@@ -1734,16 +1737,33 @@ def _reconcile_open(parent: dict, status: str) -> None:
         del parent["reconciled"]
 
 
-def settle(run_id: str, *, owner_id: str | None = None, repo_root: Path = ROOT) -> dict:
-    """Fail closed when the agent exits without recording an explicit outcome."""
+# Why the lead process stopped, as classified by the lifecycle extension from the lead model's final error.
+# Only the cause and the provider's reset time are kept, never the provider's text.
+LEAD_STOP_CODES = {"model_quota": "MODEL_QUOTA_EXHAUSTED"}
+RETRY_AFTER_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+
+
+def settle(run_id: str, *, owner_id: str | None = None, repo_root: Path = ROOT,
+           stop_cause: str | None = None, retry_after: str | None = None) -> dict:
+    """Fail closed when the agent exits without recording an explicit outcome.
+
+    A blocker a phase recorded wins. Otherwise a classified lead stop (a quota or rate-limit error of the
+    lead model) gives its own code, and anything else stays ORCHESTRATION_OUTCOME_UNRECORDED. An unknown
+    cause or a malformed reset time is dropped, never allowed to keep the run open.
+    """
     record = provenance.get_run(repo_root, run_id)
     if record["outcome"] != "in_progress":
         return record
     phases = _parent(record)["phases"]
     observed = next((phase["blocker_code"] for phase in reversed(phases)
                      if phase["status"] == "blocked" and phase["blocker_code"]), None)
-    return finish(run_id, "BLOCKED", blocker_code=observed or "ORCHESTRATION_OUTCOME_UNRECORDED",
-                  owner_id=owner_id, repo_root=repo_root)
+    stop_code = LEAD_STOP_CODES.get(stop_cause) if isinstance(stop_cause, str) else None
+    lead_stop = None
+    if observed is None and stop_code is not None:
+        valid = isinstance(retry_after, str) and RETRY_AFTER_RE.fullmatch(retry_after)
+        lead_stop = {"cause": stop_cause, "retry_after": retry_after if valid else None}
+    return finish(run_id, "BLOCKED", blocker_code=observed or stop_code or "ORCHESTRATION_OUTCOME_UNRECORDED",
+                  owner_id=owner_id, repo_root=repo_root, lead_stop=lead_stop)
 
 
 def terminal_response(record: dict, *, repo_root: Path = ROOT) -> dict:
@@ -1818,6 +1838,8 @@ def main() -> int:
     p_settle = sub.add_parser("settle")
     p_settle.add_argument("run_id")
     p_settle.add_argument("--owner", required=True)
+    p_settle.add_argument("--stop-cause", choices=sorted(LEAD_STOP_CODES))
+    p_settle.add_argument("--retry-after")
     p_status = sub.add_parser("status")
     p_status.add_argument("run_id")
     p_status.add_argument("--worktree", type=Path)
@@ -1842,7 +1864,8 @@ def main() -> int:
         elif args.command == "status":
             result = status(args.run_id, worktree=args.worktree, explicit_repo=args.repo)
         else:
-            result = terminal_response(settle(args.run_id, owner_id=args.owner))
+            result = terminal_response(settle(args.run_id, owner_id=args.owner, stop_cause=args.stop_cause,
+                                              retry_after=args.retry_after))
         print(json.dumps(result, sort_keys=True))
         return 0
     except run_lease.LeaseError as exc:
