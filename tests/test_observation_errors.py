@@ -15,12 +15,13 @@ import delivery_observer as obs
 import delivery_store as store
 import issue_dispatcher as dispatch
 
-SECRET = 'ghp_SECRETTOKEN0123456789abcdefghijklmnop'
+# A token-shaped canary: it must never reach stored evidence or the journal.
+CANARY = 'ghp_CANARY000000000000000000000000000000'
 BODY = '{"message":"private response body","documentation_url":"https://docs.github.com/x"}'
 
 # What gh writes to stderr for each failure, as observed from gh 2.4x-2.10x.
 FAILURES = {
-    'auth': f'HTTP 401: Bad credentials (https://api.github.com/repos/acme/tool/pulls/3?access_token={SECRET})',
+    'auth': f'HTTP 401: Bad credentials (https://api.github.com/repos/acme/tool/pulls/3?access_token={CANARY})',
     'auth_403': 'gh: Resource not accessible by personal access token (HTTP 403)',
     'not_found': 'gh: Not Found (HTTP 404)',
     'not_found_graphql': "GraphQL: Could not resolve to a PullRequest with the number of 3. (repository.pullRequest)",
@@ -29,7 +30,7 @@ FAILURES = {
     'gh_too_old': 'unknown flag: --slurp',
     'network': 'error connecting to api.github.com: dial tcp: lookup api.github.com: no such host',
     'network_5xx': 'gh: Server Error (HTTP 502)',
-    'unexpected': f'something nobody anticipated {SECRET}',
+    'unexpected': f'something nobody anticipated {CANARY}',
 }
 EXPECTED = {'auth': ('auth', '401'), 'auth_403': ('auth', '403'), 'not_found': ('not_found', '404'),
             'not_found_graphql': ('not_found', 'none'), 'rate_limited': ('rate_limited', '403'),
@@ -59,14 +60,15 @@ class ObservationErrorTest(unittest.TestCase):
         self.addCleanup(dispatch._NOTICES.clear)
 
     def fake_gh(self, stderr, *, sleep=0):
-        """A gh that fails like the real one: a response body (with a token) on stdout, the cause on stderr."""
+        """A gh that fails like the real one: a response body (with a canary token) on stdout, the cause on stderr."""
         script = self.path / 'gh'
         script.write_text('#!/bin/sh\n'
                           + (f'sleep {sleep}\n' if sleep else '')
-                          + f"printf '%s\\n' '{BODY} {SECRET}'\n"
+                          + "printf '%s\\n' \"$PI_FAKE_GH_STDOUT\"\n"
                           + "printf '%s\\n' \"$PI_FAKE_GH_STDERR\" >&2\nexit 1\n")
         script.chmod(script.stat().st_mode | stat.S_IXUSR)
-        env = {'PATH': os.environ.get('PATH', '/usr/bin:/bin'), 'PI_FAKE_GH_STDERR': stderr}
+        env = {'PATH': os.environ.get('PATH', '/usr/bin:/bin'), 'PI_FAKE_GH_STDOUT': f'{BODY} {CANARY}',
+               'PI_FAKE_GH_STDERR': stderr}
         return str(script), env
 
     def observe(self, gh, env, timeout=40):
@@ -74,7 +76,7 @@ class ObservationErrorTest(unittest.TestCase):
                            lambda args: dispatch.command([gh, *args], env=env, timeout=timeout), ['test'])
 
     def assert_clean(self, text):
-        for leak in (SECRET, 'private response body', 'api.github.com', 'docs.github.com', 'acme/tool/pulls'):
+        for leak in (CANARY, 'private response body', 'api.github.com', 'docs.github.com', 'acme/tool/pulls'):
             self.assertNotIn(leak, text)
 
     def test_each_simulated_gh_failure_is_classified(self):
@@ -108,7 +110,7 @@ class ObservationErrorTest(unittest.TestCase):
 
     def test_unmatched_exception_is_unexpected_with_no_raw_text(self):
         def call(args):
-            raise RuntimeError(f'{BODY} {SECRET}')
+            raise RuntimeError(f'{BODY} {CANARY}')
         item = obs.observe(self.row, self.record, call, ['test'])
         self.assertEqual(item['evidence']['observation_error'], 'unexpected')
         self.assertEqual(item['next_action'], 'Restore target access and retry')
