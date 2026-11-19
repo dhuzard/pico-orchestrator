@@ -8,6 +8,62 @@ from urllib.parse import quote
 
 SHA = re.compile(r'^[0-9a-f]{40}$')
 RUN = re.compile(r'^run-[A-Za-z0-9-]+$')
+HTTP_STATUS = re.compile(r'\bHTTP ([1-5][0-9]{2})\b')
+
+# Why GitHub observation is unavailable: a fixed set of causes, each with what to show and what to do.
+# Only the cause, the gh subcommand and the HTTP status are kept; the failure text itself never is.
+OBSERVATION_ERRORS = {
+    'auth': ('GitHub refused the target token', "Check the target token's permissions and expiry"),
+    'not_found': ('GitHub did not find the repository or pull request',
+                  'Check the pull request still exists and the target token can see the repository'),
+    'rate_limited': ('GitHub rate limit reached', 'Wait for the rate limit to reset; the next poll retries'),
+    'gh_too_old': ('the installed gh lacks an option the observer uses',
+                   'Upgrade gh on the dispatcher host (delivery observation needs gh >= 2.48.0)'),
+    'gh_missing': ('gh could not be started', 'Install gh or fix the configured gh path'),
+    'network': ('GitHub could not be reached', 'Check network access to GitHub; the next poll retries'),
+    'invalid_response': ('GitHub returned data that does not match the pull request',
+                         'Inspect the pull request in GitHub, then wait for a fresh observation'),
+    'unexpected': ('unclassified failure', 'Restore target access and retry'),
+}
+_NETWORK = ('could not resolve host', 'no such host', 'connection refused', 'connection reset',
+            'i/o timeout', 'tls handshake', 'network is unreachable', 'timed out')
+
+
+def observation_error(exc):
+    """Classify a failed observation; fail-closed, so anything unrecognized is `unexpected`.
+
+    Returns (cause, http_status or None). The caller must not keep `str(exc)`: gh's message can
+    include URLs, and a test double or a future caller could put a response body in it.
+    """
+    text = str(exc).casefold()
+    found = HTTP_STATUS.search(str(exc))
+    status = int(found.group(1)) if found else None
+    if 'command unavailable' in text:
+        cause = 'gh_missing'
+    elif 'unknown flag' in text or 'unknown shorthand flag' in text or 'unknown command' in text:
+        cause = 'gh_too_old'
+    elif status == 429 or 'rate limit' in text:
+        cause = 'rate_limited'
+    elif status in (401, 403) or 'bad credentials' in text or 'resource not accessible' in text or 'gh auth login' in text:
+        cause = 'auth'
+    elif status == 404 or 'could not resolve to a' in text:
+        cause = 'not_found'
+    elif (status is not None and status >= 500) or any(marker in text for marker in _NETWORK):
+        cause = 'network'
+    elif 'invalid json' in text or isinstance(exc, (ValueError, KeyError, TypeError, AttributeError)):
+        cause = 'invalid_response'
+    else:
+        cause = 'unexpected'
+    return cause, status
+
+
+def _operation(args):
+    """The gh subcommand only, from a fixed set; never the endpoint, which names the repository and PR."""
+    if isinstance(args, list) and args[:1] == ['api']:
+        return 'api'
+    if isinstance(args, list) and args[:2] == ['pr', 'view']:
+        return 'pr view'
+    return 'gh'
 
 
 def now():
@@ -199,6 +255,12 @@ def observe(row, record, call, expected=None):
         return item
     item['pr_number'] = number
     item['pr_url'] = f'https://github.com/{repo}/pull/{number}'
+    last = {'operation': 'none'}
+    untracked = call
+
+    def call(args):
+        last['operation'] = _operation(args)
+        return untracked(args)
     try:
         endpoint = f'repos/{repo}/pulls/{number}'
         pr = call(['api', endpoint])
@@ -275,7 +337,12 @@ def observe(row, record, call, expected=None):
             item.update(delivery='needs_human_review', reason='Expected checks passed; human review needed; merge rules may be incomplete', next_action='Review the pull request', actor='human')
         else:
             item.update(reason='Required checks or review evidence is incomplete', next_action='Inspect branch rules and pull request')
-    except Exception:
-        # Do not expose provider errors, URLs with credentials, or raw responses.
-        item.update(checks='unavailable', review='unknown', reason='GitHub observation unavailable', next_action='Restore target access and retry')
+    except Exception as exc:
+        # Do not expose provider errors, URLs with credentials, or raw responses: keep only the classified cause.
+        cause, status = observation_error(exc)
+        what, action = OBSERVATION_ERRORS[cause]
+        item.update(checks='unavailable', review='unknown', reason=f'GitHub observation unavailable: {what} ({cause})',
+                    next_action=action)
+        item['evidence'] = {'observation_error': cause, 'observation_operation': last['operation'],
+                            'observation_http_status': str(status) if status is not None else 'none'}
     return item

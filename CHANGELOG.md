@@ -8,6 +8,10 @@ All notable changes to PICO are recorded here. The format follows
 
 ### Added
 
+- Unavailable GitHub delivery observation is classified (`auth`, `not_found`,
+  `rate_limited`, `gh_too_old`, `gh_missing`, `network`, `invalid_response`,
+  `unexpected`), with a matching next action and one journal line per cause; the
+  `gh` message itself is never kept (#111).
 - Opt-in Garden delivery feedback (`pico watch --feedback`): a delivery card can
   send a PR comment, or a change request pinned to the observed commit, as the
   person's own `gh` account. Previewed and confirmed per send, refused when the PR
