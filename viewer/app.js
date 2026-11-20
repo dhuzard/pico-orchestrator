@@ -1020,7 +1020,7 @@ async function previewThenRun(action, body) {
   showPreview(action, first, async () => showResult(await postAction({ ...body, confirm: first.confirm })));
 }
 $("action-cancel").addEventListener("click", () => $("action-dialog").close());
-$("action-dialog").addEventListener("close", () => { state.paused = false; refresh(); });
+$("action-dialog").addEventListener("close", () => { state.paused = false; refresh(); refreshApprovals(true); });
 $("workspace-mode").addEventListener("click", () => { history.replaceState(null, "", location.pathname); applyMode(); });
 $("runs-mode").addEventListener("click", () => { location.hash = "runs"; });
 window.addEventListener("hashchange", () => { applyMode(); render(state.label); window.scrollTo({ top: 0 }); });
@@ -1072,6 +1072,80 @@ async function refreshDeliveries() {
   if (active && $("delivery-list").contains(active) && (active.tagName === "TEXTAREA" || active.tagName === "SELECT")) return;
   renderDeliveries();
 }
+// pico watch --approvals: approve dispatcher queue issues. The server previews each approval
+// (exact digest, target, mode, actor) and records it only after the confirmation in the dialog.
+const approvalState = { fetchedAt: 0, data: null, enabled: true };
+async function refreshApprovals(force = false) {
+  if (!approvalState.enabled || (!force && Date.now() - approvalState.fetchedAt < 30000)) return;
+  approvalState.fetchedAt = Date.now();
+  let data;
+  try {
+    const response = await fetch("/api/approvals", { cache: "no-store", headers: tokenHeaders() });
+    data = await response.json().catch(() => ({ ok: false, error: "The Garden returned no answer." }));
+    if (response.status === 404 && data.error_code === "APPROVALS_OFF") { approvalState.enabled = false; $("approvals-panel").hidden = true; return; }
+    if (data.error_code === "CONTROL_TOKEN_INVALID") data = { ok: false, tokenMissing: true };
+    else if (data.error_code === "APPROVAL_IDENTITY_REJECTED") data = { ok: false, identityRejected: true, error: data.error };
+  } catch { data = { ok: false, error: "The Garden server did not answer." }; }
+  approvalState.data = data;
+  renderApprovals();
+}
+function renderApprovals() {
+  const data = approvalState.data;
+  if (!data) return;
+  $("approvals-panel").hidden = false;
+  $("approvals-meta").textContent = data.ok ? `Queue ${data.queue} · approving as ${data.actor} · ${data.issues.length} queued` : "";
+  globalThis.PicoApprovals.render($("approvals-list"), data, { onApprove: startApproval });
+}
+async function postApproval(body) {
+  try {
+    const response = await fetch("/api/approvals", { method: "POST", cache: "no-store",
+      headers: { "Content-Type": "application/json", ...tokenHeaders() }, body: JSON.stringify(body) });
+    return await response.json().catch(() => ({ ok: false, error_code: `HTTP_${response.status}`, error: "No answer from the Garden." }));
+  } catch { return { ok: false, error_code: "CONNECTION_LOST", error: "The Garden server did not answer; nothing was approved." }; }
+}
+function approvalFailure(content, result) {
+  const stale = result.error_code === "CONTROL_PREVIEW_STALE";
+  content.append(el("p", "action-result fail", stale ? "Issue changed, reload." : `Not approved · ${result.error_code || "UNKNOWN"}`));
+  content.append(el("p", "action-note", stale ? "The issue, its target or the mode changed since the preview. Close this dialog, reload the queue and review it again." : (result.error || "")));
+  $("action-confirm").hidden = true;
+}
+async function startApproval(item, mode) {
+  state.paused = true;
+  const content = $("action-content");
+  const confirm = $("action-confirm");
+  $("action-eyebrow").textContent = `APPROVE · QUEUE #${item.number}`;
+  $("action-title").textContent = mode === "local-mutation" ? "Approve with code changes" : "Approve read-only";
+  content.replaceChildren(el("p", "action-note", "Re-reading the issue for a preview…"));
+  confirm.hidden = true; confirm.disabled = false;
+  $("action-dialog").showModal();
+  const first = await postApproval({ issue: item.number, mode });
+  content.replaceChildren();
+  if (!(first.ok && first.stage === "preview")) { approvalFailure(content, first); return; }
+  const p = first.preview;
+  const modeLine = el("p", "approval-mode");
+  modeLine.append(el("span", "", "Mode: "), el("strong", "", p.mode_label));
+  const digestLine = el("p", "approval-digest");
+  digestLine.append(el("span", "", "Digest: "), el("strong", "", p.digest_short), el("span", "", p.digest.slice(12)));
+  content.append(modeLine, digestLine, factList([["Queue issue", `${p.queue} #${p.issue}`], ["Title", p.title], ["Target", p.target],
+    ["Checkout", p.checkout], ["Approved by", p.actor], ["Current state", globalThis.PicoApprovals.stateLabel(p.current_state)]]));
+  content.append(el("p", "action-note", "Objective"), el("pre", "action-pre", p.objective), el("p", "action-note", "Acceptance criteria"), el("pre", "action-pre", p.criteria));
+  if (p.note) content.append(el("p", "action-note", p.note));
+  confirm.textContent = `Approve #${p.issue} ${globalThis.PicoApprovals.MODES[mode]}`;
+  confirm.hidden = false;
+  confirm.onclick = async () => {
+    confirm.disabled = true;
+    content.append(el("p", "action-note", "Recording the approval…"));
+    const result = await postApproval({ issue: item.number, mode, confirm: first.confirm, digest: p.digest });
+    content.replaceChildren();
+    if (result.ok && result.stage === "done") {
+      content.append(el("p", "action-result ok", `Approved #${result.issue} ${globalThis.PicoApprovals.MODES[result.mode]}.`),
+        el("p", "action-note", `Digest ${result.digest_short}, by ${result.actor}. The dispatcher re-reads the issue and starts it on its next poll.`));
+      confirm.hidden = true;
+    } else approvalFailure(content, result);
+    approvalState.fetchedAt = 0;
+  };
+}
+$("approvals-reload").addEventListener("click", () => refreshApprovals(true));
 async function refreshIssues(force = false) {
   if (!force && Date.now() - issueState.fetchedAt < 30000) return;
   issueState.fetchedAt = Date.now();
@@ -1099,6 +1173,7 @@ async function refresh() {
     if (state.workspaceMode) { await refreshWorkspace(); await refreshControls(); }
     refreshIssues();  // not awaited: a slow gh call must not hold up the live run view
     refreshDeliveries();
+    refreshApprovals();
     applyMode();
     state.label = state.workspaceMode ? `Child runs of workspace ${state.workspaceId || ""}` : data.repository;
     render(state.label);

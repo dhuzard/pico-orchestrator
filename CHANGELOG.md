@@ -8,6 +8,16 @@ All notable changes to PICO are recorded here. The format follows
 
 ### Added
 
+- Opt-in Garden approval of dispatcher queue issues (`pico watch --approvals
+  --dispatcher-config <file>`), usable from a phone through Tailscale Serve. The
+  terminal `approve` and the Garden call one shared approval core
+  (`record_approval`) and write the same row; the terminal still needs a TTY and
+  the typed digest. The Garden previews each approval and confirms it with an HMAC
+  over issue, digest, target, checkout, mode and login, recomputed on the re-read
+  issue. `--allowed-host` and `--require-tailscale-login` bind remote approvals to
+  a Tailscale login; `--token-file` keeps a 0600 session token across restarts.
+  Attempts are audited in `garden-approvals.jsonl`. No repair, reject or dispatch
+  action. New template `deploy/systemd/pico-garden.service`.
 - A lead process that stops on its model's usage quota or rate limit settles as
   `MODEL_QUOTA_EXHAUSTED`, not `ORCHESTRATION_OUTCOME_UNRECORDED`, with the provider's
   reset time when it states one. The dispatcher shows "Retry after <time>";

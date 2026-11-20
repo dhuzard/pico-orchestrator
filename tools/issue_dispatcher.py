@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -35,6 +36,14 @@ TERMINAL = {"completed", "partial", "blocked", "interrupted", "cancelled", "stal
 
 class DispatcherError(Exception):
     pass
+
+
+class TaskInvalid(DispatcherError):
+    """The queued issue is not an approvable task (format, state, label or allowlist)."""
+
+
+class AlreadyDispatched(DispatcherError):
+    """The issue's approval was already consumed by a dispatch; a new attempt needs a new issue."""
 
 
 GITHUB_ENV = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "GH_CONFIG_DIR", "GH_HOST")
@@ -177,29 +186,36 @@ class Task:
     execution_id: str
 
 
+def task_sections(body: str) -> dict:
+    """The three required sections of a queue issue body, or TaskInvalid."""
+    if not isinstance(body, str) or len(body) > 14000:
+        raise TaskInvalid("invalid task content")
+    matches = list(HEADING.finditer(body))
+    if len(matches) != len(REQUIRED) or [m.group(1).strip() for m in matches] != list(REQUIRED):
+        raise TaskInvalid("use exactly ## Target repository, ## Objective and ## Acceptance criteria")
+    return {m.group(1).strip(): body[m.end():matches[i + 1].start() if i + 1 < len(matches) else len(body)].strip()
+            for i, m in enumerate(matches)}
+
+
 def parse_task(issue: dict, cfg: dict) -> Task:
     if issue.get("state", "OPEN").upper() != "OPEN":
-        raise DispatcherError("issue is not open")
+        raise TaskInvalid("issue is not open")
     labels = issue.get("labels") or []
     names = {x.get("name", "") if isinstance(x, dict) else str(x) for x in labels}
     if "pico:queued" not in names:
-        raise DispatcherError("issue lacks pico:queued label")
+        raise TaskInvalid("issue lacks pico:queued label")
     number = issue.get("number")
     if isinstance(number, bool) or not isinstance(number, int) or number < 1:
-        raise DispatcherError("invalid issue number")
+        raise TaskInvalid("invalid issue number")
     title, body = issue.get("title"), issue.get("body")
     if not isinstance(title, str) or not isinstance(body, str) or len(body) > 14000:
-        raise DispatcherError("invalid task content")
-    matches = list(HEADING.finditer(body))
-    if len(matches) != len(REQUIRED) or [m.group(1).strip() for m in matches] != list(REQUIRED):
-        raise DispatcherError("use exactly ## Target repository, ## Objective and ## Acceptance criteria")
-    parts = {m.group(1).strip(): body[m.end():matches[i + 1].start() if i + 1 < len(matches) else len(body)].strip()
-             for i, m in enumerate(matches)}
+        raise TaskInvalid("invalid task content")
+    parts = task_sections(body)
     repo = parts["Target repository"]
     if not REPO.fullmatch(repo) or repo.casefold() not in cfg["targets"]:
-        raise DispatcherError("target repository is not on the operator allowlist")
+        raise TaskInvalid("target repository is not on the operator allowlist")
     if not (1 <= len(parts["Objective"]) <= 3200 and 1 <= len(parts["Acceptance criteria"]) <= 700):
-        raise DispatcherError("objective or acceptance criteria exceed the allowed size")
+        raise TaskInvalid("objective or acceptance criteria exceed the allowed size")
     objective = f"{parts['Objective']}\n\nAcceptance criteria:\n{parts['Acceptance criteria']}"
     digest = hashlib.sha256(json.dumps([title, body], ensure_ascii=False).encode()).hexdigest()
     execution_id = "issue-" + hashlib.sha256(f"{cfg['queue']}:{number}:{digest}".encode()).hexdigest()[:28]
@@ -263,32 +279,37 @@ def repair_parent(cfg: dict, db, parent_issue: int, task: Task) -> dict:
     return item
 
 
-def approve(cfg: dict, number: int, mutate: bool, repair_of: int | None = None) -> None:
-    if not sys.stdin.isatty():
-        raise DispatcherError("approval requires an interactive local terminal")
+APPROVABLE = frozenset({"approved", "stale"})  # states a (re)approval may overwrite; anything else was dispatched
+
+
+def record_approval(cfg: dict, number: int, mutate: bool, confirm, repair_of: int | None = None) -> Task:
+    """The single approval core, shared by the terminal CLI and the Garden.
+
+    Re-reads the issue with the queue credential, parses it against the
+    allowlist, refuses a dispatched task, re-observes a repair parent, then asks
+    `confirm(task, repair)` for the digest the human confirmed. That digest must
+    equal the live one; the approval row is written under BEGIN IMMEDIATE after
+    re-checking that nothing was dispatched meanwhile. `confirm` raises to cancel.
+    """
     task = parse_task(issue_view(cfg, number), cfg)
     with database(cfg) as db:
         current = db.execute("SELECT state FROM approvals WHERE number=?", (number,)).fetchone()
-        if current and current["state"] not in {"approved", "stale"}:
-            raise DispatcherError("task was already dispatched; create a new issue for a new attempt")
+        if current and current["state"] not in APPROVABLE:
+            raise AlreadyDispatched("task was already dispatched; create a new issue for a new attempt")
         repair = None
         if repair_of is not None:
             if not mutate:
                 raise DispatcherError('repair approval requires --allow-mutation')
             repair = repair_parent(cfg, db, repair_of, task)
-            print(f"Repair of queue #{repair_of}, exact head {repair['head_sha']}; one repair allowance per root delivery.")
-        print(f"Issue #{number} in {cfg['queue']}\nTarget: {task.repo}\nCheckout: {task.checkout}")
-        print(f"Mode: {'LOCAL CODE MUTATION' if mutate else 'READ-ONLY'}\n\n{task.objective}\n")
-        print("PICO autonomy policy still applies; this is not an OS sandbox or merge authorization.")
-        phrase = f"approve {task.digest[:12]}"
-        if input(f"Type '{phrase}' to authorize this exact issue version: ").strip() != phrase:
+        confirmed = confirm(task, repair)
+        if not isinstance(confirmed, str) or not hmac.compare_digest(confirmed.encode(), task.digest.encode()):
             raise DispatcherError("approval cancelled")
         # Serialize the one-attempt allowance with the normal exact approval.
         # Consume on approval, retaining the charge across crashes or stale tasks.
         db.execute('BEGIN IMMEDIATE')
         current = db.execute('SELECT state FROM approvals WHERE number=?', (number,)).fetchone()
-        if current and current['state'] not in {'approved', 'stale'}:
-            raise DispatcherError('task changed while approval was pending; refusing to overwrite its execution state')
+        if current and current['state'] not in APPROVABLE:
+            raise AlreadyDispatched('task changed while approval was pending; refusing to overwrite its execution state')
         if repair is not None:
             lineage = db.execute('SELECT root_issue FROM delivery_repairs WHERE repair_issue=?', (repair_of,)).fetchone()
             root_issue = lineage[0] if lineage else repair_of
@@ -310,7 +331,45 @@ def approve(cfg: dict, number: int, mutate: bool, repair_of: int | None = None) 
            (number, task.digest, task.repo, task.checkout, task.execution_id,
             "local-mutation" if mutate else "read-only", "approved"))
         db.commit()
+    return task
+
+
+def approve(cfg: dict, number: int, mutate: bool, repair_of: int | None = None) -> None:
+    """Terminal approval: the operator types the digest prefix of the exact issue version."""
+    if not sys.stdin.isatty():
+        raise DispatcherError("approval requires an interactive local terminal")
+
+    def typed(task: Task, repair: dict | None) -> str:
+        if repair is not None:
+            print(f"Repair of queue #{repair_of}, exact head {repair['head_sha']}; one repair allowance per root delivery.")
+        print(f"Issue #{number} in {cfg['queue']}\nTarget: {task.repo}\nCheckout: {task.checkout}")
+        print(f"Mode: {'LOCAL CODE MUTATION' if mutate else 'READ-ONLY'}\n\n{task.objective}\n")
+        print("PICO autonomy policy still applies; this is not an OS sandbox or merge authorization.")
+        phrase = f"approve {task.digest[:12]}"
+        if input(f"Type '{phrase}' to authorize this exact issue version: ").strip() != phrase:
+            raise DispatcherError("approval cancelled")
+        return task.digest
+
+    record_approval(cfg, number, mutate, typed, repair_of=repair_of)
     print(f"Approved issue #{number}; eligible for dispatch after service starts.")
+
+
+def approval_states(cfg: dict) -> dict[int, dict]:
+    """Recorded approval rows by issue number, read-only; empty before the first approval."""
+    state: Path = cfg["state"]
+    if not state.is_file():
+        return {}
+    db = sqlite3.connect(state.resolve().as_uri() + "?mode=ro", uri=True, timeout=20)
+    try:
+        db.row_factory = sqlite3.Row
+        rows = db.execute("SELECT number, digest, mode, state FROM approvals").fetchall()
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc):
+            return {}
+        raise
+    finally:
+        db.close()
+    return {row["number"]: dict(row) for row in rows}
 
 
 def pico_action(cfg: dict, row: sqlite3.Row, action: str, objective: str = "") -> dict:

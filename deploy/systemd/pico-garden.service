@@ -1,0 +1,40 @@
+# TEMPLATE ONLY — not installed automatically. Review all paths before use.
+# Pico Garden with dispatcher-queue approvals and delivery feedback, on loopback only.
+# Remote access is Tailscale Serve in front of 127.0.0.1:8765 (see
+# docs/issue-dispatcher.md, "Approving from the Garden over Tailscale").
+#
+# /etc/pico/garden.env (root-owned, 0644; it holds no secret):
+#   PICO_GARDEN_HOST=<host>.<tailnet>.ts.net
+#   PICO_GARDEN_LOGIN=<your Tailscale login, as `tailscale whois` shows it>
+[Unit]
+Description=PICO Garden (approvals + feedback, loopback for Tailscale Serve)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=pico
+Environment=HOME=/home/pico
+Environment=PATH=/home/pico/.local/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=/etc/pico/garden.env
+WorkingDirectory=/home/pico/src/pico-orchestrator
+ExecStart=/usr/bin/python3 /home/pico/src/pico-orchestrator/tools/watch.py --all \
+  --state-dir /home/pico/.local/state/pi-coding-orchestrator \
+  --port 8765 \
+  --approvals --dispatcher-config /home/pico/.config/pi-coding-orchestrator/dispatcher.json \
+  --feedback \
+  --token-file /home/pico/.config/pi-coding-orchestrator/garden-token \
+  --allowed-host ${PICO_GARDEN_HOST} \
+  --require-tailscale-login ${PICO_GARDEN_LOGIN}
+Restart=on-failure
+RestartSec=10
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

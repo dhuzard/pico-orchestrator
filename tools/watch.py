@@ -39,6 +39,7 @@ ASSETS = {"/": ("index.html", "text/html; charset=utf-8"),
           "/app.js": ("app.js", "text/javascript; charset=utf-8"),
           "/issues.js": ("issues.js", "text/javascript; charset=utf-8"),
           "/deliveries.js": ("deliveries.js", "text/javascript; charset=utf-8"),
+          "/approvals.js": ("approvals.js", "text/javascript; charset=utf-8"),
           "/style.css": ("style.css", "text/css; charset=utf-8")}
 
 
@@ -522,7 +523,7 @@ TOKEN_ENDPOINTS = frozenset({"/api/controls", "/api/branches", "/api/runs", "/ap
 def make_handler(directory: Path, repository: str | None, workspace: WorkspaceSource | None = None,
                  controls=None, port: int | None = None, issues: garden_issues.IssuesSource | None = None,
                  setup: workspace_setup.SetupControls | None = None, dispatcher_state: Path | None = None,
-                 feedback=None):
+                 feedback=None, approvals=None, allowed_hosts=()):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, format, *args):
             if not self.path.startswith("/api/"):
@@ -537,7 +538,7 @@ def make_handler(directory: Path, repository: str | None, workspace: WorkspaceSo
         def _host_ok(self) -> bool:
             # DNS-rebinding guard: only this server's own loopback names are served.
             bound = port if port is not None else self.server.server_address[1]
-            if garden_controls.host_allowed(self.headers.get("Host"), bound):
+            if garden_controls.host_allowed(self.headers.get("Host"), bound, allowed_hosts):
                 return True
             payload = self._json(421, {"ok": False, "error_code": "HOST_REJECTED", "error": "unexpected Host header"})
             self.send_header("Content-Length", str(len(payload)))
@@ -567,6 +568,25 @@ def make_handler(directory: Path, repository: str | None, workspace: WorkspaceSo
                 try:
                     data = setup.authorize(self.headers, body)
                     payload = self._json(200, setup.act_setup(data))
+                except garden_controls.ControlError as exc:
+                    payload = self._json(exc.status, {"ok": False, "error_code": exc.code, "error": exc.detail})
+                self._send(payload)
+                return
+            if path == "/api/approvals":
+                if approvals is None:
+                    self._send(self._json(404, {"ok": False, "error_code": "APPROVALS_OFF",
+                                                "error": "start pico watch with --approvals --dispatcher-config <file>"}))
+                    return
+                try:
+                    length = int(self.headers.get("Content-Length") or 0)
+                except ValueError:
+                    length = -1
+                if length < 0:
+                    self._send(self._json(400, {"ok": False, "error_code": "CONTROL_BODY_INVALID"}))
+                    return
+                body = self.rfile.read(min(length, garden_controls.MAX_BODY + 1)) if length else b""
+                try:
+                    payload = self._json(200, approvals.act(*approvals.authorize(self.headers, body)))
                 except garden_controls.ControlError as exc:
                     payload = self._json(exc.status, {"ok": False, "error_code": exc.code, "error": exc.detail})
                 self._send(payload)
@@ -615,7 +635,7 @@ def make_handler(directory: Path, repository: str | None, workspace: WorkspaceSo
 
         def _token_ok(self) -> bool:
             # With controls on, every data endpoint needs the session token too (TOKEN_ENDPOINTS).
-            auth = controls or setup or feedback
+            auth = controls or setup or feedback or approvals
             if auth is None:
                 return True
             try:
@@ -641,6 +661,17 @@ def make_handler(directory: Path, repository: str | None, workspace: WorkspaceSo
                                          else setup.discovery())
                 except garden_controls.ControlError as exc:
                     payload = self._json(exc.status, {"ok": False, "error_code": exc.code, "error": exc.detail})
+                self._send(payload)
+                return
+            if path == "/api/approvals":
+                if approvals is None:
+                    payload = self._json(404, {"ok": False, "error_code": "APPROVALS_OFF",
+                                               "error": "start pico watch with --approvals --dispatcher-config <file>"})
+                else:
+                    try:
+                        payload = self._json(200, approvals.listing(approvals.authorize_read(self.headers)))
+                    except garden_controls.ControlError as exc:
+                        payload = self._json(exc.status, {"ok": False, "error_code": exc.code, "error": exc.detail})
                 self._send(payload)
                 return
             if path in TOKEN_ENDPOINTS and not self._token_ok():
@@ -750,6 +781,20 @@ def main() -> None:
     parser.add_argument("--feedback", action="store_true",
                         help="let this browser session send PR comments or change requests on observed deliveries, "
                              "as the account gh is logged in as (not with --workspace)")
+    parser.add_argument("--approvals", action="store_true",
+                        help="let this browser session approve dispatcher queue issues, as "
+                             "`issue_dispatcher.py approve` does (needs --dispatcher-config; not with --workspace)")
+    parser.add_argument("--dispatcher-config", type=Path, metavar="DISPATCHER_JSON",
+                        help="dispatcher configuration read by --approvals (queue, allowlist, state database)")
+    parser.add_argument("--allowed-host", action="append", default=[], metavar="FQDN",
+                        help="also accept this HTTPS host name (for example the Tailscale Serve name) for Host "
+                             "and Origin; repeatable; needs --approvals and --require-tailscale-login")
+    parser.add_argument("--require-tailscale-login", action="append", default=[], metavar="LOGIN",
+                        help="approvals need the Tailscale-User-Login header set by Tailscale Serve to equal "
+                             "this login; repeatable")
+    parser.add_argument("--token-file", type=Path, metavar="PATH",
+                        help="persistent session token (0600 file owned by you, created if missing) instead of "
+                             "a new token per start")
     args = parser.parse_args()
     if args.all and args.repo:
         parser.error("--all and --repo cannot be combined")
@@ -759,6 +804,20 @@ def main() -> None:
         parser.error("--setup-root cannot be combined with workspace, repository or control options")
     if args.feedback and args.workspace:
         parser.error("--feedback works on dispatcher deliveries, which are not shown with --workspace")
+    if args.approvals and (args.workspace or args.setup_root):
+        parser.error("--approvals cannot be combined with --workspace or --setup-root")
+    if args.approvals != (args.dispatcher_config is not None):
+        parser.error("--approvals and --dispatcher-config go together")
+    if (args.allowed_host or args.require_tailscale_login) and not args.approvals:
+        parser.error("--allowed-host and --require-tailscale-login only apply to --approvals")
+    if args.allowed_host and not args.require_tailscale_login:
+        parser.error("--allowed-host exposes approvals beyond loopback: add --require-tailscale-login <login>")
+    if args.token_file and not (args.approvals or args.feedback or args.controls):
+        parser.error("--token-file needs --approvals, --feedback or --controls")
+    try:
+        allowed_hosts = tuple(garden_controls.normalize_allowed_host(name) for name in args.allowed_host)
+    except ValueError as exc:
+        parser.error(f"--allowed-host: {exc}")
     if not 0 <= args.port <= 65535:
         parser.error("--port must be between 0 and 65535")
     default_state = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "pi-coding-orchestrator"
@@ -796,22 +855,45 @@ def main() -> None:
         os.environ["PI_ORCHESTRATOR_STATE_DIR"] = str(state)
     if args.setup_root and not args.setup_root.is_dir():
         parser.error("--setup-root must be an existing directory")
+    token = None
+    if args.token_file:
+        import garden_approvals
+        try:
+            token = garden_approvals.load_or_create_token(args.token_file)
+        except (OSError, ValueError) as exc:
+            parser.error(f"--token-file: {exc}")
+    # Always loopback: remote access, if any, is a proxy such as Tailscale Serve in front of this port.
     server = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(
         directory, repository, workspace, issues=issues, dispatcher_state=args.dispatcher_state))
     setup = workspace_setup.SetupControls(args.setup_root, server.server_port, state=state) if args.setup_root else None
     if setup:
         server.RequestHandlerClass = make_handler(directory, repository, port=server.server_port, setup=setup,
                                                   dispatcher_state=args.dispatcher_state)
+    approvals = None
+    if args.approvals:
+        import garden_approvals
+        import issue_dispatcher
+        try:
+            approvals = garden_approvals.GardenApprovals(
+                server.server_port, args.dispatcher_config, token=token, allowed_hosts=allowed_hosts,
+                required_logins=args.require_tailscale_login, audit_path=state / "garden-approvals.jsonl")
+        except (OSError, ValueError, issue_dispatcher.DispatcherError) as exc:
+            server.server_close()
+            parser.error(f"--approvals: {exc}")
+        token = approvals.token
     feedback = None
     if args.feedback:
         import delivery_feedback
         feedback = delivery_feedback.DeliveryFeedback(
             server.server_port, args.dispatcher_state or state / "issue-dispatcher.sqlite3",
-            repository=repository, audit_path=state / "garden-feedback.jsonl")
+            repository=repository, audit_path=state / "garden-feedback.jsonl", token=token)
+        token = feedback.token
+    if feedback or approvals:
         server.RequestHandlerClass = make_handler(directory, repository, port=server.server_port, issues=issues,
-                                                  dispatcher_state=args.dispatcher_state, feedback=feedback)
+                                                  dispatcher_state=args.dispatcher_state, feedback=feedback,
+                                                  approvals=approvals, allowed_hosts=allowed_hosts)
     if args.controls:
-        controls = garden_controls.Controls(workspace.manifest, server.server_port, state_dir=state)
+        controls = garden_controls.Controls(workspace.manifest, server.server_port, state_dir=state, token=token)
         server.RequestHandlerClass = make_handler(directory, repository, workspace, controls, server.server_port,
                                                   issues=issues, dispatcher_state=args.dispatcher_state)
     label = f"workspace {workspace.workspace_id}" if workspace else repository or "all repositories"
@@ -821,9 +903,20 @@ def main() -> None:
     elif controls:
         print(f"Pico watch: http://127.0.0.1:{server.server_port}/#token={controls.token}  ({label}, controls on)", flush=True)
         print("Keep this URL private: it authorizes actions for this session only.", flush=True)
-    elif feedback:
-        print(f"Pico watch: http://127.0.0.1:{server.server_port}/#token={feedback.token}  ({label}, feedback on)", flush=True)
-        print("Keep this URL private: it lets this session post to GitHub as your gh account.", flush=True)
+    elif feedback or approvals:
+        modes = ", ".join(name for name, on in (("feedback", feedback), ("approvals", approvals)) if on)
+        # A persistent token stays out of logs (a service journal): it is read from its file instead.
+        fragment = "#token=<contents of --token-file>" if args.token_file else f"#token={token}"
+        print(f"Pico watch: http://127.0.0.1:{server.server_port}/{fragment}  ({label}, {modes} on)", flush=True)
+        for name in allowed_hosts:
+            print(f"Remote (through Tailscale Serve): https://{name}/{fragment}", flush=True)
+        if approvals:
+            who = ", ".join(sorted(approvals.required_logins)) or "the local token holder"
+            print(f"Approvals of {approvals.cfg['queue']} queue issues are allowed for: {who}", flush=True)
+        print("Keep this URL private: it lets this session "
+              + ("post to GitHub as your gh account" if feedback else "")
+              + (" and " if feedback and approvals else "")
+              + ("approve queue issues for dispatch" if approvals else "") + ".", flush=True)
     else:
         print(f"Pico watch: http://127.0.0.1:{server.server_port}  ({label})", flush=True)
     print(f"Reading: {state / 'workspaces' if workspace else directory}", flush=True)
