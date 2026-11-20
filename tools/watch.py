@@ -523,7 +523,14 @@ TOKEN_ENDPOINTS = frozenset({"/api/controls", "/api/branches", "/api/runs", "/ap
 def make_handler(directory: Path, repository: str | None, workspace: WorkspaceSource | None = None,
                  controls=None, port: int | None = None, issues: garden_issues.IssuesSource | None = None,
                  setup: workspace_setup.SetupControls | None = None, dispatcher_state: Path | None = None,
-                 feedback=None, approvals=None, allowed_hosts=()):
+                 feedback=None, approvals=None, allowed_hosts=(), required_logins=None):
+    if required_logins is None:
+        required_logins = approvals.required_logins if approvals is not None else ()
+    required_logins = frozenset(required_logins)
+    if allowed_hosts and not required_logins:
+        # A remote Host is only ever served to an allowed Tailscale login.
+        raise ValueError("--allowed-host needs --require-tailscale-login")
+
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, format, *args):
             if not self.path.startswith("/api/"):
@@ -535,16 +542,23 @@ def make_handler(directory: Path, repository: str | None, workspace: WorkspaceSo
             self.send_header("Cache-Control", "no-store")
             return json.dumps(body).encode()
 
-        def _host_ok(self) -> bool:
-            # DNS-rebinding guard: only this server's own loopback names are served.
+        def _host_ok(self, method: str) -> bool:
+            # DNS-rebinding guard: only this server's own loopback names, and the allowed remote names, are served.
             bound = port if port is not None else self.server.server_address[1]
-            if garden_controls.host_allowed(self.headers.get("Host"), bound, allowed_hosts):
-                return True
-            payload = self._json(421, {"ok": False, "error_code": "HOST_REJECTED", "error": "unexpected Host header"})
-            self.send_header("Content-Length", str(len(payload)))
-            self.end_headers()
-            self.wfile.write(payload)
-            return False
+            if not garden_controls.host_allowed(self.headers.get("Host"), bound, allowed_hosts):
+                payload = self._json(421, {"ok": False, "error_code": "HOST_REJECTED", "error": "unexpected Host header"})
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return False
+            # A remote Host (Tailscale Serve) needs an allowed Tailscale login on EVERY endpoint, static
+            # files and reads included, and a POST from that same https origin; loopback is unchanged.
+            try:
+                garden_controls.check_remote_request(self.headers, method, allowed_hosts, required_logins)
+            except garden_controls.ControlError as exc:
+                self._send(self._json(exc.status, {"ok": False, "error_code": exc.code, "error": exc.detail}))
+                return False
+            return True
 
         def _send(self, payload: bytes) -> None:
             self.send_header("X-Content-Type-Options", "nosniff")
@@ -553,7 +567,7 @@ def make_handler(directory: Path, repository: str | None, workspace: WorkspaceSo
             self.wfile.write(payload)
 
         def do_POST(self):
-            if not self._host_ok():
+            if not self._host_ok("POST"):
                 return
             path = urlsplit(self.path).path
             if path == "/api/setup" and setup is not None:
@@ -646,7 +660,7 @@ def make_handler(directory: Path, repository: str | None, workspace: WorkspaceSo
                 return False
 
         def do_GET(self):
-            if not self._host_ok():
+            if not self._host_ok("GET"):
                 return
             parts = urlsplit(self.path)
             path = parts.path
@@ -793,8 +807,8 @@ def main() -> None:
                         help="approvals need the Tailscale-User-Login header set by Tailscale Serve to equal "
                              "this login; repeatable")
     parser.add_argument("--token-file", type=Path, metavar="PATH",
-                        help="persistent session token (0600 file owned by you, created if missing) instead of "
-                             "a new token per start")
+                        help="persistent session token (0600 file owned by you, created if missing, inside the "
+                             "PICO state directory so workers cannot read it) instead of a new token per start")
     args = parser.parse_args()
     if args.all and args.repo:
         parser.error("--all and --repo cannot be combined")
@@ -859,7 +873,7 @@ def main() -> None:
     if args.token_file:
         import garden_approvals
         try:
-            token = garden_approvals.load_or_create_token(args.token_file)
+            token = garden_approvals.load_or_create_token(args.token_file, state_dir=state)
         except (OSError, ValueError) as exc:
             parser.error(f"--token-file: {exc}")
     # Always loopback: remote access, if any, is a proxy such as Tailscale Serve in front of this port.
@@ -886,7 +900,8 @@ def main() -> None:
         import delivery_feedback
         feedback = delivery_feedback.DeliveryFeedback(
             server.server_port, args.dispatcher_state or state / "issue-dispatcher.sqlite3",
-            repository=repository, audit_path=state / "garden-feedback.jsonl", token=token)
+            repository=repository, audit_path=state / "garden-feedback.jsonl", token=token,
+            allowed_hosts=allowed_hosts, required_logins=approvals.required_logins if approvals else ())
         token = feedback.token
     if feedback or approvals:
         server.RequestHandlerClass = make_handler(directory, repository, port=server.server_port, issues=issues,

@@ -16,7 +16,7 @@ All notable changes to PICO are recorded here. The format follows
   over issue, digest, target, checkout, mode and login, recomputed on the re-read
   issue. `--allowed-host` and `--require-tailscale-login` bind remote approvals to
   a Tailscale login; `--token-file` keeps a 0600 session token across restarts.
-  Attempts are audited in `garden-approvals.jsonl`. No repair, reject or dispatch
+  Previews and attempts are audited in `garden-approvals.jsonl`. No repair, reject or dispatch
   action. New template `deploy/systemd/pico-garden.service`.
 - A lead process that stops on its model's usage quota or rate limit settles as
   `MODEL_QUOTA_EXHAUSTED`, not `ORCHESTRATION_OUTCOME_UNRECORDED`, with the provider's
@@ -122,6 +122,24 @@ All notable changes to PICO are recorded here. The format follows
   promotion authority for the issue dispatcher (#34).
 
 ### Security
+
+- Remote Garden hardening. A request sent to an `--allowed-host` name (Tailscale
+  Serve) now needs exactly one allowed `Tailscale-User-Login` on every endpoint,
+  static files and reads (`/api/runs`, `/api/deliveries`) included, and a remote
+  POST must carry `Origin: https://<that host>`; a loopback `Origin` on a remote
+  `Host` is refused. Delivery feedback now works from the phone, but only with a
+  verified login. Loopback requests are unchanged.
+- `--token-file` must lie inside the PICO state directory (`--state-dir`), which
+  worker sandboxes cannot read; a path elsewhere refuses to start. The template
+  `deploy/systemd/pico-garden.service` uses
+  `~/.local/state/pi-coding-orchestrator/garden-token` and the same `User=` as
+  `pico-dispatcher.service`.
+- Workers can no longer read PICO's configuration directory
+  (`$XDG_CONFIG_HOME/pi-coding-orchestrator`, default `~/.config/pi-coding-orchestrator`:
+  `dispatcher.json`, `provider-api.env`, the queue token).
+- An unavailable delivery observation keeps the evidence gathered before the error
+  (`base`, `rules`, `checks_source`) next to the classified cause; Garden approval
+  previews are audited in `garden-approvals.jsonl` too (stage `preview`, no issue text).
 
 - Mutating Claude workers run in Claude Code's OS sandbox by default (#63, slices 2 to 4).
   Their shell commands may write only in the bound worktree, its git metadata, the temp

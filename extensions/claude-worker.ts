@@ -277,15 +277,18 @@ function withRealPath(path: string, realpath: (path: string) => string): string[
 }
 
 /**
- * Paths a worker must not read: PICO state directories (provenance, leases) and credential locations, each
- * also at its resolved location when it is a symlink (for example `~/.ssh` linked into a dotfiles repository).
+ * Paths a worker must not read: PICO state directories (provenance, leases, the Garden token), PICO's user
+ * configuration directory (dispatcher.json, provider-api.env, the queue token; only the parent reads it) and
+ * credential locations, each also at its resolved location when it is a symlink (for example `~/.ssh` linked
+ * into a dotfiles repository).
  */
 export function sandboxDeniedReads(parentEnv: NodeJS.ProcessEnv, home: string,
                                    realpath: (path: string) => string = realpathSync): string[] {
   const xdgState = absoluteOrNull(parentEnv.XDG_STATE_HOME) ?? join(home, ".local", "state");
   const xdgConfig = absoluteOrNull(parentEnv.XDG_CONFIG_HOME);
   const state = [absoluteOrNull(parentEnv.PI_ORCHESTRATOR_STATE_DIR) ?? join(ORCHESTRATOR_ROOT, "provenance"),
-    absoluteOrNull(parentEnv.PI_CODING_ORCHESTRATOR_STATE_DIR), join(xdgState, PICO_DIR_NAME)];
+    absoluteOrNull(parentEnv.PI_CODING_ORCHESTRATOR_STATE_DIR), join(xdgState, PICO_DIR_NAME),
+    join(xdgConfig ?? join(home, ".config"), PICO_DIR_NAME)];
   const credentials = [...SANDBOX_CREDENTIAL_PATHS.map((path) => join(home, path)),
     xdgConfig ? join(xdgConfig, "gh") : null, absoluteOrNull(parentEnv.GH_CONFIG_DIR),
     absoluteOrNull(parentEnv.PI_DISPATCHER_QUEUE_CREDENTIAL_PATH)];

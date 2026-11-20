@@ -3075,12 +3075,12 @@ test("a sandboxed worker may write only its worktree and declared caches, and re
   for (const path of sandbox.filesystem.allowWrite) assert.ok(!path.startsWith("/state/pico") && !path.startsWith(SANDBOX_CWD));
   assert.deepEqual(sandbox.filesystem.denyWrite, ["/home/u/.cache/pi-coding-orchestrator", "/home/u/.config/pi-coding-orchestrator"]);
   // Reads: the PICO state directory (Garden/lease/provenance), the default state root, the gh config and the rest.
-  for (const path of ["/state/pico", "/home/u/.local/state/pi-coding-orchestrator", "/home/u/.config/gh", "/home/u/.ssh",
-    "/home/u/.git-credentials", "/home/u/.aws", "/home/u/.claude/.credentials.json"]) {
+  for (const path of ["/state/pico", "/home/u/.local/state/pi-coding-orchestrator", "/home/u/.config/pi-coding-orchestrator",
+    "/home/u/.config/gh", "/home/u/.ssh", "/home/u/.git-credentials", "/home/u/.aws", "/home/u/.claude/.credentials.json"]) {
     assert.ok(sandbox.filesystem.denyRead.includes(path), path);
   }
-  assert.equal(sandbox.filesystem.denyRead.length, 2 + SANDBOX_CREDENTIAL_PATHS.length,
-    "the state dir and the XDG state root (no provenance fallback when the state dir is set), then credentials");
+  assert.equal(sandbox.filesystem.denyRead.length, 3 + SANDBOX_CREDENTIAL_PATHS.length,
+    "the state dir, the XDG state root (no provenance fallback when the state dir is set) and the PICO config dir, then credentials");
   for (const path of sandbox.filesystem.denyRead) assert.ok(!SANDBOX_CWD.startsWith(path), path);
   // Network: only the allowlist, denied deterministically instead of a prompt a headless worker cannot answer.
   assert.deepEqual(sandbox.network, { allowedDomains: ["registry.npmjs.org", "*.pythonhosted.org"], strictAllowlist: true });
@@ -3097,7 +3097,11 @@ test("a sandboxed worker may write only its worktree and declared caches, and re
       PI_DISPATCHER_QUEUE_CREDENTIAL_PATH: "/queue/token" } }) as any;
   assert.deepEqual(moved.sandbox.filesystem.allowWrite, ["/xc/pip"]);
   assert.deepEqual(moved.sandbox.filesystem.denyWrite, ["/pico-cache", "/xg/pi-coding-orchestrator"]);
-  for (const path of ["/xs/pi-coding-orchestrator", "/xg/gh", "/ghc", "/queue/token"]) assert.ok(moved.sandbox.filesystem.denyRead.includes(path), path);
+  for (const path of ["/xs/pi-coding-orchestrator", "/xg/pi-coding-orchestrator", "/xg/gh", "/ghc", "/queue/token"]) {
+    assert.ok(moved.sandbox.filesystem.denyRead.includes(path), path);
+  }
+  assert.ok(!moved.sandbox.filesystem.denyRead.includes("/home/u/.config/pi-coding-orchestrator"), "XDG_CONFIG_HOME is honored");
+  assert.ok(moved.permissions.deny.includes("Read(//xg/pi-coding-orchestrator/**)"), "dispatcher.json, provider-api.env, queue token");
   assert.ok(moved.permissions.deny.includes("Read(//queue/token)"));
   assert.ok(moved.permissions.deny.includes("Read(//queue/token/**)"));
   // Without PI_ORCHESTRATOR_STATE_DIR, the state directory is this orchestrator checkout's provenance/.

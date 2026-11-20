@@ -13,17 +13,17 @@ After=network-online.target
 
 [Service]
 Type=simple
-User=pico
-Environment=HOME=/home/pico
-Environment=PATH=/home/pico/.local/bin:/usr/local/bin:/usr/bin:/bin
+User=dhuzard
+Environment=HOME=/home/dhuzard
+Environment=PATH=/home/dhuzard/.local/bin:/usr/local/bin:/usr/bin:/bin
 EnvironmentFile=/etc/pico/garden.env
-WorkingDirectory=/home/pico/src/pico-orchestrator
-ExecStart=/usr/bin/python3 /home/pico/src/pico-orchestrator/tools/watch.py --all \
-  --state-dir /home/pico/.local/state/pi-coding-orchestrator \
+WorkingDirectory=/home/dhuzard/src/pico-orchestrator
+ExecStart=/usr/bin/python3 /home/dhuzard/src/pico-orchestrator/tools/watch.py --all \
+  --state-dir /home/dhuzard/.local/state/pi-coding-orchestrator \
   --port 8765 \
-  --approvals --dispatcher-config /home/pico/.config/pi-coding-orchestrator/dispatcher.json \
+  --approvals --dispatcher-config /home/dhuzard/.config/pi-coding-orchestrator/dispatcher.json \
   --feedback \
-  --token-file /home/pico/.config/pi-coding-orchestrator/garden-token \
+  --token-file /home/dhuzard/.local/state/pi-coding-orchestrator/garden-token \
   --allowed-host ${PICO_GARDEN_HOST} \
   --require-tailscale-login ${PICO_GARDEN_LOGIN}
 Restart=on-failure

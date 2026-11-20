@@ -22,7 +22,7 @@ copy, so the login names the tailnet user. The session token is still required:
 it keeps other local users, who could reach the loopback port with a forged
 header, out. Without `--require-tailscale-login` (loopback only), the actor is
 "local-token". There is no repair (`--repair-of`), reject or dispatch action.
-Each confirmed attempt is appended to `<state-dir>/garden-approvals.jsonl`.
+Each preview and confirmed attempt is appended to `<state-dir>/garden-approvals.jsonl`.
 """
 from __future__ import annotations
 
@@ -46,7 +46,7 @@ from garden_controls import ControlError  # noqa: E402
 
 MODES = {"read-only": False, "local-mutation": True}
 MODE_LABELS = {"read-only": "READ-ONLY", "local-mutation": "LOCAL CODE MUTATION"}
-LOGIN_HEADER = "Tailscale-User-Login"
+LOGIN_HEADER = garden_controls.LOGIN_HEADER
 LOGIN_RE = re.compile(r"^[A-Za-z0-9._@+-]{1,254}$")
 TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{32,256}$")
 DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -58,11 +58,27 @@ def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def load_or_create_token(path: Path) -> str:
-    """A persistent session token: a 0600 regular file owned by this user, created when missing."""
+def token_path_inside(path: Path, state_dir: Path) -> bool:
+    """Whether `path` lies under the PICO state directory, which Pico workers cannot read."""
+    try:
+        parent = Path(path).expanduser().parent.resolve()
+        return parent.is_relative_to(Path(state_dir).expanduser().resolve())
+    except (OSError, RuntimeError):
+        return False
+
+
+def load_or_create_token(path: Path, state_dir: Path | None = None) -> str:
+    """A persistent session token: a 0600 regular file owned by this user, created when missing.
+
+    With `state_dir`, the file must lie inside that PICO state directory: workers run as the
+    same OS user, and their sandbox denies reads of the state directory but not of arbitrary
+    locations (a token elsewhere would let a worker drive the Garden)."""
     path = Path(path).expanduser()
     if not path.is_absolute():
         raise ValueError("--token-file must be an absolute path")
+    if state_dir is not None and not token_path_inside(path, state_dir):
+        raise ValueError(f"--token-file must be inside the PICO state directory {state_dir}, "
+                         "which Pico workers cannot read (for example <state-dir>/garden-token)")
     try:
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
     except FileExistsError:
@@ -116,12 +132,7 @@ class GardenApprovals:
         """The Tailscale login when one is required, else the local token holder."""
         if not self.required_logins:
             return LOCAL_ACTOR
-        values = headers.get_all(LOGIN_HEADER) if hasattr(headers, "get_all") else [headers.get(LOGIN_HEADER)]
-        values = [value for value in values or [] if value is not None]
-        if len(values) != 1 or values[0] not in self.required_logins:
-            raise ControlError(403, "APPROVAL_IDENTITY_REJECTED",
-                               "approvals need a Tailscale login this Garden allows; open it through Tailscale Serve")
-        return values[0]
+        return garden_controls.tailscale_login(headers, self.required_logins)
 
     def authorize_read(self, headers) -> str:
         self.check_token(headers)
@@ -183,9 +194,11 @@ class GardenApprovals:
                 result = self._handle(number, mode, confirm, digest, actor, entry)
             except ControlError as exc:
                 result = {"ok": False, "stage": "refused", "error_code": exc.code, "error": exc.detail}
-            if confirm is not None:
-                self._audit({**entry, "stage": result.get("stage"), "ok": bool(result.get("ok")),
-                             "error_code": result.get("error_code")})
+            if confirm is None and isinstance(result.get("preview"), dict):
+                entry["digest"] = result["preview"].get("digest")
+            # Previews are audited too (stage "preview"); neither line carries the issue text.
+            self._audit({**entry, "stage": result.get("stage"), "ok": bool(result.get("ok")),
+                         "error_code": result.get("error_code")})
             return {"action": "approve", **result}
         finally:
             self._lock.release()

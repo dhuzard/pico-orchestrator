@@ -7,7 +7,10 @@ of reimplementing their gates. The viewer stays read-only without the flag.
 
 Security model, all fail closed:
 - every request must carry Host 127.0.0.1:<port> or localhost:<port>
-  (DNS-rebinding guard; applied to reads too);
+  (DNS-rebinding guard; applied to reads too), or, for `pico watch --approvals`
+  behind Tailscale Serve, an `--allowed-host` name; such a remote request needs an
+  allowed Tailscale login on every endpoint and a POST from https://<that host>
+  (check_remote_request);
 - an action is a same-origin JSON POST carrying the per-session token, which
   is generated at launch and printed only in the launch URL's fragment;
 - every mutating action is two-step: the first call returns a preview and a
@@ -176,6 +179,7 @@ def _safe_policy_location(path: Path) -> Path:
     return top
 
 
+LOGIN_HEADER = "Tailscale-User-Login"
 HOSTNAME_RE = re.compile(r"^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$")
 
 
@@ -191,11 +195,44 @@ def host_allowed(host: str | None, port: int, allowed_hosts=()) -> bool:
     """Loopback Host for this port, or an allowed HTTPS name (as proxied by Tailscale Serve, default port 443)."""
     if host in {f"127.0.0.1:{port}", f"localhost:{port}"}:
         return True
+    return remote_host(host, allowed_hosts) is not None
+
+
+def remote_host(host: str | None, allowed_hosts=()) -> str | None:
+    """The allowed HTTPS name a request was sent to (Tailscale Serve), or None for a loopback/unknown Host."""
     if not host or not allowed_hosts:
-        return False
+        return None
     name = host.lower()
     name = name[:-4] if name.endswith(":443") else name
-    return name in allowed_hosts
+    return name if name in allowed_hosts else None
+
+
+def tailscale_login(headers, required_logins) -> str:
+    """Exactly one Tailscale-User-Login header naming an allowed login, or ControlError.
+
+    Tailscale Serve sets this header on the requests it proxies and replaces a
+    client-supplied copy, so it names the tailnet user of the requesting device."""
+    values = headers.get_all(LOGIN_HEADER) if hasattr(headers, "get_all") else [headers.get(LOGIN_HEADER)]
+    values = [value for value in values or [] if value is not None]
+    if not required_logins or len(values) != 1 or values[0] not in required_logins:
+        raise ControlError(403, "APPROVAL_IDENTITY_REJECTED",
+                           "this Garden needs a Tailscale login it allows; open it through Tailscale Serve")
+    return values[0]
+
+
+def check_remote_request(headers, method: str, allowed_hosts=(), required_logins=()) -> str | None:
+    """Gate for every request sent to an allowed remote Host (static files and reads included).
+
+    Returns the verified login for a remote request and None for a loopback one, whose
+    checks are unchanged. A remote request needs exactly one allowed Tailscale login, and
+    a remote POST must come from `https://<that same host>`: a loopback Origin is refused."""
+    name = remote_host(headers.get("Host"), allowed_hosts)
+    if name is None:
+        return None
+    login = tailscale_login(headers, required_logins)
+    if method != "GET" and headers.get("Origin") != f"https://{name}":
+        raise ControlError(403, "CONTROL_ORIGIN_REJECTED", "actions must come from this Garden page")
+    return login
 
 
 def origin_allowed(origin: str | None, port: int, allowed_hosts=()) -> bool:

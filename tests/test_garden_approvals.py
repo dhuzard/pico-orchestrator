@@ -113,7 +113,8 @@ class ApprovalCoreTest(ApprovalsBase):
                           "mode_label": "LOCAL CODE MUTATION", "digest": task.digest, "actor": "local-token"})
         self.assertEqual(shown["preview"]["criteria"], "Tests pass.")
         self.assertIsNone(self.row(), "a preview records nothing")
-        self.assertFalse(self.audit.exists(), "a preview is not an approval attempt")
+        [line] = self.audit.read_text().splitlines()
+        self.assertEqual(json.loads(line)["stage"], "preview", "a preview is audited, not approved")
         done = self.confirm(garden, shown, "local-mutation")
         self.assertEqual((done["ok"], done["stage"], done["status"]), (True, "done", "APPROVED"), done)
         self.assertEqual(self.row(), self.row(cli_cfg))
@@ -122,13 +123,14 @@ class ApprovalCoreTest(ApprovalsBase):
         garden = self.approvals()
         shown = self.preview(garden, actor=LOGIN)
         self.confirm(garden, shown, actor=LOGIN)
-        [line] = self.audit.read_text().splitlines()
+        previewed, line = self.audit.read_text().splitlines()
         entry = json.loads(line)
         self.assertEqual({k: entry[k] for k in ("issue", "digest", "mode", "actor", "stage", "ok", "error_code")},
                          {"issue": 7, "digest": shown["preview"]["digest"], "mode": "read-only", "actor": LOGIN,
                           "stage": "done", "ok": True, "error_code": None})
         self.assertRegex(entry["at"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
-        self.assertNotIn("validation", line, "the audit never holds issue text")
+        for text in (line, previewed):
+            self.assertNotIn("validation", text, "the audit never holds issue text")
         self.assertEqual(os.stat(self.audit).st_mode & 0o777, 0o600)
 
     def test_an_issue_edited_after_the_preview_is_refused_as_stale(self):
@@ -325,7 +327,8 @@ class ApprovalsEndpointTest(ApprovalsBase):
         code, done = self.request(server, body={"issue": 7, "mode": "local-mutation", "confirm": shown["confirm"],
                                                 "digest": shown["preview"]["digest"]}, headers=signed)
         self.assertEqual((code, done["stage"], done["actor"]), (200, "done", LOGIN))
-        self.assertEqual(json.loads(self.audit.read_text())["actor"], LOGIN)
+        lines = [json.loads(line) for line in self.audit.read_text().splitlines()]
+        self.assertEqual([(entry["stage"], entry["actor"]) for entry in lines], [("preview", LOGIN), ("done", LOGIN)])
         self.assertEqual(self.row()["mode"], "local-mutation")
 
     def test_a_loopback_request_with_a_required_login_still_needs_the_header(self):
@@ -355,6 +358,140 @@ class ApprovalsEndpointTest(ApprovalsBase):
         self.assertFalse(garden_controls.origin_allowed(f"https://{HOST}", 8765))
         with self.assertRaises(garden_controls.ControlError):
             garden_controls.authorize_json({"Origin": f"https://{HOST}"}, b"{}", port=8765, token="t")
+
+
+class RemoteGardenTest(ApprovalsBase):
+    """A remote Host (Tailscale Serve) is served only to an allowed login, on every endpoint."""
+
+    request = ApprovalsEndpointTest.request
+
+    def serve_all(self):
+        import delivery_feedback
+        garden = self.approvals(allowed_hosts=[HOST], required_logins=[LOGIN])
+        feedback = delivery_feedback.DeliveryFeedback(
+            0, self.root / "issue-dispatcher.sqlite3", token=garden.token, adapter=object(),
+            allowed_hosts=[HOST], required_logins=[LOGIN], audit_path=self.root / "garden-feedback.jsonl")
+        server = ThreadingHTTPServer(("127.0.0.1", 0), watch.make_handler(
+            self.root / "runs", None, approvals=garden, feedback=feedback, allowed_hosts=(HOST,)))
+        self.addCleanup(server.server_close)
+        garden.port = feedback.port = server.server_port
+        return garden, server
+
+    def raw(self, server, path, headers):
+        thread = threading.Thread(target=server.handle_request)
+        thread.start()
+        request = urllib.request.Request(f"http://127.0.0.1:{server.server_port}{path}", headers=headers)
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status, response.read()
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.read()
+        finally:
+            thread.join(timeout=5)
+
+    FEEDBACK = {"issue": 7, "kind": "comment", "body": "Looks good"}
+
+    def test_remote_host_without_an_allowed_login_is_refused_everywhere(self):
+        garden, server = self.serve_all()
+        base = {"Host": HOST, "X-Pico-Token": garden.token}
+        for login in (None, "intruder@github"):
+            headers = dict(base) if login is None else {**base, "Tailscale-User-Login": login}
+            for path in ("/", "/app.js", "/api/runs", "/api/deliveries", "/api/approvals"):
+                code, body = self.request(server, path, headers=headers)
+                self.assertEqual((code, body["error_code"]), (403, "APPROVAL_IDENTITY_REJECTED"), (path, login))
+            code, body = self.request(server, "/api/delivery-feedback", body=self.FEEDBACK,
+                                      headers={**headers, "Origin": f"https://{HOST}"})
+            self.assertEqual((code, body["error_code"]), (403, "APPROVAL_IDENTITY_REJECTED"), login)
+        code, body = self.raw(server, "/", {**base, "Tailscale-User-Login": LOGIN})
+        self.assertEqual(code, 200)
+        self.assertIn(b"<html", body.lower())
+        # Exactly one login header: a second one (even the allowed login twice) is refused.
+        import http.client
+        thread = threading.Thread(target=server.handle_request)
+        thread.start()
+        connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+        connection.putrequest("GET", "/api/runs", skip_host=True)
+        for name, value in (("Host", HOST), ("X-Pico-Token", garden.token),
+                            ("Tailscale-User-Login", LOGIN), ("Tailscale-User-Login", LOGIN)):
+            connection.putheader(name, value)
+        connection.endheaders()
+        response = connection.getresponse()
+        self.assertEqual((response.status, json.load(response)["error_code"]), (403, "APPROVAL_IDENTITY_REJECTED"))
+        connection.close()
+        thread.join(timeout=5)
+
+    def test_remote_feedback_needs_the_login_and_the_same_https_origin(self):
+        garden, server = self.serve_all()
+        signed = {"Host": HOST, "X-Pico-Token": garden.token, "Tailscale-User-Login": LOGIN}
+        for path in ("/api/runs", "/api/deliveries"):
+            code, _ = self.request(server, path, headers=signed)
+            self.assertEqual(code, 200, path)
+        code, body = self.request(server, "/api/delivery-feedback", body=self.FEEDBACK,
+                                  headers={**signed, "Origin": f"https://{HOST}"})
+        # Past every request check: the refusal is about the (absent) delivery, not the request.
+        self.assertEqual((code, body["stage"], body["error_code"]), (200, "refused", "DELIVERY_UNKNOWN"))
+        port = server.server_port
+        for origin in (f"http://127.0.0.1:{port}", f"http://localhost:{port}", None, "https://evil.example"):
+            headers = {**signed, **({"Origin": origin} if origin else {})}
+            for path, payload in (("/api/delivery-feedback", self.FEEDBACK),
+                                  ("/api/approvals", {"issue": 7, "mode": "read-only"})):
+                code, body = self.request(server, path, body=payload, headers=headers)
+                self.assertEqual((code, body["error_code"]), (403, "CONTROL_ORIGIN_REJECTED"), (path, origin))
+        self.assertIsNone(self.row())
+
+    def test_loopback_requests_keep_todays_checks(self):
+        garden, server = self.serve_all()
+        port = server.server_port
+        code, _ = self.raw(server, "/", {})
+        self.assertEqual(code, 200, "the static page needs no login on loopback")
+        code, _ = self.request(server, "/api/runs", headers={"X-Pico-Token": garden.token})
+        self.assertEqual(code, 200)
+        code, body = self.request(server, "/api/delivery-feedback", body=self.FEEDBACK,
+                                  headers={"X-Pico-Token": garden.token, "Origin": f"http://127.0.0.1:{port}"})
+        self.assertEqual((code, body["error_code"]), (200, "DELIVERY_UNKNOWN"))
+
+    def test_feedback_accepts_the_https_origin_only_with_a_verified_login(self):
+        import delivery_feedback
+        import garden_controls
+        feedback = delivery_feedback.DeliveryFeedback(8765, self.root / "d.sqlite3", token="t" * 40,
+                                                      allowed_hosts=[HOST], required_logins=[LOGIN])
+        headers = {"Origin": f"https://{HOST}", "X-Pico-Token": "t" * 40, "Content-Type": "application/json"}
+        for login in (None, "intruder@github"):
+            with self.assertRaises(garden_controls.ControlError) as caught:
+                feedback.authorize({**headers, **({"Tailscale-User-Login": login} if login else {})}, b"{}")
+            self.assertEqual(caught.exception.code, "APPROVAL_IDENTITY_REJECTED")
+        self.assertEqual(feedback.authorize({**headers, "Tailscale-User-Login": LOGIN}, b"{}"), {})
+        local = delivery_feedback.DeliveryFeedback(8765, self.root / "d.sqlite3", token="t" * 40)
+        with self.assertRaises(garden_controls.ControlError):
+            local.authorize({**headers, "Tailscale-User-Login": LOGIN}, b"{}")
+        with self.assertRaisesRegex(ValueError, "require-tailscale-login"):
+            delivery_feedback.DeliveryFeedback(8765, self.root / "d.sqlite3", allowed_hosts=[HOST])
+        with self.assertRaisesRegex(ValueError, "require-tailscale-login"):
+            watch.make_handler(self.root / "runs", None, allowed_hosts=(HOST,))
+
+
+class TokenFileLocationTest(ApprovalsBase):
+    def test_a_token_file_outside_the_state_dir_is_refused(self):
+        state = self.root / "state"
+        state.mkdir()
+        inside = state / "garden-token"
+        self.assertTrue(garden_approvals.load_or_create_token(inside, state_dir=state))
+        config = self.root / "config" / "pi-coding-orchestrator"
+        config.mkdir(parents=True)
+        for path in (config / "garden-token", self.root / "garden-token", state / ".." / "garden-token"):
+            with self.assertRaisesRegex(ValueError, "state directory"):
+                garden_approvals.load_or_create_token(path, state_dir=state)
+            self.assertFalse(path.exists(), path)
+        # A path that leaves the state dir through a symlink is judged by where it resolves.
+        (self.root / "escape").symlink_to(self.root / "config")
+        with self.assertRaisesRegex(ValueError, "state directory"):
+            garden_approvals.load_or_create_token(state / ".." / "escape" / "garden-token", state_dir=state)
+        argv = ["watch.py", "--all", "--state-dir", str(state), "--feedback",
+                "--token-file", str(config / "garden-token")]
+        with patch.object(sys, "argv", argv), patch("sys.stderr"), self.assertRaises(SystemExit) as caught:
+            watch.main()
+        self.assertEqual(caught.exception.code, 2)
+        self.assertFalse((config / "garden-token").exists())
 
 
 if __name__ == "__main__":
