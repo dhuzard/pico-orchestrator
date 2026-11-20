@@ -10,7 +10,8 @@
     return result;
   };
   const label = value => String(value || "unknown").replaceAll("_", " ");
-  const attention = new Set(["needs_human_review", "needs_decision", "changes_requested", "blocked", "unavailable"]);
+  // audit_failed: the automatic audit refused the merge. auditing (waiting on the audit) is in "Waiting on checks".
+  const attention = new Set(["needs_human_review", "needs_decision", "changes_requested", "blocked", "unavailable", "audit_failed"]);
   const finished = new Set(["merged", "closed", "cancelled"]);
   function verifiedLink(row) {
     if (typeof row.repository !== "string" || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(row.repository)) return null;

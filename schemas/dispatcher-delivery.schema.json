@@ -16,7 +16,7 @@
     "head_sha": {"type": ["string", "null"]},
     "checks": {"enum": ["unknown", "running", "passed", "failed", "stale", "unavailable"]},
     "review": {"enum": ["unknown", "not_requested", "requested", "changes_requested", "approved", "stale"]},
-    "delivery": {"enum": ["waiting_ci", "needs_human_review", "needs_decision", "merged", "closed"]},
+    "delivery": {"enum": ["waiting_ci", "needs_human_review", "needs_decision", "auditing", "audit_failed", "merged", "closed"]},
     "reason": {"type": "string"}, "next_action": {"type": "string"}, "actor": {"type": "string"},
     "observed_at": {"type": "string"}, "first_seen": {"type": "string"}, "last_seen": {"type": "string"},
     "evidence": {"type": "object"}

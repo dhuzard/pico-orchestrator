@@ -40,6 +40,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import activity  # noqa: E402
 import garden_controls  # noqa: E402
 import issue_dispatcher  # noqa: E402
 from garden_controls import ControlError  # noqa: E402
@@ -258,6 +259,10 @@ class GardenApprovals:
         except (OSError, sqlite3.Error) as exc:
             raise ControlError(503, "APPROVAL_STATE_UNAVAILABLE", "the dispatcher state cannot be written") from exc
         self._done.add(confirm)
+        activity.emit(self.cfg, "approval",
+                      f"Approved queue #{number} ({'with code changes' if MODES[mode] else 'read-only'})",
+                      f"Target {task.repo}, digest {task.digest[:12]}, approved in the Garden by {actor}.",
+                      f"https://github.com/{self.cfg['queue']}/issues/{number}", issue=number)
         return {"ok": True, "stage": "done", "status": "APPROVED", "issue": number, "mode": mode,
                 "digest_short": task.digest[:12], "actor": actor}
 

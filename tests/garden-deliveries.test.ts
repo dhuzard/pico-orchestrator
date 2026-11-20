@@ -59,3 +59,18 @@ test("connection loss and old observations remain visible instead of implying fr
   assert.match(container.textContent, /Execution: completed/);
   assert.equal(container.all().some(item => item.tagName === "BUTTON"), false);
 });
+test("a failed automatic audit needs attention; auditing waits; an automatic merge is history", () => {
+  const render = renderer(); const container = new Element("div");
+  const data = { ok: true, deliveries: [
+    { ...row, title: "Audit refused", delivery_state: "audit_failed", reason: "Automatic audit failed: an acceptance criterion is not met" },
+    { ...row, title: "Being audited", delivery_state: "auditing" },
+    { ...row, title: "Auto merged", delivery_state: "merged", reason: "Merged automatically after a passing audit" }] };
+  render(container, data);
+  assert.match(container.textContent, /Audit refused/); assert.match(container.textContent, /audit failed/);
+  assert.match(container.textContent, /acceptance criterion is not met/);
+  assert.doesNotMatch(container.textContent, /Being audited|Auto merged/);
+  render(container, data, { filter: "running" });
+  assert.match(container.textContent, /Being audited/); assert.doesNotMatch(container.textContent, /Audit refused|Auto merged/);
+  render(container, data, { filter: "history" });
+  assert.match(container.textContent, /Merged automatically after a passing audit/);
+});

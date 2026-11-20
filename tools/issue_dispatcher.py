@@ -26,6 +26,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import delivery_store
 import delivery_observer
+import activity
+import delivery_autopilot
 
 REPO = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 HEADING = re.compile(r"^## ([^\n]+)\s*$", re.MULTILINE)
@@ -123,6 +125,30 @@ def command(argv: list[str], *, timeout: int = 40, env: dict | None = None) -> d
     return value
 
 
+def command_text(argv: list[str], *, timeout: int = 60, env: dict | None = None, limit: int = 8_000_000) -> str:
+    """Like `command`, for a gh operation whose output is text (a diff, `gh pr merge`)."""
+    try:
+        run = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, check=False, env=env)
+    except subprocess.TimeoutExpired as exc:
+        raise DispatcherError(f"command timed out: {argv[0]}") from exc
+    except OSError as exc:
+        raise DispatcherError(f"command unavailable: {argv[0]}") from exc
+    if run.returncode:
+        detail = (run.stderr or "").strip().splitlines()[0][:200] if (run.stderr or "").strip() else ""
+        raise DispatcherError(f"GitHub operation failed (exit {run.returncode})" + (f": {detail}" if detail else ""))
+    if len(run.stdout) > limit:
+        raise DispatcherError("output too large")
+    return run.stdout
+
+
+def _absolute_file(value, name: str) -> Path | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not Path(value).expanduser().is_absolute():
+        raise DispatcherError(f"{name} must be an absolute path")
+    return Path(value).expanduser()
+
+
 def load_config(path: Path) -> dict:
     data = json.loads(path.expanduser().read_text(encoding="utf-8"))
     if not isinstance(data, dict) or not REPO.fullmatch(str(data.get("queue_repository", ""))):
@@ -170,7 +196,21 @@ def load_config(path: Path) -> dict:
             or not isinstance(v, list) or not v or not all(isinstance(x, str) and 0 < len(x) <= 200 for x in v)
             for k, v in expected.items())):
         raise DispatcherError("delivery_expected_checks must map allowed repositories to nonempty check name lists")
-    return {**credentials, 'aggregate_ledger': ledger, "delivery_expected_checks": {k.casefold(): v for k, v in expected.items()}, "queue": data["queue_repository"], "targets": normalized, "state": state,
+    provider_env = _absolute_file(data.get("provider_env_file"), "provider_env_file")
+    notify = data.get("notify", {})
+    if not isinstance(notify, dict) or set(notify) - {"telegram_env_file"}:
+        raise DispatcherError("notify accepts only telegram_env_file")
+    notify = {"telegram_env_file": _absolute_file(notify["telegram_env_file"], "notify.telegram_env_file")} \
+        if notify.get("telegram_env_file") is not None else {}
+    try:
+        autopilot = delivery_autopilot.validate_config(
+            data.get("delivery_autopilot"), normalized, {k.casefold() for k in expected}, bool(credentials), provider_env)
+    except ValueError as exc:
+        raise DispatcherError(str(exc)) from exc
+    extra = {"delivery_autopilot": autopilot, "notify": notify}
+    if provider_env is not None:
+        extra["provider_env_file"] = provider_env
+    return {**credentials, **extra, 'aggregate_ledger': ledger, "delivery_expected_checks": {k.casefold(): v for k, v in expected.items()}, "queue": data["queue_repository"], "targets": normalized, "state": state,
             "poll": poll, "duration": duration, "calls": calls,
             "gh": str(data.get("gh_executable", "gh")),
             "pico": str(data.get("pico_executable", "pico"))}
@@ -255,7 +295,18 @@ def database(cfg: dict):
         repair_issue INTEGER PRIMARY KEY, parent_issue INTEGER NOT NULL,
         root_issue INTEGER NOT NULL, parent_head TEXT NOT NULL, digest TEXT NOT NULL)''')
     db.commit()
+    delivery_autopilot.initialize(db)
+    # Activity events already sent, so a transient observation gap does not announce a delivery twice.
+    db.execute('CREATE TABLE IF NOT EXISTS activity_marks (mark TEXT PRIMARY KEY, at TEXT NOT NULL)')
+    db.commit()
     return db
+
+
+def first_time(db: sqlite3.Connection, mark: str) -> bool:
+    """True once per mark, durably."""
+    cursor = db.execute('INSERT OR IGNORE INTO activity_marks VALUES (?, ?)', (mark, activity.now()))
+    db.commit()
+    return cursor.rowcount == 1
 
 
 def repair_parent(cfg: dict, db, parent_issue: int, task: Task) -> dict:
@@ -350,8 +401,11 @@ def approve(cfg: dict, number: int, mutate: bool, repair_of: int | None = None) 
             raise DispatcherError("approval cancelled")
         return task.digest
 
-    record_approval(cfg, number, mutate, typed, repair_of=repair_of)
+    task = record_approval(cfg, number, mutate, typed, repair_of=repair_of)
     print(f"Approved issue #{number}; eligible for dispatch after service starts.")
+    activity.emit(cfg, "approval", f"Approved queue #{number} ({'with code changes' if mutate else 'read-only'})",
+                  f"Target {task.repo}, digest {task.digest[:12]}, from the terminal.",
+                  f"https://github.com/{cfg['queue']}/issues/{number}", issue=number)
 
 
 def approval_states(cfg: dict) -> dict[int, dict]:
@@ -437,9 +491,11 @@ def classify(record: dict) -> str:
 def report(cfg: dict, db: sqlite3.Connection, row: sqlite3.Row) -> None:
     if row["reported"] == row["state"]:
         return
+    merge_note = ("Its delivery pull request is audited automatically and merged when the audit passes; "
+                  "no deployment was requested by the dispatcher.") if delivery_autopilot.settings(cfg, row['repo']) \
+        else "No automatic merge or deployment was requested by the dispatcher."
     body = (f"PICO dispatcher: **{row['state']}**\n\n"
-            f"Execution ID: `{row['execution_id']}`. "
-            "No automatic merge or deployment was requested by the dispatcher.")
+            f"Execution ID: `{row['execution_id']}`. " + merge_note)
     if row['state'] in {'blocked', 'partial', 'interrupted', 'launch_uncertain'}:
         body += '\n\nHuman action: inspect the execution evidence and resolve the blocker. A new attempt requires a fresh scoped approval.'
     try:
@@ -483,15 +539,26 @@ def reconcile_delivery(cfg: dict, db: sqlite3.Connection, row: sqlite3.Row) -> N
     except (DispatcherError, OSError, ValueError) as exc:
         notice(row['number'], 'delivery evidence unavailable', exc)
         item = delivery_observer.observe(row, {}, lambda _: None)
+    item = delivery_autopilot.overlay(cfg, db, item)
     previous = db.execute("SELECT projection FROM deliveries WHERE issue=?", (row["number"],)).fetchone()
+    old = {}
     if previous:
         try:
             old = json.loads(previous[0])
             if old.get("execution_id") == row["execution_id"] and old.get("reason") == item["reason"]:
                 item["first_seen"] = old.get("first_seen") or item["first_seen"]
         except (ValueError, TypeError):
-            pass
+            old = {}
     delivery_store.save(db, item)
+    if item['publication'] == 'observed' and type(item['pr_number']) is int:
+        mark = f"delivery_opened:{row['execution_id']}:{item['pr_number']}"
+        known = isinstance(old, dict) and old.get('execution_id') == row['execution_id'] \
+            and old.get('pr_number') == item['pr_number']
+        # A delivery already known before this poll (or before this feature) is marked, not announced.
+        if first_time(db, mark) and not known:
+            activity.emit(cfg, 'delivery_opened', f"Delivery PR opened: {item['repository']}#{item['pr_number']}",
+                          f"Queue #{row['number']} produced a pull request; checks: {item['checks']}.",
+                          item['pr_url'], issue=row['number'], pr=item['pr_number'], sha=item['head_sha'])
     handoff_comment(cfg, row, item)
 
 
@@ -559,6 +626,36 @@ def handoff_comment(cfg: dict, row: sqlite3.Row, item: dict) -> None:
         return
 
 
+FINISHED = {"completed", "partial", "blocked", "interrupted", "cancelled"}
+
+
+def run_finished(cfg: dict, row, state: str, record: dict | None) -> None:
+    """One activity event when an execution reaches a final state (never for the same state twice)."""
+    if state not in FINISHED or row["state"] == state:
+        return
+    record = record if isinstance(record, dict) else {}
+    blocker = record.get('error_code') or (record.get('run') or {}).get('blocker_code')
+    summary = f"Execution {state}" + (f": {blocker}" if isinstance(blocker, str) and re.fullmatch(r'[A-Z][A-Z0-9_]{0,100}', blocker) else "") \
+        + f". Target {row['repo']}."
+    activity.emit(cfg, "run_finished", f"Run {state}: queue #{row['number']}", summary,
+                  f"https://github.com/{cfg['queue']}/issues/{row['number']}", issue=row["number"])
+
+
+def autopilot_step(cfg: dict, db: sqlite3.Connection) -> None:
+    """Audit or merge at most one delivery; a failure here never stops the poll loop."""
+    if not cfg.get("delivery_autopilot"):
+        return
+    try:
+        env = target_env(cfg)
+        delivery_autopilot.step(
+            cfg, db,
+            gh_json=lambda args: command([cfg["gh"], *args], env=env),
+            gh_text=lambda args: command_text([cfg["gh"], *args], env=env, timeout=120),
+            read_issue=lambda number: issue_view(cfg, number))
+    except Exception as exc:  # noqa: BLE001 - logged; the next poll retries
+        print(f"pico-autopilot: step failed: {type(exc).__name__}: {str(exc)[:200]}", file=sys.stderr, flush=True)
+
+
 def tick(cfg: dict, db: sqlite3.Connection) -> None:
     rows = db.execute("SELECT * FROM approvals ORDER BY number").fetchall()
     for row in rows:
@@ -599,12 +696,14 @@ def tick(cfg: dict, db: sqlite3.Connection) -> None:
             db.execute("UPDATE approvals SET state='launching' WHERE number=?", (row["number"],))
             db.commit()
             row = db.execute("SELECT * FROM approvals WHERE number=?", (row["number"],)).fetchone()
+        record = None
         try:
             if row["state"] == "launching":
                 # Idempotent start recovers a crash after launch without launching a duplicate.
                 existing = None if fresh_intent else pico_action(cfg, row, 'status')
                 if existing is not None and existing.get('error_code') != 'EXECUTION_UNKNOWN':
                     state = 'launch_uncertain' if existing.get('error_code') else classify(existing)
+                    run_finished(cfg, row, state, existing)
                     db.execute('UPDATE approvals SET state=? WHERE number=?', (state, row['number']))
                     db.commit()
                     continue
@@ -614,18 +713,22 @@ def tick(cfg: dict, db: sqlite3.Connection) -> None:
                 else:
                     repair = db.execute('SELECT * FROM delivery_repairs WHERE repair_issue=?', (row['number'],)).fetchone()
                     if repair is None:
-                        state = classify(pico_action(cfg, row, "start", issue.objective))
+                        record = pico_action(cfg, row, "start", issue.objective)
+                        state = classify(record)
                     else:
                         fresh = repair_parent(cfg, db, repair['parent_issue'], issue)
                         if fresh['head_sha'] != repair['parent_head'] or issue.digest != repair['digest']:
                             state = 'stale'
                         else:
-                            state = classify(pico_action(cfg, row, 'start', issue.objective))
+                            record = pico_action(cfg, row, 'start', issue.objective)
+                            state = classify(record)
             else:
-                state = classify(pico_action(cfg, row, "status"))
+                record = pico_action(cfg, row, "status")
+                state = classify(record)
         except DispatcherError as exc:
             print(f"Issue #{row['number']}: {exc}", file=sys.stderr)
             continue  # transient errors are not terminal evidence
+        run_finished(cfg, row, state, record)
         db.execute("UPDATE approvals SET state=? WHERE number=?", (state, row["number"]))
         db.commit()
         current = db.execute("SELECT * FROM approvals WHERE number=?", (row["number"],)).fetchone()
@@ -633,6 +736,7 @@ def tick(cfg: dict, db: sqlite3.Connection) -> None:
             reconcile_delivery(cfg, db, current)
         else:
             report(cfg, db, current)
+    autopilot_step(cfg, db)
 
 
 MIN_GH = (2, 48, 0)  # first release with `gh api --paginate --slurp`, used by delivery observation
