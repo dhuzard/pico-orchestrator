@@ -122,9 +122,9 @@ reload"). As on the terminal, editing the issue later still makes the dispatcher
 mark the approval `stale` before launch.
 
 Not available from the Garden: repairs (`--repair-of` stays on the terminal), rejecting
-an issue, and starting or retrying a run. Every confirmed attempt is appended to
-`<state-dir>/garden-approvals.jsonl` (mode 0600) with the time, issue, digest, mode,
-login and result, never the issue text.
+an issue, and starting or retrying a run. Every preview (stage `preview`) and every
+confirmed attempt is appended to `<state-dir>/garden-approvals.jsonl` (mode 0600)
+with the time, issue, digest, mode, login and result, never the issue text.
 
 ### Identity, token and hosts
 
@@ -137,6 +137,12 @@ login and result, never the issue text.
   as `Origin: https://<host>.<tailnet>.ts.net`, in addition to the loopback names.
   It needs `--approvals` and `--require-tailscale-login`; Garden refuses to start
   otherwise.
+- A request whose `Host` is an allowed remote name is served only with exactly one
+  `Tailscale-User-Login` header naming an allowed login, on **every** endpoint: the
+  page, its scripts, `/api/runs`, `/api/deliveries`, approvals and feedback
+  (`APPROVAL_IDENTITY_REJECTED` otherwise). A remote POST must also carry
+  `Origin: https://<that same host>`; a loopback `Origin` on a remote `Host` is
+  refused (`CONTROL_ORIGIN_REJECTED`). Loopback requests keep their checks.
 - `--require-tailscale-login <login>` (repeatable): every approvals request, reads
   included, must carry exactly one `Tailscale-User-Login` header equal to one of
   these logins, and that login is the recorded actor. A loopback request without
@@ -148,9 +154,13 @@ login and result, never the issue text.
   `--token-file <absolute path>` keeps one token across restarts: a regular file
   owned by the service user with mode 0600, created when missing; a symlink, other
   owner or wider mode refuses to start. The token is then not printed in the log.
-- The `--allowed-host` origin is accepted only by `/api/approvals`. Delivery feedback
-  and workspace controls keep their loopback-only `Origin` check, so on the phone the
-  feedback box is refused (`CONTROL_ORIGIN_REJECTED`); send feedback from the server.
+  The file must be inside the PICO state directory (`--state-dir`, for example
+  `~/.local/state/pi-coding-orchestrator/garden-token`), which worker sandboxes
+  cannot read: workers run as the same OS user, so a token elsewhere (such as
+  `~/.config/…`) would let a worker drive the Garden. A path outside it refuses to start.
+- The `--allowed-host` origin is accepted by `/api/approvals` and, with a verified
+  Tailscale login, by `/api/delivery-feedback`, so feedback also works from the
+  phone. Workspace controls keep their loopback-only `Origin` check.
 - `--approvals` cannot be combined with `--workspace` or `--setup-root`. It can be
   combined with `--feedback`; both share one session token.
 
@@ -164,12 +174,13 @@ login and result, never the issue text.
    trailing dot) for the host, and `tailscale whois <phone tailnet IP>` for your login.
 3. Write `/etc/pico/garden.env` (no secret in it):
    `PICO_GARDEN_HOST=<host>.<tailnet>.ts.net` and `PICO_GARDEN_LOGIN=<login>`.
-4. Review and install `deploy/systemd/pico-garden.service`, then
+4. Review and install `deploy/systemd/pico-garden.service` (its `User=` must be the
+   user of `pico-dispatcher.service`: Garden opens the 0600 dispatcher database), then
    `sudo systemctl daemon-reload && sudo systemctl enable --now pico-garden.service`.
    It runs `watch.py --all --approvals --feedback --token-file …` as the service user.
 5. `sudo tailscale serve --bg https / http://127.0.0.1:8765` (check it with
    `tailscale serve status`; undo with `sudo tailscale serve reset`).
-6. As the service user, read the token: `cat ~/.config/pi-coding-orchestrator/garden-token`.
+6. As the service user, read the token: `cat ~/.local/state/pi-coding-orchestrator/garden-token`.
    On the phone, open and bookmark `https://<host>.<tailnet>.ts.net/#token=<token>`.
    The page removes the token from the address bar after loading, so reopen the
    bookmark rather than reloading. Rotate the token by deleting the file and

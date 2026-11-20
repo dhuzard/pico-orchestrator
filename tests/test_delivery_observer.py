@@ -105,6 +105,30 @@ class DeliveryTest(unittest.TestCase):
         # The rollup stays the primary source whenever the token can read it.
         self.assertEqual(self.observe()['evidence']['checks_source'], 'check_rollup')
 
+    def test_an_observation_error_keeps_the_partial_evidence_gathered_before_it(self):
+        def job(sha):
+            return {'name': 'test', 'status': 'completed', 'conclusion': 'success', 'head_sha': sha}
+        # Actions evidence for another commit is refused after base, rules and checks_source were observed.
+        runs = [{'id': 1, 'event': 'pull_request', 'head_sha': self.sha}]
+        item = self.observe_with(self.actions_call(runs, {1: [job('b' * 40)]}))
+        self.assertEqual(item['checks'], 'unavailable')
+        self.assertEqual({key: item['evidence'][key] for key in ('base', 'rules', 'checks_source')},
+                         {'base': 'main', 'rules': 'branch_protection_observed', 'checks_source': 'actions'})
+        self.assertIn('observation_error', item['evidence'])
+        self.assertIn('observation_operation', item['evidence'])
+        # The stored projection keeps both the partial evidence and the classified cause.
+        cfg = {'state': self.path / 'store.sqlite3'}
+        with dispatch.database(cfg) as db:
+            store.save(db, item)
+            db.commit()
+        stored = store.list_deliveries(cfg['state'])[0]['evidence']
+        self.assertEqual(stored, item['evidence'])
+        # An error before anything was observed records only the cause, as before.
+        def failing(args):
+            raise RuntimeError('boom')
+        self.assertEqual(set(self.observe_with(failing)['evidence']),
+                         {'observation_error', 'observation_operation', 'observation_http_status'})
+
     def test_checks_fail_closed(self):
         for verdict, expected in [('SKIPPED', 'failed'), ('NEUTRAL', 'failed'), ('CANCELLED', 'failed')]:
             self.checks['statusCheckRollup'][0]['conclusion'] = verdict

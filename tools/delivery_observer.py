@@ -275,6 +275,7 @@ def observe(row, record, call, expected=None):
         head = pr['head']['sha']
         base = pr['base']['ref']
         item['head_sha'] = head
+        item['evidence']['base'] = base  # partial evidence survives a later observation error
         if integrated_head is None or head != integrated_head:
             item.update(checks='stale', review='stale', reason='PR head is not bound to a unique integrated commit', next_action='Inspect publication and integrated commit')
             return item
@@ -303,12 +304,15 @@ def observe(row, record, call, expected=None):
                 rules_status = 'unknown'
         except Exception:
             rules_status = 'unknown'
+        item['evidence']['rules'] = rules_status
         try:
             checks = call(['pr', 'view', str(number), '--repo', repo, '--json', 'number,headRefOid,statusCheckRollup'])
             rollup, checks_source = (checks.get('statusCheckRollup') if isinstance(checks, dict) else None), 'check_rollup'
         except Exception:
             # Typically a fine-grained token without Checks permission; the fallback is bound to `head`.
+            item['evidence']['checks_source'] = 'actions'
             checks, rollup, checks_source = {'number': number, 'headRefOid': head}, actions_checks(repo, head, call), 'actions'
+        item['evidence']['checks_source'] = checks_source
         reviews = call(['api', '--paginate', '--slurp', f'{endpoint}/reviews'])
         if isinstance(reviews, list) and all(isinstance(page, list) for page in reviews):
             reviews = [r for page in reviews for r in page]
@@ -343,6 +347,8 @@ def observe(row, record, call, expected=None):
         what, action = OBSERVATION_ERRORS[cause]
         item.update(checks='unavailable', review='unknown', reason=f'GitHub observation unavailable: {what} ({cause})',
                     next_action=action)
-        item['evidence'] = {'observation_error': cause, 'observation_operation': last['operation'],
+        # Merge, not replace: keep what was observed before the error (base, checks_source, rules).
+        item['evidence'] = {**(item.get('evidence') or {}), 'observation_error': cause,
+                            'observation_operation': last['operation'],
                             'observation_http_status': str(status) if status is not None else 'none'}
     return item

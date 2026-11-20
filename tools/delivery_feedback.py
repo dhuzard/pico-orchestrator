@@ -52,8 +52,13 @@ class DeliveryFeedback:
     remembered for the session: the same text cannot be sent twice to the same commit by mistake."""
 
     def __init__(self, port: int, dispatcher_state: Path, *, repository: str | None = None,
-                 audit_path: Path | None = None, adapter=github_sync, token: str | None = None):
+                 audit_path: Path | None = None, adapter=github_sync, token: str | None = None,
+                 allowed_hosts=(), required_logins=()):
         self.port = port
+        self.allowed_hosts = frozenset(allowed_hosts)
+        self.required_logins = frozenset(required_logins)
+        if self.allowed_hosts and not self.required_logins:
+            raise ValueError("remote feedback (--allowed-host) needs --require-tailscale-login")
         self.dispatcher_state = Path(dispatcher_state)
         self.repository = repository
         self.audit_path = audit_path
@@ -68,7 +73,12 @@ class DeliveryFeedback:
         garden_controls.check_session_token(headers, self.token)
 
     def authorize(self, headers, body: bytes) -> dict:
-        return garden_controls.authorize_json(headers, body, port=self.port, token=self.token)
+        """Loopback origin as before; the https origin of an allowed host only with a verified Tailscale login."""
+        data = garden_controls.authorize_json(headers, body, port=self.port, token=self.token,
+                                              allowed_hosts=self.allowed_hosts)
+        if not garden_controls.origin_allowed(headers.get("Origin"), self.port):
+            garden_controls.tailscale_login(headers, self.required_logins)
+        return data
 
     # -- the action ----------------------------------------------------------
     def act(self, data: dict) -> dict:

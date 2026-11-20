@@ -6,6 +6,7 @@ After=network-online.target
 
 [Service]
 Type=simple
+# Must match User= in pico-garden.service: both open the 0600 dispatcher database.
 User=dhuzard
 Environment=HOME=/home/dhuzard
 Environment=PATH=/home/dhuzard/.local/bin:/usr/local/bin:/usr/bin:/bin
