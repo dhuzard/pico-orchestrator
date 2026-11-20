@@ -8,6 +8,7 @@
   <link rel="stylesheet" href="/style.css">
   <script src="/issues.js" defer></script>
   <script src="/deliveries.js" defer></script>
+  <script src="/approvals.js" defer></script>
   <script src="/app.js" defer></script>
 </head>
 <body>
@@ -17,6 +18,11 @@
       <div class="top-actions"><span id="connection" class="connection"><span class="pulse"></span> Connecting</span><button id="pause" class="quiet-button" type="button">Pause updates</button></div>
     </header>
     <main>
+      <section id="approvals-panel" class="panel approvals-panel" aria-labelledby="approvals-title" hidden>
+        <div class="section-heading"><div><p class="eyebrow">DISPATCHER QUEUE</p><h2 id="approvals-title">Approvals</h2></div><button id="approvals-reload" class="quiet-button" type="button">Reload</button></div>
+        <p id="approvals-meta" class="detail-note"></p>
+        <div id="approvals-list" aria-live="polite"></div>
+      </section>
       <section id="delivery-panel" class="panel delivery-panel" aria-labelledby="delivery-title" hidden>
         <div class="section-heading"><div><p class="eyebrow">NEXT DECISIONS</p><h2 id="delivery-title">Delivery attention</h2></div><span id="delivery-connection" class="soft-count">Read-only</span></div>
         <div class="view-switch delivery-filters" role="group" aria-label="Delivery filter"><button class="view-button selected" type="button" data-delivery-filter="attention" aria-pressed="true">Needs attention</button><button class="view-button" type="button" data-delivery-filter="running" aria-pressed="false">Waiting on checks</button><button class="view-button" type="button" data-delivery-filter="history" aria-pressed="false">History</button></div>

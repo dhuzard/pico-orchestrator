@@ -98,7 +98,89 @@ python3 tools/issue_dispatcher.py --config ~/.config/pi-coding-orchestrator/disp
 python3 -m unittest discover -s tests -p test_issue_dispatcher.py -v
 ```
 
-`approve` requires a local interactive terminal and typing the exact task fingerprint prefix. The service itself never self-approves. `--allow-mutation` permits mutations already authorized by the target's autonomy policy; it is *not* limited to code edits by this adapter. **Keep push, PR, merge and deploy disabled in the target policy unless separately reviewing an expanded authority scope.** Do not expose the approval CLI through Moltis or Telegram.
+`approve` requires a local interactive terminal and typing the exact task fingerprint prefix. The only other way to approve is the opt-in Garden approval described in [Approving from the Garden over Tailscale](#approving-from-the-garden-over-tailscale), which calls the same approval core after a previewed, identity-bound confirmation. The service itself never self-approves. `--allow-mutation` permits mutations already authorized by the target's autonomy policy; it is *not* limited to code edits by this adapter. **Keep push, PR, merge and deploy disabled in the target policy unless separately reviewing an expanded authority scope.** Do not expose the approval CLI through Moltis or Telegram.
+
+## Approving from the Garden over Tailscale
+
+`pico watch --approvals --dispatcher-config <dispatcher.json>` adds an **Approvals**
+panel to the Garden: the open `pico:queued` issues of the queue repository, each
+with its number, title, target, objective and acceptance criteria (collapsible),
+the first 12 characters of its digest, any reason it cannot be approved, and the
+dispatcher's current state for it. Only an issue that was never dispatched (no
+approval yet, or `approved` / `stale`) shows **Approve read-only** and **Approve
+with code changes** (the Garden's name for `--allow-mutation`).
+
+Both buttons open a preview first. The Garden re-reads the issue with the queue
+credential and shows the target, checkout, the mode in bold, the full digest and
+the login that will be recorded. Confirming re-reads the issue again and calls
+`record_approval`, the same function `approve` uses: the same parse and allowlist,
+the same refusal of a dispatched task under `BEGIN IMMEDIATE`, and the same
+`approvals` row (no schema change). The confirmation is an HMAC over the action,
+issue number, digest, target, checkout, mode and login, recomputed on the live
+issue; anything that moved is refused as `CONTROL_PREVIEW_STALE` ("Issue changed,
+reload"). As on the terminal, editing the issue later still makes the dispatcher
+mark the approval `stale` before launch.
+
+Not available from the Garden: repairs (`--repair-of` stays on the terminal), rejecting
+an issue, and starting or retrying a run. Every confirmed attempt is appended to
+`<state-dir>/garden-approvals.jsonl` (mode 0600) with the time, issue, digest, mode,
+login and result, never the issue text.
+
+### Identity, token and hosts
+
+- Garden still listens on `127.0.0.1` only. Remote access is
+  [Tailscale Serve](https://tailscale.com/docs/features/tailscale-serve) proxying HTTPS from
+  `https://<host>.<tailnet>.ts.net` to the loopback port. Serve sets
+  `Tailscale-User-Login` to the tailnet user of the requesting device and replaces
+  any copy the client sent. Do not use Tailscale Funnel.
+- `--allowed-host <host>.<tailnet>.ts.net` (repeatable) is accepted as `Host` and
+  as `Origin: https://<host>.<tailnet>.ts.net`, in addition to the loopback names.
+  It needs `--approvals` and `--require-tailscale-login`; Garden refuses to start
+  otherwise.
+- `--require-tailscale-login <login>` (repeatable): every approvals request, reads
+  included, must carry exactly one `Tailscale-User-Login` header equal to one of
+  these logins, and that login is the recorded actor. A loopback request without
+  the header is refused too. Use the login `tailscale whois <phone tailnet IP>`
+  prints (with GitHub sign-in it looks like `dhuzard@github`). Without this flag
+  (loopback only), the actor is recorded as `local-token`.
+- The session token is still required for every data read and every write. It
+  stops other local users, who could reach the loopback port and forge the header.
+  `--token-file <absolute path>` keeps one token across restarts: a regular file
+  owned by the service user with mode 0600, created when missing; a symlink, other
+  owner or wider mode refuses to start. The token is then not printed in the log.
+- The `--allowed-host` origin is accepted only by `/api/approvals`. Delivery feedback
+  and workspace controls keep their loopback-only `Origin` check, so on the phone the
+  feedback box is refused (`CONTROL_ORIGIN_REJECTED`); send feedback from the server.
+- `--approvals` cannot be combined with `--workspace` or `--setup-root`. It can be
+  combined with `--feedback`; both share one session token.
+
+### Setup
+
+1. Install Tailscale on the server and the phone, and sign both in to the same
+   tailnet: `curl -fsSL https://tailscale.com/install.sh | sh`, then
+   `sudo tailscale up`. Enable MagicDNS and HTTPS certificates for the tailnet in
+   the admin console. Restrict the tailnet ACL so only your devices reach the server.
+2. Find the names: `tailscale status --json | jq -r .Self.DNSName` (drop the
+   trailing dot) for the host, and `tailscale whois <phone tailnet IP>` for your login.
+3. Write `/etc/pico/garden.env` (no secret in it):
+   `PICO_GARDEN_HOST=<host>.<tailnet>.ts.net` and `PICO_GARDEN_LOGIN=<login>`.
+4. Review and install `deploy/systemd/pico-garden.service`, then
+   `sudo systemctl daemon-reload && sudo systemctl enable --now pico-garden.service`.
+   It runs `watch.py --all --approvals --feedback --token-file …` as the service user.
+5. `sudo tailscale serve --bg https / http://127.0.0.1:8765` (check it with
+   `tailscale serve status`; undo with `sudo tailscale serve reset`).
+6. As the service user, read the token: `cat ~/.config/pi-coding-orchestrator/garden-token`.
+   On the phone, open and bookmark `https://<host>.<tailnet>.ts.net/#token=<token>`.
+   The page removes the token from the address bar after loading, so reopen the
+   bookmark rather than reloading. Rotate the token by deleting the file and
+   restarting the service.
+
+This implements the identity requirement of the
+[remote Garden ADR](remote-garden-adr.md) for this one action: an approval needs
+an allowed Tailscale login plus the session token, an exact preview and a
+state-bound, single-use confirmation. Device enrollment, revocation inside Garden
+and a read-only monitor role are not built; revoke a lost phone in the Tailscale
+admin console and rotate the token.
 
 ## Independently supervised systemd service (not enabled)
 

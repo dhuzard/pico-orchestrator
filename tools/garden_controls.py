@@ -176,8 +176,31 @@ def _safe_policy_location(path: Path) -> Path:
     return top
 
 
-def host_allowed(host: str | None, port: int) -> bool:
-    return host in {f"127.0.0.1:{port}", f"localhost:{port}"}
+HOSTNAME_RE = re.compile(r"^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$")
+
+
+def normalize_allowed_host(name: str) -> str:
+    """A fully qualified HTTPS host name the operator allows in addition to loopback, or ValueError."""
+    value = str(name).strip().lower().rstrip(".")
+    if not HOSTNAME_RE.fullmatch(value):
+        raise ValueError(f"not a fully qualified host name: {name!r}")
+    return value
+
+
+def host_allowed(host: str | None, port: int, allowed_hosts=()) -> bool:
+    """Loopback Host for this port, or an allowed HTTPS name (as proxied by Tailscale Serve, default port 443)."""
+    if host in {f"127.0.0.1:{port}", f"localhost:{port}"}:
+        return True
+    if not host or not allowed_hosts:
+        return False
+    name = host.lower()
+    name = name[:-4] if name.endswith(":443") else name
+    return name in allowed_hosts
+
+
+def origin_allowed(origin: str | None, port: int, allowed_hosts=()) -> bool:
+    return origin in {f"http://127.0.0.1:{port}", f"http://localhost:{port}"} or \
+        (origin is not None and origin in {f"https://{name}" for name in allowed_hosts})
 
 
 def check_session_token(headers, token: str) -> None:
@@ -187,10 +210,12 @@ def check_session_token(headers, token: str) -> None:
         raise ControlError(403, "CONTROL_TOKEN_INVALID", "open the Garden from the URL printed at launch")
 
 
-def authorize_json(headers, body: bytes, *, port: int, token: str) -> dict:
-    """Same-origin, token-bearing, size-bounded JSON object, or ControlError."""
-    origin = headers.get("Origin")
-    if origin not in {f"http://127.0.0.1:{port}", f"http://localhost:{port}"}:
+def authorize_json(headers, body: bytes, *, port: int, token: str, allowed_hosts=()) -> dict:
+    """Same-origin, token-bearing, size-bounded JSON object, or ControlError.
+
+    `allowed_hosts` is empty for every existing control; only Garden approvals,
+    which also require a Tailscale identity, accept an HTTPS origin."""
+    if not origin_allowed(headers.get("Origin"), port, allowed_hosts):
         raise ControlError(403, "CONTROL_ORIGIN_REJECTED", "actions must come from this Garden page")
     check_session_token(headers, token)
     if (headers.get("Content-Type") or "").split(";")[0].strip() != "application/json":

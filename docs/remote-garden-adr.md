@@ -2,6 +2,8 @@
 
 Status: proposed architecture for [#90](https://github.com/dhuzard/pico-orchestrator/issues/90), R0. Reviewed against the local Garden implementation on 2026-10-30. This decision does **not** enable remote access.
 
+Update 2026-11-20: one action is now available remotely, approving a dispatcher queue issue (`pico watch --approvals`, see [Approving from the Garden over Tailscale](issue-dispatcher.md#approving-from-the-garden-over-tailscale)). It uses Tailscale Serve as the single identity source: Garden stays on loopback, accepts the `Tailscale-User-Login` header only for logins named with `--require-tailscale-login`, still requires the session token (which keeps other local users from forging the header on the loopback hop), and accepts the Tailscale host only through an explicit `--allowed-host`. Each approval is previewed, bound by HMAC to the issue digest, target, checkout, mode and login, rechecked against the live issue, single-use and audited. This is not the general gateway described below: there is no enrollment, Garden-side revocation or role model, and every other control stays loopback-only.
+
 ## Decision
 
 Keep `pico watch` bound to `127.0.0.1` by default. Build remote access as a separate, explicitly enabled gateway that accepts only authenticated private HTTPS connections, provides a read-only role first, and forwards a narrow, sanitized Garden API. Prefer a private overlay with HTTPS (Tailscale Serve is one candidate) for the first pilot. A deliberate SSH tunnel can be supported for a single operator, but the tunnel alone does not provide Garden user or device authorization. Do not use Tailscale Funnel, public port forwarding, `0.0.0.0` on Garden, or a copied local Garden URL as a shortcut.
