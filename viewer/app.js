@@ -1146,6 +1146,22 @@ async function startApproval(item, mode) {
   };
 }
 $("approvals-reload").addEventListener("click", () => refreshApprovals(true));
+// pico watch --approvals: recent dispatcher activity (approvals, runs, audits, merges, deploys).
+const feedState = { fetchedAt: 0, enabled: true };
+async function refreshActivity(force = false) {
+  if (!feedState.enabled || (!force && Date.now() - feedState.fetchedAt < 30000)) return;
+  feedState.fetchedAt = Date.now();
+  let data;
+  try {
+    const response = await fetch("/api/activity", { cache: "no-store", headers: tokenHeaders() });
+    data = await response.json().catch(() => ({ ok: false, error_code: `HTTP_${response.status}` }));
+    if (response.status === 404 && data.error_code === "ACTIVITY_OFF") { feedState.enabled = false; $("activity-panel").hidden = true; return; }
+    if (data.error_code === "CONTROL_TOKEN_INVALID") data = { ok: false, tokenMissing: true };
+  } catch { data = { ok: false, error: "The Garden server did not answer." }; }
+  $("activity-panel").hidden = false;
+  globalThis.PicoActivity.render($("feed-list"), data);
+}
+$("feed-reload").addEventListener("click", () => refreshActivity(true));
 async function refreshIssues(force = false) {
   if (!force && Date.now() - issueState.fetchedAt < 30000) return;
   issueState.fetchedAt = Date.now();
@@ -1174,6 +1190,7 @@ async function refresh() {
     refreshIssues();  // not awaited: a slow gh call must not hold up the live run view
     refreshDeliveries();
     refreshApprovals();
+    refreshActivity();
     applyMode();
     state.label = state.workspaceMode ? `Child runs of workspace ${state.workspaceId || ""}` : data.repository;
     render(state.label);

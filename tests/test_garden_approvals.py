@@ -118,6 +118,12 @@ class ApprovalCoreTest(ApprovalsBase):
         done = self.confirm(garden, shown, "local-mutation")
         self.assertEqual((done["ok"], done["stage"], done["status"]), (True, "done", "APPROVED"), done)
         self.assertEqual(self.row(), self.row(cli_cfg))
+        # Both approvals are reported in the activity log, after the fact; neither carries the issue text.
+        events = [json.loads(line) for line in (self.root / "activity.jsonl").read_text().splitlines()]
+        self.assertEqual([(e["kind"], e["issue"]) for e in events], [("approval", 7), ("approval", 7)])
+        self.assertIn("from the terminal", events[0]["summary"])
+        self.assertIn("in the Garden by local-token", events[1]["summary"])
+        self.assertNotIn("Add validation tests", json.dumps(events))
 
     def test_audit_line_records_time_issue_digest_mode_actor_and_result(self):
         garden = self.approvals()

@@ -1,0 +1,20 @@
+{
+  "queue_repository": "dhuzard/pico-tasks",
+  "targets": {"Neuronautix/metadatapp": "/home/pico/metadatapp-target"},
+  "poll_seconds": 60,
+  "max_duration_seconds": 1200,
+  "max_lead_calls": 20,
+  "state_path": "/home/pico/.local/state/pi-coding-orchestrator/issue-dispatcher.sqlite3",
+  "gh_executable": "/usr/bin/gh",
+  "pico_executable": "/home/pico/.local/bin/pico",
+  "queue_token_file": "/home/pico/.config/pi-coding-orchestrator/queue-token",
+  "target_gh_config_dir": "/home/pico/.config/pi-coding-orchestrator/target-gh",
+  "delivery_expected_checks": {
+    "Neuronautix/metadatapp": ["Continuous Integration", "Bootstrap from a fresh clone", "Check declarations are current"]
+  },
+  "provider_env_file": "/home/pico/.config/pi-coding-orchestrator/provider-api.env",
+  "delivery_autopilot": {
+    "Neuronautix/metadatapp": {"merge_method": "merge", "model": "claude-opus-5-5", "max_diff_bytes": 150000}
+  },
+  "notify": {"telegram_env_file": "/home/pico/.local/state/pi-coding-orchestrator/telegram.env"}
+}

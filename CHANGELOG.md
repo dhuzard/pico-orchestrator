@@ -8,6 +8,21 @@ All notable changes to PICO are recorded here. The format follows
 
 ### Added
 
+- Opt-in automatic audit and merge of the dispatcher's own delivery PRs
+  (`delivery_autopilot` per target in `dispatcher.json`). Once every expected check
+  passed on the current head, deterministic pre-checks run (diff size; no `.github/`,
+  `.pi/`, `CODEOWNERS`, `.env` or secret-like paths; no fork; approved issue
+  unchanged), then one Anthropic Messages API audit with structured output, the
+  issue, PR text and diff marked untrusted. The pass rule is applied in code. A pass
+  posts the report and merges with `gh pr merge --match-head-commit`; a fail posts
+  the report and shows `audit_failed`. At most three attempts per head SHA. New
+  `delivery_audits` table (additive) and delivery states `auditing` and
+  `audit_failed`. Without the setting nothing changes.
+- Activity log `<state dir>/activity.jsonl` (approvals, finished runs, delivery PRs,
+  audits, merges, deploys), a **Recent activity** Garden panel (`GET /api/activity`)
+  and optional send-only Telegram notices (`notify.telegram_env_file`). New CLI
+  `tools/activity.py emit` for external tools such as the deploy script. Template
+  `deploy/dispatcher.json.template`.
 - Opt-in Garden approval of dispatcher queue issues (`pico watch --approvals
   --dispatcher-config <file>`), usable from a phone through Tailscale Serve. The
   terminal `approve` and the Garden call one shared approval core

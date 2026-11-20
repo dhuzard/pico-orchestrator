@@ -9,6 +9,7 @@
   <script src="/issues.js" defer></script>
   <script src="/deliveries.js" defer></script>
   <script src="/approvals.js" defer></script>
+  <script src="/activity.js" defer></script>
   <script src="/app.js" defer></script>
 </head>
 <body>
@@ -18,6 +19,10 @@
       <div class="top-actions"><span id="connection" class="connection"><span class="pulse"></span> Connecting</span><button id="pause" class="quiet-button" type="button">Pause updates</button></div>
     </header>
     <main>
+      <section id="activity-panel" class="panel feed-panel" aria-labelledby="feed-title" hidden>
+        <div class="section-heading"><div><p class="eyebrow">WHAT HAPPENED</p><h2 id="feed-title">Recent activity</h2></div><button id="feed-reload" class="quiet-button" type="button">Reload</button></div>
+        <div id="feed-list" class="feed-list" aria-live="polite"></div>
+      </section>
       <section id="approvals-panel" class="panel approvals-panel" aria-labelledby="approvals-title" hidden>
         <div class="section-heading"><div><p class="eyebrow">DISPATCHER QUEUE</p><h2 id="approvals-title">Approvals</h2></div><button id="approvals-reload" class="quiet-button" type="button">Reload</button></div>
         <p id="approvals-meta" class="detail-note"></p>

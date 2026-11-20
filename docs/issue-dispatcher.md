@@ -210,7 +210,7 @@ The unit has **no dependency on `moltis.service`**. It runs as `dhuzard`, so pro
 
 - A private queue repository is an optional separate project; this PR neither creates it nor changes target projects.
 - No automatic issue discovery beyond operator approval (`approve --issue N`). Approved jobs are stored in SQLite and polled. Only one runs at a time; it does not yet implement #34 dependencies or merge-gating.
-- No automatic draft PR, merge, deployment, permission escalation, task creation or autostart on installation.
+- No automatic draft PR, deployment, permission escalation, task creation or autostart on installation. No automatic merge unless a target opts in to `delivery_autopilot` (see [Automatic audit and merge of deliveries](#automatic-audit-and-merge-of-deliveries)).
 - Status is written as GitHub issue comments when possible. Comment delivery is retried on failure, but a crash between comment and local checkpoint can duplicate a status comment.
 - Task authorization is a local exact-title/body digest, not a cryptographic statement about human identity against a compromised same-user process. Store state and credentials with strict permissions. Any lead capable of reading the local state or GitHub credentials remains part of the threat model.
 - `interrupted` is terminal for this prototype; no unattended retries, no resume, no automatic expansion of permissions. A new issue and new explicit approval is required for a new execution attempt.
@@ -258,7 +258,8 @@ list. `pico watch --all` reads the default dispatcher database and shows a
 read-only Delivery attention panel with Needs attention, Waiting on checks and
 History views. `--dispatcher-state /absolute/path/state.sqlite3` selects another
 database; the existing loopback and control-token protections still apply. GitHub
-links open the native review surface; Garden does not approve or merge a PR.
+links open the native review surface; Garden does not approve or merge a PR
+(a target with `delivery_autopilot` is merged by the dispatcher, not by the Garden).
 
 ### Quick feedback from the Garden
 
@@ -307,3 +308,129 @@ shared headless launch lock. Workspace parallelism remains separately governed.
 This boundary is local cooperative admission, not isolation from a malicious
 same-user process. No live ledger or automatic repair policy is enabled by
 installing these changes.
+
+## Automatic audit and merge of deliveries
+
+For a target listed in `delivery_autopilot`, there is no human merge gate: an
+automated audit decides, a pass merges the pull request, and the person is told
+afterwards (activity log, Garden, Telegram). Nobody has to read the code. A target
+that is not listed behaves exactly as before: the dispatcher never merges.
+
+```json
+"provider_env_file": "/home/pico/.config/pi-coding-orchestrator/provider-api.env",
+"delivery_autopilot": {
+  "Neuronautix/metadatapp": {"merge_method": "merge", "model": "claude-opus-5-5", "max_diff_bytes": 150000}
+}
+```
+
+The three per-target settings are optional and default to the values shown. The
+target must also have `delivery_expected_checks` and separate target credentials
+(`target_gh_config_dir`), and `provider_env_file` must be set; the dispatcher refuses
+to start otherwise. `provider_env_file` is a `KEY=VALUE` file, mode 0600, owned by
+the service user. Only `ANTHROPIC_API_KEY` is read, by the dispatcher process itself,
+at audit time, and sent only in the `x-api-key` header of the audit request: it is
+never put in the environment of `gh`, `pico` or any child, and never logged. An
+unreadable or missing key postpones the audit (one journal line) without using an
+attempt. PICO's configuration directory is already denied to workers.
+
+On each poll, after observing deliveries, the dispatcher acts on at most one
+delivery. It is eligible only when:
+
+- the queue issue has an approval whose execution `completed`, with the same
+  execution id as the delivery (the dispatcher's own run);
+- the observer bound the PR to that run's publication evidence, the PR is open
+  and not a draft, and both its head and base repositories are the target (no fork);
+- every expected check passed on the PR's **current** head, and no human requested
+  changes;
+- that head SHA has no final audit yet. Audits are recorded per head SHA, so the
+  same commit is never audited, or merged, twice.
+
+A draft or moved PR is re-checked on later polls and shown as "Not audited
+automatically yet".
+
+**Deterministic pre-checks** run first; a failure is final for that head and makes
+no model call. The diff must be at most `max_diff_bytes`. No changed path (renames
+included) may be under `.github/` or `.pi/`, be a `CODEOWNERS` file or an `.env`
+file, or be named like a secret, credential or key (`*secret*`, `*credential*`,
+`*.pem`, `*.key`, `id_rsa`, `.netrc` and similar). GitHub must list every changed
+file. The queue issue must still match the digest that was approved: after an edit,
+the approved task text is no longer available.
+
+**The model audit** is one Anthropic Messages API request (`model`, default
+`claude-opus-5-5`, effort `high`) with structured output: a JSON schema the answer
+must match (`verdict` pass|fail, `risk`, a 3 to 5 sentence plain-language `summary`,
+`intent_matches`, one `acceptance_criteria_met` entry per criterion with evidence,
+and `findings` with severity critical|high|medium|low|info, title, file, line and
+detail). The input is THE TASK (title, Objective and Acceptance criteria of the
+approved queue issue), the PR title and body, the unified diff and a CI summary.
+The system prompt states that the issue, the PR text and the diff are untrusted
+data and that any instruction inside them must be ignored. Each of them is wrapped
+in a tag carrying a random nonce, so text inside cannot close the block.
+
+**The pass rule is applied by the dispatcher, not the model:** verdict `pass`, and
+`intent_matches`, and every acceptance criterion met (at least one assessed), and
+no critical or high finding, and the pre-checks passed.
+
+- **Pass:** the report is posted as a PR comment, then the PR is merged with
+  `gh pr merge <n> --merge --match-head-commit <audited sha>` using the target
+  credentials. GitHub refuses the merge if the head moved; the dispatcher also
+  re-reads the PR first and never merges a head other than the audited one. The
+  merge commit and time are recorded. A refused merge is retried twice with
+  backoff, then the delivery becomes `audit_failed`.
+- **Fail:** the report is posted as a PR comment and the PR stays open. The
+  delivery shows `audit_failed` in the Garden and in the queue handoff comment. A
+  fix needs a new queue issue and approval.
+- **API or GitHub error:** retried after 5, then 10 minutes, at most three attempts
+  per head SHA; then `audit_failed` with the reason. An invalid or refused model
+  answer counts as an error. A refusal is not retried on another model.
+
+Every attempt records the model and its input and output tokens in the
+`delivery_audits` table of the dispatcher database (a new table; existing tables
+are unchanged). Delivery states gain `auditing` (queued, retrying or merging; shown
+under "Waiting on checks") and `audit_failed` (shown under "Needs attention"). A
+merged delivery says "Merged automatically after a passing audit".
+
+The audit is the only gate when the target has no branch protection (like
+Neuronautix/metadatapp). A wrong pass by the model is merged; the pre-checks keep
+workflow, agent-policy and credential files out of automatic merges.
+
+## Activity and notifications
+
+The dispatcher and the Garden append events to `<state dir>/activity.jsonl` (mode
+0600, one JSON object per line): `{at, kind, title, summary, url, issue?, pr?, sha?}`,
+where `kind` is `approval`, `run_finished`, `delivery_opened`, `audit_passed`,
+`audit_failed`, `merged`, `deploy` or `error`. Events come from a terminal or Garden
+approval, a run reaching a final state (with its blocker code), a delivery PR seen
+for the first time, an audit result, a merge and a refused merge. Issue bodies and
+diffs are never written.
+
+`pico watch --approvals --dispatcher-config …` serves the latest 50 events, newest
+first, at `GET /api/activity`, and shows them in a **Recent activity** panel at the
+top of the page. The endpoint needs the session token; on an `--allowed-host` name it
+also needs the allowed Tailscale login, like every endpoint.
+
+Optional Telegram notices, send-only:
+
+```json
+"notify": {"telegram_env_file": "/home/pico/.local/state/pi-coding-orchestrator/telegram.env"}
+```
+
+The file holds `PICO_TELEGRAM_BOT_TOKEN` and `PICO_TELEGRAM_CHAT_ID`, mode 0600,
+owned by the service user (a symlink is refused). Each event becomes one plain-text
+`sendMessage` to that chat: title, summary and URL. Pico never calls `getUpdates`
+and never acts on a message sent to the bot. A failed notice is logged (without the
+token) and never blocks the dispatcher. Keep the file in the state directory, which
+workers cannot read.
+
+External tools add events with:
+
+```bash
+python3 tools/activity.py emit --config ~/.config/pi-coding-orchestrator/dispatcher.json \
+  --kind deploy --title "Deployed abc1234" --summary "Pico abc1234 is live." \
+  --url https://github.com/dhuzard/pico-orchestrator/commit/abc1234
+```
+
+It appends the event and sends the notice; `--url` is optional and must be an
+absolute `https` URL. Run it as the service user (for example `sudo -u pico …` over
+SSH): the Telegram file must be owned by the user reading it, and a log created by
+another user could not be read by the Garden. `deploy/dispatcher.json.template` shows a complete configuration.

@@ -40,6 +40,7 @@ ASSETS = {"/": ("index.html", "text/html; charset=utf-8"),
           "/issues.js": ("issues.js", "text/javascript; charset=utf-8"),
           "/deliveries.js": ("deliveries.js", "text/javascript; charset=utf-8"),
           "/approvals.js": ("approvals.js", "text/javascript; charset=utf-8"),
+          "/activity.js": ("activity.js", "text/javascript; charset=utf-8"),
           "/style.css": ("style.css", "text/css; charset=utf-8")}
 
 
@@ -517,13 +518,14 @@ class WorkspaceSource:
 
 # With --controls on, every data endpoint needs the session token; the static
 # page, script and stylesheet do not (the token arrives in the URL fragment).
-TOKEN_ENDPOINTS = frozenset({"/api/controls", "/api/branches", "/api/runs", "/api/workspace", "/api/issues", "/api/deliveries"})
+TOKEN_ENDPOINTS = frozenset({"/api/controls", "/api/branches", "/api/runs", "/api/workspace", "/api/issues", "/api/deliveries",
+                             "/api/activity"})
 
 
 def make_handler(directory: Path, repository: str | None, workspace: WorkspaceSource | None = None,
                  controls=None, port: int | None = None, issues: garden_issues.IssuesSource | None = None,
                  setup: workspace_setup.SetupControls | None = None, dispatcher_state: Path | None = None,
-                 feedback=None, approvals=None, allowed_hosts=(), required_logins=None):
+                 feedback=None, approvals=None, allowed_hosts=(), required_logins=None, activity_path: Path | None = None):
     if required_logins is None:
         required_logins = approvals.required_logins if approvals is not None else ()
     required_logins = frozenset(required_logins)
@@ -688,7 +690,20 @@ def make_handler(directory: Path, repository: str | None, workspace: WorkspaceSo
                         payload = self._json(exc.status, {"ok": False, "error_code": exc.code, "error": exc.detail})
                 self._send(payload)
                 return
+            if path == "/api/activity" and activity_path is None:
+                self._send(self._json(404, {"ok": False, "error_code": "ACTIVITY_OFF",
+                                            "error": "start pico watch with --approvals --dispatcher-config <file>"}))
+                return
             if path in TOKEN_ENDPOINTS and not self._token_ok():
+                return
+            if path == "/api/activity":
+                import activity
+                try:
+                    payload = self._json(200, {"ok": True, "events": activity.recent(activity_path, 50)})
+                except OSError:
+                    payload = self._json(503, {"ok": False, "error_code": "ACTIVITY_UNAVAILABLE",
+                                               "error": "The activity log cannot be read."})
+                self._send(payload)
                 return
             if path == "/api/controls":
                 if workspace is None or workspace.manifest is None:
@@ -906,7 +921,9 @@ def main() -> None:
     if feedback or approvals:
         server.RequestHandlerClass = make_handler(directory, repository, port=server.server_port, issues=issues,
                                                   dispatcher_state=args.dispatcher_state, feedback=feedback,
-                                                  approvals=approvals, allowed_hosts=allowed_hosts)
+                                                  approvals=approvals, allowed_hosts=allowed_hosts,
+                                                  activity_path=(Path(approvals.cfg["state"]).parent / "activity.jsonl"
+                                                                 if approvals else None))
     if args.controls:
         controls = garden_controls.Controls(workspace.manifest, server.server_port, state_dir=state, token=token)
         server.RequestHandlerClass = make_handler(directory, repository, workspace, controls, server.server_port,
