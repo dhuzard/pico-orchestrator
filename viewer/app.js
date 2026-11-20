@@ -699,20 +699,24 @@ function renderWorkspaceSessions(data) {
 }
 function renderWorkspace(data) { renderWorkspaceOverview(data); renderWorkspaceBoard(data); renderWorkspaceAttention(data); renderWorkspaceTokens(data); renderWorkspaceSessions(data); renderControls(); setStatus(); }
 // Controls (pico watch --controls): every action previews first and runs only after confirmation.
-// The session token arrives in the launch URL's fragment and is kept in memory only.
-const controlState = { token: null, enabled: false, panels: null, fetchedAt: 0 };
+// The session token arrives in the launch URL's fragment; token.js strips it from the address bar
+// and remembers it in this browser, so a tokenless link to the Garden works later.
+const controlState = { token: globalThis.PicoToken.load(), enabled: false, panels: null, fetchedAt: 0 };
 // With controls on, the server also requires the token to read panels and branches.
 const tokenHeaders = () => controlState.token ? { "X-Pico-Token": controlState.token } : {};
-(() => {
-  const match = /(?:^#|&)token=([A-Za-z0-9_-]{20,})/.exec(location.hash);
-  if (match) { controlState.token = match[1]; history.replaceState(null, "", location.pathname); }
-})();
+// A refused token is forgotten here and in storage; the panels then ask for the URL printed at launch.
+function checkToken(data) {
+  if (globalThis.PicoToken.rejected(data) && controlState.token) {
+    globalThis.PicoToken.forget(); controlState.token = null; controlState.enabled = false;
+  }
+  return data;
+}
 async function refreshControls(force = false) {
   if (!force && Date.now() - controlState.fetchedAt < 10000) return;
   controlState.fetchedAt = Date.now();
   try {
     const response = await fetch("/api/controls", { cache: "no-store", headers: tokenHeaders() });
-    const data = await response.json();
+    const data = checkToken(await response.json());
     controlState.panels = data.ok ? data : null;
     controlState.enabled = Boolean(data.ok && data.enabled && controlState.token);
   } catch { controlState.panels = null; controlState.enabled = false; }
@@ -1059,6 +1063,7 @@ async function refreshDeliveries() {
     const response = await fetch("/api/deliveries", { cache: "no-store", headers: tokenHeaders() });
     if (response.status === 403) {
       // Started with --feedback (or --controls): reads need the session token from the launch URL.
+      checkToken(await response.json().catch(() => null));
       deliveryState.data = { ok: false, tokenMissing: true, deliveries: [] };
     } else {
       if (!response.ok) throw new Error("Delivery observations unavailable");
@@ -1081,7 +1086,7 @@ async function refreshApprovals(force = false) {
   let data;
   try {
     const response = await fetch("/api/approvals", { cache: "no-store", headers: tokenHeaders() });
-    data = await response.json().catch(() => ({ ok: false, error: "The Garden returned no answer." }));
+    data = checkToken(await response.json().catch(() => ({ ok: false, error: "The Garden returned no answer." })));
     if (response.status === 404 && data.error_code === "APPROVALS_OFF") { approvalState.enabled = false; $("approvals-panel").hidden = true; return; }
     if (data.error_code === "CONTROL_TOKEN_INVALID") data = { ok: false, tokenMissing: true };
     else if (data.error_code === "APPROVAL_IDENTITY_REJECTED") data = { ok: false, identityRejected: true, error: data.error };
@@ -1154,7 +1159,7 @@ async function refreshActivity(force = false) {
   let data;
   try {
     const response = await fetch("/api/activity", { cache: "no-store", headers: tokenHeaders() });
-    data = await response.json().catch(() => ({ ok: false, error_code: `HTTP_${response.status}` }));
+    data = checkToken(await response.json().catch(() => ({ ok: false, error_code: `HTTP_${response.status}` })));
     if (response.status === 404 && data.error_code === "ACTIVITY_OFF") { feedState.enabled = false; $("activity-panel").hidden = true; return; }
     if (data.error_code === "CONTROL_TOKEN_INVALID") data = { ok: false, tokenMissing: true };
   } catch { data = { ok: false, error: "The Garden server did not answer." }; }
@@ -1182,6 +1187,7 @@ async function refresh() {
     const response = await fetch("/api/runs", { cache: "no-store", headers: tokenHeaders() });
     // With controls on, every data endpoint needs the session token from the launch URL.
     state.tokenRequired = response.status === 403;
+    if (state.tokenRequired) checkToken(await response.json().catch(() => null));
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const data = await response.json();
     state.runs = data.runs || []; state.healthy = true;

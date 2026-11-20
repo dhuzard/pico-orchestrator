@@ -198,10 +198,16 @@ def load_config(path: Path) -> dict:
         raise DispatcherError("delivery_expected_checks must map allowed repositories to nonempty check name lists")
     provider_env = _absolute_file(data.get("provider_env_file"), "provider_env_file")
     notify = data.get("notify", {})
-    if not isinstance(notify, dict) or set(notify) - {"telegram_env_file"}:
-        raise DispatcherError("notify accepts only telegram_env_file")
+    if not isinstance(notify, dict) or set(notify) - {"telegram_env_file", "garden_url"}:
+        raise DispatcherError("notify accepts only telegram_env_file and garden_url")
+    garden = notify.get("garden_url")
     notify = {"telegram_env_file": _absolute_file(notify["telegram_env_file"], "notify.telegram_env_file")} \
         if notify.get("telegram_env_file") is not None else {}
+    if garden is not None:
+        try:
+            notify["garden_url"] = activity.garden_url(garden)
+        except activity.ActivityError as exc:
+            raise DispatcherError(str(exc)) from exc
     try:
         autopilot = delivery_autopilot.validate_config(
             data.get("delivery_autopilot"), normalized, {k.casefold() for k in expected}, bool(credentials), provider_env)
@@ -638,7 +644,42 @@ def run_finished(cfg: dict, row, state: str, record: dict | None) -> None:
     summary = f"Execution {state}" + (f": {blocker}" if isinstance(blocker, str) and re.fullmatch(r'[A-Z][A-Z0-9_]{0,100}', blocker) else "") \
         + f". Target {row['repo']}."
     activity.emit(cfg, "run_finished", f"Run {state}: queue #{row['number']}", summary,
-                  f"https://github.com/{cfg['queue']}/issues/{row['number']}", issue=row["number"])
+                  f"https://github.com/{cfg['queue']}/issues/{row['number']}", issue=row["number"],
+                  garden=state != "completed")
+
+
+def announce_approvals(cfg: dict, db: sqlite3.Connection) -> None:
+    """One `approval_needed` event per (queue issue, digest) that is valid and awaits an approval.
+
+    Only with notices configured (`notify`): it costs one `gh issue list` per poll. A task needs
+    approval when it has no approval row, or when its row is stale for an older version (the issue
+    was edited after an approval). An edited issue has a new digest, so it is announced again.
+    This only reports: it never approves, dispatches or comments. A failure never stops the poll."""
+    if not cfg.get("notify"):
+        return
+    try:
+        issues = queued_issues(cfg)
+    except DispatcherError as exc:
+        notice(0, 'queued issues unavailable for approval notices', exc)
+        return
+    _NOTICES.pop((0, 'queued issues unavailable for approval notices'), None)
+    garden = (cfg.get("notify") or {}).get("garden_url")
+    for item in issues:
+        try:
+            task = parse_task(item, cfg)
+            objective = task_sections(item["body"])["Objective"]
+        except (DispatcherError, KeyError, TypeError):
+            continue  # not approvable as written: nothing to ask the person
+        row = db.execute("SELECT digest, state FROM approvals WHERE number=?", (task.number,)).fetchone()
+        if row is not None and not (row["state"] == "stale" and row["digest"] != task.digest):
+            continue
+        if not first_time(db, f"approval_needed:{task.number}:{task.digest}"):
+            continue
+        brief = " ".join(objective.split())
+        brief = brief if len(brief) <= 200 else brief[:199].rstrip() + "…"
+        activity.emit(cfg, "approval_needed", f"Approval needed: #{task.number} {item.get('title') or ''}".strip(),
+                      f"Target {task.repo}. {brief}",
+                      garden or f"https://github.com/{cfg['queue']}/issues/{task.number}", issue=task.number)
 
 
 def autopilot_step(cfg: dict, db: sqlite3.Connection) -> None:
@@ -736,6 +777,7 @@ def tick(cfg: dict, db: sqlite3.Connection) -> None:
             reconcile_delivery(cfg, db, current)
         else:
             report(cfg, db, current)
+    announce_approvals(cfg, db)
     autopilot_step(cfg, db)
 
 

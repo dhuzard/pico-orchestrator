@@ -1,4 +1,4 @@
-// Recent dispatcher activity (`GET /api/activity`, with --approvals): approvals, finished runs,
+// Recent dispatcher activity (`GET /api/activity`, with --approvals): issues awaiting approval, approvals, finished runs,
 // delivery PRs, audit results, merges and deploys, newest first. Text only: titles and summaries
 // can carry model or issue text, so they are never parsed as HTML.
 (function (root) {
@@ -10,7 +10,7 @@
     return result;
   };
   const KINDS = {
-    approval: ["✅", "Approved"], run_finished: ["🏁", "Run finished"], delivery_opened: ["📬", "Delivery opened"],
+    approval_needed: ["🙋", "Approval needed"], approval: ["✅", "Approved"], run_finished: ["🏁", "Run finished"], delivery_opened: ["📬", "Delivery opened"],
     audit_passed: ["🔎", "Audit passed"], audit_failed: ["⛔", "Audit failed"], merged: ["🌱", "Merged"],
     deploy: ["🚀", "Deployed"], error: ["⚠️", "Error"],
   };

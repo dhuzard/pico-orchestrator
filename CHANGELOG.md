@@ -8,6 +8,17 @@ All notable changes to PICO are recorded here. The format follows
 
 ### Added
 
+- Garden links in notices: optional `notify.garden_url` in `dispatcher.json` (https,
+  no credentials, query or fragment, so never the session token). Telegram notices
+  for `approval_needed`, `audit_failed`, `error`, `delivery_opened` and a
+  `run_finished` that did not complete end with `Garden: <url>`.
+- Activity kind `approval_needed`: with notices configured, the dispatcher reports
+  each valid open `pico:queued` issue without an approval once per issue and digest
+  (an edited issue is announced again; marks in `activity_marks`). It never approves.
+- The Garden page remembers its session token in `localStorage` (per origin) after
+  opening the `#token=` link, so a plain Garden link works; a refused token is
+  forgotten and the page asks for the launch URL again (`viewer/token.js`).
+
 - Opt-in automatic audit and merge of the dispatcher's own delivery PRs
   (`delivery_autopilot` per target in `dispatcher.json`). Once every expected check
   passed on the current head, deterministic pre-checks run (diff size; no `.github/`,

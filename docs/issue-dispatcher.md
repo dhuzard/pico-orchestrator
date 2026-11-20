@@ -182,9 +182,10 @@ with the time, issue, digest, mode, login and result, never the issue text.
    `tailscale serve status`; undo with `sudo tailscale serve reset`).
 6. As the service user, read the token: `cat ~/.local/state/pi-coding-orchestrator/garden-token`.
    On the phone, open and bookmark `https://<host>.<tailnet>.ts.net/#token=<token>`.
-   The page removes the token from the address bar after loading, so reopen the
-   bookmark rather than reloading. Rotate the token by deleting the file and
-   restarting the service.
+   The page removes the token from the address bar and remembers it in this browser,
+   so later plain links (`https://<host>.<tailnet>.ts.net/`, as in notices) work too.
+   Rotate the token by deleting the file and restarting the service; the old one is
+   then refused, forgotten by the page, and the `#token=` link is needed again.
 
 This implements the identity requirement of the
 [remote Garden ADR](remote-garden-adr.md) for this one action: an approval needs
@@ -398,11 +399,21 @@ workflow, agent-policy and credential files out of automatic merges.
 
 The dispatcher and the Garden append events to `<state dir>/activity.jsonl` (mode
 0600, one JSON object per line): `{at, kind, title, summary, url, issue?, pr?, sha?}`,
-where `kind` is `approval`, `run_finished`, `delivery_opened`, `audit_passed`,
-`audit_failed`, `merged`, `deploy` or `error`. Events come from a terminal or Garden
-approval, a run reaching a final state (with its blocker code), a delivery PR seen
-for the first time, an audit result, a merge and a refused merge. Issue bodies and
-diffs are never written.
+where `kind` is `approval_needed`, `approval`, `run_finished`, `delivery_opened`,
+`audit_passed`, `audit_failed`, `merged`, `deploy` or `error`. Events come from a
+queue issue waiting for approval, a terminal or Garden approval, a run reaching a
+final state (with its blocker code), a delivery PR seen for the first time, an
+audit result, a merge and a refused merge. Issue bodies and diffs are never written.
+
+`approval_needed` is reported when notices are configured (`notify` is set): each
+poll the dispatcher lists the open `pico:queued` issues once more and, for each one
+that parses as a task for an allowed target and has no approval (or whose approval
+went stale because the issue changed), records one event per issue and digest:
+title "Approval needed: #N <title>", summary the target and the first 200
+characters of the Objective, URL the Garden (`notify.garden_url`) or else the
+issue. An edited issue has a new digest and is announced again; an invalid,
+approved or dispatched issue is not. Announcements are remembered in the
+`activity_marks` table. This never approves anything.
 
 `pico watch --approvals --dispatcher-config …` serves the latest 50 events, newest
 first, at `GET /api/activity`, and shows them in a **Recent activity** panel at the
@@ -412,7 +423,10 @@ also needs the allowed Tailscale login, like every endpoint.
 Optional Telegram notices, send-only:
 
 ```json
-"notify": {"telegram_env_file": "/home/pico/.local/state/pi-coding-orchestrator/telegram.env"}
+"notify": {
+  "telegram_env_file": "/home/pico/.local/state/pi-coding-orchestrator/telegram.env",
+  "garden_url": "https://pico-pilot.tail35e544.ts.net/"
+}
 ```
 
 The file holds `PICO_TELEGRAM_BOT_TOKEN` and `PICO_TELEGRAM_CHAT_ID`, mode 0600,
@@ -421,6 +435,16 @@ owned by the service user (a symlink is refused). Each event becomes one plain-t
 and never acts on a message sent to the bot. A failed notice is logged (without the
 token) and never blocks the dispatcher. Keep the file in the state directory, which
 workers cannot read.
+
+`garden_url` (optional) is the Garden's address as the phone opens it. It must be an
+`https` URL without credentials, query or fragment, so it can never carry the
+session token. When it is set, the notice of an event that asks you to look or act
+ends with a `Garden: <garden_url>` line: `approval_needed`, `audit_failed`, `error`,
+`delivery_opened`, and `run_finished` unless the run completed. The event's own URL
+(the issue or PR) is unchanged. The link has no `#approvals`-style anchor: the page
+uses its fragment for the token and the run view, and its panels load after the
+page. The link works without a token once this browser has opened the
+`#token=` link (step 6 above).
 
 External tools add events with:
 

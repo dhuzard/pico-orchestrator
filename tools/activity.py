@@ -9,6 +9,9 @@ Telegram is send-only: `sendMessage` to one configured chat. This module never
 calls `getUpdates`, never reads a reply and never acts on a message. A failed
 notice is logged (without the bot token) and never blocks the caller. Messages
 carry the title, the summary and the URL only: no issue body, diff or secret.
+When `notify.garden_url` is configured, a notice that asks the person to look or
+act (approval needed, failed audit, error, a run that did not complete, a new
+delivery) ends with a "Garden: <url>" line. That URL never carries the session token.
 
 CLI for external tools (the local deploy script calls it over SSH):
 
@@ -29,8 +32,8 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-KINDS = ("approval", "run_finished", "delivery_opened", "audit_passed", "audit_failed", "merged", "deploy", "error")
-ICONS = {"approval": "✅", "run_finished": "🏁", "delivery_opened": "📬", "audit_passed": "🔎",
+KINDS = ("approval_needed", "approval", "run_finished", "delivery_opened", "audit_passed", "audit_failed", "merged", "deploy", "error")
+ICONS = {"approval_needed": "🙋", "approval": "✅", "run_finished": "🏁", "delivery_opened": "📬", "audit_passed": "🔎",
          "audit_failed": "⛔", "merged": "🌱", "deploy": "🚀", "error": "⚠️"}
 SHA = re.compile(r"^[0-9a-f]{40}$")
 CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
@@ -39,6 +42,9 @@ TELEGRAM_CHAT = re.compile(r"^-?[0-9]{1,20}$")
 ENV_LINE = re.compile(r"^([A-Z][A-Z0-9_]{0,63})=(.*)$")
 LIMITS = {"title": 200, "summary": 1200, "url": 500}
 FILENAME = "activity.jsonl"
+# Kinds whose notice links the Garden: there is something to look at or do there. A finished run
+# links it only when it did not complete; the dispatcher says so explicitly (`emit(..., garden=True)`).
+GARDEN_KINDS = frozenset({"approval_needed", "audit_failed", "error", "delivery_opened"})
 
 
 class ActivityError(ValueError):
@@ -64,6 +70,26 @@ def safe_url(value) -> str | None:
         return None
     if parts.scheme != "https" or not parts.hostname or parts.username or parts.password:
         return None
+    return value
+
+
+def garden_url(value) -> str:
+    """`notify.garden_url`: an absolute https URL without credentials, query or fragment.
+
+    The Garden's session token travels in the fragment (`#token=`); a configured link must never
+    carry it, nor anything else that a chat history would keep. Raises ActivityError otherwise."""
+    if not isinstance(value, str) or not value or len(value) > 300 or CONTROL.search(value) \
+            or any(char.isspace() for char in value):
+        raise ActivityError("notify.garden_url must be an https URL")
+    if "#" in value or "?" in value:
+        raise ActivityError("notify.garden_url must not have a query or a fragment (never put the session token in it)")
+    try:
+        parts = urllib.parse.urlsplit(value)
+        parts.port  # noqa: B018 - raises ValueError on an invalid port
+    except ValueError:
+        raise ActivityError("notify.garden_url must be an https URL") from None
+    if parts.scheme != "https" or not parts.hostname or parts.username or parts.password or "@" in parts.netloc:
+        raise ActivityError("notify.garden_url must be an https URL without credentials")
     return value
 
 
@@ -132,13 +158,18 @@ def read_private_env(path: Path) -> dict:
     return values
 
 
-def telegram_message(entry: dict) -> str:
+def telegram_message(entry: dict, garden: str | None = None) -> str:
+    """Plain text: icon and title, summary, URL and, when given, a last "Garden: <url>" line."""
     lines = [f"{ICONS.get(entry['kind'], '•')} {entry['title']}"]
     if entry.get("summary"):
         lines.append(entry["summary"])
     if entry.get("url"):
         lines.append(entry["url"])
-    return "\n".join(lines)[:4000]
+    text = "\n".join(lines)
+    if garden and garden != entry.get("url"):
+        tail = f"\nGarden: {garden}"
+        return text[:4000 - len(tail)] + tail
+    return text[:4000]
 
 
 def send_telegram(env_file: Path, text: str, *, opener=urllib.request.urlopen, timeout: int = 10) -> None:
@@ -163,14 +194,19 @@ def send_telegram(env_file: Path, text: str, *, opener=urllib.request.urlopen, t
         raise ActivityError("Telegram did not accept the message")
 
 
-def notify(cfg: dict, entry: dict, *, sender=None) -> bool:
-    """Best-effort notice; True when sent. Never raises."""
+def notify(cfg: dict, entry: dict, *, sender=None, garden: bool | None = None) -> bool:
+    """Best-effort notice; True when sent. Never raises.
+
+    `garden` asks for the Garden link (None: only for GARDEN_KINDS); it is added only when
+    `notify.garden_url` is configured."""
     sender = sender or send_telegram
-    env_file = (cfg.get("notify") or {}).get("telegram_env_file")
+    settings = cfg.get("notify") or {}
+    env_file = settings.get("telegram_env_file")
     if not env_file:
         return False
+    wanted = entry.get("kind") in GARDEN_KINDS if garden is None else garden
     try:
-        sender(Path(env_file), telegram_message(entry))
+        sender(Path(env_file), telegram_message(entry, settings.get("garden_url") if wanted else None))
         return True
     except Exception as exc:  # noqa: BLE001 - a notice must never stop the dispatcher
         detail = str(exc) if isinstance(exc, ActivityError) else type(exc).__name__
@@ -179,7 +215,7 @@ def notify(cfg: dict, entry: dict, *, sender=None) -> bool:
 
 
 def emit(cfg: dict, kind: str, title: str, summary: str = "", url: str | None = None, *, sender=None,
-         **fields) -> dict | None:
+         garden: bool | None = None, **fields) -> dict | None:
     """Append one event to the activity log and notify. Never raises: activity is a report, not authority."""
     try:
         entry = event(kind, title, summary, url, **fields)
@@ -190,7 +226,7 @@ def emit(cfg: dict, kind: str, title: str, summary: str = "", url: str | None = 
         append(log_path(cfg), entry)
     except (OSError, KeyError, TypeError) as exc:
         print(f"pico-activity: activity log not written: {type(exc).__name__}", file=sys.stderr, flush=True)
-    notify(cfg, entry, sender=sender)
+    notify(cfg, entry, sender=sender, garden=garden)
     return entry
 
 

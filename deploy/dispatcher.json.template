@@ -16,5 +16,8 @@
   "delivery_autopilot": {
     "Neuronautix/metadatapp": {"merge_method": "merge", "model": "claude-opus-5-5", "max_diff_bytes": 150000}
   },
-  "notify": {"telegram_env_file": "/home/pico/.local/state/pi-coding-orchestrator/telegram.env"}
+  "notify": {
+    "telegram_env_file": "/home/pico/.local/state/pi-coding-orchestrator/telegram.env",
+    "garden_url": "https://pico-pilot.tail35e544.ts.net/"
+  }
 }

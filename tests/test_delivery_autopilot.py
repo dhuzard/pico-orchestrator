@@ -502,6 +502,90 @@ class DispatcherEventsTest(AutopilotBase):
         self.assertEqual(self.events()[0]["url"], f"https://github.com/{REPO}/pull/42")
         self.assertEqual(self.delivery()["delivery"], "waiting_ci", "not eligible yet: no overlay")
 
+    def queued(self, number, title=TITLE, body=BODY, **extra):
+        return {"number": number, "title": title, "body": body, "state": "OPEN",
+                "labels": [{"name": "pico:queued"}], **extra}
+
+    def announce(self, issues, garden="https://pico-pilot.tail35e544.ts.net/"):
+        self.cfg["notify"] = {"telegram_env_file": self.root / "telegram.env", **({"garden_url": garden} if garden else {})}
+        with patch.object(disp, "queued_issues", return_value=issues), \
+                patch.object(disp.activity, "send_telegram", side_effect=lambda path, text: self.sent.append(text)):
+            disp.announce_approvals(self.cfg, self.db)
+        return [e for e in self.events() if e["kind"] == "approval_needed"]
+
+    def test_approval_needed_once_per_issue_version(self):
+        garden = "https://pico-pilot.tail35e544.ts.net/"
+        long_body = BODY.replace("Add input validation to the parser.", "Word " * 100)
+        issues = [self.queued(7), self.queued(9), self.queued(10, title="Second", body=long_body)]
+        events = self.announce(issues)
+        self.assertEqual([(e["issue"], e["title"]) for e in events],
+                         [(9, f"Approval needed: #9 {TITLE}"), (10, "Approval needed: #10 Second")])
+        self.assertEqual(events[0]["summary"], f"Target {REPO}. Add input validation to the parser.")
+        self.assertEqual(events[0]["url"], garden)
+        self.assertLessEqual(len(events[1]["summary"]), len(f"Target {REPO}. ") + 200)
+        self.assertTrue(events[1]["summary"].endswith("…"))
+        self.assertNotIn("Acceptance", events[1]["summary"])
+        self.assertEqual(self.sent[0], f"🙋 Approval needed: #9 {TITLE}\nTarget {REPO}. Add input validation to the parser.\n{garden}")
+        self.assertEqual(len(self.announce(issues)), 2, "the same versions are not announced twice")
+        edited = BODY.replace("Add input validation", "Add strict input validation")
+        events = self.announce([self.queued(9, body=edited), self.queued(10, title="Second", body=long_body)])
+        self.assertEqual([e["issue"] for e in events], [9, 10, 9], "an edited issue is announced again")
+        self.assertEqual(len(self.sent), 3)
+        self.assertEqual(self.db.execute("SELECT count(*) FROM approvals").fetchone()[0], 1, "nothing is approved")
+
+    def test_approval_needed_skips_invalid_and_approved_issues(self):
+        task = disp.parse_task(self.queued(9), self.cfg)
+        self.db.execute("INSERT INTO approvals VALUES (9, ?, ?, '/tmp/target', 'issue-9', 'read-only', 'approved', NULL)",
+                        (task.digest, REPO))
+        self.db.execute("INSERT INTO approvals VALUES (12, ?, ?, '/tmp/target', 'issue-12', 'read-only', 'stale', NULL)",
+                        (disp.parse_task(self.queued(12), self.cfg).digest, REPO))
+        self.db.execute("INSERT INTO approvals VALUES (13, 'old', ?, '/tmp/target', 'issue-13', 'read-only', 'stale', NULL)",
+                        (REPO,))
+        self.db.commit()
+        invalid = [self.queued(20, body="no sections"), self.queued(21, body=BODY.replace(REPO, "evil/repo")),
+                   self.queued(22, state="CLOSED"), self.queued(23, labels=[])]
+        events = self.announce([self.queued(9), self.queued(12), self.queued(13), *invalid], garden=None)
+        self.assertEqual([(e["issue"], e["url"]) for e in events], [(13, "https://github.com/acme/queue/issues/13")],
+                         "only the issue whose approval went stale for an older version")
+        self.assertFalse(any("Garden:" in text for text in self.sent))
+
+    def test_approval_notices_need_notify_and_never_block_the_poll(self):
+        self.cfg["notify"] = {}
+        with patch.object(disp, "queued_issues", side_effect=AssertionError("no queue listing without notices")):
+            disp.announce_approvals(self.cfg, self.db)
+        self.cfg["notify"] = {"garden_url": "https://pico-pilot.tail35e544.ts.net/"}
+        with patch.object(disp, "queued_issues", side_effect=disp.DispatcherError("GitHub operation failed (exit 1)")), \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            disp.announce_approvals(self.cfg, self.db)
+            disp.announce_approvals(self.cfg, self.db)
+        self.assertEqual(err.getvalue().count("queued issues unavailable"), 1)
+        with patch.object(disp, "queued_issues", return_value=[self.queued(9)]), \
+                patch.object(disp.activity, "send_telegram", side_effect=OSError("down")):
+            self.cfg["notify"]["telegram_env_file"] = self.root / "telegram.env"
+            with contextlib.redirect_stderr(io.StringIO()):
+                disp.announce_approvals(self.cfg, self.db)
+        self.assertEqual([e["issue"] for e in self.events()], [9], "logged even when the notice fails")
+
+    def test_garden_url_config(self):
+        base = {"queue_repository": "acme/queue", "targets": {REPO: "/tmp/target"},
+                "state_path": str(self.root / "s.sqlite3")}
+        path = self.root / "dispatcher.json"
+        path.write_text(json.dumps({**base, "notify": {"garden_url": "https://pico-pilot.tail35e544.ts.net/"}}))
+        self.assertEqual(disp.load_config(path)["notify"], {"garden_url": "https://pico-pilot.tail35e544.ts.net/"})
+        for bad in ("http://pico.example/", "https://pico.example/#token=abcdefghijklmnopqrstuvwxyz",
+                    "https://pico.example/?token=x", "relative/path"):
+            path.write_text(json.dumps({**base, "notify": {"garden_url": bad}}))
+            with self.assertRaises(disp.DispatcherError, msg=bad):
+                disp.load_config(path)
+
+    def test_run_finished_links_the_garden_unless_completed(self):
+        self.cfg["notify"] = {"telegram_env_file": self.root / "telegram.env",
+                              "garden_url": "https://pico-pilot.tail35e544.ts.net/"}
+        with patch.object(disp.activity, "send_telegram", side_effect=lambda path, text: self.sent.append(text)):
+            disp.run_finished(self.cfg, {"state": "running", "number": 7, "repo": REPO}, "completed", {})
+            disp.run_finished(self.cfg, {"state": "running", "number": 8, "repo": REPO}, "partial", {})
+        self.assertEqual(["Garden:" in text for text in self.sent], [False, True])
+
     def test_tick_runs_one_autopilot_step_after_observation(self):
         calls = []
         with patch.object(disp, "target_env", return_value={}), \
