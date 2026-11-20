@@ -156,6 +156,61 @@ class TelegramTest(ActivityBase):
             activity.main(["emit", "--config", str(config), "--kind", "other", "--title", "x"])
 
 
+GARDEN = "https://pico-pilot.tail35e544.ts.net/"
+
+
+class GardenLinkTest(ActivityBase):
+    def test_garden_url_must_be_plain_https(self):
+        self.assertEqual(activity.garden_url(GARDEN), GARDEN)
+        self.assertEqual(activity.garden_url("https://pico.example:8443/garden"), "https://pico.example:8443/garden")
+        for bad in ("http://pico.example/", "https://pico.example/#token=" + "a" * 30, "https://pico.example/#approvals",
+                    "https://pico.example/?token=abc", "https://pico.example/?", "https://pico.example/#",
+                    "https://user:pw@pico.example/", "https://user@pico.example/", "javascript:alert(1)", "https:///x",
+                    "https://pico.example/ x", "https://pico.example:99999/", "", None, 42, "https://" + "a" * 300):
+            with self.assertRaises(activity.ActivityError, msg=bad):
+                activity.garden_url(bad)
+
+    def notices(self, garden=GARDEN, **kwargs):
+        sent = []
+        cfg = {**self.cfg, "notify": {**self.cfg["notify"], **({"garden_url": garden} if garden else {})}}
+        sender = lambda path, text: sent.append(text)  # noqa: E731
+        for kind in activity.KINDS:
+            activity.emit(cfg, kind, f"{kind} event", "summary", "https://github.com/acme/tool/pull/4", sender=sender)
+        activity.emit(cfg, "run_finished", "Run blocked: queue #7", "s", sender=sender, garden=True)
+        activity.emit(cfg, "run_finished", "Run completed: queue #8", "s", sender=sender, garden=False)
+        return sent
+
+    def test_the_garden_link_is_added_only_where_there_is_something_to_do(self):
+        sent = self.notices()
+        linked = [text.splitlines()[0] for text in sent if text.endswith(f"\nGarden: {GARDEN}")]
+        self.assertEqual(linked, ["🙋 approval_needed event", "📬 delivery_opened event", "⛔ audit_failed event",
+                                  "⚠️ error event", "🏁 Run blocked: queue #7"])
+        self.assertIn("🔎 audit_passed event\nsummary\nhttps://github.com/acme/tool/pull/4", sent)
+        self.assertTrue(all(text.count("https://github.com/acme/tool/pull/4") == 1 for text in sent[:-2]),
+                        "the event's own URL stays")
+        self.assertFalse(any("Garden:" in text for text in self.notices(garden=None)), "no link without garden_url")
+        self.assertEqual([e["url"] for e in activity.recent(self.log)][-1], "https://github.com/acme/tool/pull/4")
+
+    def test_no_duplicate_line_when_the_event_url_is_the_garden(self):
+        sent = []
+        cfg = {**self.cfg, "notify": {**self.cfg["notify"], "garden_url": GARDEN}}
+        activity.emit(cfg, "approval_needed", "Approval needed: #7 x", "Target acme/tool.", GARDEN,
+                      sender=lambda path, text: sent.append(text))
+        self.assertEqual(sent, [f"🙋 Approval needed: #7 x\nTarget acme/tool.\n{GARDEN}"])
+        long = activity.telegram_message(activity.event("error", "t", "s" * 1200, "https://github.com/a/b"), GARDEN)
+        self.assertLessEqual(len(long), 4000)
+        self.assertTrue(long.endswith(f"Garden: {GARDEN}"))
+
+    def test_a_failing_notifier_with_a_garden_link_never_blocks(self):
+        cfg = {**self.cfg, "notify": {**self.cfg["notify"], "garden_url": GARDEN}}
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            entry = activity.emit(cfg, "approval_needed", "Approval needed: #7 x", "s", GARDEN,
+                                  sender=lambda *_: (_ for _ in ()).throw(OSError("down")))
+        self.assertEqual(entry["kind"], "approval_needed")
+        self.assertEqual(activity.recent(self.log)[0]["title"], "Approval needed: #7 x")
+        self.assertIn("notification not sent", err.getvalue())
+
+
 class ActivityEndpointTest(ActivityBase):
     def serve(self, **options):
         cfg = {"queue": "acme/queue", "targets": {"acme/tool": "/tmp/t"}, "state": self.cfg["state"], "pico": "pico",

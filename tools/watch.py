@@ -41,6 +41,7 @@ ASSETS = {"/": ("index.html", "text/html; charset=utf-8"),
           "/deliveries.js": ("deliveries.js", "text/javascript; charset=utf-8"),
           "/approvals.js": ("approvals.js", "text/javascript; charset=utf-8"),
           "/activity.js": ("activity.js", "text/javascript; charset=utf-8"),
+          "/token.js": ("token.js", "text/javascript; charset=utf-8"),
           "/style.css": ("style.css", "text/css; charset=utf-8")}
 
 

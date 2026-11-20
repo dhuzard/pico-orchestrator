@@ -2916,11 +2916,15 @@ data endpoint (`/api/controls`, `/api/branches`, `/api/runs`,
 CONTROL_TOKEN_INVALID` without it. The page sends the token on every poll; a
 page opened without it shows "Open the URL printed at launch". The static
 page, script and stylesheet are served without the token, since the token
-reaches the page only in the URL fragment. The page keeps the token in memory
-only and removes it from the address bar, so a reload or a second tab opened
-from the address bar has no token and shows only that message. Open the full
-launch URL printed in the terminal again to recover. The token is deliberately
-not kept in `sessionStorage` or any other browser storage. Without `--controls` nothing needs
+reaches the page only in the URL fragment. `viewer/token.js` removes the token
+from the address bar and remembers it in `localStorage` under
+`pico-garden-token:<origin>`, so a reload, a second tab or a tokenless link
+(such as the `notify.garden_url` line of a dispatcher notice) is authorized again.
+When storage is unavailable the token stays in page memory only. A reply with
+`CONTROL_TOKEN_INVALID` clears the stored token and the page shows that message
+(a refused Tailscale login or origin does not clear it). Open the full launch
+URL printed in the terminal again to recover. Anyone who can use this browser
+profile can open the Garden until the token is rotated. Without `--controls` nothing needs
 a token, and `/api/controls` stays a read-only panel. A
 malformed or negative `Content-Length` on `POST /api/action` is answered with
 `400 CONTROL_BODY_INVALID`.
