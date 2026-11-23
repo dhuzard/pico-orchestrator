@@ -7,11 +7,11 @@ After=network-online.target
 [Service]
 Type=simple
 # Must match User= in pico-garden.service: both open the 0600 dispatcher database.
-User=dhuzard
-Environment=HOME=/home/dhuzard
-Environment=PATH=/home/dhuzard/.local/bin:/usr/local/bin:/usr/bin:/bin
-WorkingDirectory=/home/dhuzard/src/pico-orchestrator
-ExecStart=/usr/bin/python3 /home/dhuzard/src/pico-orchestrator/tools/issue_dispatcher.py --config /home/dhuzard/.config/pi-coding-orchestrator/dispatcher.json serve
+User=pico
+Environment=HOME=/home/pico
+Environment=PATH=/home/pico/.local/bin:/usr/local/bin:/usr/bin:/bin
+WorkingDirectory=/home/pico/pico-orchestrator
+ExecStart=/usr/bin/python3 /home/pico/pico-orchestrator/tools/issue_dispatcher.py --config /home/pico/.config/pi-coding-orchestrator/dispatcher.json serve
 Restart=on-failure
 RestartSec=10
 UMask=0077

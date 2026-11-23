@@ -196,7 +196,7 @@ admin console and rotate the token.
 
 ## Independently supervised systemd service (not enabled)
 
-Only after review, copy `deploy/systemd/pico-dispatcher.service` to `/etc/systemd/system/pico-dispatcher.service`, verify user, paths and installed binaries, then explicitly run:
+Only after review, copy `deploy/systemd/pico-dispatcher.service` to `/etc/systemd/system/pico-dispatcher.service`, verify user, paths and installed binaries, then explicitly run. The supplied service units and `deploy/dispatcher.json.template` use the `pico` pilot account and `/home/pico`; adapt all three together if your service user or installation path differs.
 
 ```bash
 sudo systemctl daemon-reload
@@ -205,7 +205,7 @@ sudo systemctl status pico-dispatcher.service
 journalctl -u pico-dispatcher.service -f
 ```
 
-The unit has **no dependency on `moltis.service`**. It runs as `dhuzard`, so processes share that account's credentials and filesystem; process independence is not privilege isolation. The service and launched workers depend on MSI + WSL uptime. On service restart, systemd's default control-group termination may interrupt children; the dispatcher records `interrupted` rather than auto-resuming or starting a fresh execution. Recovery requires a separate inspected operator action.
+The unit has **no dependency on `moltis.service`**. It runs as `pico` in the supplied template, so processes share that account's credentials and filesystem; process independence is not privilege isolation. On service restart, systemd's default control-group termination may interrupt children; the dispatcher records `interrupted` rather than auto-resuming or starting a fresh execution. Recovery requires a separate inspected operator action.
 
 ## Current restrictions / follow-ups
 

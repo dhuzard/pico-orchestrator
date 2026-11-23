@@ -17,8 +17,9 @@ all of these hold, re-checked against GitHub immediately before acting:
 - that head SHA has no final audit yet.
 
 Deterministic pre-checks run first and need no model: the diff must fit in
-`max_diff_bytes`, and no changed path may be under `.github/` or `.pi/`, be a
-CODEOWNERS file, or look like a secret, credential, key or `.env` file. A failed
+`max_diff_bytes`, and no changed path may be under `.github/`, `.pi/`, `scripts/`
+or `deploy/`, be a dependency/build manifest, CODEOWNERS file, or look like a
+secret, credential, key or `.env` file. A failed
 pre-check is a final `fail` without a model call.
 
 The model audit is one Anthropic Messages API call with structured JSON output.
@@ -65,6 +66,14 @@ SEVERITIES = ("critical", "high", "medium", "low", "info")
 BLOCKING_SEVERITIES = {"critical", "high"}
 SECRET_SUFFIXES = (".pem", ".key", ".p12", ".pfx", ".jks", ".keystore")
 SECRET_NAMES = {"id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", ".netrc", ".npmrc", ".pypirc", ".git-credentials"}
+BUILD_FILES = {
+    "package.json", "package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml", "yarn.lock",
+    "bun.lock", "bun.lockb", "pyproject.toml", "poetry.lock", "uv.lock", "pipfile", "pipfile.lock",
+    "cargo.toml", "cargo.lock", "go.mod", "go.sum", "gemfile", "gemfile.lock", "composer.json",
+    "composer.lock", "cmakelists.txt", "gradle.properties", "gradle.lockfile", "justfile", "taskfile.yml",
+    "taskfile.yaml", "tox.ini", "setup.py", "setup.cfg", "build.gradle", "build.gradle.kts",
+    "settings.gradle", "settings.gradle.kts", "gradlew", "gradlew.bat", "mvnw", "mvnw.cmd", "pom.xml",
+}
 
 REPORT_SCHEMA = {
     "type": "object",
@@ -303,13 +312,19 @@ def protected_reason(path: str) -> str | None:
     parts = [part for part in str(path).split("/") if part]
     if not parts:
         return "an empty path"
-    if parts[0] == ".github":
+    first = parts[0].casefold()
+    if first == ".github":
         return ".github/** (workflows and repository automation)"
-    if parts[0] == ".pi":
+    if first == ".pi":
         return ".pi/** (agent policy)"
+    if first in {"scripts", "deploy"}:
+        return f"{parts[0]}/** (build or deployment automation)"
     name = parts[-1].casefold()
     if name == "codeowners":
         return "CODEOWNERS"
+    if (name in BUILD_FILES or name.startswith(("requirements", "dockerfile", "makefile"))
+            or name.endswith((".mk", ".gemspec", ".csproj", ".fsproj", ".sln"))):
+        return "a dependency or build file"
     if name == ".env" or name.startswith(".env.") or name.endswith(".env"):
         return "an environment file"
     if "secret" in name or "credential" in name or name in SECRET_NAMES or name.endswith(SECRET_SUFFIXES):

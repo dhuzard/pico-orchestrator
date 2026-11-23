@@ -286,7 +286,9 @@ class EligibilityTest(AutopilotBase):
 class PrecheckTest(AutopilotBase):
     def test_protected_paths_are_blocked_without_a_model_call(self):
         for path in (".github/workflows/ci.yml", ".pi/autonomy.yaml", "docs/CODEOWNERS", "config/.env",
-                     "deploy/.env.production", "app/secrets.yaml", "aws_credentials.json", "certs/server.pem"):
+                     "deploy/.env.production", "app/secrets.yaml", "aws_credentials.json", "certs/server.pem",
+                     "package.json", "src/package-lock.json", "requirements-dev.txt", "pyproject.toml",
+                     "Makefile", "Dockerfile.prod", "scripts/build.sh", "deploy/release.sh"):
             with self.subTest(path=path):
                 self.db.execute("DELETE FROM delivery_audits")
                 self.db.commit()
