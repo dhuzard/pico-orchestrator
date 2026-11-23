@@ -598,7 +598,7 @@ def report_comment(rec: dict, passed: bool, reasons: list[str], report: dict | N
              f"Commit `{head}` · model `{rec.get('model') or 'none'}` · "
              f"tokens in/out {rec.get('input_tokens') or 0}/{rec.get('output_tokens') or 0}", ""]
     if passed:
-        lines.append("The audit passed: this pull request is merged automatically at exactly this commit.")
+        lines.append("The audit passed. Pico will attempt to merge this exact commit; check the pull request state for the result.")
     else:
         lines.append("The audit failed: this pull request stays open and is **not** merged. "
                      "A fix needs a new queue issue and approval.")
@@ -799,14 +799,14 @@ def _merge(cfg, db, item, options, rec, *, gh_json, gh_text, sender, now) -> str
             require_eligible(pr, repo, head)  # never merge a head that moved since the audit
             require_default_base(gh_json, pr, repo)
             require_fresh_checks(gh_json, cfg, item)
-            if not rec["comment_posted"]:
-                report = json.loads(rec["report"]) if rec["report"] else None
-                post_comment(gh_json, repo, number, head, report_comment(rec, True, [], report, None))
-                rec = _write(db, item, comment_posted=1)
             require_fresh_review(gh_json, repo, number, head)
             final_pr = live_pr(gh_json, repo, number)
             require_eligible(final_pr, repo, head)
             require_default_base(gh_json, final_pr, repo)
+            if not rec["comment_posted"]:
+                report = json.loads(rec["report"]) if rec["report"] else None
+                post_comment(gh_json, repo, number, head, report_comment(rec, True, [], report, None))
+                rec = _write(db, item, comment_posted=1)
             gh_text(["pr", "merge", str(number), "--repo", repo, MERGE_FLAGS[options["merge_method"]],
                      "--match-head-commit", head])
             merged = live_pr(gh_json, repo, number)

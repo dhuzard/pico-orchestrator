@@ -398,6 +398,7 @@ class AuditTest(AutopilotBase):
         model = FakeModel(report())
         self.assertEqual(self.step(model), "passed+merge_refused")
         self.assertEqual(self.github.merges(), [])
+        self.assertEqual(self.github.comments, [])
         self.assertIn("changes_requested", self.rec()["reason"])
 
     def test_head_moving_during_final_checks_blocks_merge(self):
@@ -405,6 +406,7 @@ class AuditTest(AutopilotBase):
         model = FakeModel(report())
         self.assertEqual(self.step(model), "passed+merge_refused")
         self.assertEqual(self.github.merges(), [])
+        self.assertEqual(self.github.comments, [])
         self.assertIn("head moved", self.rec()["reason"])
 
     def test_pass_comments_then_merges_at_the_audited_head(self):
