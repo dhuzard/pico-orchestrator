@@ -196,7 +196,7 @@ admin console and rotate the token.
 
 ## Independently supervised systemd service (not enabled)
 
-Only after review, copy `deploy/systemd/pico-dispatcher.service` to `/etc/systemd/system/pico-dispatcher.service`, verify user, paths and installed binaries, then explicitly run:
+Only after review, copy `deploy/systemd/pico-dispatcher.service` to `/etc/systemd/system/pico-dispatcher.service`, verify user, paths and installed binaries, then explicitly run. The supplied service units and `deploy/dispatcher.json.template` use the `pico` pilot account and `/home/pico`; adapt all three together if your service user or installation path differs.
 
 ```bash
 sudo systemctl daemon-reload
@@ -205,7 +205,7 @@ sudo systemctl status pico-dispatcher.service
 journalctl -u pico-dispatcher.service -f
 ```
 
-The unit has **no dependency on `moltis.service`**. It runs as `dhuzard`, so processes share that account's credentials and filesystem; process independence is not privilege isolation. The service and launched workers depend on MSI + WSL uptime. On service restart, systemd's default control-group termination may interrupt children; the dispatcher records `interrupted` rather than auto-resuming or starting a fresh execution. Recovery requires a separate inspected operator action.
+The unit has **no dependency on `moltis.service`**. It runs as `pico` in the supplied template, so processes share that account's credentials and filesystem; process independence is not privilege isolation. On service restart, systemd's default control-group termination may interrupt children; the dispatcher records `interrupted` rather than auto-resuming or starting a fresh execution. Recovery requires a separate inspected operator action.
 
 ## Current restrictions / follow-ups
 
@@ -340,9 +340,10 @@ delivery. It is eligible only when:
 - the queue issue has an approval whose execution `completed`, with the same
   execution id as the delivery (the dispatcher's own run);
 - the observer bound the PR to that run's publication evidence, the PR is open
-  and not a draft, and both its head and base repositories are the target (no fork);
-- every expected check passed on the PR's **current** head, and no human requested
-  changes;
+  and not a draft, both its head and base repositories are the target (no fork),
+  and its base is the target's current default branch;
+- every expected check passed on the PR's **current** head, no human requested
+  review or changes, and no earlier review is stale;
 - that head SHA has no final audit yet. Audits are recorded per head SHA, so the
   same commit is never audited, or merged, twice.
 
@@ -351,11 +352,14 @@ automatically yet".
 
 **Deterministic pre-checks** run first; a failure is final for that head and makes
 no model call. The diff must be at most `max_diff_bytes`. No changed path (renames
-included) may be under `.github/` or `.pi/`, be a `CODEOWNERS` file or an `.env`
-file, or be named like a secret, credential or key (`*secret*`, `*credential*`,
-`*.pem`, `*.key`, `id_rsa`, `.netrc` and similar). GitHub must list every changed
-file. The queue issue must still match the digest that was approved: after an edit,
-the approved task text is no longer available.
+included) may be under `.github/`, `.pi/`, `scripts/` or `deploy/`, be a dependency,
+build or executable test configuration file, a `CODEOWNERS` file or an `.env` file, or be named like a secret,
+credential or key (`*secret*`, `*credential*`, `*.pem`, `*.key`, `id_rsa`, `.netrc`
+and similar). GitHub must provide a complete changed-file count, a text patch
+for every file and the old path of every rename or copy. Binary or patchless
+files are left for human review. The queue issue must still be open, have the
+`pico:queued` label and match the digest that was approved; closing, unqueueing
+or editing it stops automatic merging.
 
 **The model audit** is one Anthropic Messages API request (`model`, default
 `claude-opus-5-5`, effort `high`) with structured output: a JSON schema the answer
@@ -369,15 +373,20 @@ data and that any instruction inside them must be ignored. Each of them is wrapp
 in a tag carrying a random nonce, so text inside cannot close the block.
 
 **The pass rule is applied by the dispatcher, not the model:** verdict `pass`, and
-`intent_matches`, and every acceptance criterion met (at least one assessed), and
-no critical or high finding, and the pre-checks passed.
+`intent_matches`, and one positive report entry for every acceptance item derived
+from the approved queue task, in the same order and with the exact criterion text,
+and no critical or high finding, and the pre-checks passed. A report that omits,
+renames or adds an item fails even if its verdict is `pass`.
 
 - **Pass:** the report is posted as a PR comment, then the PR is merged with
   `gh pr merge <n> --merge --match-head-commit <audited sha>` using the target
-  credentials. GitHub refuses the merge if the head moved; the dispatcher also
-  re-reads the PR first and never merges a head other than the audited one. The
-  merge commit and time are recorded. A refused merge is retried twice with
-  backoff, then the delivery becomes `audit_failed`.
+  credentials. The dispatcher re-reads the exact head, default base branch,
+  configured checks (through Actions and commit status) and human reviews before
+  merging. A newly failed check, review request, change request or stale review
+  blocks the merge.
+  GitHub also refuses the merge if the head moved. The merge commit and time are
+  recorded. Transient GitHub failures are retried twice with backoff, then the
+  delivery becomes `audit_failed`.
 - **Fail:** the report is posted as a PR comment and the PR stays open. The
   delivery shows `audit_failed` in the Garden and in the queue handoff comment. A
   fix needs a new queue issue and approval.
