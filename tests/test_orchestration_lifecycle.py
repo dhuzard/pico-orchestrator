@@ -21,6 +21,7 @@ import backend_preflight as bp
 import parent_orchestration as po
 import provenance
 import routing_engine as engine
+import run_lease
 import watch
 
 
@@ -385,7 +386,11 @@ class LifecycleTest(unittest.TestCase):
             time.sleep(0.02)
             return original(*args, **kwargs)
 
-        with unittest.mock.patch.object(provenance, "update_parent_orchestration", delayed_update):
+        # This test checks serialized updates, not the production five-second
+        # contention deadline. Parallel full-suite runs on a small VM can hold
+        # the lease longer than that while the eight test threads wait.
+        with unittest.mock.patch.object(provenance, "update_parent_orchestration", delayed_update), \
+             unittest.mock.patch.object(run_lease, "LOCK_WAIT_SECONDS", 30):
             with ThreadPoolExecutor(max_workers=8) as pool:
                 list(pool.map(lambda index: parent.event({"kind": "phase",
                     "phase": f"phase-{index}", "status": "completed"}), range(8)))
