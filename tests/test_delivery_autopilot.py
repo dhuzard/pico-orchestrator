@@ -331,7 +331,9 @@ class PrecheckTest(AutopilotBase):
                      "deploy/.env.production", "app/secrets.yaml", "aws_credentials.json", "certs/server.pem",
                      "package.json", "src/package-lock.json", "requirements-dev.txt", "pyproject.toml",
                      "Makefile", "Dockerfile.prod", "scripts/build.sh", "deploy/release.sh",
-                     ".gitmodules", "src/build.sh", "pnpm-workspace.yaml", "docs/../.github/workflows/ci.yml"):
+                     ".gitmodules", "src/build.sh", "pnpm-workspace.yaml", "docs/../.github/workflows/ci.yml",
+                     "vite.config.ts", "webpack.config.cjs", "rollup.config.mjs", "jest.config.js",
+                     "tests/conftest.py", ".yarnrc.yml", "Jenkinsfile", ".pre-commit-config.yaml"):
             with self.subTest(path=path):
                 self.db.execute("DELETE FROM delivery_audits")
                 self.db.commit()

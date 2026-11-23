@@ -352,8 +352,8 @@ automatically yet".
 
 **Deterministic pre-checks** run first; a failure is final for that head and makes
 no model call. The diff must be at most `max_diff_bytes`. No changed path (renames
-included) may be under `.github/`, `.pi/`, `scripts/` or `deploy/`, be a dependency
-or build file, a `CODEOWNERS` file or an `.env` file, or be named like a secret,
+included) may be under `.github/`, `.pi/`, `scripts/` or `deploy/`, be a dependency,
+build or executable test configuration file, a `CODEOWNERS` file or an `.env` file, or be named like a secret,
 credential or key (`*secret*`, `*credential*`, `*.pem`, `*.key`, `id_rsa`, `.netrc`
 and similar). GitHub must provide a complete changed-file count, a text patch
 for every file and the old path of every rename or copy. Binary or patchless

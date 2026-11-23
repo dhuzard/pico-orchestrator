@@ -78,8 +78,12 @@ BUILD_FILES = {
     "settings.gradle", "settings.gradle.kts", "gradlew", "gradlew.bat", "mvnw", "mvnw.cmd", "pom.xml",
     "pnpm-workspace.yaml", "deno.json", "deno.lock", "uv.toml", "procfile", "brewfile",
     "compose.yml", "compose.yaml", "docker-compose.yml", "docker-compose.yaml",
+    "conftest.py", "jenkinsfile", ".pre-commit-config.yaml", ".pre-commit-config.yml",
+    ".yarnrc", ".yarnrc.yml", ".yarnrc.yaml", "pytest.ini", "meson.build",
+    "workspace", "workspace.bazel", "module.bazel", "build.bazel", ".bazelrc",
 }
-BUILD_SUFFIXES = (".mk", ".gemspec", ".csproj", ".fsproj", ".sln", ".sh", ".bash", ".zsh", ".ps1", ".bat", ".cmd")
+BUILD_SUFFIXES = (".mk", ".gemspec", ".csproj", ".fsproj", ".sln", ".sh", ".bash", ".zsh", ".ps1", ".bat", ".cmd",
+                  ".config.js", ".config.cjs", ".config.mjs", ".config.ts", ".config.cts", ".config.mts")
 
 REPORT_SCHEMA = {
     "type": "object",
