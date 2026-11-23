@@ -342,8 +342,8 @@ delivery. It is eligible only when:
 - the observer bound the PR to that run's publication evidence, the PR is open
   and not a draft, both its head and base repositories are the target (no fork),
   and its base is the target's current default branch;
-- every expected check passed on the PR's **current** head, and no human requested
-  changes;
+- every expected check passed on the PR's **current** head, no human requested
+  review or changes, and no earlier review is stale;
 - that head SHA has no final audit yet. Audits are recorded per head SHA, so the
   same commit is never audited, or merged, twice.
 
@@ -355,9 +355,11 @@ no model call. The diff must be at most `max_diff_bytes`. No changed path (renam
 included) may be under `.github/`, `.pi/`, `scripts/` or `deploy/`, be a dependency
 or build file, a `CODEOWNERS` file or an `.env` file, or be named like a secret,
 credential or key (`*secret*`, `*credential*`, `*.pem`, `*.key`, `id_rsa`, `.netrc`
-and similar). GitHub must provide a complete changed-file count and the old path
-of every rename or copy. The queue issue must still match the digest that was
-approved: after an edit, the approved task text is no longer available.
+and similar). GitHub must provide a complete changed-file count, a text patch
+for every file and the old path of every rename or copy. Binary or patchless
+files are left for human review. The queue issue must still be open, have the
+`pico:queued` label and match the digest that was approved; closing, unqueueing
+or editing it stops automatic merging.
 
 **The model audit** is one Anthropic Messages API request (`model`, default
 `claude-opus-5-5`, effort `high`) with structured output: a JSON schema the answer
@@ -380,7 +382,8 @@ renames or adds an item fails even if its verdict is `pass`.
   `gh pr merge <n> --merge --match-head-commit <audited sha>` using the target
   credentials. The dispatcher re-reads the exact head, default base branch,
   configured checks (through Actions and commit status) and human reviews before
-  merging. A newly failed check, change request or stale review blocks the merge.
+  merging. A newly failed check, review request, change request or stale review
+  blocks the merge.
   GitHub also refuses the merge if the head moved. The merge commit and time are
   recorded. Transient GitHub failures are retried twice with backoff, then the
   delivery becomes `audit_failed`.

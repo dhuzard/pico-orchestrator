@@ -243,7 +243,8 @@ def candidate(item: dict) -> bool:
     return (item.get("publication") == "observed" and type(item.get("pr_number")) is int
             and isinstance(item.get("head_sha"), str) and bool(SHA.fullmatch(item["head_sha"]))
             and item.get("execution") == "completed" and item.get("checks") == "passed"
-            and item.get("review") != "changes_requested" and item.get("delivery") not in ("merged", "closed"))
+            and item.get("review") in {"not_requested", "approved"}
+            and item.get("delivery") not in ("merged", "closed"))
 
 
 def overlay(cfg: dict, db, item: dict) -> dict:
@@ -349,8 +350,18 @@ def require_fresh_checks(gh_json, cfg: dict, item: dict) -> None:
         raise Ineligible(f"the audited head's current checks are {state}")
 
 
-def require_fresh_review(gh_json, repository: str, number: int, head: str) -> None:
-    """A new human change request or stale review stops an automatic merge."""
+def require_no_review_requests(pr: dict) -> None:
+    for field in ("requested_reviewers", "requested_teams"):
+        requested = pr.get(field)
+        if not isinstance(requested, list):
+            raise AutopilotError("GitHub did not report requested reviewers")
+        if requested:
+            raise Ineligible("a human review is requested")
+
+
+def require_fresh_review(gh_json, pr: dict, repository: str, number: int, head: str) -> None:
+    """A requested or adverse human review stops an automatic merge."""
+    require_no_review_requests(pr)
     try:
         pages = gh_json(["api", "--paginate", "--slurp", f"repos/{repository}/pulls/{number}/reviews?per_page=100"])
     except Exception as exc:
@@ -404,6 +415,8 @@ def changed_files(gh_json, repository: str, number: int, expected_count) -> list
         if not isinstance(entry, dict) or not isinstance(entry.get("filename"), str) \
                 or entry.get("status") not in {"added", "removed", "modified", "renamed", "copied", "changed", "unchanged"}:
             raise AutopilotError("GitHub returned an invalid file list")
+        if not isinstance(entry.get("patch"), str) or not entry["patch"].startswith("@@"):
+            raise Blocked("GitHub omitted a text patch for a changed file")
         paths.append(entry["filename"])
         previous = entry.get("previous_filename")
         if entry["status"] in {"renamed", "copied"} and not isinstance(previous, str):
@@ -446,6 +459,11 @@ def approved_task(read_issue, issue_number: int, digest: str) -> dict:
     title, body = issue.get("title") if isinstance(issue, dict) else None, issue.get("body") if isinstance(issue, dict) else None
     if not isinstance(title, str) or not isinstance(body, str):
         raise AutopilotError("queue issue unavailable")
+    labels = issue.get("labels") if isinstance(issue, dict) else None
+    names = {label.get("name") for label in labels if isinstance(label, dict)} if isinstance(labels, list) else set()
+    if (type(issue.get("number")) is not int or issue["number"] != issue_number
+            or issue.get("state") != "OPEN" or "pico:queued" not in names):
+        raise Blocked("the approved queue issue is closed, unqueued or has a different identity")
     if hashlib.sha256(json.dumps([title, body], ensure_ascii=False).encode()).hexdigest() != digest:
         raise Blocked("the queue issue changed after it was approved; the approved task text is not available")
     try:
@@ -683,7 +701,8 @@ def step(cfg: dict, db, *, gh_json, gh_text, read_issue, opener=urllib.request.u
             done = _audit(cfg, db, item, approval, options, rec, gh_json=gh_json, gh_text=gh_text,
                           read_issue=read_issue, opener=opener, sender=sender, now=now)
         elif rec["status"] == "passed":
-            done = _merge(cfg, db, item, options, rec, gh_json=gh_json, gh_text=gh_text, sender=sender, now=now)
+            done = _merge(cfg, db, item, approval, options, rec, gh_json=gh_json, gh_text=gh_text,
+                          read_issue=read_issue, sender=sender, now=now)
         elif rec["status"] == "failed" and not rec["comment_posted"] and rec["comment_attempts"] < MAX_ATTEMPTS:
             done = _retry_failure_comment(db, item, rec, gh_json=gh_json, now=now)
         else:
@@ -756,7 +775,8 @@ def _audit(cfg, db, item, approval, options, rec, *, gh_json, gh_text, read_issu
         return "failed"
     saved = _write(db, item, status="passed", reason="audit passed", next_attempt_at=0, **common)
     _emit(cfg, "audit_passed", f"Audit passed: {label}", report.get("summary", ""), item, sender)
-    return "passed+" + (_merge(cfg, db, item, options, saved, gh_json=gh_json, gh_text=gh_text, sender=sender, now=now) or "waiting")
+    return "passed+" + (_merge(cfg, db, item, approval, options, saved, gh_json=gh_json, gh_text=gh_text,
+                               read_issue=read_issue, sender=sender, now=now) or "waiting")
 
 
 def _fail(cfg, db, item, rec, reasons, report, blocked, *, gh_json, sender, now) -> None:
@@ -787,7 +807,7 @@ def _retry_failure_comment(db, item, rec, *, gh_json, now) -> str:
     return "comment"
 
 
-def _merge(cfg, db, item, options, rec, *, gh_json, gh_text, sender, now) -> str | None:
+def _merge(cfg, db, item, approval, options, rec, *, gh_json, gh_text, read_issue, sender, now) -> str | None:
     repo, number, head = item["repository"], item["pr_number"], item["head_sha"]
     label = f"{repo}#{number}"
     attempt = rec["merge_attempts"] + 1
@@ -796,29 +816,35 @@ def _merge(cfg, db, item, options, rec, *, gh_json, gh_text, sender, now) -> str
         if rec["merge_attempts"] and pr.get("merged_at") and pr["head"]["sha"] == head:
             merged = pr  # an earlier attempt merged, but GitHub reported it late
         else:
+            approved_task(read_issue, item["issue"], approval["digest"])
             require_eligible(pr, repo, head)  # never merge a head that moved since the audit
             require_default_base(gh_json, pr, repo)
             require_fresh_checks(gh_json, cfg, item)
-            require_fresh_review(gh_json, repo, number, head)
             final_pr = live_pr(gh_json, repo, number)
             require_eligible(final_pr, repo, head)
             require_default_base(gh_json, final_pr, repo)
+            require_fresh_review(gh_json, final_pr, repo, number, head)
+            final_pr = live_pr(gh_json, repo, number)
+            require_eligible(final_pr, repo, head)
+            require_default_base(gh_json, final_pr, repo)
+            require_no_review_requests(final_pr)
             if not rec["comment_posted"]:
                 report = json.loads(rec["report"]) if rec["report"] else None
                 post_comment(gh_json, repo, number, head, report_comment(rec, True, [], report, None))
                 rec = _write(db, item, comment_posted=1)
+            approved_task(read_issue, item["issue"], approval["digest"])
             gh_text(["pr", "merge", str(number), "--repo", repo, MERGE_FLAGS[options["merge_method"]],
                      "--match-head-commit", head])
             merged = live_pr(gh_json, repo, number)
         if not merged.get("merged_at") or merged["head"]["sha"] != head:
             raise AutopilotError("GitHub does not report the pull request as merged at the audited head")
-    except Ineligible as exc:
-        # A moved head is a new delivery to audit; anything else (closed, draft) leaves the PR to people.
+    except (Ineligible, Blocked) as exc:
+        # A moved head needs a new audit; closed/unapproved work stays with people.
         _write(db, item, status="failed", reason=f"not merged: {exc}"[:300], merge_attempts=attempt)
         _emit(cfg, "error", f"Not merged: {label}", f"The audit passed but {exc}; nothing was merged.", item, sender)
         return "merge_refused"
-    except (Blocked, AutopilotError, Exception) as exc:  # noqa: BLE001 - gh failures arrive as DispatcherError
-        detail = str(exc)[:200] if isinstance(exc, (Blocked, AutopilotError)) else type(exc).__name__ + (
+    except (AutopilotError, Exception) as exc:  # noqa: BLE001 - gh failures arrive as DispatcherError
+        detail = str(exc)[:200] if isinstance(exc, AutopilotError) else type(exc).__name__ + (
             f": {str(exc)[:160]}" if "GitHub operation failed" in str(exc) else "")
         if attempt < MAX_ATTEMPTS:
             _write(db, item, merge_attempts=attempt, reason=f"merge attempt {attempt} failed: {detail}"[:300],
