@@ -143,10 +143,17 @@ test("workflow prompt loads a compact core and points to detailed protocol", () 
   assert.ok(built.ok);
   if (!built.ok) return;
   const full = readFileSync(join(ROOT, "prompts", "orchestrate.md"), "utf8");
+  assert.ok(Buffer.byteLength(built.prompt, "utf8") <= 12_000,
+    "the repeated lead prompt must stay within its context budget");
   assert.ok(built.prompt.length < full.length / 2);
   assert.match(built.prompt, /prompts\/orchestrate\.md/);
   assert.match(built.prompt, /route_task/);
   assert.match(built.prompt, /## Completion/);
+  for (const invariant of ["PARENT_ROUTE_RECHECK_REQUIRED", "MUTATION_AUTHORIZATION_REQUIRED",
+    "fresh_context:true", "independent reviewer", "integrate_begin", "--parent-run-id",
+    "BLOCKER, CORRECTNESS, REGRESSION", "orchestration_record"]) {
+    assert.ok(built.prompt.includes(invariant), `missing core orchestration invariant: ${invariant}`);
+  }
 });
 
 test("workflow command failures are reported, not thrown into Pi", async () => {
