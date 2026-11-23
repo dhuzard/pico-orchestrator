@@ -5,6 +5,13 @@ explicit offline snapshots. It **cannot authorize or start execution**. It is
 not connected to the issue dispatcher, headless launcher or GitHub publication
 adapter. Existing exact-issue interactive approval remains unchanged.
 
+`tools/standing_snapshot.py` can normalize read-only GitHub repository and issue
+API responses for source and queue inputs. It checks immutable IDs, private
+visibility, fork status, expected repository and issue numbers, author ID and
+required content. The caller must provide scoped GitHub credentials and attest
+the observation path; this helper does not create a trusted activation record,
+write a grant, reserve spend or authorize execution.
+
 The intended eventual workflow is a bounded correction to guide prose ending
 in a private draft PR. Stage 1 supplies only a schema, deterministic structural
 admission decisions and traceable refusal evidence. A successful shadow result
