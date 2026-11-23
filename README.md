@@ -956,6 +956,14 @@ checkpoint output size. Explicit checkpoints remain available through
 block orchestration. Claude Code and Pi subagent workers manage their own
 context and start fresh.
 
+For a model with a very large context window, Pi's default compaction threshold
+may be too high for typical orchestration runs to reach. A target repository can
+pilot an earlier threshold through Pi's project `.pi/settings.json` using a
+model-specific `compaction.modelOverrides` entry. See
+[the context efficiency pilot](docs/context-efficiency.md) for the measured
+baseline, validation, and rollback plan. This is a Pi setting, not a PICO
+worker gate.
+
 Parent provenance (`parent_orchestration.context`) records the baseline, peak
 context and working tokens, Pi compactions, explicit checkpoint references, and per-backend
 worker usage (invocations, duration, and input/output/cached tokens), the peak
