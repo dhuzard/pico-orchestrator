@@ -340,7 +340,8 @@ delivery. It is eligible only when:
 - the queue issue has an approval whose execution `completed`, with the same
   execution id as the delivery (the dispatcher's own run);
 - the observer bound the PR to that run's publication evidence, the PR is open
-  and not a draft, and both its head and base repositories are the target (no fork);
+  and not a draft, both its head and base repositories are the target (no fork),
+  and its base is the target's current default branch;
 - every expected check passed on the PR's **current** head, and no human requested
   changes;
 - that head SHA has no final audit yet. Audits are recorded per head SHA, so the
@@ -351,11 +352,12 @@ automatically yet".
 
 **Deterministic pre-checks** run first; a failure is final for that head and makes
 no model call. The diff must be at most `max_diff_bytes`. No changed path (renames
-included) may be under `.github/` or `.pi/`, be a `CODEOWNERS` file or an `.env`
-file, or be named like a secret, credential or key (`*secret*`, `*credential*`,
-`*.pem`, `*.key`, `id_rsa`, `.netrc` and similar). GitHub must list every changed
-file. The queue issue must still match the digest that was approved: after an edit,
-the approved task text is no longer available.
+included) may be under `.github/`, `.pi/`, `scripts/` or `deploy/`, be a dependency
+or build file, a `CODEOWNERS` file or an `.env` file, or be named like a secret,
+credential or key (`*secret*`, `*credential*`, `*.pem`, `*.key`, `id_rsa`, `.netrc`
+and similar). GitHub must provide a complete changed-file count and the old path
+of every rename or copy. The queue issue must still match the digest that was
+approved: after an edit, the approved task text is no longer available.
 
 **The model audit** is one Anthropic Messages API request (`model`, default
 `claude-opus-5-5`, effort `high`) with structured output: a JSON schema the answer
@@ -374,10 +376,12 @@ no critical or high finding, and the pre-checks passed.
 
 - **Pass:** the report is posted as a PR comment, then the PR is merged with
   `gh pr merge <n> --merge --match-head-commit <audited sha>` using the target
-  credentials. GitHub refuses the merge if the head moved; the dispatcher also
-  re-reads the PR first and never merges a head other than the audited one. The
-  merge commit and time are recorded. A refused merge is retried twice with
-  backoff, then the delivery becomes `audit_failed`.
+  credentials. The dispatcher re-reads the exact head, default base branch,
+  configured checks (through Actions and commit status) and human reviews before
+  merging. A newly failed check, change request or stale review blocks the merge.
+  GitHub also refuses the merge if the head moved. The merge commit and time are
+  recorded. Transient GitHub failures are retried twice with backoff, then the
+  delivery becomes `audit_failed`.
 - **Fail:** the report is posted as a PR comment and the PR stays open. The
   delivery shows `audit_failed` in the Garden and in the queue handoff comment. A
   fix needs a new queue issue and approval.

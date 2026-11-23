@@ -21,6 +21,8 @@ Deterministic pre-checks run first and need no model: the diff must fit in
 or `deploy/`, be a dependency/build manifest, CODEOWNERS file, or look like a
 secret, credential, key or `.env` file. A failed
 pre-check is a final `fail` without a model call.
+The PR must target the repository's current default branch. Immediately before
+merge, current checks and human reviews are read again at the audited head.
 
 The model audit is one Anthropic Messages API call with structured JSON output.
 The issue, the PR text and the diff are wrapped as untrusted data and the system
@@ -52,6 +54,7 @@ import jsonschema
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import activity  # noqa: E402
+import delivery_observer  # noqa: E402
 
 SHA = re.compile(r"^[0-9a-f]{40}$")
 MODEL = re.compile(r"^[a-z0-9][a-z0-9.-]{0,99}$")
@@ -73,7 +76,10 @@ BUILD_FILES = {
     "composer.lock", "cmakelists.txt", "gradle.properties", "gradle.lockfile", "justfile", "taskfile.yml",
     "taskfile.yaml", "tox.ini", "setup.py", "setup.cfg", "build.gradle", "build.gradle.kts",
     "settings.gradle", "settings.gradle.kts", "gradlew", "gradlew.bat", "mvnw", "mvnw.cmd", "pom.xml",
+    "pnpm-workspace.yaml", "deno.json", "deno.lock", "uv.toml", "procfile", "brewfile",
+    "compose.yml", "compose.yaml", "docker-compose.yml", "docker-compose.yaml",
 }
+BUILD_SUFFIXES = (".mk", ".gemspec", ".csproj", ".fsproj", ".sln", ".sh", ".bash", ".zsh", ".ps1", ".bat", ".cmd")
 
 REPORT_SCHEMA = {
     "type": "object",
@@ -308,10 +314,60 @@ def require_eligible(pr: dict, repository: str, head: str) -> None:
         raise Ineligible("the pull request head moved since the last observation")
 
 
+def require_default_base(gh_json, pr: dict, repository: str) -> None:
+    """An audited PR may only merge into the repository's current default branch."""
+    try:
+        repo = gh_json(["api", f"repos/{repository}"])
+    except Exception as exc:
+        raise AutopilotError(f"repository identity unavailable ({type(exc).__name__})") from exc
+    if (not isinstance(repo, dict) or str(repo.get("full_name", "")).casefold() != repository.casefold()
+            or type(repo.get("id")) is not int or repo["id"] < 1
+            or not isinstance(repo.get("default_branch"), str) or not repo["default_branch"]):
+        raise AutopilotError("GitHub returned an invalid repository identity")
+    base_id = ((pr.get("base") or {}).get("repo") or {}).get("id")
+    head_id = ((pr.get("head") or {}).get("repo") or {}).get("id")
+    if type(base_id) is not int or type(head_id) is not int or base_id != repo["id"] or head_id != repo["id"]:
+        raise Blocked("the pull request repository identity changed")
+    if (pr.get("base") or {}).get("ref") != repo["default_branch"]:
+        raise Blocked("the pull request does not target the repository's default branch")
+
+
+def require_fresh_checks(gh_json, cfg: dict, item: dict) -> None:
+    """Recheck the exact audited head immediately before requesting a merge."""
+    repository, head = item["repository"], item["head_sha"]
+    expected = cfg.get("delivery_expected_checks", {}).get(repository.casefold())
+    observed_required = (item.get("evidence") or {}).get("required_checks")
+    required = sorted(set(expected or []) | set(observed_required or []))
+    if not required or any(not isinstance(name, str) or not name for name in required):
+        raise Blocked("required checks are unavailable")
+    try:
+        checks = delivery_observer.actions_checks(repository, head, gh_json)
+    except Exception as exc:
+        raise AutopilotError(f"fresh checks unavailable ({type(exc).__name__})") from exc
+    state, _ = delivery_observer.classify_checks(checks, required)
+    if state != "passed":
+        raise Ineligible(f"the audited head's current checks are {state}")
+
+
+def require_fresh_review(gh_json, repository: str, number: int, head: str) -> None:
+    """A new human change request or stale review stops an automatic merge."""
+    try:
+        pages = gh_json(["api", "--paginate", "--slurp", f"repos/{repository}/pulls/{number}/reviews?per_page=100"])
+    except Exception as exc:
+        raise AutopilotError(f"fresh reviews unavailable ({type(exc).__name__})") from exc
+    if not isinstance(pages, list) or any(not isinstance(page, list) for page in pages):
+        raise AutopilotError("GitHub returned an invalid review list")
+    reviews = [review for page in pages for review in page]
+    state = delivery_observer.review_state(reviews, head)
+    if state in {"changes_requested", "stale", "unknown"}:
+        raise Ineligible(f"the audited head's current review state is {state}")
+
+
 def protected_reason(path: str) -> str | None:
-    parts = [part for part in str(path).split("/") if part]
-    if not parts:
-        return "an empty path"
+    if (not isinstance(path, str) or not path or "\\" in path
+            or any(part in ("", ".", "..") for part in path.split("/"))):
+        return "an invalid or ambiguous path"
+    parts = path.split("/")
     first = parts[0].casefold()
     if first == ".github":
         return ".github/** (workflows and repository automation)"
@@ -320,10 +376,12 @@ def protected_reason(path: str) -> str | None:
     if first in {"scripts", "deploy"}:
         return f"{parts[0]}/** (build or deployment automation)"
     name = parts[-1].casefold()
+    if name.startswith(".git"):
+        return "Git configuration or metadata"
     if name == "codeowners":
         return "CODEOWNERS"
-    if (name in BUILD_FILES or name.startswith(("requirements", "dockerfile", "makefile"))
-            or name.endswith((".mk", ".gemspec", ".csproj", ".fsproj", ".sln"))):
+    if (name in BUILD_FILES or name.startswith(("requirements", "dockerfile", "containerfile", "makefile", "build."))
+            or name.endswith(BUILD_SUFFIXES)):
         return "a dependency or build file"
     if name == ".env" or name.startswith(".env.") or name.endswith(".env"):
         return "an environment file"
@@ -333,6 +391,8 @@ def protected_reason(path: str) -> str | None:
 
 
 def changed_files(gh_json, repository: str, number: int, expected_count) -> list[str]:
+    if type(expected_count) is not int or expected_count < 1:
+        raise Blocked("GitHub did not provide a positive changed-file count")
     try:
         pages = gh_json(["api", "--paginate", "--slurp", f"repos/{repository}/pulls/{number}/files?per_page=100"])
     except Exception as exc:
@@ -341,13 +401,19 @@ def changed_files(gh_json, repository: str, number: int, expected_count) -> list
         raise AutopilotError("GitHub returned an invalid file list")
     paths = []
     for entry in (item for page in pages for item in page):
-        if not isinstance(entry, dict) or not isinstance(entry.get("filename"), str):
+        if not isinstance(entry, dict) or not isinstance(entry.get("filename"), str) \
+                or entry.get("status") not in {"added", "removed", "modified", "renamed", "copied", "changed", "unchanged"}:
             raise AutopilotError("GitHub returned an invalid file list")
         paths.append(entry["filename"])
-        if isinstance(entry.get("previous_filename"), str):
-            paths.append(entry["previous_filename"])
+        previous = entry.get("previous_filename")
+        if entry["status"] in {"renamed", "copied"} and not isinstance(previous, str):
+            raise Blocked("GitHub omitted the previous path of a renamed or copied file")
+        if previous is not None:
+            if not isinstance(previous, str):
+                raise AutopilotError("GitHub returned an invalid previous path")
+            paths.append(previous)
     files = len([1 for page in pages for _ in page])
-    if type(expected_count) is int and files != expected_count:
+    if files != expected_count:
         raise Blocked(f"GitHub listed {files} of {expected_count} changed files; an incomplete list cannot be checked")
     return paths
 
@@ -622,6 +688,7 @@ def _audit(cfg, db, item, approval, options, rec, *, gh_json, gh_text, read_issu
     try:
         pr = live_pr(gh_json, repo, number)
         require_eligible(pr, repo, head)
+        require_default_base(gh_json, pr, repo)
         files = changed_files(gh_json, repo, number, pr.get("changed_files"))
         hits = sorted({f"{path} ({reason})" for path in files if (reason := protected_reason(path))})
         if hits:
@@ -630,6 +697,7 @@ def _audit(cfg, db, item, approval, options, rec, *, gh_json, gh_text, read_issu
         task = approved_task(read_issue, item["issue"], approval["digest"])
         again = live_pr(gh_json, repo, number)
         require_eligible(again, repo, head)  # the diff belongs to the audited head
+        require_default_base(gh_json, again, repo)
         prompt = build_prompt(task, pr, diff, ci_summary(item))
         report, usage = call_model(key, options["model"], prompt, opener=opener)
     except Ineligible as exc:
@@ -704,10 +772,16 @@ def _merge(cfg, db, item, options, rec, *, gh_json, gh_text, sender, now) -> str
             merged = pr  # an earlier attempt merged, but GitHub reported it late
         else:
             require_eligible(pr, repo, head)  # never merge a head that moved since the audit
+            require_default_base(gh_json, pr, repo)
+            require_fresh_checks(gh_json, cfg, item)
             if not rec["comment_posted"]:
                 report = json.loads(rec["report"]) if rec["report"] else None
                 post_comment(gh_json, repo, number, head, report_comment(rec, True, [], report, None))
                 rec = _write(db, item, comment_posted=1)
+            require_fresh_review(gh_json, repo, number, head)
+            final_pr = live_pr(gh_json, repo, number)
+            require_eligible(final_pr, repo, head)
+            require_default_base(gh_json, final_pr, repo)
             gh_text(["pr", "merge", str(number), "--repo", repo, MERGE_FLAGS[options["merge_method"]],
                      "--match-head-commit", head])
             merged = live_pr(gh_json, repo, number)
