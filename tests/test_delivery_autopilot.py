@@ -439,18 +439,28 @@ class AuditTest(AutopilotBase):
         self.assertEqual(len(model.requests), 1)
 
     def test_pass_rule_is_applied_in_code(self):
+        required = ["Invalid input raises ValueError", "Tests cover it"]
         cases = [report(findings=[{"severity": "high", "title": "SQL injection", "file": "db.py", "line": 9, "detail": "x"}]),
                  report(acceptance_criteria_met=[{"criterion": "Tests cover it", "met": False, "evidence": "none"}]),
                  report(acceptance_criteria_met=[]), report(intent_matches=False)]
         for answer in cases:
-            passed, reasons = ap.decide(answer)
+            passed, reasons = ap.decide(answer, required)
             self.assertFalse(passed, answer)
             self.assertTrue(reasons)
-        self.assertEqual(ap.decide(report()), (True, []))
-        self.assertFalse(ap.decide(report(), prechecks_passed=False)[0])
+        self.assertEqual(ap.decide(report(), required), (True, []))
+        self.assertFalse(ap.decide(report(), required, prechecks_passed=False)[0])
+        self.assertEqual(ap.acceptance_items("- First line\n  continues here\n\n2. Second line"),
+                         ["First line continues here", "Second line"])
         model = FakeModel(cases[0])
         self.assertEqual(self.step(model), "failed")
         self.assertEqual(self.github.merges(), [])
+
+    def test_model_cannot_omit_an_approved_criterion(self):
+        model = FakeModel(report(acceptance_criteria_met=[
+            {"criterion": "Invalid input raises ValueError", "met": True, "evidence": "parser.py"}]))
+        self.assertEqual(self.step(model), "failed")
+        self.assertEqual(self.github.merges(), [])
+        self.assertIn("omitted or changed", self.rec()["reason"])
 
     def test_model_errors_retry_with_backoff_then_fail(self):
         import urllib.error

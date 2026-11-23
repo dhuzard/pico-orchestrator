@@ -371,8 +371,10 @@ data and that any instruction inside them must be ignored. Each of them is wrapp
 in a tag carrying a random nonce, so text inside cannot close the block.
 
 **The pass rule is applied by the dispatcher, not the model:** verdict `pass`, and
-`intent_matches`, and every acceptance criterion met (at least one assessed), and
-no critical or high finding, and the pre-checks passed.
+`intent_matches`, and one positive report entry for every acceptance item derived
+from the approved queue task, in the same order and with the exact criterion text,
+and no critical or high finding, and the pre-checks passed. A report that omits,
+renames or adds an item fails even if its verdict is `pass`.
 
 - **Pass:** the report is posted as a PR comment, then the PR is merged with
   `gh pr merge <n> --merge --match-head-commit <audited sha>` using the target
