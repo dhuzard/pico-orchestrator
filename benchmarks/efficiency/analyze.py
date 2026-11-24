@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import statistics
 import sys
 from decimal import Decimal, InvalidOperation
@@ -134,7 +135,7 @@ def metric(report, task_id, lead_effort):
 def analyze(manifest, directory):
     if manifest.get("version") != 1 or not isinstance(manifest.get("samples"), list) or not manifest["samples"]:
         raise Invalid("version 1 and a nonempty samples list are required")
-    paired, seen = [], set()
+    paired, seen, experiment = [], set(), None
     for sample in manifest["samples"]:
         if not isinstance(sample, dict) or not isinstance(sample.get("id"), str) or not sample["id"] or sample["id"] in seen:
             raise Invalid("each sample needs a unique nonempty id")
@@ -158,6 +159,19 @@ def analyze(manifest, directory):
         differences = [k for k in FIXED if arms["baseline"]["provenance"][k] != arms["candidate"]["provenance"][k]]
         if differences:
             raise Invalid(f"{sample['id']}: unmatched fixed inputs: {', '.join(differences)}")
+        modes = {arms[v]["provenance"].get("experiment", "launch_brief") for v in VARIANTS}
+        if len(modes) != 1 or next(iter(modes)) not in {"launch_brief", "core_prompt"}:
+            raise Invalid(f"{sample['id']}: experiment mode mismatch")
+        mode = next(iter(modes))
+        if experiment is not None and experiment != mode:
+            raise Invalid("cannot mix experiment modes in one analysis")
+        experiment = mode
+        if mode == "core_prompt":
+            hashes = [arms[v]["provenance"].get("core_prompt_sha256") for v in ("baseline", "candidate")]
+            if (any(not isinstance(h, str) or not re.fullmatch(r"[0-9a-f]{64}", h) for h in hashes)
+                    or hashes[0] == hashes[1]
+                    or any(arms[v]["provenance"].get("brief_mode") != "both" for v in VARIANTS)):
+                raise Invalid(f"{sample['id']}: core prompt arms need distinct pinned prompts and the same launch brief")
         models = {v: arms[v]["metrics"]["observed_lead_models"] for v in VARIANTS}
         expected = arms["baseline"]["provenance"]["lead_model"]
         model_observed = all(models[v] == [expected] for v in VARIANTS)
@@ -171,7 +185,7 @@ def analyze(manifest, directory):
             else:
                 b, c = (arms[v]["metrics"][name] for v in ("baseline", "candidate"))
             deltas[name] = c - b if valid and number(b) and number(c) else None
-        paired.append({"id": sample["id"], "arms": arms, "model_pin_observed": model_observed,
+        paired.append({"id": sample["id"], "experiment": mode, "arms": arms, "model_pin_observed": model_observed,
                        "both_verified": valid, "candidate_minus_baseline": deltas})
     summary = {}
     for name in ("tokens", "lead_input_volume_tokens", "all_input_volume_tokens",
@@ -181,7 +195,7 @@ def analyze(manifest, directory):
         summary[name] = {"paired_observations": len(values), "mean_delta": statistics.mean(values) if values else None,
                          "sample_stddev": statistics.stdev(values) if len(values) > 1 else None,
                          "min_delta": min(values) if values else None, "max_delta": max(values) if values else None}
-    return {"version": 1, "samples": paired, "summary": summary,
+    return {"version": 1, "experiment": experiment, "samples": paired, "summary": summary,
             "interpretation": "Descriptive paired deltas only; a single sample cannot quantify variability. Missing, failed or unverified observations are excluded, not zero. Configured pins do not prove worker model or effort was observed. Provider contract cost ceiling uses conservative rates for settled observed requests, not an invoice or proof that every backend was intercepted."}
 
 

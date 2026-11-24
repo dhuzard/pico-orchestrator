@@ -291,6 +291,14 @@ def build_prompt(objective: str, prompt_path: Path = PROMPT_PATH) -> str:
     return guidance + f"{template.rstrip()}\n\n{objective}\n"
 
 
+def benchmark_launch_prompt(objective: str, brief: str, benchmark: dict | None, env: dict) -> str:
+    """Use the same launch brief in both core-prompt arms; legacy brief treatment is unchanged."""
+    core_prompt = benchmark is not None and benchmark.get("experiment") == "core_prompt"
+    path = Path(env["PICO_BENCHMARK_PROMPT_FILE"]) if core_prompt else PROMPT_PATH
+    prefix = brief if core_prompt or benchmark is None or benchmark["variant"] == "candidate" else ""
+    return prefix + build_prompt(objective, path)
+
+
 def mutation_permitted(worktree: Path) -> list[str]:
     """Names of mutating permissions the target's autonomy policy grants."""
     path = autonomy_policy.policy_path(worktree)
@@ -770,6 +778,8 @@ def _launch_locked(path: Path, *, worktree: Path, identity: str, common: Path, e
         benchmark = launch_brief.benchmark_selection(os.environ, workspace_plan.orchestrator_revision(ROOT))
     except ValueError as exc:
         raise HeadlessError("BENCHMARK_SELECTOR_INVALID", str(exc)) from exc
+    if benchmark and benchmark.get("experiment") == "core_prompt" and identity != "pico-bench-sandbox/pilot":
+        raise HeadlessError("BENCHMARK_SELECTOR_INVALID", "core prompt benchmark is limited to its local pilot repository")
     record = load_record(path)
     if record is not None and record.get("benchmark") != benchmark:
         raise HeadlessError("BENCHMARK_SELECTOR_MISMATCH", "benchmark selection cannot change for an execution")
@@ -874,8 +884,7 @@ def _launch_locked(path: Path, *, worktree: Path, identity: str, common: Path, e
     brief = launch_brief.create(worktree=worktree, repository=identity, common_dir=common,
                                 session_id=record["session_id"], executable=pi_executable, python=python,
                                 mutation_permissions=granted)
-    prompt_brief = "" if benchmark and benchmark["variant"] == "baseline" else brief
-    argv += ["--", RESUME_PROMPT if continuing else prompt_brief + build_prompt(record["objective"])]
+    argv += ["--", RESUME_PROMPT if continuing else benchmark_launch_prompt(record["objective"], brief, benchmark, os.environ)]
     if provider_config:
         if not aggregate_ledger:
             raise HeadlessError("PROVIDER_BUDGET_UNSUPPORTED", "provider mode requires an aggregate ledger")

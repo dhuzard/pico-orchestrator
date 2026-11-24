@@ -25,11 +25,11 @@ All-participant input volume was `n/a` because some worker counters were
 missing; run records alone supplied no verified-task denominator.
 
 `prompts/orchestrate-core.md`, which the launcher sends with each new run,
-is reduced from 29,360 to 10,671 UTF-8 bytes. The full
+is reduced from 29,360 to 10,871 UTF-8 bytes. The full
 `prompts/orchestrate.md` remains available for focused reads after routing.
 A test bounds the core prompt to 12,000 bytes and checks that the key route,
 mutation, review, integration, and publication instructions remain present.
-The byte reduction is 64%; actual input-token savings need a provider usage
+The byte reduction is about 63%; actual input-token savings need a provider usage
 comparison.
 
 For the Metadatapp pilot, Pi's project `.pi/settings.json` sets
@@ -96,11 +96,12 @@ tool bundle. Alternate arm order to reduce cache and time effects. To isolate
 the two changes, compare the shorter prompt with compaction held fixed, then
 compare default and 55k compaction with the prompt held fixed. A historical
 before/after comparison with both changes combined is descriptive only.
-The existing `benchmarks/efficiency/` harness supports paired launch-brief
-tests with guarded provider spending. Its analyzer now reports paired input
-volume, read-side median, and compaction deltas when observed. The harness
-must be extended and reviewed before using it to vary prompt revisions or
-project compaction settings.
+The `benchmarks/efficiency/` harness supports paired launch-brief and core
+prompt tests with guarded provider spending. Its analyzer reports paired input
+volume, read-side median, and compaction deltas when observed. The core-prompt
+mode holds the runtime and launch brief fixed and varies reviewed prompt
+snapshots. The harness still needs a separate reviewed extension to vary Pi's
+project compaction setting.
 
 For every pair, inspect the run trace and checks for:
 
