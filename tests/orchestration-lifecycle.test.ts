@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -1864,7 +1865,10 @@ const UNDERRATED = { ok: true, blocked: true, blocker_code: "CLASSIFICATION_UNDE
   head: "b".repeat(40), changed_paths: [".github/workflows/release.yml"] };
 const PASSED = { ok: true, blocked: false, blocker_code: null, diff_path_floor_matches: [], changed_paths: ["a/x"] };
 function floorVerdicts(input: Record<string, unknown>): Record<string, unknown> {
-  if (input.operation === "parent") return { ok: true, blocked: false, blocker_code: null, verdicts: [] };
+  if (input.operation === "parent") return { ok: true, blocked: false, blocker_code: null,
+    head: "b".repeat(40), changed_path_count: 1,
+    verdicts: ((input.members ?? []) as { task_id: string }[]).map((member) => ({ task_id: member.task_id,
+      path_digests: [createHash("sha256").update("a/x").digest("hex")] })) };
   const declared = ((input.route_task_result as any)?.classification?.base?.files_or_areas ?? []) as string[];
   if (String(input.worktree) === "/tmp/wt-A" && !declared.includes(".github/workflows/release.yml")) return UNDERRATED;
   return { ...PASSED, ...(String(input.worktree) === "/tmp/wt-A" ? { diff_path_floor_matches: [FLOOR_MATCH] } : {}) };
@@ -1906,6 +1910,33 @@ test("integration checks the selected external checkout and refuses an unchanged
   assert.equal(diffChecks(h).at(-1)!.input?.parent_checkout, "/tmp/integration");
   assert.equal((eventsOf(h).find((e: any) => e.kind === "wave" && e.status === "integrating") as any).integration_path, "/tmp/integration");
   assert.equal(h.checkout.head, "a".repeat(40));
+});
+
+test("integration refuses to complete worker changes against an unchanged parent checkout", async () => {
+  let committed = false;
+  let included = false;
+  const digest = createHash("sha256").update("a/x").digest("hex");
+  const h = await floorRun({ diffFloors: (input: Record<string, unknown>) => input.operation === "parent"
+    ? { ok: true, blocked: false, head: (committed ? "b" : "a").repeat(40),
+        changed_path_count: committed ? 1 : 0,
+        verdicts: [{ task_id: "A", path_digests: included ? [digest] : [] }] }
+    : PASSED });
+  const record = h.tools.get("orchestration_record");
+  await routeMutating(h, ["A"]);
+  await record.execute("w", { action: "declare_wave", wave_id: "w1", tasks: [{ task_id: "A", write_scope: ["a/**"] }] });
+  assert.equal((await record.execute("b", { action: "integrate_begin", wave_id: "w1" })).details.ok, true);
+  const refused = await record.execute("e", { action: "integrate_end", wave_id: "w1" });
+  assert.equal(refused.details.ok, false);
+  assert.match(refused.content[0].text, /INTEGRATION_COMMIT_REQUIRED/);
+  assert.equal(waveStatuses(h).includes("integrated"), false);
+  committed = true;
+  const incomplete = await record.execute("e2", { action: "integrate_end", wave_id: "w1" });
+  assert.equal(incomplete.details.ok, false);
+  assert.match(incomplete.content[0].text, /INTEGRATION_CHANGES_MISSING/);
+  included = true;
+  assert.equal((await record.execute("e3", { action: "integrate_end", wave_id: "w1" })).details.ok, true);
+  assert.equal((eventsOf(h).filter((e: any) => e.kind === "diff_floors" && e.operation === "parent").at(-1) as any).head,
+    "b".repeat(40));
 });
 
 test("premature phase completion is a recoverable refusal", async () => {
