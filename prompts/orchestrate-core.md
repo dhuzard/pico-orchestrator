@@ -87,7 +87,10 @@ with `phase`, `from_route`, `to_route`, and a closed `reason` before rerouting.
 Use unique publication branches such as `pico/<run-id>/batch-<n>`.
 For mutating waves, call `integrate_begin` and `integrate_end` in an
 external integration worktree; use `"wave_id":"auto"` for the one open
-implicit wave. A `COMPLETED` finish requires all routed phases, workers,
+implicit wave. Pass that worktree's absolute path to `integrate_begin` as
+`"path":"/absolute/integration-worktree"`; omitting `path` selects the
+parent checkout and cannot integrate a separate branch. A `COMPLETED` finish
+requires all routed phases, workers,
 and mutating waves closed and integrated. Before publication, record those
 phases completed, then dry-run and apply the reviewed publication plan with
 `--parent-run-id` while the parent is active. Its applied run reports
