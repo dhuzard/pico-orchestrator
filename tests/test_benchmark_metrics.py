@@ -71,6 +71,43 @@ def passed(task_run: str, ok: bool = True) -> dict:
 
 
 class TokenSeparation(unittest.TestCase):
+    def test_input_volume_includes_cache_reads_and_tracks_context_coverage(self):
+        record = make_record("run-1")
+        context = record["parent_orchestration"]["context"]
+        context["lead_calls"] = [
+            {"input_tokens": 10, "cached_tokens": 100},
+            {"input_tokens": 20, "cached_tokens": 200},
+            {"input_tokens": 30, "cached_tokens": 300},
+        ]
+        context["compactions"] = 1
+        context["peak_context_tokens"] = 60000
+        report = bm.run_report(record, entry=passed("run-1"))
+        self.assertEqual(report["spend_tokens"], 5400)
+        self.assertEqual(report["context_efficiency"], {
+            "lead_input_volume_tokens": 54000,
+            "all_input_volume_tokens": 64100,
+            "lead_read_side": {"median_tokens": 220, "observed_calls": 3, "missing_calls": 0},
+            "compactions": 1, "peak_context_tokens": 60000,
+        })
+        total = bm.aggregate("pilot", [report])["totals"]["context_efficiency"]
+        self.assertEqual(total["lead_input_volume_per_verified_task"], 54000)
+        self.assertEqual(total["all_input_volume_per_verified_task"], 64100)
+        self.assertEqual(total["median_run_lead_read_side_tokens"], 220)
+
+        context["lead_usage"].pop("cache_write_tokens")
+        context["lead_calls"][1].pop("cached_tokens")
+        incomplete = bm.aggregate("pilot", [bm.run_report(record, entry=passed("run-1"))])["totals"]["context_efficiency"]
+        self.assertIsNone(incomplete["lead_input_volume_tokens"])
+        self.assertIsNone(incomplete["lead_input_volume_per_verified_task"])
+        self.assertIsNone(incomplete["all_input_volume_tokens"])
+        self.assertIsNone(incomplete["all_input_volume_per_verified_task"])
+        self.assertIsNone(incomplete["median_run_lead_read_side_tokens"])
+        self.assertEqual(incomplete["lead_read_side_missing_calls"], 1)
+
+        context["lead_usage"]["cache_write_tokens"] = 3000
+        context.pop("worker_usage")
+        self.assertIsNone(bm.run_report(record)["context_efficiency"]["all_input_volume_tokens"])
+
     def test_lead_and_backend_tokens_stay_separate_and_unobserved_stays_null(self):
         report = bm.run_report(make_record("run-1"))
         self.assertEqual(report["tokens"]["lead"], {"input": 1000, "output": 200, "cache_read": 50000, "cache_write": 3000,
@@ -278,11 +315,26 @@ class Comparison(unittest.TestCase):
         self.assertEqual(d["lead_tokens"]["cache_read"]["delta"], -30000)
         self.assertEqual(d["worker_tokens"]["claude-code"]["input"]["delta"], 0)
         self.assertEqual(d["spend_tokens"]["delta"], (600 + 150 + 2000) - (1000 + 200 + 3000))
+        self.assertEqual(d["context_efficiency"]["lead_input_volume_tokens"]["delta"], -31400)
+        self.assertEqual(d["context_efficiency"]["lead_input_volume_per_verified_task"]["delta"], -31400)
+        self.assertEqual(d["context_efficiency"]["all_input_volume_per_verified_task"]["delta"], -31400)
         self.assertEqual(d["headline_tokens_per_verified_task"]["delta"], d["spend_tokens"]["delta"])  # one verified task each
         self.assertEqual(d["estimated_cost_usd"]["delta"], -0.2)
         self.assertIsNone(d["orchestration_record_calls"]["delta"])  # unobserved on both sides
         self.assertTrue(result["provenance"]["complete"])
         self.assertIn("Provenance completeness: COMPLETE", bm.render_compare(result))
+
+    def test_unpriced_cost_and_older_reports_do_not_claim_savings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            before_spec, after_spec = self.sides(Path(tmp))
+            before = bm.load_side(before_spec, None, [])
+            after = bm.load_side(after_spec, None, [])
+            before["totals"].pop("context_efficiency")
+            after["totals"]["cost"]["cost_complete"] = False
+            result = bm.compare(before, after)
+        self.assertIsNone(result["deltas"]["context_efficiency"]["all_input_volume_tokens"]["delta"])
+        self.assertIsNone(result["deltas"]["estimated_cost_usd"]["delta"])
+        self.assertIn("Input volume", bm.render_report(before))
 
     def test_delta_with_na_headline_is_null(self):
         self.assertEqual(bm._delta("n/a", 5000), {"before": "n/a", "after": 5000, "delta": None, "percent": None})

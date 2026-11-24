@@ -966,7 +966,10 @@ may be too high for typical orchestration runs to reach. A target repository can
 pilot an earlier threshold through Pi's project `.pi/settings.json` using a
 model-specific `compaction.modelOverrides` entry. See
 [the context efficiency pilot](docs/context-efficiency.md) for the measured
-baseline, validation, and rollback plan. This is a Pi setting, not a PICO
+baseline, a reproducible token comparison, and the rollback plan. Use
+`tools/benchmark_metrics.py` for provider-reported input volume including
+cache reads; its separate budget-spend metric intentionally excludes them.
+This is a Pi setting, not a PICO
 worker gate.
 
 Parent provenance (`parent_orchestration.context`) records the baseline, peak
