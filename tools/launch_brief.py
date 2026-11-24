@@ -55,7 +55,8 @@ def benchmark_selection(env: dict, revision: str | None) -> dict | None:
     """Explicit benchmark-only prompt treatment; never modifies guard behavior."""
     names = ("PICO_BENCHMARK_VARIANT", "PICO_BENCHMARK_PAIR", "PICO_BENCHMARK_REVISION",
              "PICO_BENCHMARK_LEAD_MODEL", "PICO_BENCHMARK_LEAD_EFFORT")
-    if not any(name in env for name in names):
+    prompt_names = ("PICO_BENCHMARK_EXPERIMENT", "PICO_BENCHMARK_PROMPT_FILE", "PICO_BENCHMARK_PROMPT_SHA256")
+    if not any(name in env for name in (*names, *prompt_names)):
         return None
     variant, pair, pin, model, effort = (env.get(name, "") for name in names)
     if (env.get("PICO_REAL_BENCHMARK") != "1" or variant not in {"baseline", "candidate"}
@@ -64,4 +65,21 @@ def benchmark_selection(env: dict, revision: str | None) -> dict | None:
             or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", model)
             or effort not in {"off", "minimal", "low", "medium", "high", "xhigh", "max"}):
         raise ValueError("benchmark selectors require explicit opt-in, variant, pair and matching full runtime revision")
-    return {"variant": variant, "pair": pair, "revision": pin, "lead_model": model, "lead_effort": effort}
+    selected = {"variant": variant, "pair": pair, "revision": pin, "lead_model": model, "lead_effort": effort}
+    experiment = env.get("PICO_BENCHMARK_EXPERIMENT", "")
+    prompt_file = env.get("PICO_BENCHMARK_PROMPT_FILE", "")
+    prompt_hash = env.get("PICO_BENCHMARK_PROMPT_SHA256", "")
+    if experiment or prompt_file or prompt_hash:
+        path = Path(prompt_file)
+        if (experiment != "core_prompt" or not path.is_absolute()
+                or not re.fullmatch(r"[0-9a-f]{64}", prompt_hash)):
+            raise ValueError("core prompt benchmark needs a pinned absolute prompt snapshot")
+        try:
+            content = path.read_bytes()
+            content.decode("utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise ValueError("core prompt benchmark snapshot is unreadable") from exc
+        if not 1 <= len(content) <= 40_000 or hashlib.sha256(content).hexdigest() != prompt_hash:
+            raise ValueError("core prompt benchmark snapshot changed or exceeds 40 KB")
+        selected.update(experiment="core_prompt", prompt_sha256=prompt_hash)
+    return selected

@@ -78,6 +78,8 @@ def main():
     parser.add_argument("--lead-model", required=True)
     parser.add_argument("--lead-effort", required=True)
     parser.add_argument("--model-config", type=Path, required=True)
+    parser.add_argument("--experiment", choices=("launch_brief", "core_prompt"), default="launch_brief")
+    parser.add_argument("--core-prompt-file", type=Path, help="reviewed prompt for the core_prompt experiment")
     parser.add_argument("--pico", default="pico")
     args = parser.parse_args()
     try:
@@ -96,6 +98,16 @@ def main():
             raise real.Refused("absolute provider config and aggregate ledger paths are required")
         provider_bytes = Path(config).read_bytes()
         model_bytes = args.model_config.read_bytes()
+        if (args.experiment == "core_prompt") != (args.core_prompt_file is not None):
+            raise real.Refused("--core-prompt-file is required only for the core_prompt experiment")
+        prompt_bytes = args.core_prompt_file.read_bytes() if args.core_prompt_file else None
+        if prompt_bytes is not None:
+            try:
+                prompt_bytes.decode("utf-8")
+            except UnicodeError as exc:
+                raise real.Refused("core prompt must be UTF-8") from exc
+            if not 1 <= len(prompt_bytes) <= 40_000:
+                raise real.Refused("core prompt must contain 1 to 40000 bytes")
         cfg = json.loads(provider_bytes)
         limits = budget_ledger.inspect(ledger)["limits"]
         for scope in ("lifetime", "attempt"):
@@ -115,6 +127,7 @@ def main():
         snapshots.mkdir(mode=0o700)
         provider_snapshot, provider_hash = snapshot_config(snapshots, "provider.json", provider_bytes)
         model_snapshot, model_hash = snapshot_config(snapshots, "models.yaml", model_bytes)
+        prompt_snapshot, prompt_hash = snapshot_config(snapshots, "core-prompt.md", prompt_bytes) if prompt_bytes is not None else (None, None)
         state = out / "state"
         state.mkdir()
         fixture = setup.create(out / "work", args.max_tokens, args.max_lead_calls, args.duration,
@@ -125,6 +138,12 @@ def main():
                    PICO_BENCHMARK_LEAD_EFFORT=args.lead_effort,
                    PI_ORCHESTRATOR_MODEL_CONFIG=str(model_snapshot),
                    PICO_PROVIDER_BUDGET_CONFIG=str(provider_snapshot))
+        if prompt_snapshot is not None:
+            env.update(PICO_BENCHMARK_EXPERIMENT="core_prompt", PICO_BENCHMARK_PROMPT_FILE=str(prompt_snapshot),
+                       PICO_BENCHMARK_PROMPT_SHA256=prompt_hash)
+        else:
+            for name in ("PICO_BENCHMARK_EXPERIMENT", "PICO_BENCHMARK_PROMPT_FILE", "PICO_BENCHMARK_PROMPT_SHA256"):
+                env.pop(name, None)
         started = real.now()
         start = time.monotonic()
         launch = real.execute([pico, "workspace", "schedule", fixture["manifest"], "--no-access-check", "--allow-mutation", "--json"], env, "launch")
@@ -135,6 +154,8 @@ def main():
         validations = validation.validate_completed(pico, env, Path(fixture["manifest"]), workspace, launch["output"], state, real)
         metrics = real.benchmark_metrics.workspace_report(state, fixture["workspace_id"], label=args.variant)
         provenance = {"variant": args.variant, "pair": args.pair, "revision": args.revision,
+                      "experiment": args.experiment, "core_prompt_sha256": prompt_hash,
+                      "brief_mode": "both" if prompt_snapshot is not None else "variant",
                       "task_id": "one-line", "task_kind": fixture["task_kind"], "task_sha256": fixture["task_sha256"], "base_commit": fixture["base_commit"],
                       "acceptance_sha256": fixture["acceptance_sha256"], "autonomy_policy_sha256": fixture["autonomy_policy_sha256"],
                       "routing_policy_sha256": digest(ROOT / "routing/default-policy.yaml"),
@@ -153,6 +174,8 @@ def main():
                 pass
         expected_selection = {"variant": args.variant, "pair": args.pair, "revision": args.revision,
                               "lead_model": args.lead_model, "lead_effort": args.lead_effort}
+        if prompt_hash is not None:
+            expected_selection.update(experiment="core_prompt", prompt_sha256=prompt_hash)
         observed = len(records) == 1 and records[0].get("benchmark") == expected_selection and records[0].get("orchestrator_revision") == args.revision
         # Keep provider reservations distinct from model-reported cost. An unsettled
         # reservation is not an actual charge; it remains explicit and conservative.
@@ -162,7 +185,8 @@ def main():
                              "actual": item.get("actual")}
                             for item in ledger_after["reservations"].values()
                             if item.get("attempt_id") in execution_ids]
-        snapshots_unchanged = digest(provider_snapshot) == provider_hash and digest(model_snapshot) == model_hash
+        snapshots_unchanged = (digest(provider_snapshot) == provider_hash and digest(model_snapshot) == model_hash
+                               and (prompt_snapshot is None or digest(prompt_snapshot) == prompt_hash))
         report = {"version": 1, "selector_observed": observed, "config_snapshots_unchanged": snapshots_unchanged, "provenance": provenance, "started_at": started, "finished_at": real.now(),
                   "provider_ledger": {"entries": provider_entries,
                                       "all_entries_settled": bool(provider_entries) and all(e["state"] == "settled" for e in provider_entries)},

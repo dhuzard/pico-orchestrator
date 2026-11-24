@@ -29,6 +29,55 @@ def test_benchmark_selector_fails_closed():
             launch_brief.benchmark_selection(broken, rev)
 
 
+def test_core_prompt_selector_pins_bytes_and_requires_pilot_repository(tmp_path, monkeypatch):
+    import hashlib
+    import headless_run
+    rev = "a" * 40
+    prompt = tmp_path / "prompt.md"
+    prompt.write_text("# reviewed pilot prompt\n")
+    digest = hashlib.sha256(prompt.read_bytes()).hexdigest()
+    env = {"PICO_REAL_BENCHMARK": "1", "PICO_BENCHMARK_VARIANT": "baseline",
+           "PICO_BENCHMARK_PAIR": "pair-1", "PICO_BENCHMARK_REVISION": rev,
+           "PICO_BENCHMARK_LEAD_MODEL": "provider/model", "PICO_BENCHMARK_LEAD_EFFORT": "high",
+           "PICO_BENCHMARK_EXPERIMENT": "core_prompt", "PICO_BENCHMARK_PROMPT_FILE": str(prompt),
+           "PICO_BENCHMARK_PROMPT_SHA256": digest}
+    selected = launch_brief.benchmark_selection(env, rev)
+    assert selected["prompt_sha256"] == digest
+    assert selected["experiment"] == "core_prompt"
+    for broken in ({**env, "PICO_REAL_BENCHMARK": "0"},
+                   {**env, "PICO_BENCHMARK_PROMPT_FILE": "relative.md"},
+                   {**env, "PICO_BENCHMARK_PROMPT_SHA256": "0" * 64}):
+        with pytest.raises(ValueError):
+            launch_brief.benchmark_selection(broken, rev)
+    monkeypatch.setattr(headless_run.workspace_plan, "orchestrator_revision", lambda root: rev)
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    with pytest.raises(headless_run.HeadlessError, match="local pilot repository"):
+        headless_run._launch_locked(tmp_path / "execution.json", worktree=tmp_path, identity="other/repo",
+                                   common=tmp_path, execution_id="x", objective="x", allow_mutation=False,
+                                   resume=False, pi_executable="pi", python=sys.executable)
+    assert not (tmp_path / "execution.json").exists()
+    prompt.write_text("changed")
+    with pytest.raises(ValueError, match="changed"):
+        launch_brief.benchmark_selection(env, rev)
+
+
+def test_core_prompt_arms_keep_identical_launch_brief(tmp_path):
+    import headless_run
+    prompt = tmp_path / "prompt.md"
+    prompt.write_text("# Reviewed prompt\n$ARGUMENTS\n")
+    env = {"PICO_BENCHMARK_PROMPT_FILE": str(prompt)}
+    baseline = {"variant": "baseline", "experiment": "core_prompt"}
+    candidate = {"variant": "candidate", "experiment": "core_prompt"}
+    a = headless_run.benchmark_launch_prompt("Fix the task", "BRIEF\n", baseline, env)
+    b = headless_run.benchmark_launch_prompt("Fix the task", "BRIEF\n", candidate, env)
+    assert a == b
+    assert a.startswith("BRIEF\n")
+    assert "Fix the task" in a
+    legacy = headless_run.benchmark_launch_prompt("Fix the task", "BRIEF\n", {"variant": "baseline"}, {})
+    assert not legacy.startswith("BRIEF\n")
+
+
 def report(tokens=100, verified=True, complete=True):
     return {"selector_observed": True, "config_snapshots_unchanged": True, "elapsed_seconds": 2, "launch": {"exit_code": 0},
             "validation": [{"task": "pilot", "validation": "VALIDATED", "exit_code": 0}],
@@ -89,6 +138,30 @@ def test_paired_analysis_reports_cache_inclusive_volume_only_when_observed(tmp_p
     candidate["metrics"]["totals"]["context_efficiency"]["all_input_volume_tokens"] = None
     (tmp_path / "candidate.json").write_text(json.dumps(candidate))
     assert analysis.analyze(manifest, tmp_path)["summary"]["all_input_volume_tokens"]["mean_delta"] is None
+
+
+def test_core_prompt_analysis_requires_distinct_prompts_and_same_brief(tmp_path):
+    fixed = {k: "pinned" for k in analysis.FIXED}
+    fixed.update(lead_model="m", task_id="pilot", provider_caps={"tokens": 1000})
+    for variant, prompt_hash, tokens in (("baseline", "a" * 64, 1000), ("candidate", "b" * 64, 700)):
+        payload = report(tokens)
+        payload["provenance"] = {**fixed, "variant": variant, "pair": "one", "experiment": "core_prompt",
+                                 "core_prompt_sha256": prompt_hash, "brief_mode": "both"}
+        (tmp_path / f"{variant}.json").write_text(json.dumps(payload))
+    manifest = {"version": 1, "samples": [{"id": "one", "baseline": {"report": "baseline.json"},
+                                            "candidate": {"report": "candidate.json"}}]}
+    result = analysis.analyze(manifest, tmp_path)
+    assert result["experiment"] == "core_prompt"
+    assert result["summary"]["tokens"]["mean_delta"] == -300
+    candidate = json.loads((tmp_path / "candidate.json").read_text())
+    candidate["provenance"]["core_prompt_sha256"] = "a" * 64
+    (tmp_path / "candidate.json").write_text(json.dumps(candidate))
+    with pytest.raises(analysis.Invalid, match="distinct pinned prompts"):
+        analysis.analyze(manifest, tmp_path)
+    candidate["provenance"].update(core_prompt_sha256="b" * 64, brief_mode="variant")
+    (tmp_path / "candidate.json").write_text(json.dumps(candidate))
+    with pytest.raises(analysis.Invalid, match="same launch brief"):
+        analysis.analyze(manifest, tmp_path)
 
 
 def test_fixture_has_reproducible_base_and_trusted_check(tmp_path):

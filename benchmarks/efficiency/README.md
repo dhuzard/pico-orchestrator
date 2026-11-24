@@ -5,9 +5,26 @@ excludes cache reads. Its paired analysis now also reports deltas for
 `metrics.totals.context_efficiency` input volume (fresh + cache read + cache
 write), lead read-side median, and compactions when those counters are complete.
 Inspect peak context and quality in the arm reports. This harness
-holds the Pico revision and project configuration fixed and varies only the
-launch brief. It is not yet an A/B harness for the prompt or compaction
-setting; see [the context efficiency pilot](../../docs/context-efficiency.md).
+holds the Pico revision and project configuration fixed. The default experiment
+varies only the launch brief. `--experiment core_prompt` instead holds the
+launch brief identical in both arms and varies a reviewed, pinned core prompt
+snapshot. It is not an A/B harness for the project compaction setting; see
+[the context efficiency pilot](../../docs/context-efficiency.md).
+
+For the core-prompt experiment, prepare two reviewed UTF-8 prompt files outside
+Git and pass each with `--core-prompt-file`. Use the **same runtime revision**,
+task, model settings and shared provider ledger in both arms. The runner copies
+the prompt bytes to a private per-arm snapshot; the selector records its SHA-256
+and refuses a changed snapshot. The runtime accepts this override only with
+the real-benchmark opt-in and the local `pico-bench-sandbox/pilot` fixture. The
+analyzer requires distinct prompt hashes and the same launch-brief treatment.
+For example, extract the old prompt from an exact commit with `git show
+<old-sha>:prompts/orchestrate-core.md > /outside-git/baseline.md`, copy the
+current prompt to `/outside-git/candidate.md`, then add `--experiment
+core_prompt --core-prompt-file /outside-git/baseline.md` to the baseline arm
+and the candidate file to the candidate arm in the commands below. Review the
+bytes and hashes before any paid run. This isolates prompt text, not Pi
+compaction behavior or production task quality.
 
 The default pilot is a local, one-line arithmetic task with an acceptance check outside the target repository. `--task-kind config` selects a separate configuration-edit cohort: set `display.max_results` in `settings.json` from 10 to 20. Its independent acceptance script requires exactly that one tracked file and exact expected content. Both arms use the same runtime revision, task, deterministic base commit, policies, model configuration, lead model and thinking level. Only the launch brief differs. The selector is opt-in and recorded in the execution; all normal lifecycle, routing, worker, review, isolation and budget guards remain active. Neither arm publishes. The task can still fail, stop at a limit, or have missing usage data.
 
