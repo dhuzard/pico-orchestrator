@@ -25,11 +25,11 @@ All-participant input volume was `n/a` because some worker counters were
 missing; run records alone supplied no verified-task denominator.
 
 `prompts/orchestrate-core.md`, which the launcher sends with each new run,
-is reduced from 29,360 to 10,871 UTF-8 bytes. The full
+is reduced from 29,360 to 11,057 UTF-8 bytes. The full
 `prompts/orchestrate.md` remains available for focused reads after routing.
 A test bounds the core prompt to 12,000 bytes and checks that the key route,
 mutation, review, integration, and publication instructions remain present.
-The byte reduction is about 63%; actual input-token savings need a provider usage
+The byte reduction is about 62%; actual input-token savings need a provider usage
 comparison.
 
 For the Metadatapp pilot, Pi's project `.pi/settings.json` sets

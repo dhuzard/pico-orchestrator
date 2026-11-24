@@ -149,6 +149,8 @@ test("workflow prompt loads a compact core and points to detailed protocol", () 
   assert.match(built.prompt, /prompts\/orchestrate\.md/);
   assert.match(built.prompt, /route_task/);
   assert.match(built.prompt, /## Completion/);
+  assert.match(built.prompt, /Pass that worktree's absolute path to `integrate_begin`/);
+  assert.ok(built.prompt.includes('"path":"/absolute/integration-worktree"'));
   for (const invariant of ["PARENT_ROUTE_RECHECK_REQUIRED", "MUTATION_AUTHORIZATION_REQUIRED",
     "fresh_context:true", "independent reviewer", "integrate_begin", "--parent-run-id",
     "BLOCKER, CORRECTNESS, REGRESSION", "orchestration_record"]) {
