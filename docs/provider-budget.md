@@ -142,6 +142,20 @@ contract atomically on every request, so an idle gateway holding the old
 configuration is refused after the change. Replaying a stale expected digest
 cannot change the ledger again.
 
+A spent provider ledger can add **lifetime launch slots only** after every
+reservation is settled. This supports a predeclared retry or additional paired
+arms without replacing the ledger or raising its dollar, token, request, day,
+task, or attempt ceilings. The command compares the current launch limit,
+records the previous/new value, timestamp, reason and unchanged lifetime dollar
+ceiling in `lifetime_launch_history`, and refuses a stale or lower replacement.
+It does not authorize spending beyond the existing lifetime dollar ceiling.
+
+```sh
+python3 tools/budget_ledger.py extend-launches /absolute/private/existing-ledger.json \
+  --expected 4 --replacement 6 \
+  --reason 'Two more paired arms under the existing approved dollar cap'
+```
+
 The generated native Pi entry for `claude-opus-5-5` explicitly retains
 `compat.forceAdaptiveThinking`. This makes `--thinking high` send adaptive
 thinking and `output_config.effort=high`; it does not translate to a legacy token

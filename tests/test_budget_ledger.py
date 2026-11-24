@@ -118,6 +118,55 @@ class LedgerTest(unittest.TestCase):
                 self.assertEqual(data["provider_contract"], "a" * 64)
                 self.assertNotIn("provider_contract_history", data)
 
+    def test_extend_launch_slots_preserves_spent_provider_ledger_and_dollar_cap(self):
+        limits = {"attempt": {"launches": 1, "requests": 2, "tokens": 1000, "cost_usd": "10"},
+                  "lifetime": {"launches": 1, "requests": 4, "tokens": 2000, "cost_usd": "20"}}
+        ledger.initialize(self.path, limits)
+        ledger.bind_provider_contract(self.path, "a" * 64)
+        first = ledger.reserve_launch(self.path, task_id="t1", attempt_id="a1", provider_bound=True,
+                                      provider_contract="a" * 64)
+        ledger.settle(self.path, first, actual={"launches": 1, "requests": 0, "tokens": 0, "cost_usd": "0"}, complete=True)
+        with self.assertRaisesRegex(ledger.BudgetError, "lifetime launches"):
+            ledger.reserve_launch(self.path, task_id="t2", attempt_id="a2", provider_bound=True,
+                                  provider_contract="a" * 64)
+        result = ledger.extend_lifetime_launches(self.path, expected=1, replacement=3,
+                                                 reason="More paired arms under the same approved dollar cap")
+        self.assertEqual(result["limits"]["lifetime"], {**limits["lifetime"], "launches": 3})
+        self.assertEqual(result["reservations"][first]["state"], "settled")
+        self.assertEqual(result["lifetime_launch_history"][0]["cost_usd"], "20")
+        self.assertEqual(ledger.inspect(self.path), result)
+        self.assertTrue(ledger.reserve_launch(self.path, task_id="t2", attempt_id="a2", provider_bound=True,
+                                              provider_contract="a" * 64))
+        with self.assertRaisesRegex(ledger.BudgetError, "cost_usd"):
+            ledger.reserve(self.path, operation_id="too-expensive", task_id="t2", attempt_id="a2",
+                           maximum={"launches": 0, "requests": 1, "tokens": 1, "cost_usd": "21"},
+                           supported={"launches", "requests", "tokens", "cost_usd"},
+                           provider_contract="a" * 64)
+        with self.assertRaisesRegex(ledger.BudgetError, "CONFLICT"):
+            ledger.extend_lifetime_launches(self.path, expected=1, replacement=4, reason="stale")
+
+    def test_extend_launch_slots_refuses_unsettled_or_unbound_ledgers_and_tampering(self):
+        ledger.initialize(self.path, {"lifetime": {"launches": 1, "cost_usd": "20"}})
+        with self.assertRaisesRegex(ledger.BudgetError, "CONFLICT"):
+            ledger.extend_lifetime_launches(self.path, expected=1, replacement=2, reason="no contract")
+        ledger.bind_provider_contract(self.path, "a" * 64)
+        operation = ledger.reserve_launch(self.path, task_id="t", attempt_id="a", provider_bound=True,
+                                          provider_contract="a" * 64)
+        before = self.path.read_bytes()
+        with self.assertRaisesRegex(ledger.BudgetError, "CONFLICT"):
+            ledger.extend_lifetime_launches(self.path, expected=1, replacement=2, reason="active")
+        self.assertEqual(self.path.read_bytes(), before)
+        ledger.settle(self.path, operation, actual={"launches": 1, "requests": 0, "tokens": 0,
+                                                  "cost_usd": "0"}, complete=True)
+        with self.assertRaisesRegex(ledger.BudgetError, "must increase"):
+            ledger.extend_lifetime_launches(self.path, expected=1, replacement=1, reason="unchanged")
+        ledger.extend_lifetime_launches(self.path, expected=1, replacement=2, reason="settled")
+        changed = json.loads(self.path.read_text())
+        changed["limits"]["lifetime"]["cost_usd"] = "30"
+        self.path.write_text(json.dumps(changed))
+        with self.assertRaisesRegex(ledger.BudgetError, "UNREADABLE"):
+            ledger.inspect(self.path)
+
     def test_crash_after_reservation_and_next_day_retains_full_allowance(self):
         ledger.initialize(self.path, {"day": {"requests": 1}})
         code = ("import os,sys;sys.path.insert(0,sys.argv[1]);import budget_ledger as l;"
