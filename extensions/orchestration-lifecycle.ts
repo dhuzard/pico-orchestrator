@@ -1828,9 +1828,11 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
       return reply(false, `BLOCKED: ${DIFF_UNVERIFIABLE}: the merged change of the wave could not be checked against the path floors; the integration did not end.`, verdict);
     }
     if (verdict.blocked !== true) {
-      if (integrationPath !== targetCwd && (typeof verdict.head !== "string" || verdict.head === integrationBase || verdict.changed_path_count === 0))
-        return reply(false, "BLOCKED: INTEGRATION_COMMIT_REQUIRED: commit the integrated changes in the integration worktree before ending the wave.");
-      if (integrationPath !== targetCwd) {
+      const checkedWorkerChanges = members.some((id) => (checkedChanges.get(id)?.size ?? 0) > 0);
+      const commitRequired = integrationPath !== targetCwd || checkedWorkerChanges;
+      if (commitRequired && (typeof verdict.head !== "string" || verdict.head === integrationBase || verdict.changed_path_count === 0))
+        return reply(false, "BLOCKED: INTEGRATION_COMMIT_REQUIRED: commit the integrated changes in the selected checkout before ending the wave.");
+      if (commitRequired) {
         for (const id of members) {
           const checked = checkedChanges.get(id) ?? new Set<string>();
           const item = (Array.isArray(verdict.verdicts) ? verdict.verdicts : []).find((v: Json) => v.task_id === id) as Json | undefined;

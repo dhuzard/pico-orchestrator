@@ -417,7 +417,10 @@ path_floors:
   (committed, working tree and untracked) against every member's route
   result: what was actually merged, including a branch merged from elsewhere
   or the lead's own edits. A path only another member's checked worktree
-  changed is left to that member. An underrated merge is recorded and
+  changed is left to that member. If a checked worker changed files, the
+  selected checkout must advance to a commit containing every checked path;
+  an unchanged parent checkout cannot complete the wave merely because a
+  separate worker or integration branch has a commit. An underrated merge is recorded and
   re-routed the same way, and the integration does not end: restore the
   integration checkout to the recorded HEAD, call `integrate_abort`, run the new
   route's workers in a fresh wave, then integrate again.
