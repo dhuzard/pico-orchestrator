@@ -240,7 +240,7 @@ def mission_brief(id: str, repo_root: Path = REPO_ROOT_DEFAULT, *, limit: int = 
     items = {item["id"]: item for item in _load_valid_backlog(repo_root)}
     linked = [items.get(item_id) for item_id in mission["backlog_items"]]
     pending = [{"id": item_id, "status": item["status"] if item else "missing"}
-               for item_id, item in zip(mission["backlog_items"], linked)
+               for item_id, item in zip(mission["backlog_items"], linked, strict=True)
                if item is None or item["status"] != "completed"]
     goal = " ".join(mission["goal"].split())
     return {
