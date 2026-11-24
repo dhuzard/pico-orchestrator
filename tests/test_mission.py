@@ -78,6 +78,27 @@ class MissionStoreTest(unittest.TestCase):
         self.assertEqual(mission_store.mission_get("MISSION-001", self.repo_root)["goal"], "Ship the feature")
         self.assertEqual([m["id"] for m in mission_store.mission_list(self.repo_root)], ["MISSION-001"])
 
+    def test_brief_is_bounded_read_only_and_reports_omissions(self):
+        for number in range(3, 9):
+            backlog.backlog_add(id=f"ORCH-{number:03d}", title=f"Task {number}",
+                                description="Another task", version="v-test", priority="high",
+                                repo_root=self.repo_root)
+        ids = [f"ORCH-{number:03d}" for number in range(1, 9)]
+        mission_store.mission_add(id="MISSION-001", goal="A " + "long goal " * 50,
+                                  backlog_items=ids, repo_root=self.repo_root)
+        path = mission_store.missions_path(self.repo_root)
+        before = path.read_bytes()
+        rc, out, err = invoke_cli(["--repo-root", str(self.repo_root), "brief", "MISSION-001"])
+        self.assertEqual((rc, err), (0, ""))
+        brief = json.loads(out)
+        self.assertEqual(brief["linked_count"], 8)
+        self.assertEqual(brief["pending_count"], 8)
+        self.assertEqual([item["id"] for item in brief["pending"]], ids[:5])
+        self.assertEqual(brief["pending_omitted"], 3)
+        self.assertTrue(brief["goal_truncated"])
+        self.assertLessEqual(len(brief["goal_excerpt"]), 160)
+        self.assertEqual(path.read_bytes(), before)
+
     def test_schema_rejects_unknown_fields_and_status(self):
         schema = mission_store.load_schema(self.repo_root)
         bad = {

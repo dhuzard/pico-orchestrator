@@ -5,7 +5,7 @@ import test from "node:test";
 import { WORKFLOW_COMMANDS } from "../extensions/workflow-commands.ts";
 
 const ROOT = join(import.meta.dirname, "..");
-const MISSION_COMMANDS = ["deliver","deliver-status","deliver-link","deliver-pause","deliver-resume","deliver-cancel"];
+const MISSION_COMMANDS = ["deliver","deliver-status","deliver-brief","deliver-link","deliver-pause","deliver-resume","deliver-cancel"];
 
 test("documented workflow commands match exported registry", () => {
   const readme = readFileSync(join(ROOT, "README.md"), "utf8");

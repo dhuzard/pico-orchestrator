@@ -95,6 +95,10 @@ def cmd_show(args: argparse.Namespace) -> None:
     _json(store.mission_get(args.id, _repo_root(args)))
 
 
+def cmd_brief(args: argparse.Namespace) -> None:
+    _json(store.mission_brief(args.id, _repo_root(args)))
+
+
 def cmd_update_status(args: argparse.Namespace, status: str) -> None:
     _json(store.mission_update(args.id, _repo_root(args), status=status))
 
@@ -161,6 +165,10 @@ def build_parser() -> argparse.ArgumentParser:
     show = sub.add_parser("show", help="show one mission")
     show.add_argument("id")
     show.set_defaults(func=cmd_show)
+
+    brief = sub.add_parser("brief", help="show bounded mission and backlog status for resuming context")
+    brief.add_argument("id")
+    brief.set_defaults(func=cmd_brief)
 
     reconcile = sub.add_parser("reconcile", help="observe backlog and complete mission if all items are completed")
     reconcile.add_argument("id")

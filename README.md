@@ -698,6 +698,7 @@ manage mission state; they do not merge PRs or deploy changes:
 | --- | --- |
 | `/deliver <goal>` | Create a mission and start planning. |
 | `/deliver-status [MISSION-ID]` | Show one mission, or list all missions without an ID. |
+| `/deliver-brief MISSION-ID` | Show a bounded, read-only mission and backlog brief for resuming work. |
 | `/deliver-link MISSION-ID BACKLOG-ID` | Link an existing backlog item to a mission. |
 | `/deliver-pause MISSION-ID` | Pause a running mission. |
 | `/deliver-resume MISSION-ID` | Resume a planned or paused mission. |
@@ -825,7 +826,11 @@ creates durable mission state in `missions/missions.yaml` and queues bounded
 `/orchestrate` planning for the next engineering task. Mission goals that
 contain explicit bullets like `- ORCH-016: Scheduler invoking /orchestrate` can
 be expanded with `python3 tools/mission.py plan-backlog MISSION-001` into a
-validated backlog DAG linked back to the mission. `/deliver-status`,
+validated backlog DAG linked back to the mission. `/deliver-brief MISSION-ID`
+reads stored mission and backlog state into a short JSON brief: it shows at
+most five pending task IDs and counts anything omitted. Use `/deliver-status`
+for the full record. The brief does not check live GitHub or CI state.
+`/deliver-status`,
 `/deliver-link`, `/deliver-pause`, `/deliver-resume`, and `/deliver-cancel`
 are thin command wrappers around `tools/mission.py`; they do not push branches, mutate GitHub,
 mark PRs ready, merge, deploy, or replace the `/orchestrate` execution engine.

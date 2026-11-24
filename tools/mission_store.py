@@ -232,6 +232,30 @@ def mission_get(id: str, repo_root: Path = REPO_ROOT_DEFAULT) -> dict:
     raise MissionNotFoundError(f"no mission with id {id!r}")
 
 
+def mission_brief(id: str, repo_root: Path = REPO_ROOT_DEFAULT, *, limit: int = 5) -> dict:
+    """Bounded, read-only orientation from durable mission and backlog state."""
+    if type(limit) is not int or limit < 1:
+        raise ValueError("brief limit must be a positive integer")
+    mission = mission_get(id, repo_root)
+    items = {item["id"]: item for item in _load_valid_backlog(repo_root)}
+    linked = [items.get(item_id) for item_id in mission["backlog_items"]]
+    pending = [{"id": item_id, "status": item["status"] if item else "missing"}
+               for item_id, item in zip(mission["backlog_items"], linked, strict=True)
+               if item is None or item["status"] != "completed"]
+    goal = " ".join(mission["goal"].split())
+    return {
+        "id": mission["id"], "status": mission["status"],
+        "goal_excerpt": goal[:160], "goal_truncated": len(goal) > 160,
+        "updated_at": mission["updated_at"],
+        "base_branch": mission["base_branch"], "base_sha": mission["base_sha"],
+        "linked_count": len(linked), "pending_count": len(pending),
+        "pending": pending[:limit], "pending_omitted": max(0, len(pending) - limit),
+        "current": {key: values[:limit] for key, values in mission["current"].items()},
+        "current_omitted": {key: max(0, len(values) - limit)
+                            for key, values in mission["current"].items()},
+    }
+
+
 def parse_backlog_bullets(goal: str) -> list[dict[str, str]]:
     """Extract an ordered backlog plan from explicit goal bullets.
 
