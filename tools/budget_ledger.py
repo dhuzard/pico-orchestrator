@@ -134,6 +134,23 @@ def _load(path):
             _fail("provider contract differs from its history")
         if last_attempt_cost is not None and Decimal(last_attempt_cost) != Decimal(str(data["limits"]["attempt"]["cost_usd"])):
             _fail("attempt dollar limit differs from its history")
+        launch_history = data.get("lifetime_launch_history", [])
+        if not isinstance(launch_history, list):
+            _fail("invalid lifetime launch history")
+        previous_launches = None
+        for event in launch_history:
+            old = _amounts({"launches": event["previous"]})["launches"]
+            new = _amounts({"launches": event["replacement"]})["launches"]
+            if new <= old or (previous_launches is not None and old != previous_launches):
+                _fail("lifetime launch history is discontinuous or non-increasing")
+            _identity(event["reason"])
+            datetime.fromisoformat(event["at"])
+            recorded_cost = _amounts({"cost_usd": event["cost_usd"]})["cost_usd"]
+            if Decimal(recorded_cost) != Decimal(str(data["limits"]["lifetime"]["cost_usd"])):
+                _fail("lifetime dollar ceiling differs from launch history")
+            previous_launches = new
+        if previous_launches is not None and previous_launches != data["limits"]["lifetime"]["launches"]:
+            _fail("lifetime launch limit differs from its history")
         for operation, entry in data["reservations"].items():
             _identity(operation)
             _identity(entry["task_id"])
@@ -309,6 +326,29 @@ def rebind_empty_provider_contract(path, *, expected, replacement, reason, attem
         return data
 
 
+def extend_lifetime_launches(path, *, expected, replacement, reason):
+    """Add launch slots to a settled provider ledger without changing its dollar cap."""
+    expected = _amounts({"launches": expected})["launches"]
+    replacement = _amounts({"launches": replacement})["launches"]
+    reason = _identity(reason)
+    if replacement <= expected:
+        _fail("replacement lifetime launch limit must increase")
+    with _locked(path) as path:
+        data = _load(path)
+        lifetime = data["limits"].get("lifetime", {})
+        if (lifetime.get("launches") != expected or "cost_usd" not in lifetime
+                or "provider_contract" not in data):
+            _fail("expected provider-bound lifetime launch and dollar limits are required", "AGGREGATE_BUDGET_CONFLICT")
+        if any(entry["state"] != "settled" for entry in data["reservations"].values()):
+            _fail("all reservations must be settled before extending launch slots", "AGGREGATE_BUDGET_CONFLICT")
+        data.setdefault("lifetime_launch_history", []).append({
+            "previous": expected, "replacement": replacement, "cost_usd": lifetime["cost_usd"],
+            "reason": reason, "at": datetime.now(timezone.utc).isoformat()})
+        lifetime["launches"] = replacement
+        _save(path, data)
+        return data
+
+
 def reserve_launch(path, *, task_id, attempt_id, operation_id=None, provider_bound=False, provider_contract=None):
     """Charge one attempted launch. Provider ceilings are refused at this boundary.
 
@@ -333,9 +373,20 @@ def main(argv=None):
     create.add_argument("--limits", required=True, help='JSON, e.g. {"day":{"launches":4},"lifetime":{"launches":20}}')
     show = sub.add_parser("status")
     show.add_argument("path", type=Path)
+    extend = sub.add_parser("extend-launches", help="increase only lifetime launch slots in a settled provider ledger")
+    extend.add_argument("path", type=Path)
+    extend.add_argument("--expected", type=int, required=True)
+    extend.add_argument("--replacement", type=int, required=True)
+    extend.add_argument("--reason", required=True)
     args = parser.parse_args(argv)
     try:
-        result = initialize(args.path, json.loads(args.limits)) if args.command == "init" else inspect(args.path)
+        if args.command == "init":
+            result = initialize(args.path, json.loads(args.limits))
+        elif args.command == "extend-launches":
+            result = extend_lifetime_launches(args.path, expected=args.expected,
+                                              replacement=args.replacement, reason=args.reason)
+        else:
+            result = inspect(args.path)
     except (BudgetError, ValueError, OSError) as exc:
         print(json.dumps({"ok": False, "error_code": getattr(exc, "code", "AGGREGATE_BUDGET_INVALID"), "error": str(exc)}))
         return 1
