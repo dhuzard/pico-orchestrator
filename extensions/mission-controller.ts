@@ -91,6 +91,19 @@ export default function missionController(pi: ExtensionAPI) {
     },
   });
 
+  pi.registerCommand("deliver-brief", {
+    description: "Show a short, read-only mission and backlog brief for resuming work",
+    handler: async (args, ctx) => {
+      const id = args.trim();
+      if (!id || id.includes(" ")) {
+        ctx.ui.notify("Usage: /deliver-brief MISSION-001", "error");
+        return;
+      }
+      const result = await runMissionCommand(["brief", id], ctx.cwd, ctx.signal);
+      await showMissionResult(ctx, result);
+    },
+  });
+
   pi.registerCommand("deliver-link", {
     description: "Link an existing backlog item to a mission",
     handler: async (args, ctx) => {

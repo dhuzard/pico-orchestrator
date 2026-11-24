@@ -24,7 +24,7 @@ const EXPECTED_REGISTRATIONS: Record<string, { tools: string[]; commands: string
   "provider-budget-guard.ts": { tools: [], commands: [], events: ["tool_call"] },
   "workflow-commands.ts": { tools: [], commands: [...WORKFLOW_COMMANDS], events: [] },
   "mission-controller.ts": { tools: [],
-    commands: ["deliver", "deliver-status", "deliver-link", "deliver-pause", "deliver-resume", "deliver-cancel"], events: [] },
+    commands: ["deliver", "deliver-status", "deliver-brief", "deliver-link", "deliver-pause", "deliver-resume", "deliver-cancel"], events: [] },
   "orchestration-lifecycle.ts": { tools: ["ClaudeWorker", "orchestration_record"], commands: [],
     events: ["before_agent_start", "tool_call", "tool_result", "turn_end",
       "session_compact", "session_compact_failed", "agent_before_settle", "session_start", "session_shutdown"] },
