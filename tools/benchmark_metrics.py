@@ -19,6 +19,11 @@ child run ended COMPLETED and whose checks all passed). With no such task it is
 "n/a", never 0 or infinity. Qualification tasks launch no run and are reported
 separately; they are not in the denominator.
 
+The separate context-efficiency block reports provider-counted input volume
+(fresh input + cache reads + cache writes), lead read-side medians, Pi
+compactions, and peak parent context. Missing counters stay unknown. Input
+volume is neither the workspace budget's spend metric nor a billed cost.
+
 Exit codes: 0 ok, 1 provenance incomplete in --compare (facts of BEFORE missing from
 AFTER), 2 invalid invocation or unreadable records.
 """
@@ -28,6 +33,7 @@ import argparse
 import json
 import os
 import re
+import statistics
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -112,6 +118,27 @@ def spend(block: dict) -> tuple[int, bool]:
     """Input + output + cache-write of one participant, and whether all three were observed."""
     values = [block.get(name) for name in ("input", "output", "cache_write")]
     return sum(v for v in values if v is not None), all(v is not None for v in values)
+
+
+def input_volume(block: dict) -> int | None:
+    """Provider-counted input, including cache reads and writes; not budget spend or cost."""
+    values = [_count(block.get(name)) for name in ("input", "cache_read", "cache_write")]
+    return sum(values) if all(value is not None for value in values) else None
+
+
+def lead_read_side(calls: Any) -> dict:
+    """Median fresh + cache-read tokens per lead call; cache writes are not stored per call."""
+    if not isinstance(calls, list):
+        return {"median_tokens": None, "observed_calls": 0, "missing_calls": None}
+    values = []
+    for call in calls:
+        fresh = _count(call.get("input_tokens")) if isinstance(call, dict) else None
+        cached = _count(call.get("cached_tokens")) if isinstance(call, dict) else None
+        if fresh is not None and cached is not None:
+            values.append(fresh + cached)
+    missing = len(calls) - len(values)
+    return {"median_tokens": statistics.median(values) if values and missing == 0 else None,
+            "observed_calls": len(values), "missing_calls": missing}
 
 
 def _sum_known(values: list) -> int | float | None:
@@ -405,6 +432,11 @@ def run_report(record: dict, *, state: Path | None = None, session_dirs: list[Pa
     spent = [spend(p) for p in participants]
     cost, unpriced = usage.cost_coverage(context)
     lead_calls = context.get("lead_calls")
+    lead_volume = input_volume(used["lead"])
+    worker_volumes = [input_volume(block) for block in used["workers"].values()]
+    worker_usage_known = isinstance(context.get("worker_usage"), dict) and all(
+        isinstance(part, dict) for part in context["worker_usage"].values())
+    read_side = lead_read_side(lead_calls)
     files = session_files(state, record.get("run_id", ""), session_dirs or []) if state is not None else []
     calls = session_calls(files, record.get("run_id", ""))
     phase_ids = [str(ph.get("id")) for ph in parent.get("phases") or [] if isinstance(ph, dict)]
@@ -422,6 +454,14 @@ def run_report(record: dict, *, state: Path | None = None, session_dirs: list[Pa
         "run_id": record.get("run_id"), "task": task,
         "tokens": used,
         "spend_tokens": sum(s for s, _ in spent), "spend_complete": all(c for _, c in spent),
+        "context_efficiency": {
+            "lead_input_volume_tokens": lead_volume,
+            "all_input_volume_tokens": lead_volume + sum(worker_volumes)
+                if lead_volume is not None and worker_usage_known and all(v is not None for v in worker_volumes) else None,
+            "lead_read_side": read_side,
+            "compactions": _count(context.get("compactions")),
+            "peak_context_tokens": _count(context.get("peak_context_tokens")),
+        },
         "calls": {"lead": len(lead_calls) if isinstance(lead_calls, list) else None,
                   **({"lead_limit": {key: context["lead_call_limit"].get(key) for key in (
                       "max_lead_calls", "source", "warn_at", "warned_at_call", "calls_at_limit", "stopped", "stopped_reason")}}
@@ -464,6 +504,14 @@ def aggregate(label: str, runs: list[dict], *, workspace_id: str | None = None, 
     durations = [r["wall_clock_seconds"] for r in runs]
     verified = [r for r in runs if r["outcome"]["verified"]]
     spend_tokens = sum(r["spend_tokens"] for r in runs)
+    efficiency = [r["context_efficiency"] for r in runs]
+    lead_volumes = [r["lead_input_volume_tokens"] for r in efficiency]
+    all_volumes = [r["all_input_volume_tokens"] for r in efficiency]
+    read_medians = [r["lead_read_side"]["median_tokens"] for r in efficiency]
+    compactions = [r["compactions"] for r in efficiency]
+    peaks = [r["peak_context_tokens"] for r in efficiency]
+    lead_volume = sum(lead_volumes) if runs and all(v is not None for v in lead_volumes) else None
+    all_volume = sum(all_volumes) if runs and all(v is not None for v in all_volumes) else None
     return {
         "report_version": REPORT_VERSION, "label": label, "workspace_id": workspace_id,
         "runs": runs,
@@ -478,6 +526,21 @@ def aggregate(label: str, runs: list[dict], *, workspace_id: str | None = None, 
                      "cost_complete": not unpriced, "unpriced": unpriced},
             "tasks": {"runs": len(runs), "completed": sum(r["outcome"]["final_status"] == "COMPLETED" for r in runs),
                       "verified": len(verified), "qualification": qualification or []},
+            "context_efficiency": {
+                "lead_input_volume_tokens": lead_volume,
+                "lead_input_volume_per_verified_task": round(lead_volume / len(verified), 3)
+                    if lead_volume is not None and verified else None,
+                "all_input_volume_tokens": all_volume,
+                "all_input_volume_per_verified_task": round(all_volume / len(verified), 3)
+                    if all_volume is not None and verified else None,
+                "median_run_lead_read_side_tokens": statistics.median(read_medians)
+                    if runs and all(v is not None for v in read_medians) else None,
+                "lead_read_side_observed_calls": sum(r["lead_read_side"]["observed_calls"] for r in efficiency),
+                "lead_read_side_missing_calls": sum(r["lead_read_side"]["missing_calls"] for r in efficiency)
+                    if all(r["lead_read_side"]["missing_calls"] is not None for r in efficiency) else None,
+                "compactions": sum(compactions) if runs and all(v is not None for v in compactions) else None,
+                "peak_context_tokens": max(peaks) if runs and all(v is not None for v in peaks) else None,
+            },
         },
         "headline": {
             "metric": "tokens per verified task (input + output + cache_write)",
@@ -556,6 +619,7 @@ def unresolved_binds(report: dict) -> list[dict]:
 
 def compare(before: dict, after: dict) -> dict:
     bt, at = before["totals"], after["totals"]
+    be, ae = bt.get("context_efficiency") or {}, at.get("context_efficiency") or {}
     deltas: dict[str, Any] = {
         "headline_tokens_per_verified_task": _delta(before["headline"]["value"], after["headline"]["value"]),
         "verified_tasks": _delta(bt["tasks"]["verified"], at["tasks"]["verified"]),
@@ -565,7 +629,12 @@ def compare(before: dict, after: dict) -> dict:
                                              (at["calls"]["orchestration_record"] or {}).get("total")),
         "run_seconds_sum": _delta(bt["run_seconds_sum"], at["run_seconds_sum"]),
         "wall_clock_span_seconds": _delta(bt["wall_clock_span_seconds"], at["wall_clock_span_seconds"]),
-        "estimated_cost_usd": _delta(bt["cost"]["estimated_usd"], at["cost"]["estimated_usd"]),
+        "estimated_cost_usd": _delta(bt["cost"]["estimated_usd"] if bt["cost"]["cost_complete"] else None,
+                                     at["cost"]["estimated_usd"] if at["cost"]["cost_complete"] else None),
+        "context_efficiency": {name: _delta(be.get(name), ae.get(name)) for name in (
+            "lead_input_volume_tokens", "lead_input_volume_per_verified_task", "all_input_volume_tokens",
+            "all_input_volume_per_verified_task",
+            "median_run_lead_read_side_tokens", "compactions", "peak_context_tokens")},
         "lead_tokens": {n: _delta(bt["tokens"]["lead"].get(n), at["tokens"]["lead"].get(n)) for n in TOKEN_NAMES.values()},
         "worker_tokens": {b: {n: _delta(bt["tokens"]["workers"].get(b, {}).get(n), at["tokens"]["workers"].get(b, {}).get(n))
                               for n in TOKEN_NAMES.values()}
@@ -608,6 +677,18 @@ def render_report(report: dict) -> str:
     lines.append(f"Duration: run_seconds_sum={_cell(totals['run_seconds_sum'])} s, "
                  f"wall_clock_span_seconds={_cell(totals['wall_clock_span_seconds'])} s (first start to last end)")
     lines.append(f"Cost: {_cell(cost['estimated_usd'])} USD, cost_complete={cost['cost_complete']}, unpriced={cost['unpriced'] or 'none'}")
+    efficiency = totals.get("context_efficiency") or {}
+    lines.append("Input volume (fresh + cache read + cache write): "
+                 f"lead={_cell(efficiency.get('lead_input_volume_tokens'))}, "
+                 f"lead/verified task={_cell(efficiency.get('lead_input_volume_per_verified_task'))}, "
+                 f"all={_cell(efficiency.get('all_input_volume_tokens'))}, "
+                 f"all/verified task={_cell(efficiency.get('all_input_volume_per_verified_task'))}")
+    lines.append("Lead read-side (fresh + cache read): "
+                 f"median of run medians={_cell(efficiency.get('median_run_lead_read_side_tokens'))}, "
+                 f"observed calls={_cell(efficiency.get('lead_read_side_observed_calls'))}, "
+                 f"missing calls={_cell(efficiency.get('lead_read_side_missing_calls'))}; "
+                 f"compactions={_cell(efficiency.get('compactions'))}, "
+                 f"peak context={_cell(efficiency.get('peak_context_tokens'))}")
     tasks = totals["tasks"]
     lines.append(f"Tasks: {tasks['completed']}/{tasks['runs']} completed, {tasks['verified']} verified")
     head = report["headline"]
@@ -622,6 +703,11 @@ def render_compare(result: dict) -> str:
     for name in ("headline_tokens_per_verified_task", "verified_tasks", "spend_tokens", "lead_calls",
                  "orchestration_record_calls", "run_seconds_sum", "wall_clock_span_seconds", "estimated_cost_usd"):
         item = d[name]
+        pct = "" if item["percent"] is None else f" ({item['percent']:+.1f}%)"
+        change = NA if item["delta"] is None else f"{item['delta']:+,}"
+        lines.append(f"  {name:<36}{_cell(item['before']):>12} -> {_cell(item['after']):>12}  {change}{pct}")
+    lines.append("Context efficiency (input volume includes cache reads and writes; read-side excludes writes)")
+    for name, item in d["context_efficiency"].items():
         pct = "" if item["percent"] is None else f" ({item['percent']:+.1f}%)"
         change = NA if item["delta"] is None else f"{item['delta']:+,}"
         lines.append(f"  {name:<36}{_cell(item['before']):>12} -> {_cell(item['after']):>12}  {change}{pct}")

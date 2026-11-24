@@ -64,6 +64,33 @@ def test_paired_analysis_never_imputes_incomplete_or_failed_data(tmp_path):
         analysis.analyze(manifest, tmp_path)
 
 
+def test_paired_analysis_reports_cache_inclusive_volume_only_when_observed(tmp_path):
+    fixed = {k: "pinned" for k in analysis.FIXED}
+    fixed.update(lead_model="m", task_id="pilot", provider_caps={"tokens": 1000})
+    values = {
+        "baseline": {"lead_input_volume_tokens": 1000, "all_input_volume_tokens": 1200,
+                     "median_run_lead_read_side_tokens": 500, "compactions": 0},
+        "candidate": {"lead_input_volume_tokens": 700, "all_input_volume_tokens": 850,
+                      "median_run_lead_read_side_tokens": 300, "compactions": 1},
+    }
+    for variant in ("baseline", "candidate"):
+        payload = report()
+        payload["metrics"]["totals"]["context_efficiency"] = values[variant]
+        payload["provenance"] = {**fixed, "variant": variant, "pair": "one"}
+        (tmp_path / (variant + ".json")).write_text(json.dumps(payload))
+    manifest = {"version": 1, "samples": [{"id": "one", "baseline": {"report": "baseline.json"},
+                                            "candidate": {"report": "candidate.json"}}]}
+    result = analysis.analyze(manifest, tmp_path)
+    assert result["summary"]["lead_input_volume_tokens"]["mean_delta"] == -300
+    assert result["summary"]["all_input_volume_tokens"]["mean_delta"] == -350
+    assert result["summary"]["median_run_lead_read_side_tokens"]["mean_delta"] == -200
+    assert result["summary"]["compactions"]["mean_delta"] == 1
+    candidate = json.loads((tmp_path / "candidate.json").read_text())
+    candidate["metrics"]["totals"]["context_efficiency"]["all_input_volume_tokens"] = None
+    (tmp_path / "candidate.json").write_text(json.dumps(candidate))
+    assert analysis.analyze(manifest, tmp_path)["summary"]["all_input_volume_tokens"]["mean_delta"] is None
+
+
 def test_fixture_has_reproducible_base_and_trusted_check(tmp_path):
     import subprocess
     spec = importlib.util.spec_from_file_location("efficiency_setup", ROOT / "benchmarks/efficiency/setup.py")

@@ -862,6 +862,10 @@ worktrees, serialize all delegated mutations.
 
 Do not transmit private chain-of-thought, secrets, or transcripts between
 workers. Never persist them in provenance.
+When location is uncertain, search for paths or symbols before opening files.
+Read bounded ranges and expand only when the task needs more context. For long
+diffs and logs, retain the file or commit reference and send workers the
+relevant excerpt.
 
 Transmit:
 - requirements;

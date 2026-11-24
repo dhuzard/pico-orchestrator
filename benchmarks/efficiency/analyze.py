@@ -105,8 +105,14 @@ def metric(report, task_id, lead_effort):
         tokens = totals.get("spend_tokens") if totals.get("spend_complete") else None
         usd = cost.get("estimated_usd") if cost.get("cost_complete") and not cost.get("unpriced") else None
         calls = totals["calls"].get("lead")
+        context = totals.get("context_efficiency") or {}
         elapsed = report.get("elapsed_seconds")
         return {"verified": valid, "tokens": tokens if number(tokens) else None,
+                "lead_input_volume_tokens": context.get("lead_input_volume_tokens") if number(context.get("lead_input_volume_tokens")) else None,
+                "all_input_volume_tokens": context.get("all_input_volume_tokens") if number(context.get("all_input_volume_tokens")) else None,
+                "median_run_lead_read_side_tokens": context.get("median_run_lead_read_side_tokens")
+                    if number(context.get("median_run_lead_read_side_tokens")) else None,
+                "compactions": context.get("compactions") if number(context.get("compactions")) else None,
                 "model_reported_estimated_cost_usd": usd if number(usd) else None,
                 "model_reported_cost_coverage": {"complete": cost.get("cost_complete") is True and not cost.get("unpriced"),
                                                  "unpriced": cost.get("unpriced")},
@@ -157,7 +163,9 @@ def analyze(manifest, directory):
         model_observed = all(models[v] == [expected] for v in VARIANTS)
         valid = model_observed and all(arms[v]["metrics"]["verified"] and arms[v]["metrics"]["selector_observed"] and arms[v]["metrics"]["config_snapshots_unchanged"] for v in VARIANTS)
         deltas = {}
-        for name in ("tokens", "model_reported_estimated_cost_usd", "provider_contract_cost_ceiling_usd", "lead_calls", "elapsed_seconds"):
+        for name in ("tokens", "lead_input_volume_tokens", "all_input_volume_tokens",
+                     "median_run_lead_read_side_tokens", "compactions",
+                     "model_reported_estimated_cost_usd", "provider_contract_cost_ceiling_usd", "lead_calls", "elapsed_seconds"):
             if name == "provider_contract_cost_ceiling_usd":
                 b, c = (arms[v]["metrics"]["provider_contract_cost_ceiling"]["ceiling_usd"] for v in ("baseline", "candidate"))
             else:
@@ -166,7 +174,9 @@ def analyze(manifest, directory):
         paired.append({"id": sample["id"], "arms": arms, "model_pin_observed": model_observed,
                        "both_verified": valid, "candidate_minus_baseline": deltas})
     summary = {}
-    for name in ("tokens", "model_reported_estimated_cost_usd", "provider_contract_cost_ceiling_usd", "lead_calls", "elapsed_seconds"):
+    for name in ("tokens", "lead_input_volume_tokens", "all_input_volume_tokens",
+                 "median_run_lead_read_side_tokens", "compactions",
+                 "model_reported_estimated_cost_usd", "provider_contract_cost_ceiling_usd", "lead_calls", "elapsed_seconds"):
         values = [p["candidate_minus_baseline"][name] for p in paired if p["candidate_minus_baseline"][name] is not None]
         summary[name] = {"paired_observations": len(values), "mean_delta": statistics.mean(values) if values else None,
                          "sample_stddev": statistics.stdev(values) if len(values) > 1 else None,
