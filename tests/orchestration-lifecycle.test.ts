@@ -7,7 +7,8 @@ import { join } from "node:path";
 import { test } from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Value } from "typebox/value";
-import { classifyLeadStop, createOrchestrationLifecycle, leaseOwner, leaseProcessState, runJson, scopesOverlap } from "../extensions/orchestration-lifecycle.ts";
+import { classifyLeadStop, createOrchestrationLifecycle, DEFAULT_SNAPSHOT_TIMEOUT_MS, leaseOwner, leaseProcessState, runJson, scopesOverlap,
+  snapshotHelperDeadlineMs, snapshotTimeoutMs } from "../extensions/orchestration-lifecycle.ts";
 import { hostname } from "node:os";
 import { classifyClaudeInvocationError, resolveClaudeBackendModel } from "../extensions/claude-backend-adapter.ts";
 import { buildWorkerEnv, BWRAP_PROBE_ARGS, claudeWorkerArgs, describeDenials, detectWorkerSandbox, inGitDirectory, parseClaudeResult,
@@ -16,6 +17,7 @@ import { buildWorkerEnv, BWRAP_PROBE_ARGS, claudeWorkerArgs, describeDenials, de
 import type { SandboxProbe } from "../extensions/claude-worker.ts";
 
 type Handler = (event: any, context?: any) => Promise<any> | any;
+const labelDigest = (label: string) => createHash("sha256").update(label).digest("hex");
 
 function harness(preflight: Record<string, unknown>, failEvent = false, verifyOk = true,
                  options: { scopeOk?: boolean; worktreeOk?: boolean; worktreeBlocker?: string; entries?: any[];
@@ -31,7 +33,11 @@ function harness(preflight: Record<string, unknown>, failEvent = false, verifyOk
                    diffFloors?: (input: Record<string, unknown>) => Record<string, unknown>;
                    boundPhases?: string[];
                    eventRefusal?: (input: Record<string, unknown>) => Record<string, unknown> | null;
-                   gateRefusal?: (input: Record<string, unknown>) => Record<string, unknown> | null } = {}) {
+                   gateRefusal?: (input: Record<string, unknown>) => Record<string, unknown> | null;
+                   // Snapshot and head operations run for real: runJson -> tools/session_scope.py -> Git.
+                   realScope?: boolean; snapshotTimeoutMs?: number;
+                   // Only to exercise the outer (runJson) timeout: the timeout runJson really gets.
+                   outerTimeoutMs?: number } = {}) {
   const handlers = new Map<string, Handler>();
   const tools = new Map<string, any>();
   const calls: { script: string; args: string[]; input?: Record<string, unknown> }[] = [];
@@ -39,12 +45,16 @@ function harness(preflight: Record<string, unknown>, failEvent = false, verifyOk
   const checkout = { digest: "clean", status: [] as string[], head: "a".repeat(40), heads: {} as Record<string, string> };
   let escalated = false;
   const messages: { message: any; options?: any }[] = [];
-  const command = async (script: string, args: string[], input?: Record<string, unknown>) => {
+  const command = async (script: string, args: string[], input?: Record<string, unknown>, timeoutMs?: number) => {
     calls.push({ script, args, input });
     if (script.endsWith("run_lease.py")) return options.heartbeatResult ?? { ok: true, state: "live" };
+    if (script.endsWith("session_scope.py") && options.realScope && (input?.operation === "snapshot" || input?.operation === "head")) {
+      return runJson(script, args, input, options.outerTimeoutMs ?? timeoutMs);
+    }
     if (script.endsWith("session_scope.py")) {
       if (input?.operation === "head") return { ok: true, head: checkout.heads[String(input.path)] ?? checkout.head };
-      if (input?.operation === "snapshot") return { ok: true, digest: checkout.digest, status: [...checkout.status] };
+      // The real helper returns a complete SHA-256 digest; the fake derives one from the checkout label.
+      if (input?.operation === "snapshot") return { ok: true, digest: labelDigest(checkout.digest), status: [...checkout.status] };
       if (input?.operation === "worktree") return options.worktreeOk === false
         ? { ok: false, blocker_code: options.worktreeBlocker ?? "WORKER_WORKSPACE_INVALID" }
         : { ok: true, blocker_code: null, path: input.path };
@@ -117,7 +127,8 @@ function harness(preflight: Record<string, unknown>, failEvent = false, verifyOk
   } as unknown as ExtensionAPI;
   // The host's real sandbox prerequisites never decide a test: the probe is the fake's (available unless overridden).
   createOrchestrationLifecycle(command, options.clock,
-    options.sandboxProbe ?? (() => ({ available: true, detail: "test probe" })))(pi);
+    options.sandboxProbe ?? (() => ({ available: true, detail: "test probe" })),
+    { snapshotTimeoutMs: options.snapshotTimeoutMs })(pi);
   const parentCalls = (operation: string) =>
     calls.filter((call) => call.script.endsWith("parent_orchestration.py") && call.args[0] === operation);
   const leaseCalls = (operation: string) =>
@@ -655,7 +666,7 @@ test("workers of different tasks overlap only inside a declared wave; integratio
   h.checkout.status = [];
   const ended = await record.execute("e", { action: "integrate_end", wave_id: "w1" });
   assert.equal(ended.details.ok, true);
-  assert.equal(ended.details.result.digest, "merged");
+  assert.equal(ended.details.result.digest, labelDigest("merged"));
   assert.ok(h.calls.some((call) => call.input?.kind === "wave" && call.input.status === "integrated"));
   // Snapshot re-based: the parent's own merge does not latch a scope violation.
   assert.equal(await h.handlers.get("tool_call")!(spawn("a4", "A:codex_reviewer")), undefined);
@@ -3476,4 +3487,340 @@ test("a lead quota error settles the run as a quota stop; a silent exit does not
   await recovered.handlers.get("message_end")!({ message: ok });
   await recovered.handlers.get("session_shutdown")!({ reason: "quit" });
   assert.equal(recovered.parentCalls("settle")[0].args.includes("--stop-cause"), false);
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// Parent-checkout snapshot guard, end to end: lifecycle tool_call/tool_result -> real runJson -> tools/session_scope.py
+// -> real Git on a disposable repository. A PATH shim may only delay or fail selected Git subcommands.
+// ---------------------------------------------------------------------------------------------------------------
+const REAL_GIT = spawnSync("sh", ["-c", "command -v git"], { encoding: "utf8" }).stdout.trim();
+const GIT_SHIM = `#!/usr/bin/env bash
+args=("$@"); i=0
+while [ $i -lt \${#args[@]} ]; do case "\${args[$i]}" in -C|-c) i=$((i+2));; -*) i=$((i+1));; *) break;; esac; done
+sub="\${args[$i]:-}"
+if [ -n "\${PICO_GIT_SHIM_CONTROL:-}" ] && [ -f "$PICO_GIT_SHIM_CONTROL" ]; then
+  while read -r action name value; do
+    [ "$name" = "$sub" ] || continue
+    case "$action" in delay) sleep "$value";; fail) exit "$value";; esac
+  done < "$PICO_GIT_SHIM_CONTROL"
+fi
+exec "${REAL_GIT}" "$@"
+`;
+
+async function withGitFixture(body: (fx: { repo: string; git: (...args: string[]) => string; shim: (...lines: string[]) => void;
+                                           clear: () => void }) => Promise<void>) {
+  const base = mkdtempSync(join(tmpdir(), "pico-snapshot-guard-"));
+  const repo = join(base, "repo");
+  const shimDir = join(base, "shim");
+  const control = join(base, "control");
+  mkdirSync(repo);
+  mkdirSync(shimDir);
+  writeFileSync(join(shimDir, "git"), GIT_SHIM, { mode: 0o755 });
+  const git = (...args: string[]) => {
+    const result = spawnSync(REAL_GIT, ["-C", repo, ...args], { encoding: "utf8" });
+    assert.equal(result.status, 0, `git ${args.join(" ")}`);
+    return result.stdout;
+  };
+  git("init", "-q", "-b", "main");
+  writeFileSync(join(repo, "tracked.txt"), "base\n");
+  git("add", "tracked.txt");
+  git("-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-qm", "base");
+  const saved = { PATH: process.env.PATH, control: process.env.PICO_GIT_SHIM_CONTROL };
+  process.env.PATH = `${shimDir}:${process.env.PATH}`;
+  process.env.PICO_GIT_SHIM_CONTROL = control;
+  try {
+    await body({ repo, git, shim: (...lines) => writeFileSync(control, lines.join("\n") + "\n"),
+      clear: () => rmSync(control, { force: true }) });
+  } finally {
+    process.env.PATH = saved.PATH;
+    if (saved.control === undefined) delete process.env.PICO_GIT_SHIM_CONTROL; else process.env.PICO_GIT_SHIM_CONTROL = saved.control;
+    rmSync(base, { recursive: true, force: true });
+  }
+}
+
+const workerCall = (id: string) => ({ toolName: "spawn_subagent", toolCallId: id, input: { task: "review" } });
+const workerResult = (id: string) => ({ toolName: "spawn_subagent", toolCallId: id, input: {},
+  content: [{ type: "text", text: "done" }], details: { subagent_id: `sub-${id}` } });
+const scopeChecks = (h: ReturnType<typeof harness>) =>
+  h.parentCalls("event").map((call) => call.input as any).filter((input) => input?.kind === "scope_check");
+const scopePhaseBlocks = (h: ReturnType<typeof harness>) =>
+  h.parentCalls("event").map((call) => call.input as any).filter((input) => input?.kind === "phase" && input.status === "blocked")
+    .map((input) => input.blocker_code);
+
+/** After a latch: no worker, no worktree, no integration, no COMPLETED; PARTIAL still finishes. */
+async function assertLatched(h: ReturnType<typeof harness>, code: string) {
+  const next = await h.handlers.get("tool_call")!(workerCall("after-latch"));
+  assert.equal(next.block, true);
+  assert.match(next.reason, new RegExp(`^${code}:`));
+  assert.equal((await h.handlers.get("tool_call")!({ toolName: "bash", toolCallId: "g", input: { command: "git worktree add ../x" } })).block, true);
+  const record = h.tools.get("orchestration_record");
+  for (const action of ["integrate_begin", "integrate_end"]) {
+    const refused = await record.execute("i", { action, wave_id: "auto" });
+    assert.equal(refused.details.ok, false);
+    assert.match(refused.content[0].text, new RegExp(`^BLOCKED: ${code}:`));
+  }
+  const completed = await record.execute("f", { action: "finish", status: "COMPLETED" });
+  assert.equal(completed.details.ok, false);
+  assert.match(completed.content[0].text, new RegExp(`^BLOCKED: ${code}:`));
+  assert.equal(h.parentCalls("finish").length, 0, "COMPLETED never reaches the recorder");
+  assert.equal((await record.execute("p", { action: "finish", status: "PARTIAL" })).details.ok, true);
+}
+
+function assertMetadataOnly(check: any) {
+  // Closed record: digests, counts, operation names and numbers; never paths or Git text.
+  assert.deepEqual(Object.keys(check).sort(), ["after_digest", "before_digest", "changed_count", "deadline_ms", "elapsed_ms",
+    "error_kind", "exit_code", "kind", "latched", "operation", "phase", "signal", "stage", "step_id", "suboperation",
+    "task_id", "timeout_ms", "tool", "verdict"]);
+  assert.equal(JSON.stringify(check).includes("tracked.txt"), false);
+}
+
+test("snapshot guard: an unchanged but slow parent checkout within the budget passes", async () => {
+  await withGitFixture(async (fx) => {
+    const h = harness({ ok: true, status: "READY" }, false, true, { realScope: true, snapshotTimeoutMs: 6000 });
+    await startRun(h, fx.repo);
+    fx.shim("delay status 1");
+    assert.notEqual((await h.handlers.get("tool_call")!(workerCall("w1")))?.block, true);
+    const result = await h.handlers.get("tool_result")!(workerResult("w1"));
+    assert.equal(result, undefined, "no blocker appended");
+    assert.deepEqual(scopeChecks(h), []);
+    assert.notEqual((await h.handlers.get("tool_call")!(workerCall("w2")))?.block, true);
+  });
+});
+
+test("snapshot guard: tracked, untracked, staged and index-only changes are drift, without claiming the worker did it", async () => {
+  const cases: [string, (fx: any) => void, ((fx: any) => void)?][] = [
+    ["tracked edit", (fx) => writeFileSync(join(fx.repo, "tracked.txt"), "edit\n")],
+    ["untracked file", (fx) => writeFileSync(join(fx.repo, "new.txt"), "x\n")],
+    ["edit behind an unchanged status line", (fx) => writeFileSync(join(fx.repo, "tracked.txt"), "two\n"),
+      (fx) => writeFileSync(join(fx.repo, "tracked.txt"), "one\n")],
+    ["staged-only change", (fx) => { writeFileSync(join(fx.repo, "tracked.txt"), "two\n"); fx.git("add", "tracked.txt"); },
+      (fx) => { writeFileSync(join(fx.repo, "tracked.txt"), "one\n"); fx.git("add", "tracked.txt"); }],
+    ["index-only flag", (fx) => fx.git("update-index", "--assume-unchanged", "tracked.txt")],
+  ];
+  for (const [name, change, setup] of cases) {
+    await withGitFixture(async (fx) => {
+      setup?.(fx);
+      const h = harness({ ok: true, status: "READY" }, false, true, { realScope: true, snapshotTimeoutMs: 10_000 });
+      await startRun(h, fx.repo);
+      assert.notEqual((await h.handlers.get("tool_call")!(workerCall("w1")))?.block, true, name);
+      change(fx);
+      const result = await h.handlers.get("tool_result")!(workerResult("w1"));
+      const text = result.content.at(-1).text;
+      assert.match(text, /^Orchestration blocker: WORKER_SCOPE_VIOLATION\. The parent checkout changed while this worker call was in flight/, name);
+      assert.match(text, /is not established/, name);
+      const [check] = scopeChecks(h);
+      assertMetadataOnly(check);
+      assert.equal(check.verdict, "drift", name);
+      assert.equal(check.latched, true);
+      assert.match(check.before_digest, /^[0-9a-f]{64}$/);
+      assert.match(check.after_digest, /^[0-9a-f]{64}$/);
+      assert.notEqual(check.before_digest, check.after_digest);
+      assert.equal(check.error_kind, null);
+      assert.deepEqual(scopePhaseBlocks(h), ["WORKER_SCOPE_VIOLATION"]);
+      await assertLatched(h, "WORKER_SCOPE_VIOLATION");
+    });
+  }
+});
+
+test("snapshot guard: a post-call snapshot past the helper deadline is unverifiable, with the before digest", async () => {
+  await withGitFixture(async (fx) => {
+    const h = harness({ ok: true, status: "READY" }, false, true, { realScope: true, snapshotTimeoutMs: 2000 });
+    await startRun(h, fx.repo);
+    assert.notEqual((await h.handlers.get("tool_call")!(workerCall("w1")))?.block, true);
+    fx.shim("delay status 5");
+    const started = performance.now();
+    const result = await h.handlers.get("tool_result")!(workerResult("w1"));
+    assert.ok(performance.now() - started < 4000, "bounded by the snapshot budget, not by the delayed Git");
+    const text = result.content.at(-1).text;
+    assert.match(text, /^Orchestration blocker: WORKER_SCOPE_UNVERIFIABLE\. The parent checkout could not be verified/);
+    assert.match(text, /snapshot\/status Timeout after \d+ ms \(snapshot budget 2000 ms, helper deadline 1600 ms\)/);
+    assert.match(text, /No change is claimed/);
+    assert.doesNotMatch(text, /WORKER_SCOPE_VIOLATION/);
+    const [check] = scopeChecks(h);
+    assertMetadataOnly(check);
+    assert.deepEqual({ verdict: check.verdict, stage: check.stage, latched: check.latched, after: check.after_digest,
+      operation: check.operation, suboperation: check.suboperation, error_kind: check.error_kind,
+      deadline: check.deadline_ms, timeout: check.timeout_ms },
+    { verdict: "unverifiable", stage: "after", latched: true, after: null, operation: "snapshot", suboperation: "status",
+      error_kind: "Timeout", deadline: 1600, timeout: 2000 });
+    assert.match(check.before_digest, /^[0-9a-f]{64}$/);
+    assert.ok(check.elapsed_ms >= 1500 && check.elapsed_ms < 2000, `elapsed ${check.elapsed_ms}`);
+    assert.deepEqual(scopePhaseBlocks(h), ["WORKER_SCOPE_UNVERIFIABLE"]);
+    fx.clear();
+    await assertLatched(h, "WORKER_SCOPE_UNVERIFIABLE");
+  });
+});
+
+test("snapshot guard: failed or malformed Git output blocks as unverifiable and never yields a digest", async () => {
+  for (const [control, suboperation, kind, exit] of [["fail ls-files 128", "index", "NonzeroExit", 128],
+    ["fail status 141", "status", "NonzeroExit", 141], ["fail rev-parse 0", "repository", "MalformedOutput", null]] as const) {
+    await withGitFixture(async (fx) => {
+      const h = harness({ ok: true, status: "READY" }, false, true, { realScope: true, snapshotTimeoutMs: 10_000 });
+      await startRun(h, fx.repo);
+      assert.notEqual((await h.handlers.get("tool_call")!(workerCall("w1")))?.block, true);
+      fx.shim(control);
+      const result = await h.handlers.get("tool_result")!(workerResult("w1"));
+      assert.match(result.content.at(-1).text, /^Orchestration blocker: WORKER_SCOPE_UNVERIFIABLE\./, control);
+      const [check] = scopeChecks(h);
+      assertMetadataOnly(check);
+      assert.deepEqual([check.verdict, check.after_digest, check.suboperation, check.error_kind, check.exit_code],
+        ["unverifiable", null, suboperation, kind, exit], control);
+      fx.clear();
+      await assertLatched(h, "WORKER_SCOPE_UNVERIFIABLE");
+    });
+  }
+});
+
+test("snapshot guard: an outer helper timeout is unverifiable, and a later successful check never clears the latch", async () => {
+  await withGitFixture(async (fx) => {
+    // The lifecycle gives the helper a 4 s deadline; runJson really gets 800 ms, so the outer timeout fires first.
+    const h = harness({ ok: true, status: "READY" }, false, true, { realScope: true, snapshotTimeoutMs: 5000 });
+    await startRun(h, fx.repo);
+    assert.notEqual((await h.handlers.get("tool_call")!(workerCall("w1")))?.block, true);
+    assert.notEqual((await h.handlers.get("tool_call")!(workerCall("w2")))?.block, true);
+    const outer = harness({ ok: true, status: "READY" }, false, true, { realScope: true, snapshotTimeoutMs: 5000, outerTimeoutMs: 800 });
+    await startRun(outer, fx.repo);
+    assert.notEqual((await outer.handlers.get("tool_call")!(workerCall("o1")))?.block, true);
+    assert.notEqual((await outer.handlers.get("tool_call")!(workerCall("o2")))?.block, true);
+    fx.shim("delay status 3");
+    const late = await outer.handlers.get("tool_result")!(workerResult("o1"));
+    assert.match(late.content.at(-1).text, /^Orchestration blocker: WORKER_SCOPE_UNVERIFIABLE\..*snapshot\/subprocess Timeout/);
+    const [check] = scopeChecks(outer);
+    assert.deepEqual([check.suboperation, check.error_kind, check.after_digest], ["subprocess", "Timeout", null]);
+    // The killed helper's Git would have finished by now; nothing it could print reaches the lifecycle.
+    fx.clear();
+    await new Promise((resolve) => setTimeout(resolve, 3500));
+    assert.equal(await outer.handlers.get("tool_result")!(workerResult("o2")), undefined, "the concurrent worker's own check passes");
+    assert.equal(scopeChecks(outer).length, 1);
+    await assertLatched(outer, "WORKER_SCOPE_UNVERIFIABLE");
+    // Same repository, same moment, normal budget: the checkout itself is unchanged.
+    assert.equal(await h.handlers.get("tool_result")!(workerResult("w1")), undefined);
+    assert.equal(await h.handlers.get("tool_result")!(workerResult("w2")), undefined);
+  });
+});
+
+test("snapshot guard: the original 30 s budget with a 31 s post-call snapshot is unverifiable, not a violation", async () => {
+  // Pinned c5ed3e1/8df57a1: runJson's generic 30 s timeout labelled this `preflight` Timeout, snapshot() discarded it,
+  // and the post comparison reported WORKER_SCOPE_VIOLATION (unattributed changes) for an unchanged checkout.
+  await withGitFixture(async (fx) => {
+    const h = harness({ ok: true, status: "READY" }, false, true, { realScope: true, snapshotTimeoutMs: 30_000 });
+    await startRun(h, fx.repo);
+    assert.notEqual((await h.handlers.get("tool_call")!(workerCall("w1")))?.block, true);
+    fx.shim("delay status 31");
+    const result = await h.handlers.get("tool_result")!(workerResult("w1"));
+    const text = result.content.at(-1).text;
+    assert.match(text, /^Orchestration blocker: WORKER_SCOPE_UNVERIFIABLE\./);
+    assert.doesNotMatch(text, /unattributed changes|WORKER_SCOPE_VIOLATION/);
+    const [check] = scopeChecks(h);
+    assert.deepEqual([check.verdict, check.suboperation, check.error_kind, check.timeout_ms, check.deadline_ms],
+      ["unverifiable", "status", "Timeout", 30_000, 24_000]);
+    assert.ok(check.elapsed_ms >= 23_500 && check.elapsed_ms < 30_000, `elapsed ${check.elapsed_ms}`);
+  });
+});
+
+test("snapshot guard: a failed pre-call snapshot refuses only that call and does not latch", async () => {
+  await withGitFixture(async (fx) => {
+    const h = harness({ ok: true, status: "READY" }, false, true, { realScope: true, snapshotTimeoutMs: 10_000 });
+    await startRun(h, fx.repo);
+    fx.shim("fail status 128");
+    const refused = await h.handlers.get("tool_call")!(workerCall("w1"));
+    assert.equal(refused.block, true);
+    assert.match(refused.reason, /^WORKER_SCOPE_UNVERIFIABLE: could not snapshot the parent checkout before the worker call \(snapshot\/status NonzeroExit exit 128 .*the worker was not started/);
+    const [check] = scopeChecks(h);
+    assert.deepEqual([check.stage, check.latched, check.before_digest], ["before", false, null]);
+    assert.deepEqual(scopePhaseBlocks(h), []);
+    fx.clear();
+    assert.notEqual((await h.handlers.get("tool_call")!(workerCall("w2")))?.block, true);
+  });
+});
+
+test("snapshot guard: a worker call that never reports a result is still checked at turn end", async () => {
+  await withGitFixture(async (fx) => {
+    const h = harness({ ok: true, status: "READY" }, false, true, { realScope: true, snapshotTimeoutMs: 10_000 });
+    await startRun(h, fx.repo);
+    assert.notEqual((await h.handlers.get("tool_call")!(workerCall("w1")))?.block, true);
+    writeFileSync(join(fx.repo, "tracked.txt"), "edit\n");
+    await h.handlers.get("turn_end")!({}, { cwd: fx.repo, ui: { notify() {} }, getContextUsage: () => undefined });
+    assert.equal(scopeChecks(h)[0]?.verdict, "drift");
+    await assertLatched(h, "WORKER_SCOPE_VIOLATION");
+  });
+});
+
+test("snapshot guard: a resumed run keeps a recorded latch", async () => {
+  const cwd = process.cwd();
+  const entries: any[] = [{ type: "custom", customType: "pi-orchestration-parent-v1",
+    data: { run_id: "parent-test", session_id: "session-a", target_cwd: cwd, active: true } }];
+  const h = harness({ ok: true, status: "READY" }, false, true, { entries,
+    resumeResult: { run_id: "parent-test", status: "IN_PROGRESS", reroute_phases: [], bound_phases: [],
+      scope_latch: "WORKER_SCOPE_UNVERIFIABLE" } });
+  await h.handlers.get("session_start")!({ reason: "startup" }, { cwd,
+    sessionManager: { getSessionId: () => "session-a", getBranch: () => entries } });
+  const refused = await h.handlers.get("tool_call")!(workerCall("w1"));
+  assert.match(refused.reason, /^WORKER_SCOPE_UNVERIFIABLE: .*recorded in this run before it was resumed/);
+  const completed = await h.tools.get("orchestration_record").execute("f", { action: "finish", status: "COMPLETED" });
+  assert.match(completed.content[0].text, /^BLOCKED: WORKER_SCOPE_UNVERIFIABLE:/);
+});
+
+test("runJson: a timeout kills the helper's process group, and a late completion is ignored", { skip: process.platform === "win32" }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pico-runjson-"));
+  try {
+    const script = join(dir, "late.py");
+    const pidFile = join(dir, "child.pid");
+    writeFileSync(script, [
+      "import json, subprocess, sys, time",
+      "child = subprocess.Popen(['sleep', '30'])",
+      `open(${JSON.stringify(pidFile)}, 'w').write(str(child.pid))`,
+      "sys.stderr.write('x' * (1 << 20)); sys.stderr.flush()",
+      "time.sleep(1.5)",
+      "print(json.dumps({'ok': True, 'late': True}))",
+    ].join("\n"));
+    const result = await runJson(script, [], { operation: "snapshot", path: dir }, 500);
+    assert.deepEqual([result.ok, result.operation, result.error_category, result.timeout_ms],
+      [false, "snapshot", "Timeout", 500], "the operation comes from stdin when there are no arguments");
+    assert.ok(typeof result.elapsed_ms === "number" && (result.elapsed_ms as number) >= 500);
+    await new Promise((resolve) => setTimeout(resolve, 2500));
+    const pid = Number(readFileSync(pidFile, "utf8"));
+    let state = "gone";
+    try { state = readFileSync(`/proc/${pid}/stat`, "utf8").split(") ").at(-1)!.split(" ")[0]; } catch { /* gone */ }
+    assert.ok(state === "gone" || state === "Z", `descendant state ${state}`);
+    assert.equal(result.late, undefined);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("runJson: malformed output, nonzero exit, spawn failure and a stderr flood are typed failures without text", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pico-runjson-"));
+  try {
+    const write = (name: string, body: string) => { const path = join(dir, name); writeFileSync(path, body); return path; };
+    const crash = await runJson(write("exit.py", "raise SystemExit(7)"), [], { operation: "snapshot" }, 5000);
+    assert.equal(crash.error_category, "NonzeroExit");
+    assert.equal(crash.exit_code, 7);
+    const malformed = await runJson(write("bad.py", "print('not json SECRET')\n"), [], { operation: "snapshot" }, 5000);
+    assert.equal(malformed.error_category, "MalformedOutput");
+    assert.equal(JSON.stringify(malformed).includes("SECRET"), false);
+    assert.equal((await runJson(write("array.py", "print('[1]')\n"), [], {}, 5000)).error_category, "MalformedOutput");
+    const nonzero = await runJson(write("exit.py", "import sys\nprint('{\"ok\": true}')\nsys.exit(3)\n"), ["status"], undefined, 5000);
+    assert.deepEqual([nonzero.error_category, nonzero.exit_code, nonzero.operation], ["NonzeroExit", 3, "status"]);
+    const flooded = await runJson(write("flood.py", "import sys, json\nsys.stderr.write('e' * (4 << 20))\nprint(json.dumps({'ok': True}))\n"),
+      [], {}, 10_000);
+    assert.deepEqual(flooded, { ok: true });
+    const saved = process.env.PI_ROUTER_PYTHON;
+    process.env.PI_ROUTER_PYTHON = join(dir, "missing-python");
+    try {
+      const spawnFailure = await runJson(join(dir, "bad.py"), [], {}, 5000);
+      assert.deepEqual([spawnFailure.error_category, spawnFailure.errno], ["SpawnError", "ENOENT"]);
+    } finally {
+      if (saved === undefined) delete process.env.PI_ROUTER_PYTHON; else process.env.PI_ROUTER_PYTHON = saved;
+    }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("snapshot budget: explicit option, bounded env override, default, and helper deadline headroom", () => {
+  assert.equal(DEFAULT_SNAPSHOT_TIMEOUT_MS, 120_000);
+  assert.ok(DEFAULT_SNAPSHOT_TIMEOUT_MS > 30_000, "separate from the generic 30 s helper timeout");
+  assert.equal(snapshotTimeoutMs(5000, {}), 5000);
+  assert.throws(() => snapshotTimeoutMs(10, {}), RangeError);
+  assert.equal(snapshotTimeoutMs(undefined, { PI_ORCHESTRATION_SNAPSHOT_TIMEOUT_MS: "240000" }), 240_000);
+  assert.equal(snapshotTimeoutMs(undefined, { PI_ORCHESTRATION_SNAPSHOT_TIMEOUT_MS: "5" }), DEFAULT_SNAPSHOT_TIMEOUT_MS);
+  assert.equal(snapshotTimeoutMs(undefined, {}), DEFAULT_SNAPSHOT_TIMEOUT_MS);
+  assert.deepEqual([1000, 2000, 30_000, 120_000].map(snapshotHelperDeadlineMs), [750, 1600, 24_000, 110_000]);
 });
