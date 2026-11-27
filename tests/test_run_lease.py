@@ -713,7 +713,9 @@ class WorkerIsolationTest(StateTestCase):
         po.record_event(run_id, {"kind": "checkpoint", "phase": "S1", "reason": "worker_approval"}, **own)
         run_lease.heartbeat(run_id, "owner-a", repo_root=self.records)
         po.finish(run_id, "PARTIAL", **own)
-        self.assertEqual(session_scope.snapshot(str(self.target)), before)
+        after = session_scope.snapshot(str(self.target))
+        self.assertTrue(after["ok"], after)
+        self.assertEqual((after["digest"], after["status"]), (before["digest"], before["status"]))
         self.assertEqual(session_scope.worktree(str(self.target), str(self.target))["blocker_code"],
                          "WORKER_WORKSPACE_INVALID")
         linked = Path(self._tmp.name) / "wt-s1"

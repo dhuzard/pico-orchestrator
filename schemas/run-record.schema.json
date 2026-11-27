@@ -150,6 +150,38 @@
             "source": {"enum": ["cli", "task", "manifest", "policy", "default", "env"]}
           }
         },
+        "scope_checks": {
+          "type": "array",
+          "maxItems": 50,
+          "description": "Parent-checkout scope checks that did not pass, oldest first, written only by the lifecycle extension. Before every worker call the extension takes a complete snapshot digest of the parent checkout (HEAD, index, staged and unstaged changes, untracked files) and compares it after the call. verdict drift (code WORKER_SCOPE_VIOLATION): two complete digests differ, i.e. the checkout changed while the call was in flight; which process changed it is not established and is never asserted. verdict unverifiable (code WORKER_SCOPE_UNVERIFIABLE): a snapshot could not be taken (operation/suboperation, error_kind, exit_code, signal, elapsed_ms against deadline_ms (the helper's own deadline) and timeout_ms (the outer snapshot budget)); no change is claimed and after_digest is null. stage after entries are latched: the run refuses further workers, integration and a COMPLETED finish, also after a resume. A stage before failure only refused that call (latched false). Metadata only: never paths, Git output, diff bodies or file contents. When full the oldest entry other than the first latched one is dropped.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["at", "code", "stage", "verdict", "latched", "phase", "task_id", "step_id", "tool", "before_digest", "after_digest", "changed_count", "operation", "suboperation", "error_kind", "exit_code", "signal", "elapsed_ms", "deadline_ms", "timeout_ms"],
+            "properties": {
+              "at": {"type": "string"},
+              "code": {"enum": ["WORKER_SCOPE_VIOLATION", "WORKER_SCOPE_UNVERIFIABLE"]},
+              "stage": {"enum": ["before", "after"]},
+              "verdict": {"enum": ["drift", "unverifiable"]},
+              "latched": {"type": "boolean"},
+              "phase": {"type": ["string", "null"]},
+              "task_id": {"type": ["string", "null"]},
+              "step_id": {"type": ["string", "null"]},
+              "tool": {"type": ["string", "null"]},
+              "before_digest": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+              "after_digest": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+              "changed_count": {"type": ["integer", "null"], "minimum": 0},
+              "operation": {"type": ["string", "null"]},
+              "suboperation": {"type": ["string", "null"]},
+              "error_kind": {"type": ["string", "null"]},
+              "exit_code": {"type": ["integer", "null"]},
+              "signal": {"type": ["string", "null"]},
+              "elapsed_ms": {"type": ["integer", "null"], "minimum": 0},
+              "deadline_ms": {"type": ["integer", "null"], "minimum": 0},
+              "timeout_ms": {"type": ["integer", "null"], "minimum": 0}
+            }
+          }
+        },
         "failure_signatures": {
           "type": "array",
           "maxItems": 100,

@@ -1081,6 +1081,133 @@ cleanup unsafe or fail. Cleanup failure is reported; it does not justify data
 loss. None of this protocol grants workers permission to push, merge, open or
 close issues/PRs, or otherwise mutate GitHub.
 
+### Parent-checkout scope check
+
+Starting from a repository subdirectory covers the entire checkout. A dirty tracked submodule (modified, or with
+untracked content) makes every snapshot unverifiable (`worktree_hash`/`TrackedDirectoryUnverifiable`) until it is
+cleaned. That includes dirt that predates the run: every before-call snapshot fails, so every worker call is refused
+until the submodule is clean, and dirt that appears during a call latches `WORKER_SCOPE_UNVERIFIABLE`.
+
+Before every worker call (`AskClaude`, `ClaudeWorker`, `spawn_subagent`, `message_subagent`) the lifecycle extension
+snapshots the parent checkout with `tools/session_scope.py` (`{"operation": "snapshot", "path", "deadline_ms"}`) and
+compares it after the call (also at `turn_end` for a call that never reported a result).
+
+**Digest.** A snapshot is complete or it is a failure; there is no partial digest. It covers:
+
+- HEAD: the commit id (or `unborn` only for a symbolic HEAD whose branch verifiably does not exist; a dangling or
+  unreadable HEAD is a failure) and the ref HEAD names, or `detached` (`git symbolic-ref --quiet HEAD`). Switching
+  between two branches at the same commit, detaching at the same commit, or pointing an unborn HEAD at another branch
+  name changes the digest.
+- the porcelain status and the index itself (`git ls-files -v --stage -z`: mode, object id, stage and the
+  assume-unchanged/skip-worktree flags of every entry, so staged content is covered exactly);
+- the worktree bytes of every tracked path status reports as differing from the index or that Git hides from status;
+- the lstat file type and permission bits of every tracked path, once per path (conflict stages are deduplicated),
+  without reading content. Git ignores permission bits other than the executable bit, and with `core.fileMode=false`
+  that one too, so a chmod of a clean tracked file never reaches status. Symlinks are never followed: a tracked
+  symlink is recorded as a link, and a path below a leading component that is no longer a real directory is recorded
+  as such. A gitlink (submodule) directory is lstat'ed, never entered;
+- every untracked path (regular files by content and executable bit, symlinks by target; untracked nested
+  repositories and submodules by name only);
+- every root-level entry named exactly `.env` or `.env.<anything>` (case-sensitive), found by one shallow listing of
+  the checkout root, whether it is ignored, untracked or tracked: content, symlink target, file type and permission
+  bits, and presence. A matching directory (for example `.env.d/`) is a failure (`root_env`/`DirectoryUnverifiable`):
+  its contents are not walked and it is never recorded by name only.
+
+**Not covered.** No other ignored path is read, listed or hashed. Changes confined to them are invisible to the
+check: dependency and tool trees (`node_modules/`, `.venv/`, `__pycache__/`, `.cache/`, build output), nested env
+files (`app/.env`), and root files with other names (`.envrc`, `.npmrc`, `.env-local`), ignored through `.gitignore`,
+`.git/info/exclude` or the user's excludes file. The content of a clean tracked file whose stat data Git still
+considers fresh is not re-read; Git's own stat comparison is the guard there.
+
+Why only the root env files: measured on 2026-11-27 (Git 2.43.0, Python 3.12.3, WSL2 kernel 6.18 ext4, 8 CPUs,
+warm page cache) against a disposable local clone of this repository (268 tracked paths, clean status). Its ignored
+trees were a copy of the project's installed `node_modules` plus 12,000 synthetic 2 KiB files in
+`node_modules/.cache` and 6,000 synthetic `.py` files in `.venv`: 49,672 ignored entries
+(`git ls-files --others --ignored --exclude-standard`), of which 49,663 regular files and 9 symlinks,
+247,241,808 bytes. Medians of 5 calls (content hash: 3, root listing: 20) in each of two runs:
+
+| Operation | Run 1 | Run 2 |
+|---|---|---|
+| full snapshot, this helper | 12.7 ms | 14.2 ms |
+| full snapshot, previous helper (8223c64) | 13.8 ms | 8.7 ms |
+| `git ls-files --others --ignored --exclude-standard` (enumerate ignored files) | 46.3 ms | 52.3 ms |
+| `git status --porcelain --ignored=matching` (ignored directories, not their files) | 1.7 ms | 1.7 ms |
+| `os.walk` + lstat of every file under `node_modules/` and `.venv/` | 126.8 ms | 125.2 ms |
+| type/permission digest (`_tracked_modes`) over the 49,672 ignored paths | 144.5 ms | 133.2 ms |
+| content hash (`_hash_paths`) of every ignored path | 410.1 ms | 397.4 ms |
+| shallow root listing for `.env`/`.env.*` (`_root_env`) | < 0.1 ms | < 0.1 ms |
+
+Covering every ignored file by content would add about 0.45 s per snapshot (enumeration plus hashing; two snapshots
+per worker call) on this modest tree, and even metadata-only coverage about 0.2 s, before cold-cache effects. That
+cost grows with dependency trees the snapshot does not own, and tools legitimately rewrite those trees (bytecode and
+test caches), so changes there would read as drift. The root env files are the ignored entries most likely to hold
+credentials, and covering them costs one directory listing. The same type/permission digest over tracked paths costs
+about 2.7–2.9 µs per path on this machine.
+
+Paths are parsed NUL-separated, including rename/copy records. Only read-only commands run, with
+`GIT_OPTIONAL_LOCKS=0`: `git diff` is not used, because on Git 2.43 it rewrites `.git/index` to refresh stat data even
+with optional locks off.
+
+**No configured program runs.** Every snapshot and `head` Git command (`rev-parse`, `symbolic-ref`, `show-ref`,
+`config`, `ls-files`, `status`, and the `git status` that status runs inside each populated submodule) gets an
+environment with no inherited `GIT_*` variable. That removes the configuration channels
+(`GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n`, `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_GLOBAL`,
+`GIT_CONFIG_SYSTEM`), `GIT_EXEC_PATH` (which chooses the `git` that submodule recursion executes), trace targets and
+repository locators. It also sets `GIT_CONFIG_NOSYSTEM=1` and `GIT_CONFIG_GLOBAL=/dev/null` (and
+`GIT_CONFIG_SYSTEM=/dev/null`), so `~/.gitconfig`, `$XDG_CONFIG_HOME/git/config` and the system file are not read.
+Through `GIT_CONFIG_COUNT`, which Git passes on to submodule children, the executable integrations
+repository-local configuration could name are overridden at command-line precedence:
+
+- `core.fsmonitor=false`, because any command that reads an index would run the hook;
+- `core.hooksPath=/dev/null`;
+- for every filter driver named in the configuration of the checkout or of any populated submodule (found
+  recursively via `git config --get-regexp '^filter\.'` and each submodule's index), empty
+  `clean`/`smudge`/`process` commands and `required=false`. Status applies the clean filter when it re-hashes a
+  stat-dirty file; with an empty command Git applies no filter.
+
+Audited and not reachable from these commands: textconv and external diff drivers, pagers (no terminal),
+credential, ssh and askpass helpers (no network or prompt), `status.submoduleSummary` (long format only), and trace2
+configuration (read only from the system and global files). Real-executable canaries in
+`tests/test_snapshot_guard.py` cover inherited `GIT_CONFIG_COUNT`, `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_GLOBAL`,
+`GIT_CONFIG_SYSTEM`, `HOME`/`XDG_CONFIG_HOME` and `GIT_EXEC_PATH`, plus a repository-local fsmonitor, clean filter
+and long-running process filter, and a submodule-local fsmonitor and clean filter. Each case first shows that plain `git status` runs the canary.
+Consequences: a checkout that Git trusts only through a global, system or inherited `safe.directory` exception (one
+owned by another user) fails the snapshot (`repository`/`NonzeroExit`) rather than running with the caller's
+configuration. Filter drivers (for example Git LFS) defined only in the global configuration are not applied, so a
+stat-dirty file under such a filter can appear modified and is then hashed as it is. Driver names are enumerated
+immediately before `git status`, so a driver added in the milliseconds between the two is not overridden.
+
+**Budget.** One snapshot has its own outer budget, `PI_ORCHESTRATION_SNAPSHOT_TIMEOUT_MS` (default 120000, accepted
+1000–600000; an invalid value falls back to the default with a `SNAPSHOT_TIMEOUT_INVALID` diagnostic), separate from
+the generic 30 s helper timeout. The helper gets a shorter deadline (`budget - min(10 s, max(250 ms, budget/5))`,
+e.g. 110 s of 120 s, 24 s of 30 s) shared by every Git command and file read, so a slow command is killed (with its
+process group) and reported as a typed failure before the outer timeout fires. `runJson` runs each helper in its own
+process group; on its timeout it sends SIGTERM to the group (the snapshot helper then kills its running Git) and
+SIGKILL after 1 s. A completion after the timeout is ignored. stderr is drained and discarded.
+
+**Verdicts.** Equal digests pass. Two complete digests that differ are drift, `WORKER_SCOPE_VIOLATION`: the parent
+checkout changed while the call was in flight. Which process changed it (that worker, the lead, an editor, another
+tool) is not established and the message does not claim it. A failed after-call snapshot is
+`WORKER_SCOPE_UNVERIFIABLE`: nothing is claimed about a change. Both latch for the rest of the run, including after a
+resume (`status`/`resume` report `scope_latch`): further workers and `git worktree add` are refused, `integrate_begin`
+and `integrate_end` are refused (`integrate_abort`, which only succeeds against a verified restore, stays available),
+and COMPLETED is refused both by the extension and by the recorder; finish PARTIAL or BLOCKED. A later successful
+snapshot never clears the latch. A failed *before*-call snapshot refuses only that call (the worker never starts) and
+does not latch.
+
+**Record.** Each failed check is a closed `scope_check` event (`parent_orchestration.scope_checks`, at most 50, the
+first latched entry is never trimmed): `stage` (`before`/`after`), `verdict` (`drift`/`unverifiable`), `latched`,
+`phase`, `task_id`, `step_id`, `tool`, `before_digest`, `after_digest` (null when unverifiable), `changed_count`,
+`operation`, `suboperation` (`repository`, `head`, `head_symbolic`, `head_ref`, `index`, `config`,
+`submodule_config`, `submodule_index`, `status`, `worktree_hash`, `modes`, `untracked_hash`, `root_env`, `result`, or
+`subprocess` when the helper itself timed out, failed to spawn, exited nonzero or printed malformed output),
+`error_kind` (`Timeout`, `DeadlineExceeded`, `NonzeroExit`, `Signal`, `SpawnError`, `MalformedOutput`,
+`OutputTooLarge`, `OSError`, `HeadUnresolved`, `TrackedDirectoryUnverifiable`, `DirectoryUnverifiable`, ...),
+`exit_code`, `signal`, `elapsed_ms` (monotonic),
+`deadline_ms` (helper) and `timeout_ms` (outer budget). The same metadata goes to the diagnostic log as
+`component: "worker_scope"`. Paths, Git output, diff bodies, stderr and file contents are never recorded or logged;
+the lead's tool result names at most five changed status entries for drift.
+
 ## Task-classifier benchmark
 
 `benchmarks/classification/` measures the probabilistic boundary that precedes

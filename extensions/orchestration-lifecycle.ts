@@ -49,6 +49,40 @@ const MARKER = "PI_ORCHESTRATION_RUN_V1";
 const SESSION_ENTRY = "pi-orchestration-parent-v1";
 const MAX_OUTPUT = 256 * 1024;
 const COMMAND_TIMEOUT_MS = 30_000;
+/** After a helper timeout, how long its process group has to stop after SIGTERM before SIGKILL. */
+const KILL_GRACE_MS = 1_000;
+/**
+ * Budget of one parent-checkout snapshot, separate from the generic helper timeout: on a large or slow checkout
+ * (for example under /mnt/c on WSL) the helper's several Git commands can approach the generic 30 s. The helper
+ * gets a shorter deadline of its own (`snapshotHelperDeadlineMs`) so a slow Git command is reported as a typed
+ * failure before this outer timeout fires. Operators may set PI_ORCHESTRATION_SNAPSHOT_TIMEOUT_MS.
+ */
+export const DEFAULT_SNAPSHOT_TIMEOUT_MS = 120_000;
+export const MIN_SNAPSHOT_TIMEOUT_MS = 1_000;
+export const MAX_SNAPSHOT_TIMEOUT_MS = 600_000;
+const SNAPSHOT_TIMEOUT_ENV = "PI_ORCHESTRATION_SNAPSHOT_TIMEOUT_MS";
+const SCOPE_VIOLATION = "WORKER_SCOPE_VIOLATION";
+const SCOPE_UNVERIFIABLE = "WORKER_SCOPE_UNVERIFIABLE";
+type ScopeCode = typeof SCOPE_VIOLATION | typeof SCOPE_UNVERIFIABLE;
+/** The helper's own deadline inside an outer snapshot budget: room to report its failure before being killed. */
+export function snapshotHelperDeadlineMs(timeoutMs: number): number {
+  return timeoutMs - Math.min(10_000, Math.max(250, Math.floor(timeoutMs / 5)));
+}
+/** Effective snapshot budget: an explicit option, else a valid env override, else the default. */
+export function snapshotTimeoutMs(option?: number, env: NodeJS.ProcessEnv = process.env): number {
+  const valid = (value: number) => Number.isInteger(value) && value >= MIN_SNAPSHOT_TIMEOUT_MS && value <= MAX_SNAPSHOT_TIMEOUT_MS;
+  if (option !== undefined) {
+    if (!valid(option)) throw new RangeError(`snapshot timeout must be an integer in [${MIN_SNAPSHOT_TIMEOUT_MS}, ${MAX_SNAPSHOT_TIMEOUT_MS}] ms`);
+    return option;
+  }
+  const raw = env[SNAPSHOT_TIMEOUT_ENV];
+  if (raw !== undefined && /^\d{1,7}$/.test(raw) && valid(Number(raw))) return Number(raw);
+  if (raw !== undefined) {
+    process.stderr.write(`[orchestration-lifecycle] ${JSON.stringify({ component: "worker_scope", operation: "configure",
+      error_code: "SNAPSHOT_TIMEOUT_INVALID", effective_timeout_ms: DEFAULT_SNAPSHOT_TIMEOUT_MS })}\n`);
+  }
+  return DEFAULT_SNAPSHOT_TIMEOUT_MS;
+}
 const PHASE_STATUS = Type.Union([Type.Literal("not_started"), Type.Literal("in_progress"),
   Type.Literal("completed"), Type.Literal("blocked"), Type.Literal("failed"), Type.Literal("partial")]);
 const WORKER_STATUS = Type.Union([Type.Literal("not_started"), Type.Literal("in_progress"),
@@ -177,6 +211,12 @@ function providerObjectUnion<T extends TObject[]>(variants: [...T]) {
 }
 
 type Json = Record<string, unknown>;
+type CheckoutSnapshot = { digest: string; status: string[]; statusCount: number };
+/** Why a parent-checkout snapshot could not be taken: metadata only, never Git output, paths or file contents. */
+type SnapshotFailure = { operation: string; suboperation: string | null; error_kind: string; exit_code: number | null;
+  signal: string | number | null; errno: string | number | null; elapsed_ms: number; helper_elapsed_ms: number | null;
+  deadline_ms: number; timeout_ms: number };
+type SnapshotOutcome = { ok: true; snapshot: CheckoutSnapshot; elapsedMs: number } | { ok: false; failure: SnapshotFailure };
 type Guard = { block: true; reason: string; terminate?: boolean } | undefined;
 function python(): string { return process.env.PI_ROUTER_PYTHON ?? "python3"; }
 function samePath(left: string, right: string): boolean {
@@ -395,11 +435,40 @@ export function scopesOverlap(left: string, right: string): boolean {
   return shorter.every((segment, index) => longer[index] === segment);
 }
 
+/**
+ * Run one JSON helper: JSON on stdin, one JSON object on stdout. Never rejects. A failure is a closed object with
+ * metadata only -- `error_category` (Timeout, SpawnError, NonzeroExit, Signal, MalformedOutput, OutputTooLarge),
+ * exit code, signal, elapsed monotonic milliseconds and the effective timeout -- and never stdout or stderr text.
+ * The operation is the first argument, else the stdin `operation` (helpers such as session_scope take none).
+ * The helper runs in its own process group: a timeout sends SIGTERM to the group, then SIGKILL after a grace period,
+ * so Git or other descendants it started do not outlive it. A completion after the timeout is ignored.
+ */
 export function runJson(script: string, args: string[], input?: Json, timeoutMs = COMMAND_TIMEOUT_MS): Promise<Json> {
   return new Promise((resolve) => {
-    const child = spawn(python(), [script, ...args], { cwd: ROOT, stdio: ["pipe", "pipe", "pipe"] });
-    let output = "";
+    const started = performance.now();
+    const operation = args[0] ?? (typeof input?.operation === "string" && /^[a-z_]{1,40}$/.test(input.operation)
+      ? input.operation : "preflight");
+    const failure = (category: string, extra: Json = {}): Json => ({ ok: false, component: "orchestration_subprocess",
+      operation, error_category: category, exit_code: null, signal: null,
+      elapsed_ms: Math.round(performance.now() - started), timeout_ms: timeoutMs, ...extra,
+      orchestrator_root: ROOT, resource_path: script });
+    const group = process.platform !== "win32";
+    let child: ReturnType<typeof spawn>;
+    try {
+      child = spawn(python(), [script, ...args], { cwd: ROOT, stdio: ["pipe", "pipe", "pipe"], detached: group });
+    } catch (error) {
+      resolve(failure("SpawnError", { errno: (error as NodeJS.ErrnoException).code ?? null }));
+      return;
+    }
+    const chunks: Buffer[] = [];
+    let stdoutBytes = 0;
+    let overflow = false;
     let settled = false;
+    const signalGroup = (name: NodeJS.Signals) => {
+      try {
+        if (group && child.pid) process.kill(-child.pid, name); else child.kill(name);
+      } catch { /* already gone */ }
+    };
     const finish = (result: Json) => {
       if (settled) return;
       settled = true;
@@ -407,32 +476,45 @@ export function runJson(script: string, args: string[], input?: Json, timeoutMs 
       resolve(result);
     };
     const timer = setTimeout(() => {
-      child.kill("SIGKILL");
-      finish({ ok: false, component: "orchestration_subprocess",
-        operation: args[0] ?? "preflight", error_category: "Timeout",
-        orchestrator_root: ROOT, resource_path: script });
+      finish(failure("Timeout"));
+      // Let the helper stop its own children first, then make sure nothing in the group survives.
+      signalGroup("SIGTERM");
+      setTimeout(() => signalGroup("SIGKILL"), KILL_GRACE_MS).unref();
     }, timeoutMs);
-    child.stdout.on("data", (part: Buffer) => { output = (output + part.toString("utf8")).slice(0, MAX_OUTPUT); });
-    child.on("error", (error) => finish({ ok: false, component: "orchestration_subprocess",
-      operation: args[0] ?? "preflight", error_category: error.name,
-      orchestrator_root: ROOT, resource_path: script }));
-    child.on("close", (code) => {
-      try {
-        const result = JSON.parse(output) as Json;
-        finish(code === 0 || result.ok === false ? result : { ok: false,
-          component: "orchestration_subprocess", operation: args[0] ?? "preflight",
-          error_category: "NonzeroExit", orchestrator_root: ROOT, resource_path: script });
-      } catch { finish({ ok: false, component: "orchestration_subprocess",
-        operation: args[0] ?? "preflight", error_category: "MalformedOutput",
-        orchestrator_root: ROOT, resource_path: script }); }
+    child.stdout!.on("data", (part: Buffer) => {
+      stdoutBytes += part.length;
+      if (stdoutBytes > MAX_OUTPUT) {
+        if (!overflow) { overflow = true; signalGroup("SIGKILL"); }
+        return;
+      }
+      chunks.push(part);
     });
-    child.stdin.end(input === undefined ? "" : JSON.stringify(input));
+    // Drained and discarded: a helper that fills the stderr pipe must never stall into a timeout.
+    child.stderr!.on("data", () => {});
+    child.stdin!.on("error", () => {});
+    child.on("error", (error) => finish(failure("SpawnError", { errno: (error as NodeJS.ErrnoException).code ?? null })));
+    child.on("close", (code, signal) => {
+      if (overflow) { finish(failure("OutputTooLarge", { exit_code: code, signal })); return; }
+      let result: unknown;
+      try { result = JSON.parse(Buffer.concat(chunks).toString("utf8")); } catch { result = undefined; }
+      if (result === null || typeof result !== "object" || Array.isArray(result)) {
+        const category = signal ? "Signal" : code === 0 ? "MalformedOutput" : "NonzeroExit";
+        finish(failure(category, { exit_code: code, signal }));
+        return;
+      }
+      const json = result as Json;
+      finish(code === 0 || json.ok === false ? json
+        : failure(signal ? "Signal" : "NonzeroExit", { exit_code: code, signal }));
+    });
+    child.stdin!.end(input === undefined ? "" : JSON.stringify(input));
   });
 }
 
 export function createOrchestrationLifecycle(command: typeof runJson = runJson, clock: () => number = Date.now,
-                                            sandboxProbe: SandboxProbe = detectWorkerSandbox) {
+                                            sandboxProbe: SandboxProbe = detectWorkerSandbox,
+                                            options: { snapshotTimeoutMs?: number } = {}) {
 return function orchestrationLifecycle(pi: ExtensionAPI) {
+  const snapshotBudgetMs = snapshotTimeoutMs(options.snapshotTimeoutMs);
   let runId: string | null = null;
   let lastRunId: string | null = null;
   let lastTerminal: Json | null = null;
@@ -466,14 +548,17 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
   // Parent run: subagent id -> task/step it was spawned for.
   const subagentTasks = new Map<string, Attribution>();
   // toolCallId -> parent checkout snapshot taken before a worker call.
-  const snapshots = new Map<string, { digest: string; status: string[] }>();
+  const snapshots = new Map<string, CheckoutSnapshot>();
   // toolCallId -> worker call currently running.
   const inFlight = new Map<string, { taskId: string | null; stepId: string | null; tool: string; phase?: string }>();
   // toolCallId -> ClaudeWorker run the guard resolved; consumed by the tool's execute.
   const workerPlans = new Map<string, WorkerPlan>();
   // The run's worker sandbox posture and repository allowlist, resolved and recorded at run start or resume.
   let workerSandbox: WorkerSandboxConfig | null = null;
-  let scopeViolation: string | null = null;
+  // Latched for the rest of the run once a worker call's parent-checkout check found drift or could not verify.
+  let scopeLatch: { code: ScopeCode; detail: string } | null = null;
+  // Phases already recorded blocked by a scope check, so a second check never restates a conflicting blocker.
+  const scopeBlockedPhases = new Set<string>();
   let lastPhase = "routing";
   let currentTurn: number | null = null;
   const messageStarts = new Map<number, number>();
@@ -626,6 +711,10 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
     for (const phase of Array.isArray(result.reroute_phases) ? result.reroute_phases : []) {
       if (typeof phase === "string") pendingReroutes.add(phase);
     }
+    // A scope check latched before the stop stays latched: resuming never re-enables workers or COMPLETED.
+    if (result.scope_latch === SCOPE_VIOLATION || result.scope_latch === SCOPE_UNVERIFIABLE) {
+      scopeLatch = { code: result.scope_latch, detail: "recorded in this run before it was resumed" };
+    }
     for (const phase of Array.isArray(result.path_floor_phases) ? result.path_floor_phases : []) {
       if (typeof phase === "string") floorRerouted.add(phase);
     }
@@ -684,7 +773,7 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
   function resetRunState(): void {
     approvals.clear(); pendingRoutes.clear(); workspaces.clear(); snapshots.clear();
     subagentTasks.clear(); inFlight.clear(); claudeCalls.clear(); workerPlans.clear();
-    scopeViolation = null; activeWave = null; integrating = null; implicitOpen.clear(); routeEpochs.clear(); implicitEpoch.clear(); autoWorkers.clear(); lastPhase = "routing";
+    scopeLatch = null; scopeBlockedPhases.clear(); activeWave = null; integrating = null; implicitOpen.clear(); routeEpochs.clear(); implicitEpoch.clear(); autoWorkers.clear(); lastPhase = "routing";
     currentTurn = null; messageStarts.clear(); leadLimit = null; leadStop = null; failureBudget = null; workerSandbox = null;
     batchStart = 0; batchPeak = 0;
     pendingReroutes.clear();
@@ -967,11 +1056,109 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
     }
     return scope;
   }
-  async function snapshot(): Promise<{ digest: string; status: string[] } | null> {
-    if (!targetCwd) return null;
-    const result = await command(SESSION_SCOPE, [], { operation: "snapshot", path: targetCwd });
-    return result.ok === true && typeof result.digest === "string"
-      ? { digest: result.digest, status: Array.isArray(result.status) ? result.status as string[] : [] } : null;
+  /**
+   * Snapshot the parent checkout inside the snapshot budget. Success needs a complete digest from the helper; anything
+   * else -- no target, a helper timeout, spawn failure, nonzero exit, malformed output, or the helper's own typed
+   * failure -- is a SnapshotFailure with metadata only. A failure is never a digest and never a "change".
+   */
+  async function snapshot(path = targetCwd): Promise<SnapshotOutcome> {
+    const started = performance.now();
+    const deadline = snapshotHelperDeadlineMs(snapshotBudgetMs);
+    const fail = (fields: Partial<SnapshotFailure>): SnapshotOutcome => ({ ok: false, failure: {
+      operation: "snapshot", suboperation: null, error_kind: "Unknown", exit_code: null, signal: null, errno: null,
+      helper_elapsed_ms: null, ...fields, elapsed_ms: Math.round(performance.now() - started),
+      deadline_ms: deadline, timeout_ms: snapshotBudgetMs } });
+    if (!path) return fail({ suboperation: "target", error_kind: "TargetUnresolved" });
+    const result = await command(SESSION_SCOPE, [], { operation: "snapshot", path, deadline_ms: deadline },
+      snapshotBudgetMs);
+    const number = (value: unknown) => typeof value === "number" && Number.isFinite(value) ? value : null;
+    const token = (value: unknown) => typeof value === "string" && /^[A-Za-z0-9_.-]{1,64}$/.test(value) ? value : null;
+    if (result.ok === true) {
+      if (typeof result.digest === "string" && /^[0-9a-f]{64}$/.test(result.digest) && Array.isArray(result.status)
+          && result.status.every((entry) => typeof entry === "string")) {
+        return { ok: true, elapsedMs: Math.round(performance.now() - started), snapshot: { digest: result.digest,
+          status: result.status as string[], statusCount: number(result.status_count) ?? result.status.length } };
+      }
+      return fail({ suboperation: "result", error_kind: "MalformedOutput" });
+    }
+    if (result.component === "orchestration_subprocess") {
+      // The helper itself did not answer: runJson's timeout, spawn failure, nonzero exit or malformed output.
+      return fail({ suboperation: "subprocess", error_kind: token(result.error_category) ?? "Unknown",
+        exit_code: number(result.exit_code), signal: token(result.signal) ?? number(result.signal),
+        errno: token(result.errno) });
+    }
+    return fail({ suboperation: token(result.suboperation), error_kind: token(result.error_kind) ?? token(result.blocker_code) ?? "Unknown",
+      exit_code: number(result.exit_code), signal: number(result.signal), errno: number(result.errno),
+      helper_elapsed_ms: number(result.elapsed_ms) });
+  }
+  function describeFailure(failure: SnapshotFailure): string {
+    return `${failure.operation}/${failure.suboperation ?? "unknown"} ${failure.error_kind}` +
+      (failure.exit_code !== null ? ` exit ${failure.exit_code}` : "") + (failure.signal !== null ? ` signal ${failure.signal}` : "") +
+      ` after ${failure.elapsed_ms} ms (snapshot budget ${failure.timeout_ms} ms, helper deadline ${failure.deadline_ms} ms)`;
+  }
+  function diagnoseScope(data: Json): void {
+    process.stderr.write(`[orchestration-lifecycle] ${JSON.stringify({ component: "worker_scope", run_id: runId, ...data })}\n`);
+  }
+  /** A scope check's closed record fields: verdict, stage, digests, counts and failure metadata. */
+  function scopeRecord(verdict: "drift" | "unverifiable", stage: "before" | "after", latched: boolean,
+                       worker: { taskId: string | null; stepId: string | null; tool: string } | null,
+                       before: CheckoutSnapshot | null, after: SnapshotOutcome | null): Json {
+    const failure = after && !after.ok ? after.failure : null;
+    const changed = before && after?.ok ? after.snapshot.status.filter((entry) => !before.status.includes(entry)).length : null;
+    return { kind: "scope_check", stage, verdict, latched,
+      phase: (worker?.taskId && approvals.get(worker.taskId)?.phase) || lastPhase,
+      task_id: worker?.taskId ?? null, step_id: worker?.stepId ?? null, tool: worker?.tool ?? null,
+      before_digest: before?.digest ?? null, after_digest: after?.ok ? after.snapshot.digest : null,
+      changed_count: changed,
+      operation: failure?.operation ?? "snapshot", suboperation: failure?.suboperation ?? null,
+      error_kind: failure?.error_kind ?? null, exit_code: failure?.exit_code ?? null,
+      signal: failure?.signal === null || failure?.signal === undefined ? null : String(failure.signal),
+      elapsed_ms: failure ? failure.elapsed_ms : after?.ok ? after.elapsedMs : null,
+      deadline_ms: snapshotHelperDeadlineMs(snapshotBudgetMs), timeout_ms: snapshotBudgetMs };
+  }
+  /**
+   * Compare the parent checkout after a worker call with its snapshot from before the call. A differing complete
+   * digest is drift (WORKER_SCOPE_VIOLATION): the checkout changed while the call was in flight, by whom is not
+   * established. A failed after-snapshot is WORKER_SCOPE_UNVERIFIABLE: nothing is claimed about a change. Both latch
+   * for the rest of the run; a later successful snapshot never clears the latch. Returns the blocker text, or null.
+   */
+  async function verifyAfterWorker(worker: { taskId: string | null; stepId: string | null; tool: string } | null,
+                                   before: CheckoutSnapshot): Promise<string | null> {
+    const after = await snapshot();
+    if (after.ok && after.snapshot.digest === before.digest) return null;
+    const code: ScopeCode = after.ok ? SCOPE_VIOLATION : SCOPE_UNVERIFIABLE;
+    const record = scopeRecord(after.ok ? "drift" : "unverifiable", "after", true, worker, before, after);
+    let detail: string;
+    if (after.ok) {
+      const changed = after.snapshot.status.filter((entry) => !before.status.includes(entry));
+      detail = changed.length > 0 ? changed.slice(0, 5).join(", ") + (changed.length > 5 ? `, +${changed.length - 5} more` : "")
+        : "status entries unchanged; staged, unstaged, untracked or HEAD state differs";
+    } else {
+      detail = describeFailure(after.failure);
+    }
+    diagnoseScope({ ...record, blocker_code: code });
+    if (!scopeLatch) scopeLatch = { code, detail };
+    blockAllWorktrees();
+    await event(record);
+    const phase = String(record.phase);
+    if (!scopeBlockedPhases.has(phase)) {
+      scopeBlockedPhases.add(phase);
+      await event({ kind: "phase", phase, status: "blocked", blocker_code: code });
+    }
+    return code === SCOPE_VIOLATION
+      ? `Orchestration blocker: ${SCOPE_VIOLATION}. The parent checkout changed while this worker call was in flight (${detail}). ` +
+        "Which process changed it (this worker, the lead, or anything else writing to the checkout) is not established. " +
+        "Workers may only write in their bound worktree. Nothing was reverted; inspect the parent checkout. " +
+        "No further workers, integration or COMPLETED finish in this run: finish PARTIAL or BLOCKED."
+      : `Orchestration blocker: ${SCOPE_UNVERIFIABLE}. The parent checkout could not be verified after this worker call (${detail}). ` +
+        "No change is claimed; the checkout is simply unverified. Nothing was reverted; inspect the parent checkout. " +
+        `No further workers, integration or COMPLETED finish in this run: finish PARTIAL or BLOCKED. If the checkout is slow, raise ${SNAPSHOT_TIMEOUT_ENV} for the next run.`;
+  }
+  function scopeLatchReason(): string {
+    const latch = scopeLatch!;
+    return latch.code === SCOPE_VIOLATION
+      ? `${SCOPE_VIOLATION}: the parent checkout changed while a worker call was in flight (${latch.detail}); the cause is not established. Inspect the parent checkout; this run refuses further workers, integration and a COMPLETED finish (finish PARTIAL or BLOCKED)`
+      : `${SCOPE_UNVERIFIABLE}: the parent checkout could not be verified after a worker call (${latch.detail}). This run refuses further workers, integration and a COMPLETED finish (finish PARTIAL or BLOCKED)`;
   }
 
   /**
@@ -1283,8 +1470,8 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
       return { block: true,
         reason: `PARENT_ROUTE_RECHECK_REQUIRED: rerun route_task and backend preflight for ${[...pendingReroutes].sort().join(", ")} before worker dispatch` };
     }
-    if (scopeViolation && (WORKER_TOOLS.has(call.toolName) || isWorktreeAdd(call))) {
-      return { block: true, reason: `WORKER_SCOPE_VIOLATION: a worker changed the parent checkout (${scopeViolation}); review those changes before launching more workers` };
+    if (scopeLatch && (WORKER_TOOLS.has(call.toolName) || isWorktreeAdd(call))) {
+      return { block: true, reason: scopeLatchReason() };
     }
     if (integrating && WORKER_TOOLS.has(call.toolName)) {
       return { block: true, reason: `INTEGRATION_IN_PROGRESS: wave ${integrating} is integrating; finish with orchestration_record {"action":"integrate_end"} before launching workers` };
@@ -1339,12 +1526,17 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
       }
       // Workers must never write to the parent checkout: compare it before and after.
       const before = await snapshot();
-      if (!before) {
+      if (!before.ok) {
         claudeCalls.delete(call.toolCallId);
         workerPlans.delete(call.toolCallId);
-        return { block: true, reason: "WORKER_SCOPE_UNVERIFIABLE: could not snapshot the parent checkout" };
+        // Nothing started, so nothing is unverified: this call alone is refused and the run is not latched.
+        const record = scopeRecord("unverifiable", "before", false,
+          { taskId, stepId: step?.id ?? null, tool: call.toolName }, null, before);
+        diagnoseScope({ ...record, blocker_code: SCOPE_UNVERIFIABLE });
+        await observe(record);
+        return { block: true, reason: `${SCOPE_UNVERIFIABLE}: could not snapshot the parent checkout before the worker call (${describeFailure(before.failure)}); the worker was not started. Retry the call; if the checkout is slow, raise ${SNAPSHOT_TIMEOUT_ENV} for the next run` };
       }
-      snapshots.set(call.toolCallId, before);
+      snapshots.set(call.toolCallId, before.snapshot);
       // A routed task started while no worker runs and no wave is declared is a single-task wave: record it
       // here so the lead need not. Concurrent work still needs the lead's declare_wave (gate above).
       // Only a mutating step starts one, and only when the task has no open wave in its current route epoch:
@@ -1446,16 +1638,11 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
     const before = snapshots.get(result.toolCallId);
     snapshots.delete(result.toolCallId);
     if (runId && before) {
-      const after = await snapshot();
-      if (!after || after.digest !== before.digest) {
-        const changed = after ? after.status.filter((entry) => !before.status.includes(entry)) : [];
-        scopeViolation = changed.slice(0, 5).join(", ") || "unattributed changes";
-        blockAllWorktrees();
-        const phase = (worker?.taskId && approvals.get(worker.taskId)?.phase) || lastPhase;
-        await event({ kind: "phase", phase, status: "blocked", blocker_code: "WORKER_SCOPE_VIOLATION" });
+      const blocker = await verifyAfterWorker(worker ? { taskId: worker.taskId, stepId: worker.stepId, tool: worker.tool }
+        : { taskId: null, stepId: null, tool: result.toolName }, before);
+      if (blocker) {
         claudeCalls.delete(result.toolCallId);
-        return { content: [...result.content, { type: "text" as const,
-          text: `Orchestration blocker: WORKER_SCOPE_VIOLATION. The parent checkout changed during this worker call (${scopeViolation}). Workers may only write in their bound worktree. Nothing was reverted; inspect the changes before continuing.` }] };
+        return { content: [...result.content, { type: "text" as const, text: blocker }] };
       }
     }
     if (runId && worker?.taskId && worker.stepId && !result.isError &&
@@ -1867,6 +2054,8 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
   }
 
   async function integration(action: "integrate_begin" | "integrate_end" | "integrate_abort", requestedWaveId: string, requestedPath?: string) {
+    // A latched scope check refuses integration progress; an abort (verified restore only) stays available.
+    if (scopeLatch && action !== "integrate_abort") return reply(false, `BLOCKED: ${scopeLatchReason()}.`);
     // The lead names an implicitly recorded single-task wave as "auto".
     let waveId = requestedWaveId;
     if (requestedWaveId === "auto") {
@@ -1900,33 +2089,49 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
       if (underrated) return underrated;
       const base = path ? await command(SESSION_SCOPE, [], { operation: "head", path }) : { ok: false };
       if (base.ok !== true || typeof base.head !== "string") {
-        return reply(false, `BLOCKED: ${DIFF_UNVERIFIABLE}: the parent checkout has no HEAD to check the merged change against.`);
+        return reply(false, base.ok === true
+          ? `BLOCKED: ${DIFF_UNVERIFIABLE}: the parent checkout has no HEAD to check the merged change against.`
+          : `BLOCKED: ${DIFF_UNVERIFIABLE}: the parent checkout HEAD could not be resolved; retry integrate_begin.`);
       }
-      const before = path ? await command(SESSION_SCOPE, [], { operation: "snapshot", path }) : { ok: false };
-      if (before.ok !== true || typeof before.digest !== "string") return reply(false, `BLOCKED: ${DIFF_UNVERIFIABLE}: cannot snapshot the integration checkout.`);
       const parentBefore = await snapshot();
-      if (!parentBefore) return reply(false, `BLOCKED: ${DIFF_UNVERIFIABLE}: cannot snapshot the parent checkout.`);
-      if (path !== targetCwd && (parentBefore.status.length > 0 || (Array.isArray(before.status) && before.status.length > 0)))
+      if (!parentBefore.ok) {
+        diagnoseScope({ stage: "integrate_begin", ...parentBefore.failure });
+        return reply(false, `BLOCKED: ${DIFF_UNVERIFIABLE}: cannot snapshot the parent checkout (${describeFailure(parentBefore.failure)}); retry integrate_begin.`);
+      }
+      const before = path === targetCwd ? parentBefore : await snapshot(path);
+      if (!before.ok) {
+        diagnoseScope({ stage: "integrate_begin", ...before.failure });
+        return reply(false, `BLOCKED: ${DIFF_UNVERIFIABLE}: cannot snapshot the integration checkout (${describeFailure(before.failure)}).`);
+      }
+      if (path !== targetCwd && (parentBefore.snapshot.statusCount > 0 || before.snapshot.statusCount > 0))
         return reply(false, "BLOCKED: INTEGRATION_CHECKOUT_DIRTY: the parent and integration checkouts must be clean before external integration, including untracked paths.");
       if (!await event({ kind: "wave", wave_id: waveId, task_ids: members, status: "integrating", ...(requestedPath ? { integration_path: path } : {}) })) {
         return reply(false, "BLOCKED: parent provenance update failed; see diagnostic log.", parentFailure ?? {});
       }
       integrating = waveId;
       integrationPath = path;
-      integrationParentSnapshot = parentBefore.digest;
+      integrationParentSnapshot = parentBefore.snapshot.digest;
       integrationBase = base.head;
-      integrationSnapshot = before.digest;
+      integrationSnapshot = before.snapshot.digest;
       return reply(true, `Integration of wave ${waveId} (task${members.length === 1 ? "" : "s"} ${members.join(", ")}) started. Worker launches are refused until integrate_end.`);
     }
     if (integrating !== waveId || !members) return reply(false, `BLOCKED: INTEGRATION_NOT_STARTED: wave ${waveId} is not integrating.`);
     if (integrationPath !== targetCwd) {
       const parentNow = await snapshot();
-      if (!parentNow || parentNow.digest !== integrationParentSnapshot)
+      if (!parentNow.ok) {
+        diagnoseScope({ stage: action, ...parentNow.failure });
+        return reply(false, `BLOCKED: ${SCOPE_UNVERIFIABLE}: cannot verify the parent checkout (${describeFailure(parentNow.failure)}).`);
+      }
+      if (parentNow.snapshot.digest !== integrationParentSnapshot)
         return reply(false, "BLOCKED: INTEGRATION_PARENT_CHANGED: restore the parent checkout to its state at integration start before ending or aborting the wave.");
     }
     if (action === "integrate_abort") {
-      const restored = integrationPath ? await command(SESSION_SCOPE, [], { operation: "snapshot", path: integrationPath }) : { ok: false };
-      if (!integrationSnapshot || restored.ok !== true || restored.digest !== integrationSnapshot)
+      const restored = await snapshot(integrationPath);
+      if (!restored.ok) {
+        diagnoseScope({ stage: "integrate_abort", ...restored.failure });
+        return reply(false, `BLOCKED: ${SCOPE_UNVERIFIABLE}: the restored parent checkout could not be verified (${describeFailure(restored.failure)}); nothing is claimed about it. Retry integrate_abort.`);
+      }
+      if (!integrationSnapshot || restored.snapshot.digest !== integrationSnapshot)
         return reply(false, `BLOCKED: INTEGRATION_RESTORE_REQUIRED: restore the parent checkout exactly to its state before integrate_begin (${integrationBase}) before aborting.`);
       const abandoned = await eventUnlessRefused({ kind: "wave", wave_id: waveId, task_ids: members, status: "abandoned" },
         new Set(["INTEGRATION_RESTORE_REQUIRED"]));
@@ -1945,7 +2150,10 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
     if (merged) return merged;
     // Re-base: the parent's own merges are the new reference for later worker snapshots.
     const rebased = await snapshot();
-    if (!rebased) return reply(false, "BLOCKED: WORKER_SCOPE_UNVERIFIABLE: could not snapshot the parent checkout.");
+    if (!rebased.ok) {
+      diagnoseScope({ stage: "integrate_end", ...rebased.failure });
+      return reply(false, `BLOCKED: ${SCOPE_UNVERIFIABLE}: could not snapshot the parent checkout to re-base later worker checks (${describeFailure(rebased.failure)}); the integration has not ended. Retry integrate_end.`);
+    }
     snapshots.clear();
     if (!await event({ kind: "wave", wave_id: waveId, task_ids: members, status: "integrated" })) {
       return reply(false, "BLOCKED: parent provenance update failed; see diagnostic log.", parentFailure ?? {});
@@ -1960,7 +2168,7 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
     implicitEpoch.delete(waveId);
     if (activeWave?.id === waveId) activeWave = null;
     return reply(true, `Wave ${waveId} integrated; the parent checkout snapshot is re-based. Plan the next dependency-ready wave.`,
-      { wave_id: waveId, digest: rebased.digest });
+      { wave_id: waveId, digest: rebased.snapshot.digest });
   }
 
   pi.registerTool({
@@ -2055,6 +2263,9 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
         }
         const ended = await integration("integrate_end", params.integrate_wave_id);
         if (!ended.details.ok) return ended;
+      }
+      if (params.action === "finish" && params.status === "COMPLETED" && scopeLatch) {
+        return reply(false, `BLOCKED: ${scopeLatchReason()}.`);
       }
       const args = params.action === "status" ? ["status", runId]
         : params.action === "event" ? ["event", runId, ...ownerArgs()]
@@ -2173,7 +2384,14 @@ return function orchestrationLifecycle(pi: ExtensionAPI) {
   pi.on("turn_end", async (_event, ctx) => {
     lastCtx = ctx;
     // Worker tools block within one turn: anything still marked in flight never reported a result.
-    for (const id of [...inFlight.keys()]) { snapshots.delete(id); await workerFinished(id); }
+    for (const id of [...inFlight.keys()]) {
+      // A worker call that never reported a result is still checked: it may have run.
+      const before = snapshots.get(id);
+      const worker = inFlight.get(id);
+      snapshots.delete(id);
+      if (runId && before) await verifyAfterWorker(worker ? { taskId: worker.taskId, stepId: worker.stepId, tool: worker.tool } : null, before);
+      await workerFinished(id);
+    }
     workerPlans.clear();
     if (runId) await renewLease();
     if (!runId || parentBlocked || !budget) return;

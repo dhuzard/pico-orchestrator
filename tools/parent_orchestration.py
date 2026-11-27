@@ -426,6 +426,8 @@ def status(run_id: str, *, repo_root: Path = ROOT, worktree: Path | None = None,
             # Tasks a mutating worker may have written for and that no integrated wave covers yet: a resumed lifecycle
             # refuses to integrate them until their worktrees are bound (and so diff-checked) again.
             "bound_phases": sorted(phase["id"] for phase in parent["phases"] if phase.get("workspace_bound")),
+            # A latched parent-checkout scope check: a resumed lifecycle keeps refusing workers and COMPLETED.
+            "scope_latch": scope_latch(parent),
             "path_floor_phases": sorted(phase["id"] for phase in parent["phases"]
                                         if any(e.get("reason") == PATH_FLOOR_REASON for e in phase.get("escalations") or [])
                                         and phase.get("workspace_bound"))}
@@ -692,6 +694,79 @@ def _worker_sandbox_event(parent: dict, event: dict) -> dict:
         if len(history) > MAX_WORKER_SANDBOX_ENTRIES:
             del history[1:len(history) - MAX_WORKER_SANDBOX_ENTRIES + 1]
     return effective
+
+
+SCOPE_CODES = {"drift": "WORKER_SCOPE_VIOLATION", "unverifiable": "WORKER_SCOPE_UNVERIFIABLE"}
+SCOPE_STAGES = {"before", "after"}
+MAX_SCOPE_CHECKS = 50
+SCOPE_TOKEN_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+SCOPE_FIELDS = ("stage", "verdict", "latched", "phase", "task_id", "step_id", "tool", "before_digest", "after_digest",
+                "changed_count", "operation", "suboperation", "error_kind", "exit_code", "signal", "elapsed_ms",
+                "deadline_ms", "timeout_ms")
+
+
+def _scope_check_event(parent: dict, event: dict) -> None:
+    """Record one parent-checkout scope check that failed, written only by the lifecycle extension.
+
+    `drift`: complete before and after digests differ (WORKER_SCOPE_VIOLATION); the checkout changed while a worker
+    call was in flight, and which process changed it is not established. `unverifiable`: a snapshot could not be
+    taken (WORKER_SCOPE_UNVERIFIABLE); nothing is claimed about a change. A `latched` entry (an after-call check)
+    refuses COMPLETED for the rest of the run and is reported by `status` as `scope_latch`; a `before` failure only
+    refused that one call. Metadata only: digests, counts, the failing operation and its exit status and timings;
+    never paths, Git output or file contents.
+    """
+    verdict, stage, latched = event["verdict"], event["stage"], event["latched"]
+    if verdict not in SCOPE_CODES or stage not in SCOPE_STAGES or type(latched) is not bool or (latched and stage != "after"):
+        raise ParentRunError("invalid scope check", error_code="PARENT_EVENT_FIELDS_INVALID")
+
+    def optional(field: str, check) -> Any:
+        value = event.get(field)
+        if value is not None and not check(value):
+            raise ParentRunError(f"invalid scope check {field}", error_code="PARENT_EVENT_FIELDS_INVALID")
+        return value
+
+    def count(value: Any) -> bool:
+        return type(value) is int and 0 <= value <= 10**9
+
+    def token(value: Any) -> bool:
+        return isinstance(value, str) and bool(SCOPE_TOKEN_RE.fullmatch(value))
+
+    def digest(value: Any) -> bool:
+        return isinstance(value, str) and bool(DIGEST_RE.fullmatch(value))
+
+    entry = {"at": _now(), "code": SCOPE_CODES[verdict], "stage": stage, "verdict": verdict, "latched": latched,
+             "phase": optional("phase", lambda value: isinstance(value, str) and bool(ID_RE.fullmatch(value))),
+             "task_id": optional("task_id", lambda value: isinstance(value, str) and bool(ID_RE.fullmatch(value))),
+             "step_id": optional("step_id", lambda value: isinstance(value, str) and bool(ID_RE.fullmatch(value))),
+             "tool": optional("tool", token),
+             "before_digest": optional("before_digest", digest), "after_digest": optional("after_digest", digest),
+             "changed_count": optional("changed_count", count),
+             "operation": optional("operation", token), "suboperation": optional("suboperation", token),
+             "error_kind": optional("error_kind", token),
+             "exit_code": optional("exit_code", lambda value: type(value) is int and -1024 <= value <= 1024),
+             "signal": optional("signal", token),
+             "elapsed_ms": optional("elapsed_ms", count), "deadline_ms": optional("deadline_ms", count),
+             "timeout_ms": optional("timeout_ms", count)}
+    # Drift is two complete digests that differ; unverifiable never carries an after digest.
+    if verdict == "drift" and (entry["before_digest"] is None or entry["after_digest"] is None
+                               or entry["before_digest"] == entry["after_digest"] or entry["error_kind"] is not None):
+        raise ParentRunError("drift needs two different complete digests", error_code="PARENT_EVENT_FIELDS_INVALID")
+    if verdict == "unverifiable" and (entry["after_digest"] is not None or entry["error_kind"] is None):
+        raise ParentRunError("an unverifiable check has a failure and no after digest", error_code="PARENT_EVENT_FIELDS_INVALID")
+    if latched and entry["before_digest"] is None:
+        raise ParentRunError("a latched check compares with a before digest", error_code="PARENT_EVENT_FIELDS_INVALID")
+    checks = parent.setdefault("scope_checks", [])
+    checks.append(entry)
+    if len(checks) > MAX_SCOPE_CHECKS:
+        # Never drop the first latched entry: it is what refuses COMPLETED.
+        first = next((index for index, item in enumerate(checks) if item["latched"]), None)
+        drop = next(index for index in range(len(checks)) if index != first)
+        del checks[drop]
+
+
+def scope_latch(parent: dict) -> str | None:
+    """The blocker of the first latched scope check, or None."""
+    return next((item["code"] for item in parent.get("scope_checks") or [] if item.get("latched")), None)
 
 
 def _failure_event(parent: dict, event: dict) -> None:
@@ -1240,6 +1315,7 @@ def _record_event_unlocked(run_id: str, event: dict, *, repo_root: Path = ROOT) 
                            "policy_commit", "local_drift", "user_settings_widening"},
         "diff_floors": {"kind", "phase", "status", "from_route", "to_route", "capacity_raised", "matches", "head",
                         "route_task_result", "paths", "operation", "base", "wave_id", "path_digests"},
+        "scope_check": {"kind", *SCOPE_FIELDS},
     }
     required = {
         "phase": {"kind", "phase", "status"},
@@ -1263,6 +1339,7 @@ def _record_event_unlocked(run_id: str, event: dict, *, repo_root: Path = ROOT) 
         "retry_gate": {"kind", "phase", "step_id", "retry_budget", "source"},
         "worker_sandbox": {"kind", "state", "source"},
         "diff_floors": {"kind", "phase", "status", "matches"},
+        "scope_check": {"kind", "stage", "verdict", "latched"},
     }
     if kind not in allowed or set(event) - allowed[kind]:
         raise ParentRunError("unsupported event or unexpected fields")
@@ -1577,6 +1654,8 @@ def _record_event_unlocked(run_id: str, event: dict, *, repo_root: Path = ROOT) 
         return {**parent, "worker_sandbox_effective": effective}
     elif kind == "diff_floors":
         _diff_floors_event(parent, event)
+    elif kind == "scope_check":
+        _scope_check_event(parent, event)
     elif kind == "retry_gate":
         gate = _retry_gate_event(parent, event)
         provenance.update_parent_orchestration(repo_root, run_id, parent)
@@ -1647,6 +1726,12 @@ def _finish_unlocked(run_id: str, status: str, *, blocker_code: str | None = Non
     if record["outcome"] != "in_progress":
         return record
     if status == "COMPLETED":
+        latched = scope_latch(parent)
+        if latched:
+            raise ParentRunError("a worker call's parent-checkout check " +
+                                 ("found the checkout changed" if latched == "WORKER_SCOPE_VIOLATION"
+                                  else "could not verify the checkout") + "; finish PARTIAL or BLOCKED",
+                                 error_code=latched)
         phases = parent["phases"]
         unconfirmed = [phase["id"] for phase in phases if phase.get("escalations")
                        and not phase["escalations"][-1].get("confirmed")]
@@ -1903,7 +1988,7 @@ def main() -> int:
                           "operation": args.command, "error_category": type(exc).__name__,
                           "error_code": error_code, "error": detail, "run_id": run_id,
                           "event_kind": event_kind if isinstance(event_kind, str) and
-                            event_kind in {"phase", "worker", "child", "mutation", "context", "usage", "wave", "concurrency", "failure", "retry_gate"} else None,
+                            event_kind in {"phase", "worker", "child", "mutation", "context", "usage", "wave", "concurrency", "failure", "retry_gate", "scope_check"} else None,
                           "lifecycle_state": lifecycle_state, "validation_path": validation_path,
                           "orchestrator_commit": revision, "orchestrator_root": str(ROOT),
                           "resource_path": str(ROOT / ("schemas/run-record.schema.json" if
