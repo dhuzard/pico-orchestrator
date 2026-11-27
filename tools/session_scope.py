@@ -20,12 +20,16 @@ Operations (JSON on stdin, closed JSON verdict on stdout):
       directory as protected and denies headless edits there even in
       acceptEdits mode, so a worker bound to it cannot write at all.
   {"operation": "snapshot", "path", "deadline_ms"?}
-      complete digest of a checkout's HEAD, its index (every entry's mode, object
-      id, stage and assume-unchanged/skip-worktree flag), the worktree content of
-      every tracked path that differs from the index or that Git hides from
-      status, and every untracked file, used to detect the parent checkout changing while a
-      worker runs. Only read-only plumbing runs (never `git diff`, which rewrites
-      the index to refresh stat data). Every Git command and file read runs inside one monotonic
+      complete digest of a checkout's HEAD (commit and symbolic ref name, or
+      detached), its index (every entry's mode, object id, stage and
+      assume-unchanged/skip-worktree flag), the worktree content of every tracked
+      path that differs from the index or that Git hides from status, the lstat
+      type and permission bits of every tracked path, every untracked file, and
+      every root-level `.env`/`.env.*` entry even when ignored, used to detect the
+      parent checkout changing while a worker runs. Other ignored paths are not
+      covered. Only read-only plumbing runs (never `git diff`, which rewrites
+      the index to refresh stat data), and never a program named by configuration
+      (see snapshot_git_env). Every Git command and file read runs inside one monotonic
       deadline (`deadline_ms`, default SNAPSHOT_DEFAULT_DEADLINE_MS) so a slow
       checkout is reported as a typed failure before the caller's own timeout.
       Any failure -- a Git command that cannot start, exits nonzero, is killed,
@@ -40,7 +44,9 @@ Operations (JSON on stdin, closed JSON verdict on stdout):
 
 Diagnostic Git runs with GIT_OPTIONAL_LOCKS=0 (no opportunistic index refresh
 writes) and without repository-locating environment variables inherited from
-the caller, so `-C <path>` alone decides which repository is read.
+the caller, so `-C <path>` alone decides which repository is read. Snapshot and
+head Git commands additionally run without any inherited GIT_* variable and
+without global or system configuration.
 """
 from __future__ import annotations
 
@@ -56,23 +62,56 @@ import threading
 import time
 from pathlib import Path
 
-SNAPSHOT_FORMAT = b"pico-snapshot-v2"
+SNAPSHOT_FORMAT = b"pico-snapshot-v3"
 SNAPSHOT_DEFAULT_DEADLINE_MS = 100_000
 SNAPSHOT_MIN_DEADLINE_MS = 100
 SNAPSHOT_MAX_DEADLINE_MS = 600_000
 MAX_LISTING_BYTES = 256 * 1024 * 1024
+MAX_CONFIG_BYTES = 1024 * 1024
 MAX_STATUS_ENTRIES_REPORTED = 200
 READ_CHUNK = 1024 * 1024
 HEX_OID = re.compile(rb"[0-9a-f]{40}|[0-9a-f]{64}")
+GITLINK_MODE = b"160000"
+# Root-level ignored entries the snapshot still covers: exactly `.env` and `.env.<anything>` (case-sensitive).
+ROOT_ENV_NAME = b".env"
 # Inherited variables that would redirect `git -C <path>` to another repository, index or object store.
 REPOSITORY_ENV = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_COMMON_DIR",
                   "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE", "GIT_PREFIX")
+# Programs that the commands a snapshot runs (rev-parse, symbolic-ref, show-ref, config, ls-files, status and the
+# `git status` that status runs inside each populated submodule) could start from repository-local configuration.
+# fsmonitor runs whenever an index is read; hooks are disabled outright. Clean filters run when status re-hashes a
+# stat-dirty file; they are neutralised per driver name (see snapshot_git_env).
+SNAPSHOT_CONFIG = (("core.fsmonitor", "false"), ("core.hooksPath", os.devnull))
+FILTER_OVERRIDES = (("clean", ""), ("smudge", ""), ("process", ""), ("required", "false"))
 
 
 def git_env() -> dict:
     env = {key: value for key, value in os.environ.items() if key not in REPOSITORY_ENV}
     env["GIT_OPTIONAL_LOCKS"] = "0"
     env["GIT_TERMINAL_PROMPT"] = "0"
+    return env
+
+
+def snapshot_git_env(filters=()) -> dict:
+    """Environment for every snapshot and head Git command.
+
+    No inherited GIT_* variable survives: not the configuration channels (GIT_CONFIG_COUNT/KEY_n/VALUE_n,
+    GIT_CONFIG_PARAMETERS, GIT_CONFIG_GLOBAL/SYSTEM), not GIT_EXEC_PATH (which picks the `git` a submodule status
+    runs), not trace targets, not repository locators. Global and system configuration are off, so only the
+    repository's own configuration is read, and the executable integrations it could name are overridden at
+    command-line precedence through GIT_CONFIG_COUNT, which Git passes on to the status it runs in submodules.
+    Each filter driver named in a configuration the snapshot reads gets an empty clean/smudge/process command
+    (Git then applies no filter) and required=false.
+    """
+    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    env.update({"GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_SYSTEM": os.devnull, "GIT_CONFIG_GLOBAL": os.devnull})
+    pairs = list(SNAPSHOT_CONFIG) + [(f"filter.{name}.{key}", value) for name in sorted(set(filters))
+                                     for key, value in FILTER_OVERRIDES]
+    env["GIT_CONFIG_COUNT"] = str(len(pairs))
+    for number, (key, value) in enumerate(pairs):
+        env[f"GIT_CONFIG_KEY_{number}"] = key
+        env[f"GIT_CONFIG_VALUE_{number}"] = value
     return env
 
 
@@ -175,17 +214,19 @@ def _remaining(deadline: float) -> float:
 
 
 def _run_git(root: Path, args: list[str], deadline: float, suboperation: str, *, sink=None,
-             limit: int | None = None, ok_codes: tuple[int, ...] = (0,)) -> tuple[int, bytes]:
+             limit: int | None = None, ok_codes: tuple[int, ...] = (0,), env: dict | None = None) -> tuple[int, bytes]:
     """Run one Git command inside the deadline, streaming stdout to `sink` or collecting at most `limit` bytes.
 
     The child runs in its own process group (POSIX) so a timeout kills everything it started, and its
-    stderr is discarded: diagnostics carry the exit status, never Git's text.
+    stderr is discarded: diagnostics carry the exit status, never Git's text. The environment is always the
+    hardened snapshot_git_env (by default without filter-driver overrides).
     """
     if _remaining(deadline) <= 0:
         raise SnapshotFailure(suboperation, "DeadlineExceeded")
     try:
         proc = subprocess.Popen(["git", "-C", str(root), *args], stdin=subprocess.DEVNULL,
-                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=git_env(),
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                env=env if env is not None else snapshot_git_env(),
                                 start_new_session=os.name == "posix")
     except OSError as exc:
         raise SnapshotFailure(suboperation, "SpawnError", errno_value=exc.errno) from None
@@ -265,6 +306,18 @@ def _resolve_head(root: Path, deadline: float) -> tuple[str | None, str]:
     return None, "unborn"
 
 
+def _head_name(root: Path, deadline: float) -> bytes:
+    """The ref HEAD points at (`symbolic` + name, also for an unborn branch), or `detached`."""
+    code, ref = _run_git(root, ["symbolic-ref", "--quiet", "HEAD"], deadline, "head_symbolic",
+                         limit=4096, ok_codes=(0, 1))
+    ref = ref.removesuffix(b"\n")
+    if code == 0 and ref and b"\n" not in ref:
+        return b"symbolic\0" + ref
+    if code == 1 and not ref:
+        return b"detached"
+    raise SnapshotFailure("head_symbolic", "MalformedOutput")
+
+
 def _status_entries(status: bytes) -> tuple[list[bytes], list[bytes], list[bytes]]:
     """Porcelain v1 -z records, untracked paths, and tracked paths whose worktree differs from the index.
 
@@ -297,12 +350,14 @@ def _status_entries(status: bytes) -> tuple[list[bytes], list[bytes], list[bytes
     return entries, untracked, dirty
 
 
-def _hash_paths(top: bytes, paths: list[bytes], deadline: float, suboperation: str) -> bytes:
+def _hash_paths(top: bytes, paths: list[bytes], deadline: float, suboperation: str,
+                directory_error: str | None = None) -> bytes:
     """Digest of the current content of every path: one record per path, or a failure. Never a partial result.
 
     Regular files are hashed with their executable bit, symlinks by target; an absent path is recorded as
-    absent. An untracked nested repository is recorded by name only: its
-    contents belong to that repository. A dirty tracked directory cannot be verified by name alone.
+    absent. An untracked nested repository is recorded by name only: its contents belong to that repository.
+    Where a directory cannot be verified by name alone (a dirty tracked submodule, a root `.env` directory),
+    `directory_error` makes it a failure.
     """
     digest = hashlib.sha256()
     hashed = 0
@@ -320,8 +375,8 @@ def _hash_paths(top: bytes, paths: list[bytes], deadline: float, suboperation: s
         except OSError as exc:
             raise SnapshotFailure(suboperation, "OSError", errno_value=exc.errno) from None
         if stat.S_ISDIR(info.st_mode):
-            if suboperation == "worktree_hash":
-                raise SnapshotFailure(suboperation, "TrackedDirectoryUnverifiable")
+            if directory_error is not None:
+                raise SnapshotFailure(suboperation, directory_error)
             digest.update(b"D")
         elif stat.S_ISLNK(info.st_mode):
             try:
@@ -356,23 +411,135 @@ def _hash_paths(top: bytes, paths: list[bytes], deadline: float, suboperation: s
     return digest.digest()
 
 
-def _index_entries(listing: bytes) -> tuple[int, list[bytes]]:
-    """Count of `ls-files -v --stage -z` records and the paths Git hides from status (assume-unchanged, skip-worktree)."""
+def _real_parents(top: bytes, relative: bytes, directories: dict[bytes, bool], suboperation: str) -> bool:
+    """True when every leading component of `relative` is a real directory (lstat, never following a symlink)."""
+    end = relative.find(b"/")
+    while end != -1:
+        prefix = relative[:end]
+        known = directories.get(prefix)
+        if known is None:
+            try:
+                known = stat.S_ISDIR(os.lstat(top + b"/" + prefix).st_mode)
+            except (FileNotFoundError, NotADirectoryError):
+                known = False
+            except OSError as exc:
+                raise SnapshotFailure(suboperation, "OSError", errno_value=exc.errno) from None
+            directories[prefix] = known
+        if not known:
+            return False
+        end = relative.find(b"/", end + 1)
+    return True
+
+
+def _tracked_modes(top: bytes, paths: list[bytes], deadline: float, suboperation: str = "modes") -> bytes:
+    """Digest of the lstat file type and permission bits of every path, without reading any content.
+
+    Git ignores permission bits other than the executable bit, and under core.fileMode=false that one too, so a
+    chmod of a clean tracked file never reaches status. A symlink is never followed (neither as the path nor as a
+    leading component, which is recorded as such); a gitlink directory is lstat'ed, never entered.
+    """
+    digest = hashlib.sha256()
+    directories: dict[bytes, bool] = {}
+    for relative in paths:
+        if _remaining(deadline) <= 0:
+            raise SnapshotFailure(suboperation, "DeadlineExceeded")
+        digest.update(len(relative).to_bytes(8, "big") + relative)
+        if not _real_parents(top, relative, directories, suboperation):
+            digest.update(b"P")
+            continue
+        try:
+            info = os.lstat(top + b"/" + relative)
+        except (FileNotFoundError, NotADirectoryError):
+            digest.update(b"X")
+            continue
+        except OSError as exc:
+            raise SnapshotFailure(suboperation, "OSError", errno_value=exc.errno) from None
+        digest.update(b"M" + info.st_mode.to_bytes(4, "big"))
+    return digest.digest()
+
+
+def _index_entries(listing: bytes, suboperation: str = "index") -> list[tuple[bytes, bytes, bytes, bytes]]:
+    """`ls-files -v --stage -z` records as (tag, mode, stage, path); the tag marks assume-unchanged/skip-worktree."""
     if listing and not listing.endswith(b"\0"):
-        raise SnapshotFailure("index", "MalformedOutput")
+        raise SnapshotFailure(suboperation, "MalformedOutput")
     tokens = listing.split(b"\0")
     if tokens and tokens[-1] == b"":
         tokens.pop()
-    hidden: list[bytes] = []
+    records = []
     for token in tokens:
         meta, tab, path = token.partition(b"\t")
         fields = meta.split(b" ")
         if (not tab or not path or len(fields) != 4 or len(fields[0]) != 1 or not fields[1].isdigit()
                 or not HEX_OID.fullmatch(fields[2]) or fields[3] not in (b"0", b"1", b"2", b"3")):
-            raise SnapshotFailure("index", "MalformedOutput")
-        if fields[0].islower() or fields[0] == b"S":
-            hidden.append(path)
-    return len(tokens), hidden
+            raise SnapshotFailure(suboperation, "MalformedOutput")
+        records.append((fields[0], fields[1], fields[3], path))
+    return records
+
+
+def _filter_drivers(repo: Path, deadline: float, suboperation: str) -> set[str]:
+    """Names of the filter drivers the repository's own configuration (with its includes) defines."""
+    code, out = _run_git(repo, ["config", "-z", "--get-regexp", r"^filter\."], deadline, suboperation,
+                         limit=MAX_CONFIG_BYTES, ok_codes=(0, 1))
+    if code == 1:  # no filter key at all
+        if out:
+            raise SnapshotFailure(suboperation, "MalformedOutput")
+        return set()
+    if not out.endswith(b"\0"):
+        raise SnapshotFailure(suboperation, "MalformedOutput")
+    names = set()
+    for record in out[:-1].split(b"\0"):
+        key = record.partition(b"\n")[0]
+        if not key.startswith(b"filter."):
+            raise SnapshotFailure(suboperation, "MalformedOutput")
+        if key.count(b".") >= 2:  # filter.<driver>.<variable>; a key without a driver name defines nothing
+            names.add(os.fsdecode(key[len(b"filter."):key.rindex(b".")]))
+    return names
+
+
+def _integration_filters(top: bytes, records: list, deadline: float) -> set[str]:
+    """Filter drivers defined by the checkout and by every populated submodule `git status` will recurse into."""
+    names = _filter_drivers(Path(os.fsdecode(top)), deadline, "config")
+    pending = [(top, records)]
+    seen = {os.path.realpath(top)}
+    while pending:
+        repo, entries = pending.pop()
+        directories: dict[bytes, bool] = {}
+        for path in sorted({path for _, mode, _, path in entries if mode == GITLINK_MODE}):
+            if _remaining(deadline) <= 0:
+                raise SnapshotFailure("submodule_config", "DeadlineExceeded")
+            child = repo + b"/" + path
+            if not _real_parents(repo, path, directories, "submodule_config"):
+                continue
+            try:
+                populated = stat.S_ISDIR(os.lstat(child).st_mode) and os.path.lexists(child + b"/.git")
+            except (FileNotFoundError, NotADirectoryError):
+                populated = False
+            except OSError as exc:
+                raise SnapshotFailure("submodule_config", "OSError", errno_value=exc.errno) from None
+            real = os.path.realpath(child)
+            if not populated or real in seen:
+                continue
+            seen.add(real)
+            names |= _filter_drivers(Path(os.fsdecode(child)), deadline, "submodule_config")
+            _, listing = _run_git(Path(os.fsdecode(child)), ["ls-files", "-v", "--stage", "-z"], deadline,
+                                  "submodule_index", limit=MAX_LISTING_BYTES)
+            pending.append((child, _index_entries(listing, "submodule_index")))
+    return names
+
+
+def _root_env(top: bytes, deadline: float) -> list[bytes]:
+    """Root-level entries named `.env` or `.env.*`, from one shallow listing of the checkout root."""
+    names = []
+    try:
+        with os.scandir(top) as entries:
+            for entry in entries:
+                if _remaining(deadline) <= 0:
+                    raise SnapshotFailure("root_env", "DeadlineExceeded")
+                if entry.name == ROOT_ENV_NAME or entry.name.startswith(ROOT_ENV_NAME + b"."):
+                    names.append(entry.name)
+    except OSError as exc:
+        raise SnapshotFailure("root_env", "OSError", errno_value=exc.errno) from None
+    return sorted(names)
 
 
 def _deadline_ms(value) -> int:
@@ -404,26 +571,39 @@ def snapshot(path: str, *, deadline_ms: int | None = None) -> dict:
             raise SnapshotFailure("repository", "MalformedOutput")
         root = Path(os.fsdecode(top))
         head, head_state = _resolve_head(root, deadline)
+        head_name = _head_name(root, deadline)
         digest = hashlib.sha256(SNAPSHOT_FORMAT + b"\0")
 
         def section(name: str, value: bytes) -> None:
             digest.update(name.encode("ascii") + b"\0" + value)
 
-        section("head", (head or "").encode("ascii") + b"\0" + head_state.encode("ascii"))
-        _, status = _run_git(root, ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=none"], deadline,
-                             "status", limit=MAX_LISTING_BYTES)
-        entries, untracked, dirty = _status_entries(status)
-        section("status", hashlib.sha256(status).digest())
+        # The commit, and which ref HEAD names (two branches at one commit, detached, or an unborn branch's name).
+        section("head", (head or "").encode("ascii") + b"\0" + head_state.encode("ascii") + b"\0" + head_name)
         # The index itself: mode, object id and stage of every entry, so staged content is covered exactly, and the
         # assume-unchanged/skip-worktree tags. Plumbing only: unlike `git diff`, nothing here rewrites the index.
         _, listing = _run_git(root, ["ls-files", "-v", "--stage", "-z"], deadline, "index", limit=MAX_LISTING_BYTES)
-        index_count, hidden = _index_entries(listing)
+        records = _index_entries(listing)
+        filters = _integration_filters(top, records, deadline)
+        _, status = _run_git(root, ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=none"], deadline,
+                             "status", limit=MAX_LISTING_BYTES, env=snapshot_git_env(filters))
+        entries, untracked, dirty = _status_entries(status)
+        section("status", hashlib.sha256(status).digest())
         section("index", hashlib.sha256(listing).digest())
         # Unstaged content: the worktree bytes of every tracked path status reports as differing from the index,
         # and of every path Git hides from status; then every untracked path.
+        hidden = [path for tag, _, _, path in records if tag.islower() or tag == b"S"]
         tracked = sorted(set(dirty) | set(hidden))
-        section("worktree", len(tracked).to_bytes(8, "big") + _hash_paths(top, tracked, deadline, "worktree_hash"))
+        section("worktree", len(tracked).to_bytes(8, "big") + _hash_paths(top, tracked, deadline, "worktree_hash",
+                                                                          "TrackedDirectoryUnverifiable"))
+        # Type and permission bits of every tracked path (conflict stages once), by lstat only.
+        paths = sorted({path for _, _, _, path in records})
+        section("modes", len(paths).to_bytes(8, "big") + _tracked_modes(top, paths, deadline))
         section("untracked", len(untracked).to_bytes(8, "big") + _hash_paths(top, untracked, deadline, "untracked_hash"))
+        # Root `.env`/`.env.*` whether ignored or not: content, symlink target, and type and permission bits.
+        env_files = _root_env(top, deadline)
+        section("root_env", len(env_files).to_bytes(8, "big")
+                + _hash_paths(top, env_files, deadline, "root_env", "DirectoryUnverifiable")
+                + _tracked_modes(top, env_files, deadline, "root_env"))
     except SnapshotFailure as failure:
         return {"ok": False, "blocker_code": failure.blocker_code, "operation": "snapshot",
                 "suboperation": failure.suboperation, "error_kind": failure.error_kind,
@@ -431,7 +611,7 @@ def snapshot(path: str, *, deadline_ms: int | None = None) -> dict:
                 "elapsed_ms": elapsed(), "deadline_ms": budget}
     return {"ok": True, "digest": digest.hexdigest(), "head": head, "head_state": head_state,
             "status": [entry.decode("utf-8", errors="replace") for entry in entries[:MAX_STATUS_ENTRIES_REPORTED]],
-            "status_count": len(entries), "untracked_count": len(untracked), "index_count": index_count,
+            "status_count": len(entries), "untracked_count": len(untracked), "index_count": len(records),
             "elapsed_ms": elapsed(), "deadline_ms": budget}
 
 

@@ -45,6 +45,18 @@ def git(cwd: Path, *args: str) -> str:
     return subprocess.run([REAL_GIT, "-C", str(cwd), *args], check=True, capture_output=True, text=True).stdout.strip()
 
 
+def commit(cwd: Path, message: str, *args: str) -> None:
+    git(cwd, "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", *args, "-m", message)
+
+
+def add_submodule(repo: Path, base: Path, name: str = "child") -> Path:
+    source = base / f"{name}-source"
+    git(repo, "clone", "-q", str(repo), str(source))
+    git(repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(source), name)
+    commit(repo, f"add {name}")
+    return repo / name
+
+
 class SnapshotFixture(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -214,13 +226,14 @@ class SnapshotFailureTest(SnapshotFixture):
             self.assertEqual(caught.exception.error_kind, "MalformedOutput")
 
     def test_dirty_submodule_requires_a_complete_snapshot(self):
-        source = self.base / "source"
-        git(self.repo, "clone", "-q", str(self.repo), str(source))
-        git(self.repo, "-c", "protocol.file.allow=always", "submodule", "add", str(source), "child")
-        git(self.repo, "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-qm", "add child")
+        add_submodule(self.repo, self.base)
         self.assertTrue(self.snap()["ok"])
         (self.repo / "child" / "tracked.txt").write_text("local changes")
-        self.assert_failed(self.snap(), "worktree_hash", "TrackedDirectoryUnverifiable")
+        # Dirt that predates the worker fails every snapshot (so every worker call is refused) until it is cleaned.
+        for _ in range(3):
+            self.assert_failed(self.snap(), "worktree_hash", "TrackedDirectoryUnverifiable")
+        git(self.repo / "child", "checkout", "--", "tracked.txt")
+        self.assertTrue(self.snap()["ok"])
 
     def test_malformed_git_output_is_a_failure(self):
         # Exit 0 without output: `rev-parse --show-toplevel` printed nothing.
@@ -314,6 +327,256 @@ class SnapshotFailureTest(SnapshotFixture):
             if b"sleep" in cmdline[0] and marker.encode() in cmdline and state != "Z":
                 found.append(int(entry.name))
         return found
+
+
+class SnapshotExecutionIsolationTest(SnapshotFixture):
+    """No program named by inherited or repository-local configuration runs during a snapshot.
+
+    Every case first proves, with the real Git in the same configuration (GIT_OPTIONAL_LOCKS=0, like the helper),
+    that the canary does execute; only then does it assert that the snapshot never starts it.
+    """
+
+    def canary(self, name: str = "canary") -> tuple[Path, Path]:
+        marker = self.base / f"{name}.ran"
+        script = self.base / f"{name}.sh"
+        script.write_text(f"#!/bin/sh\necho ran >> '{marker}'\nexec cat\n")
+        script.chmod(0o755)
+        return script, marker
+
+    def assert_canary_contained(self, marker: Path, cwd: Path | None = None) -> dict:
+        control = subprocess.run([REAL_GIT, "-C", str(cwd or self.repo), "status", "--porcelain=v1", "-z",
+                                  "--untracked-files=all", "--ignore-submodules=none"], stdin=subprocess.DEVNULL,
+                                 capture_output=True, env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"})
+        self.assertTrue(marker.exists(), f"control: plain git status runs the canary (exit {control.returncode})")
+        marker.unlink()
+        result = self.snap()
+        self.assertFalse(marker.exists(), "the snapshot executed a configured program")
+        self.assertTrue(session_scope.head(str(self.repo))["ok"])
+        self.assertFalse(marker.exists(), "the head check executed a configured program")
+        return result
+
+    def test_inherited_configuration_cannot_run_fsmonitor(self):
+        script, marker = self.canary()
+        config_file = self.base / "injected.gitconfig"
+        config_file.write_text(f"[core]\n\tfsmonitor = {script}\n")
+        home = self.base / "home"
+        (home / ".config" / "git").mkdir(parents=True)
+        (home / ".gitconfig").write_text(config_file.read_text())
+        clean = self.snap()["digest"]
+        vectors = {
+            "count": {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "core.fsmonitor", "GIT_CONFIG_VALUE_0": str(script)},
+            "parameters": {"GIT_CONFIG_PARAMETERS": f"'core.fsmonitor'='{script}'"},
+            "global": {"GIT_CONFIG_GLOBAL": str(config_file)},
+            "system": {"GIT_CONFIG_SYSTEM": str(config_file)},
+            "home": {"HOME": str(home), "XDG_CONFIG_HOME": str(home / ".config")},
+        }
+        for name, variables in vectors.items():
+            with self.subTest(vector=name), unittest.mock.patch.dict(os.environ, variables):
+                for unset in ("GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_GLOBAL") if name in ("system", "home") else ():
+                    os.environ.pop(unset, None)
+                result = self.assert_canary_contained(marker)
+                self.assertTrue(result["ok"], result)
+                self.assertEqual(result["digest"], clean, "inherited configuration does not change what is read")
+
+    def test_repository_local_fsmonitor_and_clean_filter_never_run(self):
+        script, marker = self.canary()
+        with self.subTest(integration="fsmonitor"):
+            git(self.repo, "config", "core.fsmonitor", str(script))
+            self.assertTrue(self.assert_canary_contained(marker)["ok"])
+            git(self.repo, "config", "--unset", "core.fsmonitor")
+        with self.subTest(integration="clean filter"):
+            git(self.repo, "config", "filter.canary.clean", str(script))
+            git(self.repo, "config", "filter.canary.required", "true")
+            (self.repo / ".git" / "info" / "attributes").write_text("*.txt filter=canary\n")
+            # A stale stat makes status re-hash the clean file, which is where Git applies the clean filter.
+            future = time.time() + 60
+            os.utime(self.repo / "tracked.txt", (future, future))
+            self.assertTrue(self.assert_canary_contained(marker)["ok"])
+        with self.subTest(integration="long-running process filter"):
+            git(self.repo, "config", "--unset", "filter.canary.clean")
+            git(self.repo, "config", "filter.canary.process", str(script))
+            future = time.time() + 120
+            os.utime(self.repo / "tracked.txt", (future, future))
+            self.assertTrue(self.assert_canary_contained(marker)["ok"])
+
+    def test_submodule_recursion_runs_no_configured_program(self):
+        child = add_submodule(self.repo, self.base)
+        script, marker = self.canary()
+        child_git = Path(git(child, "rev-parse", "--absolute-git-dir"))
+        with self.subTest(integration="submodule fsmonitor"):
+            git(child, "config", "core.fsmonitor", str(script))
+            self.assertTrue(self.assert_canary_contained(marker)["ok"])
+            git(child, "config", "--unset", "core.fsmonitor")
+        with self.subTest(integration="submodule clean filter"):
+            git(child, "config", "filter.childcanary.clean", str(script))
+            (child_git / "info").mkdir(exist_ok=True)
+            (child_git / "info" / "attributes").write_text("*.txt filter=childcanary\n")
+            future = time.time() + 60
+            os.utime(child / "tracked.txt", (future, future))
+            self.assertTrue(self.assert_canary_contained(marker)["ok"])
+            git(child, "config", "--unset", "filter.childcanary.clean")
+        with self.subTest(integration="inherited GIT_EXEC_PATH"):
+            exec_dir = self.base / "exec"
+            exec_dir.mkdir()
+            (exec_dir / "git").write_text(f"#!/bin/sh\necho ran >> '{marker}'\nexec '{REAL_GIT}' \"$@\"\n")
+            (exec_dir / "git").chmod(0o755)
+            with unittest.mock.patch.dict(os.environ, {"GIT_EXEC_PATH": str(exec_dir)}):
+                self.assertTrue(self.assert_canary_contained(marker)["ok"])
+
+    def test_every_snapshot_command_runs_with_overridden_integrations(self):
+        with unittest.mock.patch.dict(os.environ, {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "core.fsmonitor",
+                                                   "GIT_CONFIG_VALUE_0": "x", "GIT_TRACE": "1", "GIT_EXEC_PATH": "/x"}):
+            env = session_scope.snapshot_git_env(("a.b",))
+        self.assertFalse({"GIT_TRACE", "GIT_EXEC_PATH", "GIT_CONFIG_PARAMETERS"} & set(env))
+        self.assertEqual((env["GIT_CONFIG_NOSYSTEM"], env["GIT_CONFIG_GLOBAL"], env["GIT_OPTIONAL_LOCKS"]),
+                         ("1", os.devnull, "0"))
+        config = {env[f"GIT_CONFIG_KEY_{i}"]: env[f"GIT_CONFIG_VALUE_{i}"] for i in range(int(env["GIT_CONFIG_COUNT"]))}
+        self.assertEqual(config["core.fsmonitor"], "false")
+        self.assertEqual(config["core.hooksPath"], os.devnull)
+        self.assertEqual((config["filter.a.b.clean"], config["filter.a.b.process"], config["filter.a.b.required"]),
+                         ("", "", "false"))
+
+
+class SnapshotTrackedModeTest(SnapshotFixture):
+    """Tracked-path type and permission bits are covered by lstat alone, also where Git ignores them."""
+
+    def test_tracked_chmod_with_filemode_false_changes_the_digest(self):
+        git(self.repo, "config", "core.fileMode", "false")
+        before = self.snap()
+        os.chmod(self.repo / "tracked.txt", 0o755)
+        after = self.snap()
+        self.assertTrue(after["ok"], after)
+        self.assertEqual(before["status"], after["status"], "Git itself reports nothing")
+        self.assertNotEqual(before["digest"], after["digest"])
+        os.chmod(self.repo / "tracked.txt", 0o644)
+        self.assertEqual(self.snap()["digest"], before["digest"])
+
+    def test_clean_tracked_files_are_not_reread(self):
+        for index in range(25):
+            (self.repo / f"file{index}.txt").write_text(f"{index}\n")
+        git(self.repo, "add", ".")
+        commit(self.repo, "many")
+        git(self.repo, "config", "core.fileMode", "false")
+        opened: list[str] = []
+        real_open = os.open
+
+        def counting_open(path, *args, **kwargs):
+            if str(self.repo) in os.fsdecode(path):
+                opened.append(os.fsdecode(path))
+            return real_open(path, *args, **kwargs)
+
+        with unittest.mock.patch.object(session_scope.os, "open", counting_open):
+            result = self.snap()
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(opened, [], "clean tracked content is never read")
+
+    def test_tracked_symlinks_are_not_followed(self):
+        outside = self.base / "outside.txt"
+        outside.write_text("x\n")
+        (self.repo / "link").symlink_to(outside)
+        git(self.repo, "add", "link")
+        commit(self.repo, "link")
+        git(self.repo, "config", "core.fileMode", "false")
+        before = self.snap()
+        os.chmod(outside, 0o700)
+        self.assertEqual(self.snap()["digest"], before["digest"], "the link itself did not change")
+
+    def test_conflict_stages_and_gitlinks_are_covered_once(self):
+        add_submodule(self.repo, self.base)
+        git(self.repo, "checkout", "-q", "-b", "side")
+        (self.repo / "tracked.txt").write_text("side\n")
+        commit(self.repo, "side", "-a")
+        git(self.repo, "checkout", "-q", "main")
+        (self.repo / "tracked.txt").write_text("main\n")
+        commit(self.repo, "main", "-a")
+        subprocess.run([REAL_GIT, "-C", str(self.repo), "-c", "user.name=t", "-c", "user.email=t@example.com",
+                        "merge", "-q", "side"], capture_output=True)
+        stages = git(self.repo, "ls-files", "--stage", "tracked.txt").splitlines()
+        self.assertEqual(len(stages), 3, "a three-stage conflict")
+        git(self.repo, "config", "core.fileMode", "false")
+        first, second = self.snap(), self.snap()
+        self.assertTrue(first["ok"], first)
+        self.assertEqual(first["digest"], second["digest"])
+        os.chmod(self.repo / "child", 0o700)
+        self.assertNotEqual(self.snap()["digest"], first["digest"], "the gitlink directory is lstat'ed, not entered")
+
+    def test_tracked_modes_respect_the_deadline(self):
+        with self.assertRaises(session_scope.SnapshotFailure) as caught:
+            session_scope._tracked_modes(os.fsencode(self.repo), [b"tracked.txt"], time.monotonic() - 1)
+        self.assertEqual((caught.exception.suboperation, caught.exception.error_kind), ("modes", "DeadlineExceeded"))
+
+
+class SnapshotRootEnvTest(SnapshotFixture):
+    """Root `.env`/`.env.*` entries are covered even when ignored; other ignored paths are explicitly not."""
+
+    def setUp(self):
+        super().setUp()
+        (self.repo / ".git" / "info" / "exclude").write_text(".env*\nnode_modules/\n.venv/\n.cache/\n")
+
+    def test_ignored_root_env_content_mode_link_and_presence_change_the_digest(self):
+        for name in (".env", ".env.local"):
+            with self.subTest(name=name):
+                path = self.repo / name
+                absent = self.snap()
+                path.write_text("TOKEN=one\n")
+                one = self.snap()
+                self.assertEqual(one["status"], absent["status"], "ignored: Git reports nothing")
+                path.write_text("TOKEN=two\n")
+                two = self.snap()
+                os.chmod(path, 0o600)
+                private = self.snap()
+                path.unlink()
+                path.symlink_to(self.base / "elsewhere")
+                linked = self.snap()
+                digests = [absent["digest"], one["digest"], two["digest"], private["digest"], linked["digest"]]
+                self.assertEqual(len(set(digests)), len(digests), digests)
+                path.unlink()
+                self.assertEqual(self.snap()["digest"], absent["digest"])
+
+    def test_a_root_env_directory_fails_closed(self):
+        (self.repo / ".env.d").mkdir()
+        (self.repo / ".env.d" / "secret").write_text("x\n")
+        self.assert_failed(self.snap(), "root_env", "DirectoryUnverifiable")
+
+    def test_other_ignored_paths_are_explicitly_not_covered(self):
+        for relative in ("node_modules/pkg/index.js", ".venv/lib/site.py", ".cache/blob", "nested/.env", ".envrc"):
+            (self.repo / relative).parent.mkdir(parents=True, exist_ok=True)
+            (self.repo / relative).write_text("one\n")
+        (self.repo / ".git" / "info" / "exclude").write_text(".env*\nnode_modules/\n.venv/\n.cache/\nnested/\n")
+        before = self.snap()
+        for relative in ("node_modules/pkg/index.js", ".venv/lib/site.py", ".cache/blob", "nested/.env", ".envrc"):
+            (self.repo / relative).write_text("two\n")
+        self.assertEqual(self.snap()["digest"], before["digest"], "outside the documented coverage")
+
+
+class SnapshotHeadIdentityTest(SnapshotFixture):
+    """The symbolic HEAD (branch name, or detached) is part of the digest, not only the commit it resolves to."""
+
+    def test_switching_between_branches_at_the_same_commit_changes_the_digest(self):
+        git(self.repo, "branch", "other")
+        on_main = self.snap()
+        git(self.repo, "checkout", "-q", "other")
+        on_other = self.snap()
+        self.assertEqual((on_main["head"], on_main["status"]), (on_other["head"], on_other["status"]))
+        self.assertNotEqual(on_main["digest"], on_other["digest"])
+
+    def test_detaching_at_the_same_commit_changes_the_digest(self):
+        attached = self.snap()
+        git(self.repo, "checkout", "-q", "--detach")
+        detached = self.snap()
+        self.assertEqual((detached["head"], detached["head_state"]), (attached["head"], "commit"))
+        self.assertNotEqual(attached["digest"], detached["digest"])
+
+    def test_renaming_an_unborn_branch_changes_the_digest(self):
+        unborn = self.base / "unborn"
+        unborn.mkdir()
+        git(unborn, "init", "-q", "-b", "main")
+        before = session_scope.snapshot(str(unborn))
+        git(unborn, "symbolic-ref", "HEAD", "refs/heads/other")
+        after = session_scope.snapshot(str(unborn))
+        self.assertEqual((after["head"], after["head_state"]), (None, "unborn"))
+        self.assertNotEqual(before["digest"], after["digest"])
+        self.assertEqual(session_scope.head(str(unborn)), {"ok": True, "head": None}, "head() result is unchanged")
 
 
 class ScopeCheckRecordTest(StateTestCase):
